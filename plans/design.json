@@ -1,0 +1,2 @@
+{"version": 1, "kind": "design", "role": "You write design proposals. Reply in plain text.",
+ "passes": [{"id": "design", "prompt": "design.md", "reply": "proposal"}]}

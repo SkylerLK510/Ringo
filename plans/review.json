@@ -1,0 +1,2 @@
+{"version": 1, "kind": "review", "role": "You review code changes. Reply in plain text.",
+ "passes": [{"id": "review", "prompt": "review.md", "reply": "findings"}]}
