@@ -80,6 +80,7 @@ class CallTest(unittest.TestCase):
         self.assertEqual(harness.backend('claude'), {'name': 'claude', 'argv': shlex.split(backends.JUDGE_PRESETS['claude']),
                                                      'style': 'claude'})
         self.assertEqual(harness.backend('codex')['style'], 'plain')
+        self.assertEqual(harness.backend('codex-chatgpt')['style'], 'codex')
         self.assertEqual(harness.backend('ollama:qwen3')['argv'], ['ollama', 'run', 'qwen3'])
         self.assertEqual(harness.backend('claude:my-wrapper -p')['style'], 'claude')
         self.assertEqual(harness.backend('/usr/local/bin/claude -p')['style'], 'plain')  # no name sniffing
@@ -102,6 +103,66 @@ class CallTest(unittest.TestCase):
         self.assertEqual(run.summary()['cache_write'], 0)
         with self.assertRaises(harness.BudgetExceeded):
             run.reserve()
+
+    def test_explicit_admission_refusal_is_not_charged_by_review_or_design(self):
+        for kind in ('review', 'design'):
+            p = pl.load_plan(None, kind)
+            run = harness.Run(unpriced_call_usd=0.5)
+            def refuse(*args):
+                raise harness.AdmissionRefused('not started')
+            with self.subTest(kind=kind), self.assertRaises(harness.AdmissionRefused):
+                harness.run_plan(p, 'material', B, run, call_fn=refuse)
+            self.assertEqual(run.summary()['calls'], 0)
+            self.assertEqual(run.summary()['cost_usd'], 0)
+            self.assertEqual(run.summary()['unpriced_calls'], 0)
+            self.assertEqual(run.summary()['admission_refusals'], 1)
+
+    def test_interrupted_review_or_design_keeps_cost_uncertainty(self):
+        for kind in ('review', 'design'):
+            p = pl.load_plan(None, kind)
+            run = harness.Run()
+            def interrupt(*args):
+                raise KeyboardInterrupt()
+            with self.subTest(kind=kind), self.assertRaises(KeyboardInterrupt):
+                harness.run_plan(p, 'material', B, run, call_fn=interrupt)
+            self.assertEqual(run.summary()['calls'], 1)
+            self.assertEqual(run.summary()['unpriced_calls'], 1)
+
+    @staticmethod
+    def codex_events():
+        return '\n'.join(json.dumps(x) for x in [
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'No defects found.'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 100, 'cached_input_tokens': 70,
+                                                'output_tokens': 12}}])
+
+    def test_chatgpt_backend_forces_native_auth_disables_nested_tools_and_records_tokens(self):
+        backend = harness.backend('codex-chatgpt')
+        self.assertIn('forced_login_method="chatgpt"', backend['argv'])
+        self.assertIn('model_provider="openai"', backend['argv'])
+        self.assertIn('--json', backend['argv'])
+        self.assertIn('skip_host_skill_discovery', backend['argv'])
+        with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
+            text, usage = harness.call(backend, 'SYS', 'MSG', 30)
+        invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, subscription_auth=True)
+        self.assertEqual(text, 'No defects found.')
+        self.assertEqual(usage, {'input': 30, 'cache_read': 70, 'cache_write': 0, 'output': 12, 'cost_usd': None})
+
+    def test_native_turn_failures_preserve_reported_tokens_without_becoming_success(self):
+        for tail in ('not JSON', json.dumps({'type': 'turn.failed'}),
+                     json.dumps({'type': 'item.completed', 'item': {'type': 'command_execution'}})):
+            with self.subTest(tail=tail), self.assertRaises(harness.CallError) as caught:
+                harness.codex_reply(self.codex_events() + '\n' + tail)
+            self.assertEqual(caught.exception.usage['output'], 12)
+        with self.assertRaises(harness.CallError):
+            harness.codex_reply('{"type":"item.completed","item":{"type":"agent_message","text":"draft"}}')
+
+    def test_native_process_failure_preserves_completed_usage(self):
+        error = backends.JudgeError('codex exited with 1')
+        error.stdout = self.codex_events()
+        with mock.patch.object(backends, 'run_isolated', side_effect=error), \
+                self.assertRaises(harness.CallError) as caught:
+            harness.call(harness.backend('codex-chatgpt'), 's', 'm', 1)
+        self.assertEqual(caught.exception.usage['input'], 30)
 
     def test_model_override_replaces_attached_and_duplicate_options(self):
         self.assertEqual(harness.with_model(['c', '--model=large', '-p', '--model', 'other'], 'small'),

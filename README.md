@@ -16,7 +16,7 @@ Python 3.11+ and the standard library. From this checkout:
 
 ```sh
 python3 ringo.py --help
-python3 ringo.py review --input change.txt --backend codex --max-calls 1
+python3 ringo.py review --input change.txt --backend codex-chatgpt --max-calls 1
 python3 ringo.py design --input brief.md --out proposal.md
 python3 ringo.py work --spec task.json --out /ABSOLUTE/PATH/TO/new-run
 python3 -m unittest discover -s tests -q
@@ -36,6 +36,10 @@ explicitly. See [the council workflow guide](docs/COUNCIL-WORKFLOW.md) for the
 task format, outputs, budgets and trust limits.
 
 Backends include Claude Code, Codex, local Ollama and commands that read stdin.
+`codex-chatgpt` forces native ChatGPT authentication, strips API-key and endpoint
+overrides, disables nested tools/skill discovery and records reported tokens from
+the CLI's JSON events. Its dollar cost remains unknown. The existing `codex`
+preset remains available for the caller's configured authentication.
 Authenticate with the provider's supported CLI. Usage consumes the selected account's
 allowance or API billing according to authentication and plan settings. Unknown
 cost is not zero. `--trace` uses a new folder outside this checkout; it contains
@@ -55,9 +59,7 @@ integrity ledger, and controls validation/test reuse. Improvement campaigns sear
 review prompts/plans against dev evidence. A finalist requires a sealed-test pass
 and human adoption. These gates stay advisory; no automatic adoption occurs.
 `work` repairs one task's files and does not change Ringo's prompts or plans.
-A budgeted review, design, evaluation or improvement run requires an explicitly
-declared fallback for unpriced attempts. In `work` the fallback is optional; without
-it, the first unpriced call under `max_cost` stops all later calls.
+A dollar-budgeted run requires an explicitly declared fallback for unpriced attempts.
 The final admitted call can exceed a remaining budget.
 
 Backend calls start in empty directories, which are not filesystem boundaries.
@@ -86,6 +88,16 @@ old digests or copy sealed data into this repository.
 
 A publication license has not yet been selected. No performance or quality gain
 is claimed from this repository extraction.
+
+## Use from an agent
+
+The [Ringo workflow skill](skills/ringo-harness/SKILL.md) connects ordinary coding
+and design work to actual bounded harness calls. Link that folder into the agent's
+user skills directory and set its local instructions to use it for substantive
+engineering work. For Codex, the user skill location is `~/.agents/skills/`; for
+Claude Code it is `~/.claude/skills/`. Use `RINGO_HOME` to identify this checkout
+when needed. The CLI remains explicitly invoked; installing a skill is guidance,
+not a background daemon. Start a new agent session after changing global instructions.
 
 ## Intended research use
 

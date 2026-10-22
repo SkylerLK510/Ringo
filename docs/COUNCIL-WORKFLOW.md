@@ -11,6 +11,10 @@ built-in path to it: each task names the council bridge command and rubric file.
 
 ## How a run works
 
+Before inference, Ringo parses both backend commands and performs an offline bridge
+`prepare` preflight to validate the bridge, brief, rubric and policy. Invalid setup
+therefore stops before a writer call. The initial files are not scored or adopted.
+
 Each round:
 
 1. **Write.** The writer model receives the brief, the source material, the
@@ -80,14 +84,14 @@ folder off `sys.path`.
 | `allow_execution` | `false` | Must be `true`: checks execute code, including model-written code. |
 | `council` | required | Bridge command as an argv list. Use absolute paths: it runs from an empty temporary folder. |
 | `rubric` | required | Rubric file, absolute or relative to the spec's folder. |
-| `writer`, `judge` | required | Backends: `claude`, `codex`, `ollama:MODEL`, `claude:<command>` or any command that reads stdin. |
-| `allow_tool_backends` | `false` | Must be `true` for any backend except the `claude` preset and `ollama:MODEL`, since the others may read local files. |
+| `writer`, `judge` | required | Backends: `claude`, `codex`, `codex-chatgpt`, `ollama:MODEL`, `claude:<command>` or any command that reads stdin. |
+| `allow_tool_backends` | `false` | Must be `true` for any backend except `claude`, `codex-chatgpt` and `ollama:MODEL`, since the others may read local files. |
 | `samples` | 2 | Judge calls per assessed round, 2 to 25. |
 | `max_rounds` | 3 | Writer rounds, including malformed ones. |
 | `max_calls` | 9 | Writer and judge calls together. |
 | `max_seconds` | 600 | Wall-clock bound for the whole run. |
 | `timeout_s` | 120 | Bound for each model call, capped by the time left. |
-| `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and the price to assume for calls that report none. |
+| `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and fallback price for calls reporting none. A dollar cap requires a declared fallback. |
 
 Paths in `files` and `fixtures` must be normalized relative POSIX paths without
 backslashes or components that start with `.`, so `.github/` is refused. No path
@@ -113,11 +117,12 @@ command calls the selected models and uses their accounts.
 | 0 | `ready_for_review` | All checks passed and the council recommended. `final/` holds the editable files. |
 | 1 | `needs_revision` | Every round ran without a reviewable candidate. |
 | 1 | `repeated_candidate` | The writer returned an earlier candidate again. |
-| 1 | `budget_exhausted` | The call cap, cost cap or an admission refusal stopped the run, or the wall-clock bound had been reached when the next model call or check was due to start. |
-| 1 | `error` | For example a mutated file, a bridge failure, an unreadable judge reply, a changed council policy, or a model or bridge call that timed out, including one cut short by the wall-clock bound. |
+| 1 | `budget_exhausted` | The call cap, cost cap, admission refusal or overall wall-clock bound stopped the run, including a model/bridge timeout at that deadline. |
+| 1 | `error` | For example a mutated file, bridge failure, unreadable judge reply, changed council policy, or a per-operation timeout before the overall deadline. |
 | 2 | none | The spec or output folder was refused before the run started. |
 
-An interrupted run, or one stopped by an exception the workflow does not
+Deeply nested writer JSON is treated as malformed protocol output and can be
+revised. An interrupted run, or one stopped by an exception the workflow does not
 handle, writes `report.json` with status `interrupted` and then re-raises the
 exception, so no report is printed. Each round records `malformed`,
 `repeated_candidate`, `revise` or `ready_for_review`. A round stopped by a bound,
@@ -158,8 +163,8 @@ Writer and judge calls share one `harness.Run`. A call is reserved before it
 starts and counted from then on. A call that fails or times out stays counted,
 and its cost is unknown unless the backend reported it. Unknown cost is not zero.
 Without `unpriced_call_usd`, `cost_usd` excludes it and `unpriced_calls` counts it;
-with `unpriced_call_usd`, that price is added to `cost_usd` instead. With `max_cost`
-set and no `unpriced_call_usd`, the first unpriced call stops all later calls.
+with `unpriced_call_usd`, that price is added to `cost_usd` instead. Setting
+`max_cost` without a fallback is rejected before the run starts.
 
 A Python adapter that calls `workflow.run(..., call_fn=...)` can raise
 `harness.AdmissionRefused` only when it refused before starting any provider call.
@@ -168,6 +173,11 @@ as a call. Every other exception, including a generic `BudgetExceeded`, is treat
 as a potentially started call. The built-in backends never raise it. Reports
 written before this distinction existed may count a refused admission as an
 unpriced call; they have not been rewritten.
+
+For native ChatGPT authentication, select `codex-chatgpt` for writer/judge. It
+forces the CLI's ChatGPT login method, removes API-auth/endpoint overrides and
+records reported input/cache/output tokens from JSON events. Its price remains
+unknown; it consumes the selected account's subscription allowance.
 
 Caps stop new calls. The last admitted call can overshoot a cost or token
 threshold. Ringo has no built-in token cap; an adapter must enforce one.

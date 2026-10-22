@@ -24,6 +24,17 @@ class BackendRuntimeTest(unittest.TestCase):
         self.assertIn('exited with 7', str(caught.exception))
         self.assertIn('usage-fixture', caught.exception.stdout)
 
+    def test_subscription_call_scrubs_api_auth_and_endpoint_overrides(self):
+        code = ('import json, os; print(json.dumps({k:os.environ.get(k) for k in '
+                '["OPENAI_API_KEY","CODEX_API_KEY","OPENAI_BASE_URL","OPENAI_ACCESS_TOKEN",'
+                '"OPENAI_IDENTITY_TOKEN_FILE","ANTHROPIC_AUTH_TOKEN","RINGO_TEST_MARKER"]}))')
+        overrides = dict.fromkeys(['OPENAI_API_KEY', 'CODEX_API_KEY', 'OPENAI_BASE_URL',
+                                  'OPENAI_ACCESS_TOKEN', 'OPENAI_IDENTITY_TOKEN_FILE', 'ANTHROPIC_AUTH_TOKEN'], 'fixture')
+        with mock.patch.dict(os.environ, {**overrides, 'RINGO_TEST_MARKER': 'keep'}):
+            result = json.loads(backends.run_isolated([sys.executable, '-c', code], '', 5, subscription_auth=True))
+        self.assertEqual(result.pop('RINGO_TEST_MARKER'), 'keep')
+        self.assertTrue(all(v is None for v in result.values()))
+
     def test_timeout_stops_the_child(self):
         with self.assertRaises(subprocess.TimeoutExpired):
             backends.run_isolated([sys.executable, '-c', 'import time; time.sleep(10)'], '', 0.1)

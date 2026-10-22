@@ -1,6 +1,6 @@
 ---
 name: ringo-harness
-description: Run Ringo's harness from an agent - review a code change, write a design proposal, evaluate a pipeline change with overfitting guardrails, or run a bounded improvement campaign. Use when the user asks Ringo to review a diff or PR, propose a design, test whether a pipeline change really helps.
+description: "Use Ringo for substantive coding and design workflows: review changes, propose designs, or revise declared artifacts using executable checks and Design Council assessment. Also supports explicit evaluation and bounded improvement campaigns. Simple questions and trivial edits do not require inference."
 ---
 
 # Ringo harness
@@ -8,6 +8,36 @@ description: Run Ringo's harness from an agent - review a code change, write a d
 Ringo is a harness you run as a CLI. Each task is a pipeline of isolated, single-turn model calls (a plan
 file plus prompts), assembled in code, with a trace of every call's tokens and cost. Run it from the repository
 root. You never paste its prompts yourself: the prompts live in `prompts/` and the plans in `plans/`.
+
+## Routine coding and design
+
+When this skill is the user's selected workflow, use the executable harness for
+substantive code/design work; merely reading this file is not a harness run.
+For a code change, implement it, run the project's checks, then obtain one bounded
+Ringo review before presenting it as finished. Verify each finding against the
+code and fix confirmed defects. For a substantial architecture decision, use
+`design`; for generating/revising a declared set of text files, read
+`docs/COUNCIL-WORKFLOW.md` and use `work` with the separate council bridge.
+
+Locate the checkout through `RINGO_HOME` when provided, or resolve this skill's
+symlink: the checkout is two parents above `skills/ringo-harness/`. Invoke its
+`ringo.py` by absolute path when working in another repository. Keep material,
+reports and traces in a private run folder outside both project checkouts.
+
+For native ChatGPT login, use `--backend codex-chatgpt --max-calls 1 --timeout 180`
+for the initial review/design run. This preset forces ChatGPT authentication,
+removes API-key/endpoint overrides, disables nested tools/skill discovery and
+records reported token usage. It consumes subscription allowance; dollar cost
+remains unknown. A one-call cap prevents automatic retry from starting a second
+call. Use a different backend only within the user's authentication and spending
+preferences. If login, budget or permissions prevent a run, report that explicitly;
+do not describe offline fixtures as a real model assessment.
+
+Keep the run bounded. Do not start improvement campaigns or additional inference
+rounds merely because this skill is selected. Child writer/judge/reviewer calls
+must not invoke Ringo again. The harness's isolated prompts and disabled discovery
+on `codex-chatgpt` keep the routine review from recursively loading this skill.
+Report the actual command, report path, call count and any known usage at completion.
 
 ## 1. Collect the material
 
@@ -22,11 +52,11 @@ The material is the text the harness supplies. Codex and custom commands may als
 ## 2. Run it
 
 ```bash
-python3 ringo.py review --input MATERIAL.txt [--backend claude] [--trace DIR] [--out REVIEW.md]
-python3 ringo.py design --input BRIEF.txt    [--backend claude] [--trace DIR] [--out PROPOSAL.md]
+python3 ringo.py review --input MATERIAL.txt --backend codex-chatgpt --max-calls 1 --trace NEW_DIR --out REVIEW.md
+python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --max-calls 1 --trace NEW_DIR --out PROPOSAL.md
 ```
 
-- `--backend`: `claude` (default: caches the material across passes and reports cost), `codex`, `ollama:MODEL`,
+- `--backend`: `claude` (CLI default: caches the material across passes and reports cost), `codex`, `codex-chatgpt`, `ollama:MODEL`,
   `claude:<command>` for another Claude-style command, or any command that reads stdin.
 - `--pipeline PLAN.json` runs another plan; the default is one strong call. Multi-pass plans exist for experiments;
   use one only if an evaluation showed it pays (step 4).

@@ -81,6 +81,8 @@ def backend(spec):
         argv, style = shlex.split(backends.JUDGE_PRESETS['claude']), 'claude'
     elif spec.startswith('claude:'):
         argv, style = shlex.split(spec[7:]), 'claude'
+    elif spec == 'codex-chatgpt':
+        argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'codex'
     elif spec in backends.JUDGE_PRESETS:
         argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'plain'
     elif spec.startswith('ollama:'):
@@ -108,6 +110,46 @@ def with_model(argv, model):
     return out if replaced else [*out, '--model', model]
 
 
+def codex_reply(output):
+    """Text and reported tokens from a single native Codex JSONL turn; price stays unknown."""
+    usage = dict.fromkeys(('input', 'cache_write', 'cache_read', 'output'), 0)
+    usage['cost_usd'] = None
+    messages, completed, bad = [], 0, False
+    for line in output.splitlines():
+        if not line.strip():
+            continue
+        try:
+            event = json.loads(line, parse_constant=backends._no_constant,
+                               parse_float=backends._finite_float)
+            if not isinstance(event, dict):
+                raise ValueError('event must be an object')
+            if event.get('type') == 'turn.completed':
+                completed += 1
+                reported = event.get('usage')
+                reported = reported if isinstance(reported, dict) else {}
+                def tokens(key):
+                    value = reported.get(key, 0)
+                    return value if type(value) is int and value >= 0 else 0
+                cached = min(tokens('cached_input_tokens'), tokens('input_tokens'))
+                usage['input'] += tokens('input_tokens') - cached
+                usage['cache_read'] += cached
+                usage['cache_write'] += tokens('cache_write_input_tokens')
+                usage['output'] += tokens('output_tokens')
+            item = event.get('item')
+            if event.get('type') == 'item.completed' and isinstance(item, dict):
+                if item.get('type') == 'agent_message' and isinstance(item.get('text'), str):
+                    messages.append(item['text'])
+                elif item.get('type') in {'command_execution', 'mcp_tool_call', 'web_search', 'file_change'}:
+                    bad = True
+            if event.get('type') in {'error', 'turn.failed'}:
+                bad = True
+        except (ValueError, RecursionError):
+            bad = True
+    if bad or completed != 1 or not messages or not messages[-1].strip():
+        raise CallError('codex-chatgpt returned an incomplete, failed or unexpected turn', usage)
+    return messages[-1], usage
+
+
 def call(backend, system, message, timeout_s, model=None):
     """(reply text, usage) of one isolated, single-turn call through backends.run_isolated (empty folder, no
     TypeSafe key, the whole process session killed on exit). usage is None when the backend does not report it.
@@ -117,6 +159,16 @@ def call(backend, system, message, timeout_s, model=None):
         if backend['style'] != 'claude':
             raise ValueError(f"a per-pass model needs a claude-style backend, not {backend['name']}")
         argv = with_model(argv, model)
+    if backend['style'] == 'codex':
+        try:
+            output = backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, subscription_auth=True)
+        except backends.JudgeError as exc:
+            try:
+                _, usage = codex_reply(getattr(exc, 'stdout', '') or '')
+            except CallError as parsed:
+                usage = parsed.usage
+            raise CallError(str(exc), usage) from None
+        return codex_reply(output)
     if backend['style'] == 'plain':
         return backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s), None
     with tempfile.TemporaryDirectory(prefix='ringo-system-') as d:  # created 0700; removed after the call
@@ -221,7 +273,7 @@ def outside_repo(path, what):
 
 def tool_access(name):
     """Preset declarations, not an attestation of arbitrary commands or CLI installations."""
-    return 'none' if name == 'claude' or name.startswith('ollama:') else 'disk' if name == 'codex' else 'unknown'
+    return 'none' if name in ('claude', 'codex-chatgpt') or name.startswith('ollama:') else 'disk' if name == 'codex' else 'unknown'
 
 
 def check_backends(names, allow_tools=False):
@@ -292,6 +344,11 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
             t0 = time.monotonic()
             try:
                 text, usage = call_fn(backend_spec, system, message, timeout_s, p.get('model'))
+            except AdmissionRefused as exc:
+                run.refuse_reservation()
+                run.record({**rec, 'status': 'admission_refused', 'error': str(exc),
+                            'seconds': round(time.monotonic() - t0, 3)})
+                raise
             except OSError as exc:  # the command cannot run: every retry would fail too
                 run.record({**rec, 'status': 'fatal', 'error': f'{type(exc).__name__}: {exc}',
                             'seconds': round(time.monotonic() - t0, 3)})
@@ -302,6 +359,10 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                 if attempt == 2 or not isinstance(exc, (backends.JudgeError, ValueError, subprocess.TimeoutExpired)):
                     raise
                 continue
+            except BaseException as exc:
+                run.record({**rec, 'status': 'error', 'error': f'{type(exc).__name__}: {exc}',
+                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3)})
+                raise
             try:  # the reply is paid for whatever its shape, so it is charged before it is checked
                 pipelines.check_reply(plan, p, text)
             except ValueError as exc:
@@ -395,7 +456,7 @@ def main(argv=None, *, prog='harness.py'):
         p = sub.add_parser(name, help=f'run the {name} pipeline on the material in --input')
         p.add_argument('--input', required=True, help='the material: the task and the code or brief, as one text file')
         p.add_argument('--backend', default='claude',
-                       help='claude, codex, ollama:MODEL, claude:<command>, or any command that reads stdin')
+                       help='claude, codex, codex-chatgpt, ollama:MODEL, claude:<command>, or any stdin command')
         p.add_argument('--pipeline', help='a plan JSON file (default: the built-in one-call plan)')
         p.add_argument('--out', help='write the result here instead of stdout')
         p.add_argument('--trace', help='new/empty folder outside the repository for trace, replies and material (0700)')

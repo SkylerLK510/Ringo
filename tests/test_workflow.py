@@ -118,6 +118,57 @@ class WorkflowTest(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 workflow.strict_json(text)
 
+    def test_deeply_nested_writer_json_becomes_protocol_feedback(self):
+        depth = 200000  # Also exceeds Python 3.14's JSON parser nesting limit.
+        report, seen = self.execute(['[' * depth + '0' + ']' * depth,
+                                     self.proposal('def f(x): return 2*x')])
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['rounds'][0]['status'], 'malformed')
+        self.assertIn('nesting', seen[1][1])
+
+    def test_invalid_backend_commands_and_missing_cost_fallback_are_rejected_at_setup(self):
+        for change in ({'writer': 'claude:'}, {'judge': 'ollama:'}, {'max_cost': 1}):
+            path = self.root / 'task.json'
+            path.write_text(json.dumps({**self.spec, **change}))
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                workflow.load_spec(path)
+
+    def test_invalid_bridge_fails_before_any_provider_call(self):
+        self.spec['council'] = [sys.executable, str(self.root / 'missing-bridge.py')]
+        report, seen = self.execute([])
+        self.assertEqual(report['status'], 'error')
+        self.assertEqual(report['usage']['calls'], 0)
+        self.assertEqual(seen, [])
+        self.assertEqual(report['rounds'], [])
+
+    def test_expired_deadline_during_call_is_a_budget_stop_but_early_timeout_is_an_error(self):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(self.spec))
+        prepared = {'version': 1, 'fingerprint': 'fixed', 'policy_sha256': 'a' * 64,
+                    'requests': ['one', 'two']}
+        for expired in (False, True):
+            clock = [100.0]
+            def call(*args):
+                clock[0] = 131.0 if expired else 101.0
+                raise subprocess.TimeoutExpired('provider', 1)
+            with self.subTest(expired=expired), mock.patch.object(workflow, 'bridge', return_value=prepared), \
+                    mock.patch.object(workflow.time, 'monotonic', side_effect=lambda: clock[0]):
+                report = workflow.run(path, self.root / f'run-{expired}', call_fn=call)
+            self.assertEqual(report['status'], 'budget_exhausted' if expired else 'error')
+            self.assertEqual(report['usage']['calls'], 1)
+            self.assertEqual(report['usage']['unpriced_calls'], 1)
+
+    def test_invalid_real_council_brief_fails_before_inference(self):
+        if not os.environ.get('RINGO_COUNCIL_ROOT'):
+            self.skipTest('set RINGO_COUNCIL_ROOT for real bridge smoke')
+        council_root = Path(os.environ['RINGO_COUNCIL_ROOT']).resolve()
+        self.spec.update(council=[sys.executable, str(council_root / 'bridge.py')],
+                         rubric=str(council_root / 'rubrics/code_change.json'))
+        report, seen = self.execute([], brief='Missing a hard constraints section')
+        self.assertEqual(report['status'], 'error')
+        self.assertEqual(report['usage']['calls'], 0)
+        self.assertEqual(seen, [])
+
     def test_council_escalation_blocks_publication_even_with_passing_checks(self):
         self.spec['council'] = [sys.executable, str(self.root / 'bridge.py')]
         source = FAKE_BRIDGE.replace("ok = all(json.loads(x)['accept'] for x in r['replies'])", 'ok = False')
