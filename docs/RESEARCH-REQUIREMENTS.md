@@ -1,5 +1,9 @@
 # ML and finance research requirements
 
+> Publication scope (2026-10-24): the independent HarBenchmark scorer and its
+> fixture tests are included. Referenced Ringo runtime and adapter prototypes
+> are pending separate publication; this upload makes no runtime adoption claim.
+
 Recorded 2026-10-21. Intended use: intensive machine-learning and finance research,
 with very high accuracy, efficiency and strong coding principles. The initial
 finance specialization remains to be selected.

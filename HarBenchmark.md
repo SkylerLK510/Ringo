@@ -1,5 +1,9 @@
 # HarBenchmark
 
+> Publication scope (2026-10-24): the independent HarBenchmark scorer and its
+> fixture tests are included. Referenced Ringo runtime and adapter prototypes
+> are pending separate publication; this upload makes no runtime adoption claim.
+
 HarBenchmark v0.1 is Ringo's runnable **public development benchmark**. It checks
 bounded answers across six areas using Python 3.11+ and the standard library.
 The implementation and public cases live in [harbenchmark.py](harbenchmark.py).
