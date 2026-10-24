@@ -1,5 +1,9 @@
 # Council-guided work
 
+> Publication status (2026-10-24): this guide includes tested local prototype
+> capabilities whose runtime changes are pending separate publication. This
+> documentation upload does not activate a release or change the default runtime.
+
 `python3 ringo.py work` revises a fixed set of text files until fixed executable
 checks pass and a separate Design Council assessment recommends the result, or
 until a bound is reached. It writes every candidate to a new run folder for human
@@ -13,18 +17,38 @@ built-in path to it: each task names the council bridge command and rubric file.
 
 Before inference, Ringo parses both backend commands and performs an offline bridge
 `prepare` preflight to validate the bridge, brief, rubric and policy. Invalid setup
-therefore stops before a writer call. The initial files are not scored or adopted.
+therefore stops before a writer call. The initial files are not scored or adopted:
+a round-1 reply that returns them unchanged ends the run as `repeated_candidate`,
+as an unchanged reply does in any later round.
 
 Each round:
 
 1. **Write.** The writer model receives the brief, the source material, the
    current files, the fixtures and earlier feedback. It must reply with one JSON
-   object, without Markdown fences: `{"files": {...}, "rationale": "..."}`, giving
-   the complete text of exactly the declared editable files. A reply with fences,
-   extra or missing paths, unsafe paths, duplicate keys or `NaN` is a `malformed`
-   round: the problem becomes feedback for the next round.
-2. **Stop on repeats.** A candidate identical to an earlier one ends the run as
-   `repeated_candidate` before any check or judge call.
+   object, without Markdown fences, in one of two forms, never both:
+   - `{"files": {...}, "rationale": "..."}` gives the complete text of exactly the
+     declared editable files. Use it for a new file or a rewrite of most of a file.
+   - `{"edits": [{"path": "...", "old": "...", "new": "..."}], "rationale": "..."}`
+     changes only what it names; files it does not edit stay as they are. Use it
+     for targeted changes to a long file, where restating the whole file costs
+     output tokens and risks unrequested drift in text that should not change.
+     Each `old` must occur exactly once in the current text the writer was shown.
+     Every `old` is matched against that same text, not after earlier edits, so
+     the result does not depend on edit order, and edits must not overlap.
+     Matching is exact: an anchor that matches no place or several places fails,
+     and the error names the edit and, for no match, the line where the longest
+     matching prefix of `old` occurs. One failed edit means none is applied.
+
+   Ringo turns edits into complete files before anything else, so the repeat
+   check, the checks, the mutation and symlink check and the judges all work on
+   complete text, never on edits. A reply with fences, both forms, extra or
+   missing paths in `files`, unsafe or undeclared paths, a failed edit, a result
+   over the size limit, duplicate keys or `NaN` is a `malformed` round: it makes no
+   check or judge calls, the current files stay unchanged, and the next round gets
+   the problem together with the earlier check and council feedback, not instead.
+2. **Stop on repeats.** A candidate identical to the files the writer was shown
+   or to an earlier candidate ends the run as `repeated_candidate` before any
+   check or judge call.
 3. **Check.** The candidate files and the read-only fixtures are written to
    `round-N/candidate/`, and each check command runs there in order. A check
    passes when it exits with 0. Afterwards every submitted file and fixture must
@@ -61,9 +85,8 @@ checkout:
   "writer": "claude",
   "judge": "claude",
   "allow_tool_backends": false,
-  "samples": 2,
+  "samples": 6,
   "max_rounds": 2,
-  "max_calls": 6,
   "max_seconds": 600,
   "timeout_s": 180
 }
@@ -78,20 +101,47 @@ folder off `sys.path`.
 | `version` | required | Must be `1`. Unknown fields are refused. |
 | `brief` | required | The task. The council needs a `Hard constraints:` bullet list in it; every bullet becomes a mandatory check in the decision. |
 | `material` | `""` | Fixed source material. The writer and every judge receive it as evidence, not as instructions. |
-| `files` | required | Editable files: relative path to initial complete UTF-8 text (`""` for a new file). The writer must return exactly these paths. |
+| `files` | required | Editable files: relative path to initial complete UTF-8 text (`""` for a new file). A `files` reply must give exactly these paths; an `edits` reply may change any of them. |
 | `fixtures` | `{}` | Read-only files written beside each candidate, such as checks and reference data. Disjoint from `files`. |
 | `checks` | required | One or more `{"name", "argv", "timeout_s"}` commands. `timeout_s` defaults to 30. They run in the candidate folder. |
 | `allow_execution` | `false` | Must be `true`: checks execute code, including model-written code. |
 | `council` | required | Bridge command as an argv list. Use absolute paths: it runs from an empty temporary folder. |
-| `rubric` | required | Rubric file, absolute or relative to the spec's folder. |
-| `writer`, `judge` | required | Backends: `claude`, `codex`, `codex-chatgpt`, `ollama:MODEL`, `claude:<command>` or any command that reads stdin. |
+| `rubric` | required | Rubric file, absolute or relative to the spec's folder. See "Choosing a rubric" below. |
+| `writer`, `judge` | required | Backends: `claude`, `codex`, `codex-chatgpt`, `ollama:MODEL`, `claude:<command>`, `codex:<command>` or any command that reads stdin. |
 | `allow_tool_backends` | `false` | Must be `true` for any backend except `claude`, `codex-chatgpt` and `ollama:MODEL`, since the others may read local files. |
-| `samples` | 2 | Judge calls per assessed round, 2 to 25. |
-| `max_rounds` | 3 | Writer rounds, including malformed ones. |
-| `max_calls` | 9 | Writer and judge calls together. |
+| `samples` | 6 | Judge calls per assessed round, 2 to 25. 6 is the council's default; 2 is a smoke-test value only (see below). |
+| `max_rounds` | 3 | Writer rounds, including malformed ones. With `samples` it sets the calls (see below). |
 | `max_seconds` | 600 | Wall-clock bound for the whole run. |
 | `timeout_s` | 120 | Bound for each model call, capped by the time left. |
 | `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and fallback price for calls reporting none. A dollar cap requires a declared fallback. |
+
+**Calls.** There is no call cap: the task's rounds and samples decide the calls.
+Each round makes one writer call; a well-formed, new candidate then gets one judge
+call per council sample, whatever its checks report. A malformed reply skips the
+judges for that round, and a repeated candidate ends the run. Calls are not
+retried. So a run makes at most `max_rounds x (1 + samples)` calls: the example
+above makes at most 2 x (1 + 6) = 14. A spec that still sets the removed
+`max_calls` field is refused ("max_calls was removed: calls are set by max_rounds
+and samples"). `max_seconds`, `timeout_s` and `max_cost` bound time and money.
+
+**Samples.** Use the default of 6 for any run whose verdict should count. Set
+`samples` to 2 only for a smoke test of the plumbing: with two samples, any split
+between them on a scored question gives that question a confidence of at most
+0.33, below the council's `min_confidence` of 0.5, so the round escalates even
+when both answers are good; and a veto that one of the two samples answers yes
+gets p = 0.5, below the 0.7 threshold and outside the shadow gate's veto band, so
+it passes silently. Six is the smallest even count at which one dissenting sample
+on any question type still clears the gate, and a 5-of-6 veto still fires. Keep
+the count even: the council alternates level order across samples, and an odd
+count splits it unevenly.
+
+**Choosing a rubric.** The rubrics live in the council checkout under
+`rubrics/`. Use `code_change.json` for code, `system_design.json` for design
+proposals, `report.json` for documents and reports judged against supplied
+material (research write-ups, reviews, guides), and `artifact_design.json` for
+visual artifacts such as pages and profiles. `artifact_design.json` asks about
+visual hierarchy, link destinations and screen sizes, which do not fit a
+Markdown report.
 
 Paths in `files` and `fixtures` must be normalized relative POSIX paths without
 backslashes or components that start with `.`, so `.github/` is refused. No path
@@ -116,8 +166,8 @@ command calls the selected models and uses their accounts.
 |---|---|---|
 | 0 | `ready_for_review` | All checks passed and the council recommended. `final/` holds the editable files. |
 | 1 | `needs_revision` | Every round ran without a reviewable candidate. |
-| 1 | `repeated_candidate` | The writer returned an earlier candidate again. |
-| 1 | `budget_exhausted` | The call cap, cost cap, admission refusal or overall wall-clock bound stopped the run, including a model/bridge timeout at that deadline. |
+| 1 | `repeated_candidate` | The writer returned the files it was shown, or an earlier candidate, again. |
+| 1 | `budget_exhausted` | The cost cap, admission refusal or overall wall-clock bound stopped the run, including a model/bridge timeout at that deadline. |
 | 1 | `error` | For example a mutated file, bridge failure, unreadable judge reply, changed council policy, or a per-operation timeout before the overall deadline. |
 | 2 | none | The spec or output folder was refused before the run started. |
 
@@ -131,8 +181,9 @@ say why.
 
 The run folder holds `spec.json` (the loaded spec, with defaults filled in for
 the bounds, switches and check timeouts), `source.json`
-(the workflow's SHA-256), `trace.jsonl`, the successful replies under `steps/`, and
-per round `proposal.json`, `candidate/`, the full `check-K.out` and `check-K.err`
+(the workflow's SHA-256), `trace.jsonl`, the successful replies and the first 1 MB of each failed call's raw output under `steps/`, and
+per round `proposal.json` (the complete applied files, the rationale and, when
+the writer sent edits, those edits), `candidate/`, the full `check-K.out` and `check-K.err`
 logs and `council.json`. `report.json` keeps the first 16,000 bytes of each log.
 `shortcomings.json` holds the final feedback for development use.
 
@@ -159,11 +210,12 @@ ends the run with `error`; the bridge does not retry it.
 
 ## Budgets and accounting
 
-Writer and judge calls share one `harness.Run`. A call is reserved before it
-starts and counted from then on. A call that fails or times out stays counted,
+Writer and judge calls share one `harness.Run`, which counts calls but does not
+cap them. A call is reserved before it starts and counted from then on. A call that fails or times out stays counted,
 and its cost is unknown unless the backend reported it. Unknown cost is not zero.
 Without `unpriced_call_usd`, `cost_usd` excludes it and `unpriced_calls` counts it;
-with `unpriced_call_usd`, that price is added to `cost_usd` instead. Setting
+with `unpriced_call_usd`, that price is added to `cost_usd` instead. A call that
+reported no token usage counts under `untokened_calls`; the token sums leave it out. Setting
 `max_cost` without a fallback is rejected before the run starts.
 
 A Python adapter that calls `workflow.run(..., call_fn=...)` can raise
@@ -176,11 +228,13 @@ unpriced call; they have not been rewritten.
 
 For native ChatGPT authentication, select `codex-chatgpt` for writer/judge. It
 forces the CLI's ChatGPT login method, removes API-auth/endpoint overrides and
-records reported input/cache/output tokens from JSON events. Its price remains
+records reported input/cache/output tokens from JSON events. Like every Codex
+backend it runs with a private CODEX_HOME and HOME (see the harness guide). Its price remains
 unknown; it consumes the selected account's subscription allowance.
 
-Caps stop new calls. The last admitted call can overshoot a cost or token
-threshold. Ringo has no built-in token cap; an adapter must enforce one.
+The cost cap and the wall-clock bound stop new calls; there is no call cap. The
+last admitted call can overshoot a cost or token threshold. Ringo has no built-in
+token cap; an adapter must enforce one.
 
 ## Trust boundaries
 

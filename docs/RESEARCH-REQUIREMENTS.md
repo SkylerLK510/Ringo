@@ -23,9 +23,9 @@ and experimental outcomes still require independent checks. Distinguish proposin
 a method, executing it and evaluating its results.
 
 Basic integration is implemented. `work` has a writer model return complete text
-files, runs fixed executable checks on them, sends the fixed source material,
+files or exact edits that Ringo applies to complete files, runs fixed executable checks on them, sends the fixed source material,
 files, rationale and check results to a council rubric through an offline bridge,
-and revises from the feedback within shared call, cost and time bounds. A
+and revises from the feedback within its round count and shared cost and time bounds. A
 candidate reaches `final/` only after every check passes and the council
 recommends it; a person decides what to adopt. Ringo makes the model calls and
 owns their budget; the council scores the replies and owns the decision gate.

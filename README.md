@@ -108,3 +108,10 @@ Council for structured assessment, with Ringo providing execution and validation
 Basic integration exists: `work` combines generated files, fixed checks and council
 assessment. The research workflow those requirements describe is future work, and
 the current harness has not been validated for that workload.
+
+## Research documents
+
+The [research index](docs/RESEARCH.md) links HarBenchmark, benchmark coverage gaps,
+security/CI-bot research, release architecture, local latency measurements and
+optimization options. The standalone HarBenchmark scorer and fixture tests are
+included; guides clearly label runtime prototype changes pending separate publication.
