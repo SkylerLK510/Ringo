@@ -133,6 +133,12 @@ python3 bench_latency.py --baseline-release ACTIVE_RELEASE_ID --baseline-state /
   --out /PRIVATE/NEXT_EXPERIMENT --pairs 100 --warmups 5 --execution active-fixture
 ```
 
+For a bootstrap/verifier code change, also supply
+`--baseline-launcher /PRIVATE/BASELINE/ringo.py` with `--baseline-release` and
+`--baseline-state`. Selecting an old bundle through the new launcher would time
+the new bootstrap in both arms. The [verifier study](VERIFIER-OPTIMIZATION.md)
+used separate before/after launchers and records that distinction.
+
 The runner uses randomized paired fresh CLI processes for startup, review,
 tracing, large input, design, one work round with six judges, a fixed backend
 delay, an explicit pipeline override and backend failures. Its model and council

@@ -1,5 +1,11 @@
 # Ringo latency optimization options
 
+**Follow-up (2026-10-25):** the targeted inventory-traversal optimization is now
+implemented and tested in the local runtime prototype. See the
+[measured results and source patch](VERIFIER-OPTIMIZATION.md). The original
+profile and options assessment below are retained as historical context;
+approval receipts, cross-task caching and persistent workers were not implemented.
+
 Research checked 2026-10-24. This note assesses measured local component costs and unimplemented options. It makes no additional runtime change. Raw profiles stay outside the repository.
 
 ## Decision and scope
@@ -46,7 +52,7 @@ Inventory and hashing is the largest measured component, but it is not an establ
 
 ## Options and tradeoffs
 
-All proposed improvements below are unmeasured.
+At the time of this options assessment, the proposed improvements below were unmeasured; the traversal follow-up above now has its own measurements.
 
 | Option | Latency opportunity | Integrity and approval requirements | Complexity and applicability |
 |---|---|---|---|
