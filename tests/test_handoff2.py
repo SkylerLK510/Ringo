@@ -385,14 +385,18 @@ class AdditionalRegressions(unittest.TestCase):
         ev.grade(s.dir, d, call_fn=lambda *a: self.fail('grading cannot change this outcome'))
         self.assertEqual(ev.decide(s.dir, d)[0], 'inconclusive')
 
-    def test_batch_estimate_uses_all_reader_findings(self):
+    def test_batched_checking_is_not_rejected_for_its_call_count(self):
         w = World([]); bare, _ = im.plan_files(pl.PLANS / 'review.json')
         bare['passes'] = [{'id': 'a', 'prompt': 'review.md', 'reply': 'findings'},
                           {'id': 'b', 'prompt': 'review.md', 'reply': 'findings'},
                           {'id': 'k', 'prompt': 'check.md', 'reply': 'verdicts', 'batch': 1}]
         reasons = im.screen(w.store, {'hypothesis': 'batch', 'plan': bare}, pl.PLANS / 'review.json',
-                            ev.split_cases(w.store, 'dev'), im.load_campaign(w.campaign), max_findings=4)
-        self.assertIn('estimated 10 calls', ' '.join(reasons))
+                            ev.split_cases(w.store, 'dev'), im.load_campaign(w.campaign))
+        self.assertFalse(any('calls' in r for r in reasons))
+        camp = json.loads(w.campaign.read_text())
+        w.campaign.write_text(json.dumps({**camp, 'max_calls_per_review': 4}))
+        with self.assertRaisesRegex(ValueError, 'max_calls_per_review was removed'):
+            im.load_campaign(w.campaign)
 
     def test_trace_is_refused_inside_public_repo(self):
         with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()):

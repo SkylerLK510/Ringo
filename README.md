@@ -16,30 +16,66 @@ Python 3.11+ and the standard library. From this checkout:
 
 ```sh
 python3 ringo.py --help
-python3 ringo.py review --input change.txt --backend codex-chatgpt --max-calls 1
+python3 ringo.py review --repo ../project --base BASE_SHA --head HEAD_SHA --pr-text pr.txt --backend codex-chatgpt --timeout 180
+python3 ringo.py review --input change.txt --backend codex-chatgpt --timeout 180
 python3 ringo.py design --input brief.md --out proposal.md
 python3 ringo.py work --spec task.json --out /ABSOLUTE/PATH/TO/new-run
 python3 -m unittest discover -s tests -q
 ```
 
-For reviews, supply the change description, unified diff, complete changed files and
-project README as one material file. For designs, supply the decision brief and hard
-constraints. Review/design default to one strong model call before retries; custom
-plans are JSON files under `plans/`, with instructions under `prompts/`.
+For reviews, prefer `--repo PATH --base SHA --head SHA [--pr-text FILE]`: Ringo
+builds the material in code from git objects (read-only, offline; an incomplete
+partial clone is refused): the change description, the three-dot diff, the complete
+changed files and README at head, then the unchanged definitions, subclasses,
+callers and tests of the changed symbols, within a byte budget
+(`--context-budget`, default 400000) that never drops the change itself, and a
+manifest of what was added and left out. The material is built in code before the
+call; the call is tool-free only on `claude`, `codex-chatgpt` and `ollama:` (the `codex` preset keeps a read-only
+shell, and a custom command's tools are unknown). `--input FILE` instead takes the material as one file. For designs, supply the decision brief and hard
+constraints. Review/design default to one strong model call; a call that fails or
+replies in the wrong shape is tried once more, so at most two. Custom plans are JSON
+files under `plans/`, with instructions under `prompts/`; a plan makes one call per
+pass (one per batch of findings for a batched checker, at most 50 findings per
+reader reply), each retried at most once,
+plus at most one checker repair. `work` makes one writer call and one judge call per
+council sample each round: at most `max_rounds x (1 + samples)`. There is no call
+cap: the plan or the round count decides the calls, and `--max-cost` and timeouts
+bound money and time.
 
 `work` revises a declared set of text files: a writer model returns complete
-files, fixed executable checks run on them, and a separate council assessment
-decides whether to revise or stop. A result that passes every check and is
-recommended is written to the run's `final/` folder for human review; nothing is
-applied, adopted or published. The task names the council bridge and rubric
-explicitly. See [the council workflow guide](docs/COUNCIL-WORKFLOW.md) for the
-task format, outputs, budgets and trust limits.
+files or exact search/replace edits, which Ringo turns into complete files; fixed
+executable checks run on them, and a separate council assessment decides whether
+to revise or stop. A result that passes every check and is recommended is written
+to the run's `final/` folder for human review; nothing is applied, adopted or
+published. The task names the council bridge and rubric explicitly (the council's
+`rubrics/report.json` for documents and reports, `artifact_design.json` for visual
+artifacts). Each round is judged with 6 samples by default; 2 is for smoke tests
+only. See [the council workflow guide](docs/COUNCIL-WORKFLOW.md) for the task
+format, outputs, budgets and trust limits.
+
+`review --findings-json FILE` also writes the findings as
+[ReviewBench](https://github.com/review-bench/ReviewBench) agent-contract JSON,
+one entry per finding and file. With `--repo`, files are checked against head
+and lines clamped. [adapters/reviewbench](adapters/reviewbench/README.md) runs
+Ringo as a ReviewBench reviewer image, so runs can be reproduced and scored with
+the benchmark's own judge. No ReviewBench result is claimed here.
 
 Backends include Claude Code, Codex, local Ollama and commands that read stdin.
-`codex-chatgpt` forces native ChatGPT authentication, strips API-key and endpoint
-overrides, disables nested tools/skill discovery and records reported tokens from
-the CLI's JSON events. Its dollar cost remains unknown. The existing `codex`
-preset remains available for the caller's configured authentication.
+Every Codex backend (`codex`, `codex-chatgpt` and `codex:<command>`) runs with a
+private, per-call `CODEX_HOME` holding only a copy of your `auth.json` and an empty
+`HOME`, so your global Codex instructions (`~/.codex/AGENTS.md`), skills
+(`~/.codex/skills`, `~/.agents/skills`) and memories do not load in the child. A
+login the child refreshes is written back to your `auth.json` only if that file
+did not change during the call. Ringo parses the CLI's JSON events and records
+reported tokens; a turn that uses a tool its backend does not declare is rejected.
+`codex-chatgpt` also forces native ChatGPT authentication, strips API-key and
+endpoint overrides and disables the shell. The `codex` preset keeps its shell and
+the caller's configured authentication. `codex:<command>` runs your own Codex
+command line, which must pass `--json`; it may use web search only if that command
+line passes `--search`. Codex dollar cost remains unknown.
+`--checker-backend SPEC` runs a plan's verdicts pass and its repair on a second
+backend, so another model or provider checks the findings; the plan needs a
+verdicts pass, and the trace records which backend made each call.
 Authenticate with the provider's supported CLI. Usage consumes the selected account's
 allowance or API billing according to authentication and plan settings. Unknown
 cost is not zero. `--trace` uses a new folder outside this checkout; it contains
@@ -48,6 +84,26 @@ private material. Opening the CLI help or running tests makes no provider calls.
 ## Evaluation and improvement
 
 See [the harness guide](docs/HARNESS.md) and [the agent skill](skills/ringo-harness/SKILL.md).
+
+[Approved releases and latency checks](docs/RELEASES.md) describes local versioned
+bundles, explicit activation/rollback, pinned runs and a separate offline latency
+gate. `python3 ringo.py release --help` manages releases; staging does not activate
+them. RRSI candidate adoption still requires existing sealed-test evidence and a
+human decision. Timing experiments use simulated backends and make no provider calls.
+
+[Optimization regression cases](docs/OPTIMIZE-CASES.md) check release integrity before inference,
+fresh-invocation rechecks and complete timing schedules. The full offline suite
+also runs in GitHub Actions on Python 3.11 and 3.14. The
+[overfitting audit](docs/OVERFITTING-GUARDRAILS.md) maps evidence and held-out-data
+guardrails to their tests and remaining limits.
+
+[HarBenchmark](HarBenchmark.md) provides twelve public development cases and an
+offline scorer across review, constrained repairs, design calculations, artifact
+consistency, research arithmetic and evaluation/accounting. Its comparison tables
+separate sourced external results from local development evidence and unmeasured
+coverage. See the [benchmark gap research](docs/BENCHMARK-GAPS.md) and the
+[separate security/CI bot brief](docs/SECURITY-CI-BOT-RESEARCH.md). These additions
+make no provider calls and add no work to the normal harness execution path.
 
 ```sh
 python3 evaluate.py --help
@@ -108,10 +164,3 @@ Council for structured assessment, with Ringo providing execution and validation
 Basic integration exists: `work` combines generated files, fixed checks and council
 assessment. The research workflow those requirements describe is future work, and
 the current harness has not been validated for that workload.
-
-## Research documents
-
-The [research index](docs/RESEARCH.md) links HarBenchmark, benchmark coverage gaps,
-security/CI-bot research, release architecture, local latency measurements and
-optimization options. The standalone HarBenchmark scorer and fixture tests are
-included; guides clearly label runtime prototype changes pending separate publication.
