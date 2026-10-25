@@ -1,12 +1,18 @@
 # Verifier traversal optimization
 
-Research updated 2026-10-25. This is an implemented and tested **local runtime prototype** change. The repository default runtime is still awaiting separate publication. A reviewable [implementation patch](patches/verifier-traversal.patch) is included for the prototype baseline; it is not an update applied to the default runtime.
+Research updated 2026-10-25. This change is implemented, tested and **active in the owners local Ringo installation** following explicit user adoption. The repository default runtime is still awaiting separate publication. A reviewable [implementation patch](patches/verifier-traversal.patch) is included for the prototype baseline; it is not an update applied to the repository default runtime.
+
+## Local adoption on 2026-10-25
+
+The normal local release store now selects release `e777d95353ba6de294a3deec5f2e83b1c2c44533ec02f045a322c809f43ebe42`. It is the exact immutable candidate measured below, staged again with matching source and bytecode identity. The full suite was rerun before activation: 317 tests, OK, 2 skipped. The user explicitly requested future use after disclosure of the uncertain whole-command tails; that decision and rationale are recorded in the private approval. Activation recomputed the complete measured latency suite and retained all existing release gates. No RRSI quality claim or protected-policy change was made.
+
+New invocations through the stable `ringo.py` launcher use that local release. The optimized verifier remains part of the stable bootstrap and its separate hash is recorded in run provenance. Local activation does not deploy the runtime to other machines or apply the pending runtime sources to GitHub main.
 
 ## Change and integrity contract
 
 The verifier now validates manifest paths/hashes and checks inventory/content in one iterative `os.scandir` walk. Directory-entry metadata replaces redundant path type queries. Every expected source and bytecode file still receives a complete SHA-256 read on every verification. Missing/extra files and file/directory/dangling symlinks remain rejected. There is no cross-command verification cache and no approval-receipt change. Empty unregistered directories remain compatible. Unsupported special files, previously omitted from the regular-file inventory, are now explicitly rejected without opening them.
 
-Protected evaluation/improvement rules, backend behavior, prompts and normal activation state were unchanged. This is a code-efficiency experiment, not an RRSI pipeline-quality gain or an adoption decision. Readonly bundles discourage accidents; the implementation does not claim an OS security boundary against malicious same-user concurrent mutation.
+During the measurement experiment, protected evaluation/improvement rules, backend behavior, prompts and normal activation state were unchanged. This is a code-efficiency experiment, not an RRSI pipeline-quality gain or an adoption decision. Readonly bundles discourage accidents; the implementation does not claim an OS security boundary against malicious same-user concurrent mutation.
 
 ## Same-fixture component comparison
 
@@ -41,13 +47,13 @@ Short successful command medians improved by roughly **0.4–0.7 ms** in this co
 
 The diagnostic budgets remained 5 ms absolute and 5% relative, with 100 pairs minimum and 2,000 paired bootstrap resamples, seed 7. Simultaneous bounds cover mean/p95 absolute/relative comparisons. These are not user-approved production SLOs. p99 values remain in the private reports but are descriptive. OS caches, thermal conditions and unrelated host activity were not controlled; these results do not establish live-provider or IDE latency.
 
-The deliberately failing backend workload remains failed in both arms; fast failures do not earn a success. All other executions succeeded. All 200 measured work runs completed exactly one writer and six simulated judge calls. Measurements made zero real provider calls. Normal release activation remains unchanged.
+The deliberately failing backend workload remains failed in both arms; fast failures do not earn a success. All other executions succeeded. All 200 measured work runs completed exactly one writer and six simulated judge calls. Measurements made zero real provider calls and did not alter normal release activation; the later user-authorized adoption is recorded above.
 
 ## Correctness and review
 
 The local prototype suite ran **317 tests: OK, 2 skipped**, including 10 new tests with parameterized path/hash cases. Coverage includes registered nested Unicode/whitespace names; missing and unexpected files; bytecode changes after a prior success; directory and dangling symlinks; FIFO refusal without blocking; canonical/reserved/traversal paths; malformed hashes; enumeration/content-read errors; empty-directory compatibility; and correct before-version launcher selection. Existing isolation, approval, rollback, privacy and call-count tests remain in force.
 
-The actual Ringo review reported no defects. Its performance open question is answered for these local measured fixtures; representative behavior on other storage/cache conditions remains open. No second inference review or RRSI campaign was launched.
+The actual Ringo review reported no defects. Its performance open question is answered for these local measured fixtures; representative behavior on other storage/cache conditions remains open. That experiment used one native review and no RRSI campaign; subsequent adoption verification is separate from the timing collection.
 
 ## Evidence and publication scope
 
