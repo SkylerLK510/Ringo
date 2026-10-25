@@ -447,6 +447,30 @@ else:
             state = self.activate(rid)
             self.assertEqual(rel.approved(self.state, state['active'])['quality'], evidence)
 
+    def test_matching_sources_cannot_lend_proof_to_substituted_executable_bytecode(self):
+        import evaluate
+        import marshal
+        spec = {'split': 'test', 'candidate': 'cand', 'comparators': ['base'], 'objective': 'quality',
+                'arms': {'cand': {'plan': str(self.source / 'plans/review.json'), 'backend': 'claude'}}}
+        decision = {'kind': 'decision', 'digest': 'fixture', 'result': 'pass'}
+        with mock.patch.object(evaluate, 'checked', return_value=spec), \
+                mock.patch.object(evaluate, 'ledger', return_value=[decision]):
+            evidence = rel.quality(self.root / 'store', 'fixture', rel.default_plan(self.source), self.source)
+            path = next((self.bundle / '__pycache__').glob('harness.*.pyc'))
+            header = path.read_bytes()[:16]  # Keep the legitimate checked-source hash.
+            replacement = compile('raise RuntimeError("substituted executable")',
+                                  'ringo-release/harness.py', 'exec')
+            path.chmod(0o644)
+            path.write_bytes(header + marshal.dumps(replacement))
+            manifest = copy.deepcopy(self.manifest)
+            manifest['files'][path.relative_to(self.bundle).as_posix()] = rel.file_hash(path)
+            manifest['quality'] = evidence
+            self.rewrite_manifest(manifest)
+            rel.verify(self.state, self.rid)  # Its self-consistent inventory alone is insufficient.
+            with self.assertRaisesRegex(ValueError, 'bytecode differs'):
+                self.activate()
+            self.assertFalse((self.state / 'active.json').exists())
+
     def test_preview_runs_bundled_modules_without_approval_and_one_backend_call(self):
         trace = self.root / 'trace'
         proc = self.cli(['release', 'preview', '--release', self.rid, '--', *self.review_args(trace)])

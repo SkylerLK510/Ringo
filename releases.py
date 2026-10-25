@@ -141,7 +141,7 @@ def pointer(root):
     return value
 
 
-def quality(store, digest, plan, runtime_root=None):
+def quality(store, digest, plan, runtime_root=None, *, verify_bytecode=False):
     """Read existing protected-evaluator evidence. Never score, decide or adopt here."""
     import evaluate
     import pipelines
@@ -161,6 +161,24 @@ def quality(store, digest, plan, runtime_root=None):
     runtime_root = Path(runtime_root) if runtime_root is not None else HERE
     if any(file_hash(runtime_root / name) != expected for name, expected in evaluated.items()):
         raise ValueError('staged review implementation differs from the sealed-test evidence')
+    if verify_bytecode:
+        # Full bundle hashes detect changes after staging. At activation also
+        # reject a self-consistent manifest whose executable pyc was substituted
+        # while retaining evaluated sources and their source-hash header.
+        import importlib.util
+        import py_compile
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='ringo-proof-') as folder:
+            for name in evaluate.CODE:
+                if not name.endswith('.py'):
+                    continue
+                expected = Path(folder) / (Path(name).name + 'c')
+                py_compile.compile(str(runtime_root / name), cfile=str(expected),
+                    dfile='ringo-release/' + name, doraise=True,
+                    invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
+                cached = Path(importlib.util.cache_from_source(str(runtime_root / name)))
+                if not cached.is_relative_to(runtime_root) or file_hash(cached) != file_hash(expected):
+                    raise ValueError('staged review bytecode differs from the evaluated sources')
     arm = spec['arms'][spec['candidate']]
     return {'kind': 'rrsi', 'store': str(Path(store).resolve()), 'digest': digest,
             'backend': arm['backend'], 'checker_backend': arm.get('checker_backend'),
@@ -350,7 +368,8 @@ def activate(root, rid, report, approved_by, expected_current, uncertain_reason=
         evidence = manifest['quality']
         if evidence.get('kind') == 'rrsi':
             refreshed = quality(evidence['store'], evidence['digest'],
-                                pipelines.load_plan(bundle / 'plans/review.json', 'review'), bundle)
+                                pipelines.load_plan(bundle / 'plans/review.json', 'review'), bundle,
+                                verify_bytecode=True)
             if refreshed != evidence:
                 raise ValueError('quality evidence changed')
         elif evidence != {'kind': 'deployment', 'claim': None}:

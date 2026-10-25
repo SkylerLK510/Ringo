@@ -18,7 +18,11 @@ The native Ringo review found a genuine evidence-transfer gap: a plan with an
 existing sealed-test pass could be staged alongside different review runtime
 code. This publication fixes it by matching every evaluator-frozen code file in
 the staged bundle to the checked experiment implementation, recording that hash
-and rechecking at activation. The separate stable bootstrap remains identified
+and rechecking at activation. Activation also regenerates the expected checked-hash
+bytecode for those evaluated Python sources and compares the executable files,
+so a substituted bytecode body cannot borrow matching source hashes. This
+compilation is confined to RRSI activation and adds no ordinary review pass.
+The separate stable bootstrap remains identified
 by its own hash; the claim is scoped to the evaluated review configuration, not
 the whole IDE or every runtime feature.
 
@@ -91,6 +95,10 @@ an RRSI improvement claim to a noncomparative test pass.
 requires candidate staging to reject the mismatched implementation. It also
 constructs a self-consistent fixture bundle whose manifest hashes are valid but
 whose sealed-test claim belongs to different code; activation must reject it.
+A further case preserves a legitimate source-hash header while substituting the
+executable bytecode body and updating its manifest hash; activation rejects that
+self-consistent bundle too. A positive control stages and activates matching
+comparative proof in an isolated fixture store.
 The existing suite covers exposed/retired cases, canaries, unsealed artifacts,
 frozen-input changes and failed attempts that cannot be selectively retried.
 

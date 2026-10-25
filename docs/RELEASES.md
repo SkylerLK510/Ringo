@@ -68,7 +68,10 @@ protected evaluator and verifies the evaluated candidate's normalized plan and
 prompt contents. The staged evaluator-relevant sources must match the code
 covered by that frozen experiment; a passing plan cannot lend its quality claim
 to a different runtime. Evidence records the implementation hash, objective and
-comparators. Activation rechecks those bindings. A noncomparative baseline
+comparators. Activation rechecks those bindings and compares staged executable
+bytecode with fresh checked-hash compilation of the evaluated sources, using the
+current Python environment. This compilation runs only during RRSI activation,
+not ordinary launches. Re-stage under the intended interpreter environment. A noncomparative baseline
 experiment cannot authorize an RRSI improvement claim. This module does not run
 grading, decide an experiment, change its gates or produce an adoption decision.
 The normal deployment route has no RRSI improvement claim. A person still adopts
