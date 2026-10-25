@@ -17,8 +17,9 @@ measurements, model quality scores, or an RRSI improvement campaign.
 | OPT-04: no stale success | Successful CLI review followed by source, bytecode or approval mutation, then another fresh CLI | The second invocation rechecks and rejects; backend call count remains one |
 | OPT-05: bounded normal path | Ordinary approved local review | Exactly one fixture backend call; exact release, approval, bootstrap and plan identities |
 | OPT-06: complete timing schedule | Mocked orchestration of all nine workloads, 30 pairs, two warmup pairs and injected failure/timeout | Retain all 576 scheduled invocations; warmups excluded from measured pairs; failures/timeouts retained and assessed |
+| OPT-07: metadata special files | Fresh CLI with a FIFO in place of the pointer, approval or release manifest | Reject within the subprocess deadline before inference or trace creation |
 
-The cases live in `tests/test_optimization_cases.py` as four test methods with
+The cases live in `tests/test_optimization_cases.py` as five test methods with
 parameterized scenarios. Release cases execute real fresh Python CLI processes
 with a local fixture backend. OPT-06 uses a deterministic clock and mocked
 process results to inspect the runner's complete schedule; its durations are
@@ -41,6 +42,7 @@ options requiring separate assessment.
 
 The [verifier study](VERIFIER-OPTIMIZATION.md) remains the measured evidence:
 2,000 component pairs and 900 CLI pairs. Its whole-command tail uncertainty is
-unchanged. The earlier code-review recall validation is still incomplete; no
+unchanged. The [overfitting audit](OVERFITTING-GUARDRAILS.md) adds evidence-binding and
+statistical-gate regressions. The earlier code-review recall validation is still incomplete; no
 new validation/test submissions, model comparison or spending campaign is
 started by this case continuation.

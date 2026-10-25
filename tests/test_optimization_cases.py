@@ -114,6 +114,27 @@ class OptimizationCases(unittest.TestCase):
             for n in ('ringo.py', 'releases.py', 'latency.py')}))
         self.assertEqual(identity['plan_sha256'], case.manifest['default_review_sha256'])
 
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'POSIX special-file regression')
+    def test_metadata_fifos_are_rejected_promptly_before_inference(self):
+        for kind in ('manifest', 'pointer', 'approval'):
+            with self.subTest(kind=kind):
+                case = self.fixture()
+                state = case.activate()
+                path = {'manifest': case.bundle / 'release.json',
+                        'pointer': case.state / 'active.json',
+                        'approval': case.state / 'approvals' / (state['active']['approval'] + '.json')}[kind]
+                path.parent.chmod(0o755)
+                path.unlink()
+                os.mkfifo(path)
+                trace = case.root / 'fifo-trace'
+                result = subprocess.run([fixtures.sys.executable, str(case.source / 'ringo.py'),
+                                         *case.review_args(trace)], env=case.env,
+                                        capture_output=True, text=True, timeout=3)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('regular file', result.stderr)
+                self.assertFalse((case.root / 'calls').exists())
+                self.assertFalse(trace.exists())
+
     def test_measurement_schedule_keeps_all_workloads_warmups_failures_and_timeouts(self):
         case = self.fixture()
         out = case.root / 'schedule'

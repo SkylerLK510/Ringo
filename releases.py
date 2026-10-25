@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import sys
 
 from latency import canonical, read_json, sha
@@ -19,6 +20,17 @@ LATENCY_WORKLOADS = {'startup', 'review', 'review-trace', 'review-large', 'desig
 
 def file_hash(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def metadata_json(path):
+    """Reject static symlinks and special files before a potentially blocking read.
+
+    Bundles/state are owner-managed, not an isolation boundary against concurrent
+    mutation by another process with the same account.
+    """
+    if not stat.S_ISREG(Path(path).lstat().st_mode):
+        raise ValueError('release metadata must be a regular file')
+    return read_json(path)
 
 
 def inventory(source):
@@ -117,7 +129,7 @@ def pointer(root):
         raise ValueError('active pointer cannot be a symlink')
     if not path.exists():
         return {'version': 1, 'active': None, 'previous': None}
-    value = read_json(path)
+    value = metadata_json(path)
     if not isinstance(value, dict) or set(value) != {'version', 'active', 'previous'} \
             or type(value['version']) is not int or value['version'] != 1:
         raise ValueError('invalid active pointer')
@@ -129,7 +141,7 @@ def pointer(root):
     return value
 
 
-def quality(store, digest, plan):
+def quality(store, digest, plan, runtime_root=None):
     """Read existing protected-evaluator evidence. Never score, decide or adopt here."""
     import evaluate
     import pipelines
@@ -138,13 +150,23 @@ def quality(store, digest, plan):
     if spec['split'] != 'test' or len(decisions) != 1 or decisions[0].get('result') != 'pass' \
             or decisions[0].get('void'):
         raise ValueError('RRSI candidate requires an existing non-void sealed-test pass')
+    if not spec.get('comparators'):
+        raise ValueError('RRSI candidate requires comparative sealed-test evidence')
     candidate = pipelines.load_plan(spec['arms'][spec['candidate']]['plan'], 'review')
     if config_hash(candidate) != config_hash(plan):
         raise ValueError('evaluated candidate is not the bundled effective review plan')
+    # checked() binds these current evaluator sources to the frozen digest. A
+    # passing plan cannot transfer its claim to different staged review code.
+    evaluated = {name: file_hash(evaluate.HERE / name) for name in evaluate.CODE}
+    runtime_root = Path(runtime_root) if runtime_root is not None else HERE
+    if any(file_hash(runtime_root / name) != expected for name, expected in evaluated.items()):
+        raise ValueError('staged review implementation differs from the sealed-test evidence')
     arm = spec['arms'][spec['candidate']]
     return {'kind': 'rrsi', 'store': str(Path(store).resolve()), 'digest': digest,
             'backend': arm['backend'], 'checker_backend': arm.get('checker_backend'),
-            'plan_sha256': config_hash(plan), 'decision_sha256': sha(decisions[0])}
+            'plan_sha256': config_hash(plan), 'decision_sha256': sha(decisions[0]),
+            'implementation_sha256': sha(evaluated), 'objective': spec['objective'],
+            'comparators': list(spec['comparators'])}
 
 
 def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None):
@@ -158,7 +180,7 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
         raise ValueError('quality evidence requires a candidate plan')
     files = inventory(source)
     plan = pipelines.load_plan(candidate_plan, 'review') if candidate_plan else default_plan(source)
-    evidence = quality(evaluation_store, digest, plan) if candidate_plan else {'kind': 'deployment', 'claim': None}
+    evidence = quality(evaluation_store, digest, plan, source) if candidate_plan else {'kind': 'deployment', 'claim': None}
     with locked(root), tempfile.TemporaryDirectory(prefix='.stage-', dir=root) as folder:
         tmp = Path(folder)
         for name, expected in files.items():
@@ -226,7 +248,7 @@ def verify(root, rid):
     bundle = root / 'bundles' / rid
     if (root / 'bundles').is_symlink() or bundle.is_symlink() or not bundle.is_dir() or (bundle / 'release.json').is_symlink():
         raise ValueError('missing bundle or symlink')
-    manifest = read_json(bundle / 'release.json')
+    manifest = metadata_json(bundle / 'release.json')
     if not isinstance(manifest, dict) or set(manifest) != {'version', 'files', 'quality', 'default_review_sha256', 'python_cache_tag'} \
             or type(manifest['version']) is not int or manifest['version'] != 1 or sha(manifest) != rid \
             or not isinstance(manifest['files'], dict) or not isinstance(manifest['quality'], dict) \
@@ -278,7 +300,7 @@ def approved(root, entry):
     path = root / 'approvals' / (entry['approval'] + '.json')
     if path.is_symlink():
         raise ValueError('approval cannot be a symlink')
-    record = read_json(path)
+    record = metadata_json(path)
     if not isinstance(record, dict) or sha(record) != entry['approval'] or record.get('release') != entry['release']:
         raise ValueError('approval integrity failure')
     return record
@@ -328,7 +350,7 @@ def activate(root, rid, report, approved_by, expected_current, uncertain_reason=
         evidence = manifest['quality']
         if evidence.get('kind') == 'rrsi':
             refreshed = quality(evidence['store'], evidence['digest'],
-                                pipelines.load_plan(bundle / 'plans/review.json', 'review'))
+                                pipelines.load_plan(bundle / 'plans/review.json', 'review'), bundle)
             if refreshed != evidence:
                 raise ValueError('quality evidence changed')
         elif evidence != {'kind': 'deployment', 'claim': None}:

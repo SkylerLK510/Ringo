@@ -372,7 +372,7 @@ else:
     def test_quality_requires_test_pass_and_matching_candidate(self):
         import evaluate
         plan = rel.default_plan(self.source)
-        spec = {'split': 'test', 'candidate': 'cand', 'arms': {'cand': {
+        spec = {'split': 'test', 'candidate': 'cand', 'comparators': ['base'], 'objective': 'quality', 'arms': {'cand': {
             'plan': str(self.source / 'plans/review.json'), 'backend': 'claude'}}}
         decision = {'kind': 'decision', 'digest': 'd', 'result': 'pass'}
         with mock.patch.object(evaluate, 'checked', return_value=spec), \
@@ -383,6 +383,69 @@ else:
                 spec['split'], decision['result'] = split, result
                 with self.subTest(split=split), self.assertRaises(ValueError):
                     rel.quality(self.root / 'store', 'd', plan)
+
+    def test_sealed_test_claim_cannot_transfer_to_different_staged_review_code(self):
+        import evaluate
+        spec = {'split': 'test', 'candidate': 'cand', 'comparators': ['base'], 'objective': 'quality', 'arms': {'cand': {
+            'plan': str(self.source / 'plans/review.json'), 'backend': 'claude'}}}
+        decision = {'kind': 'decision', 'digest': 'd', 'result': 'pass'}
+        with mock.patch.object(evaluate, 'checked', return_value=spec), \
+                mock.patch.object(evaluate, 'ledger', return_value=[decision]):
+            evidence = rel.quality(self.root / 'store', 'd', rel.default_plan(self.source), self.source)
+            self.assertEqual(evidence['implementation_sha256'], rel.sha({
+                n: rel.file_hash(evaluate.HERE / n) for n in evaluate.CODE}))
+            for name in evaluate.CODE:
+                path = self.source / name
+                original = path.read_bytes()
+                path.write_bytes(original + b'\n# unevaluated implementation\n')
+                try:
+                    with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'implementation differs'):
+                        rel.stage(self.source, self.state, self.source / 'plans/review.json',
+                                  self.root / 'store', 'd')
+                finally:
+                    path.write_bytes(original)
+            self.assertFalse((self.state / 'active.json').exists())
+            self.assertEqual(len(list((self.state / 'bundles').iterdir())), 1)
+
+    def test_activation_rechecks_the_review_implementation_bound_to_quality(self):
+        import evaluate
+        spec = {'split': 'test', 'candidate': 'cand', 'comparators': ['base'], 'objective': 'quality', 'arms': {'cand': {
+            'plan': str(self.source / 'plans/review.json'), 'backend': 'claude'}}}
+        decision = {'kind': 'decision', 'digest': 'd', 'result': 'pass'}
+        with mock.patch.object(evaluate, 'checked', return_value=spec), \
+                mock.patch.object(evaluate, 'ledger', return_value=[decision]):
+            evidence = rel.quality(self.root / 'store', 'd', rel.default_plan(self.source), self.source)
+            # Self-consistent forged bundle: its inventory hashes are valid but
+            # its review code differs from the implementation covered by proof.
+            path = self.bundle / 'harness.py'
+            path.chmod(0o644)
+            path.write_bytes(path.read_bytes() + b'\n# unevaluated implementation\n')
+            manifest = copy.deepcopy(self.manifest)
+            manifest['files']['harness.py'] = rel.file_hash(path)
+            manifest['quality'] = evidence
+            self.rewrite_manifest(manifest)
+            rel.verify(self.state, self.rid)
+            with self.assertRaisesRegex(ValueError, 'implementation differs'):
+                self.activate()
+            self.assertFalse((self.state / 'active.json').exists())
+
+    def test_matching_comparative_proof_can_stage_and_activate_in_fixture_store(self):
+        import evaluate
+        spec = {'split': 'test', 'candidate': 'cand', 'comparators': ['base'], 'objective': 'quality',
+                'arms': {'cand': {'plan': str(self.source / 'plans/review.json'), 'backend': 'claude'}}}
+        decision = {'kind': 'decision', 'digest': 'fixture', 'result': 'pass'}
+        with mock.patch.object(evaluate, 'checked', return_value=spec), \
+                mock.patch.object(evaluate, 'ledger', return_value=[decision]):
+            rid = rel.stage(self.source, self.state, self.source / 'plans/review.json',
+                            self.root / 'fixture-store', 'fixture')
+            _, manifest = rel.verify(self.state, rid)
+            evidence = manifest['quality']
+            self.assertEqual(evidence['comparators'], ['base'])
+            self.assertEqual(evidence['objective'], 'quality')
+            self.assertEqual(evidence['implementation_sha256'], rel.sha({
+                name: rel.file_hash(evaluate.HERE / name) for name in evaluate.CODE}))
+            state = self.activate(rid)
+            self.assertEqual(rel.approved(self.state, state['active'])['quality'], evidence)
 
     def test_preview_runs_bundled_modules_without_approval_and_one_backend_call(self):
         trace = self.root / 'trace'

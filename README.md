@@ -93,7 +93,9 @@ human decision. Timing experiments use simulated backends and make no provider c
 
 [Optimization regression cases](docs/OPTIMIZE-CASES.md) check release integrity before inference,
 fresh-invocation rechecks and complete timing schedules. The full offline suite
-also runs in GitHub Actions on Python 3.11 and 3.14.
+also runs in GitHub Actions on Python 3.11 and 3.14. The
+[overfitting audit](docs/OVERFITTING-GUARDRAILS.md) maps evidence and held-out-data
+guardrails to their tests and remaining limits.
 
 [HarBenchmark](HarBenchmark.md) provides twelve public development cases and an
 offline scorer across review, constrained repairs, design calculations, artifact
