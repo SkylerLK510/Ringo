@@ -8,6 +8,11 @@ The normal local release store now selects release `e777d95353ba6de294a3deec5f2e
 
 New invocations through the stable `ringo.py` launcher use that local release. The optimized verifier remains part of the stable bootstrap and its separate hash is recorded in run provenance. Local activation does not deploy the runtime to other machines. Source publication includes the matching runtime and tests without changing the already approved local bundle.
 
+The later [overfitting and guardrail audit](OVERFITTING-GUARDRAILS.md) records
+additional metadata/evidence fixes and their separate latency comparison. The
+component speedup below remains the earlier traversal experiment; do not
+attribute the follow-up fixes to those measurements.
+
 ## Change and integrity contract
 
 The verifier now validates manifest paths/hashes and checks inventory/content in one iterative `os.scandir` walk. Directory-entry metadata replaces redundant path type queries. Every expected source and bytecode file still receives a complete SHA-256 read on every verification. Missing/extra files and file/directory/dangling symlinks remain rejected. There is no cross-command verification cache and no approval-receipt change. Empty unregistered directories remain compatible. Unsupported special files, previously omitted from the regular-file inventory, are now explicitly rejected without opening them.

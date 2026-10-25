@@ -144,3 +144,60 @@ workload protocol; retain uncertain outcomes and do not repeat collections until
 they pass. The earlier 5 ms / 5% defaults remain provisional diagnostic budgets,
 not a user-approved production SLO. The previous verifier study remains the
 evidence for its measured speedup; guardrail fixes require their own assessment.
+
+## Final verification and latency assessment
+
+The final full suite ran **329 tests, OK, 2 skipped**, including twelve new test
+methods and their parameterized scenarios. GitHub Actions also ran all 329 tests
+successfully on Python 3.11 and 3.14. Native Ringo review used two calls: the
+initial publication review identified the implementation-binding and metadata
+issues; follow-up review reported no defects and raised the executable-bytecode
+question, which was confirmed and fixed with a negative case and positive
+control. Its other questions were resolved by inspecting the evaluator and
+running the corresponding tests. Model review is an assessment of supplied
+evidence, not a statistical quality evaluation.
+
+The final code was measured after tests and inference ended, using 100 randomized
+pairs plus five warmup pairs for each of nine workloads: 900 measured pairs and
+1,890 fresh CLI processes. Baseline and candidate used separate before/after
+launchers and matched private synthetic approvals of 58,186 bytes each. The
+baseline application was the already approved release; the final candidate
+source and bytecode were verified against the measurement bundle. Normal user
+approval state was not changed by collection. No provider calls were made.
+
+| Workload | Before p50 ms | After p50 ms | Median delta ms | Diagnostic assessment |
+|---|---:|---:|---:|---|
+| startup | 34.461 | 34.567 | +0.106 | negligible |
+| review | 66.281 | 66.403 | +0.122 | negligible |
+| review-trace | 68.030 | 68.270 | +0.241 | negligible |
+| review-large | 68.492 | 68.561 | +0.069 | uncertain |
+| design | 67.425 | 67.555 | +0.130 | uncertain |
+| work | 279.312 | 279.243 | -0.069 | uncertain |
+| review-delay | 127.827 | 127.960 | +0.133 | uncertain |
+| review-override | 67.288 | 67.356 | +0.068 | uncertain |
+| review-failure | 87.550 | 87.724 | +0.174 | uncertain |
+
+Startup, ordinary review and traced review fit both the provisional 5 ms and 5%
+mean/p95 budgets using simultaneous paired-bootstrap bounds. Six workloads
+remained uncertain; none demonstrated a beyond-budget slowdown. The ordinary
+review median rose by about 0.12 ms. This is not a claim of uniformly negligible
+latency, improved quality, or live-provider/IDE performance.
+
+All non-diagnostic runs succeeded. The 210 intentionally failing executions,
+including warmups, remained failures. All 200 measured work runs made exactly
+one writer and six simulated judge calls. Raw pairs, complete schedules, bounds,
+source identities and the preregistered protocol remain private.
+
+An earlier complete collection used the real baseline approval (108,384 bytes)
+against a smaller synthetic candidate approval (58,186 bytes). That size
+mismatch confounds attribution to the code change, so it is retained as
+exploratory evidence, not the final comparison. Final code also gained the
+activation-only bytecode check after the follow-up review. The revised protocol
+specified matched approvals before the final collection; sample counts, budgets
+and failure treatment were unchanged. Collection was not repeated to seek a
+passing verdict, and all uncertain results are retained.
+
+The existing application bundle remains pinned. The reviewed metadata and
+adoption-evidence fixes belong to the separately identified stable bootstrap and
+management code. Their publication or local application does not attach an RRSI
+quality claim or automatically activate a newly staged application candidate.
