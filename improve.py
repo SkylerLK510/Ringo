@@ -12,8 +12,9 @@ prompts, specs, splits or thresholds; and validation gives back only an aggregat
 
 1. runs the incumbent on a seeded sample of dev cases for evidence (what it found, missed and got wrong);
 2. asks the proposer, in one isolated call, for one change;
-3. screens it in code: one change only, allowed files only, prompt growth and calls per review capped, and no case
-   id, answer-key text, answer-key file path or canary in it;
+3. screens it in code: one change only, allowed files only, prompt growth capped, and no case id, answer-key
+   text, answer-key file path or canary in it (calls per review are not capped: a plan makes the calls its passes
+   need, and the cost allowance below prices every one of them, at unpriced_call_usd when none is reported);
 4. runs candidate and incumbent on the same dev sample; the candidate advances only if the bootstrap lower bound
    of its gain in U (defects found minus wrong findings) is above zero for every grader, and its cost ratio stays
    within the allowance (base + slope x the mean U gain);
@@ -29,7 +30,7 @@ With the default codex grader, allow_tool_backends must also explicitly be true,
   {"name": "c1", "incumbent": "plans/review.json", "backend": "claude", "proposer": "claude",
    "graders": ["claude", "codex"],
    "max_proposals": 10, "dev_sample": 12, "dev_runs": 1, "validation_runs": 2, "max_prompt_growth": 1.25,
-   "max_calls_per_review": 4, "allowance": [1.1, 0.4], "budget_usd": 50, "min_groups": 10,
+   "allowance": [1.1, 0.4], "budget_usd": 50, "min_groups": 10,
    "margins": {"U": 0.5, "W": 0.25}, "bootstrap": 2000, "seed": 1, "unpriced_call_usd": null,
    "allow_tool_backends": false, "timeout_s": 900, "grade_timeout_s": 1800, "proposer_timeout_s": 900}
 The null price and false tool acknowledgment intentionally refuse these defaults before spending; set them for
@@ -55,7 +56,7 @@ import pipelines
 
 HERE = Path(__file__).resolve().parent
 CAMPAIGN_DEFAULTS = {'backend': 'claude', 'proposer': 'claude', 'graders': ['claude', 'codex'], 'max_proposals': 10, 'dev_sample': 12,
-                     'dev_runs': 1, 'validation_runs': 2, 'max_prompt_growth': 1.25, 'max_calls_per_review': 4,
+                     'dev_runs': 1, 'validation_runs': 2, 'max_prompt_growth': 1.25,
                      'allowance': [1.1, 0.4], 'budget_usd': 50, 'min_groups': 10, 'margins': {'U': 0.5, 'W': 0.25},
                      'bootstrap': 2000, 'seed': 1, 'unpriced_call_usd': None, 'allow_tool_backends': False,
                      'timeout_s': harness.TIMEOUT_S, 'grade_timeout_s': 1800, 'proposer_timeout_s': harness.TIMEOUT_S}
@@ -65,12 +66,14 @@ NGRAM = 8  # a proposal may not share any run of this many words with a dev answ
 
 def load_campaign(path):
     camp = {**CAMPAIGN_DEFAULTS, **json.loads(Path(path).read_text(encoding='utf-8'))}
+    if 'max_calls_per_review' in camp:
+        raise ValueError('max_calls_per_review was removed: each plan makes the calls its passes need')
     unknown = set(camp) - set(CAMPAIGN_DEFAULTS) - {'name', 'incumbent'}
     if unknown or not isinstance(camp.get('name'), str) or not camp.get('incumbent'):
         raise ValueError(f'a campaign needs name and incumbent; unknown keys: {sorted(unknown)}')
     if not re.fullmatch(pipelines.ID, camp['name']):
         raise ValueError('campaign name must be a safe id')
-    for key in ('max_proposals', 'dev_sample', 'dev_runs', 'validation_runs', 'max_calls_per_review', 'bootstrap'):
+    for key in ('max_proposals', 'dev_sample', 'dev_runs', 'validation_runs', 'bootstrap'):
         if type(camp[key]) is not int or camp[key] < 1:
             raise ValueError(f'{key} must be a positive integer')
     if type(camp['min_groups']) is not int or camp['min_groups'] < evaluate.SPEC_DEFAULTS['min_groups']:
@@ -197,7 +200,7 @@ def candidate_key(incumbent, proposal):
     return evaluate.sha(json.dumps([normalized, used], sort_keys=True))
 
 
-def screen(store, proposal, incumbent, dev_ids, camp, max_findings=None):
+def screen(store, proposal, incumbent, dev_ids, camp):
     """Screen actual normalized instructions, never treating heuristics as an isolation guarantee."""
     why = contamination_reasons(store, '\n'.join(strings(proposal)), dev_ids)
     supplied = proposal.get('prompts', {})
@@ -231,18 +234,6 @@ def screen(store, proposal, incumbent, dev_ids, camp, max_findings=None):
     for n in introduced:
         if len(new_plan['role']) + len(normalized[n]) > growth * (len(plan['role']) + max(map(len, texts.values()))):
             why.append('a new prompt exceeds the per-call growth cap')
-    readers = sum(p['reply'] == 'findings' for p in new_plan['passes'])
-    calls = 0
-    for p in new_plan['passes']:
-        if p.get('batch'):
-            if max_findings is None:
-                why.append('calls per review for batched checking need a measured findings bound from the baseline')
-                continue
-            calls += math.ceil(readers * max_findings / p['batch'])
-        else:
-            calls += 1
-    if calls > camp['max_calls_per_review']:
-        why.append(f'estimated {calls} calls per review (limit {camp["max_calls_per_review"]})')
     return why
 
 
@@ -315,8 +306,7 @@ def experiment(store, ws, name, arms, split, camp, comparators=(), runs=1, sampl
             'allow_tool_backends': camp['allow_tool_backends'], 'grading_reserve_usd': grading_reserve,
             'timeout_s': camp['timeout_s'], 'grade_timeout_s': camp['grade_timeout_s'],
             'comparators': list(comparators), 'graders': camp['graders'], 'runs': runs, 'min_groups': camp['min_groups'],
-            'margins': camp['margins'], 'bootstrap': camp['bootstrap'], 'seed': camp['seed'], 'sample': sample,
-            'max_calls_per_review': camp['max_calls_per_review'] * 2 + 1}  # each pass may retry once, plus one repair
+            'margins': camp['margins'], 'bootstrap': camp['bootstrap'], 'seed': camp['seed'], 'sample': sample}
     path = Path(ws) / 'specs' / f'{name}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(spec, indent=1), encoding='utf-8')
@@ -376,16 +366,6 @@ def campaign(store, campaign_path, ws, call_fn=harness.call):
         return _campaign(store, camp, ws, call_fn)
 
 
-def measured_findings(store, d):
-    root = Path(store) / 'runs' / d / 'out'
-    spec = evaluate.prereg(store, d)['spec']
-    plan = pipelines.load_plan(spec['arms']['inc'].get('plan'))
-    readers = {p['id'] for p in plan['passes'] if p['reply'] == 'findings'}
-    counts = [len(pipelines.findings('x', p.read_text())[1]) for p in root.glob('*/inc.*/trace/steps/*.txt')
-              if p.name.rsplit('.', 2)[0] in readers]
-    return max(counts) if counts else None
-
-
 def estimated_experiment(store, previous, n_cases, n_arms, runs):
     """Pilot-based planning estimate, not a provider-side cap or a promise about a changed pipeline."""
     spec = evaluate.prereg(store, previous)['spec']
@@ -419,7 +399,6 @@ def _campaign(store, camp, ws, call_fn):
         d0, _ = experiment(store, ws, f"{camp['name']}-baseline", {'inc': inc}, 'dev', camp, runs=camp['dev_runs'],
                            sample=camp['dev_sample'], budget=left(), call_fn=call_fn, digests=digests)
         proof = evidence(store, d0, 'inc')
-        max_findings = measured_findings(store, d0)
         for n in range(1, camp['max_proposals'] + 1):
             if left() <= 0:
                 log.append({'n': n, 'stopped': 'budget'})
@@ -466,7 +445,7 @@ def _campaign(store, camp, ws, call_fn):
             if left() <= 0:
                 log.append({**entry, 'stopped': 'budget'})
                 break
-            why = screen(store, proposal, camp['incumbent'], dev_ids, camp, max_findings)
+            why = screen(store, proposal, camp['incumbent'], dev_ids, camp)
             if why:
                 log.append({**entry, 'result': 'rejected', 'why': why})
                 continue

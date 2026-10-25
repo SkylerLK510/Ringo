@@ -150,7 +150,7 @@ class FreezeTest(unittest.TestCase):
     def test_guardrail_parameters_and_arm_names_are_validated(self):
         s = Store()
         for over in ({'min_groups': 2}, {'min_groups': True}, {'bootstrap': 0},
-                     {'max_calls_per_review': 0}, {'seed': []}, {'kind': 'design'},
+                     {'max_calls_per_review': 4}, {'seed': []}, {'kind': 'design'},
                      {'margins': {'U': -1, 'W': 0.25}}, {'margins': {'U': 0.5, 'W': float('nan')}},
                      {'max_cost_ratio': float('inf')}, {'min_saving': 1}, {'graders': ['grader-claude'] * 2},
                      {'arms': {'../escape': {'backend': 'good'}}},
@@ -158,6 +158,8 @@ class FreezeTest(unittest.TestCase):
             with self.subTest(over=over), self.assertRaises(ev.EvalError):
                 ev.load_spec(s.spec(**over))
         self.assertFalse(any(r['kind'] == 'prereg' for r in ev.ledger(s.dir)))
+        with self.assertRaisesRegex(ev.EvalError, 'max_calls_per_review was removed'):
+            ev.load_spec(s.spec(max_calls_per_review=4))
 
     def test_any_changed_input_invalidates_the_experiment(self):
         s = Store()
@@ -201,6 +203,51 @@ class FreezeTest(unittest.TestCase):
         s = Store(policy={'alpha': 0.05})
         ev.split(s.dir, seed=5, resplit=True, new_policy={'alpha': 0.5, 'max_validation_submissions': 99})
         self.assertEqual(ev.policy(s.dir), ev.POLICY_DEFAULTS)
+
+
+class CheckerBackendTest(unittest.TestCase):
+    """An arm's checker_backend runs its plan's verdicts pass; it is checked, frozen and traced like any backend."""
+    def checked_plan(self, s):
+        prompts = s.dir / 'prompts'
+        prompts.mkdir(exist_ok=True)
+        for name in ('r.md', 'k.md'):
+            (prompts / name).write_text(f'INSTRUCTION {name}', encoding='utf-8')
+        path = s.dir / 'checked.json'
+        path.write_text(json.dumps({'version': 1, 'kind': 'review', 'role': 'r', 'prompts_dir': 'prompts',
+                                    'passes': [{'id': 'r', 'prompt': 'r.md', 'reply': 'findings'},
+                                               {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts'}]}))
+        return str(path)
+
+    def arms(self, s, checker):
+        return {'cand': {'plan': self.checked_plan(s), 'backend': 'good', 'checker_backend': checker},
+                'base': {'plan': None, 'backend': 'base'}}
+
+    def test_bad_checker_backends_are_refused_at_freeze(self):
+        s = Store(groups=2, fractions=(1, 0, 0))
+        for arms, error in [({'cand': {'plan': None, 'backend': 'good', 'checker_backend': 'reviewer'}}, 'verdicts pass'),
+                            ({'cand': {'plan': None, 'backend': 'good', 'checker_backend': ' '}}, 'checker_backend')]:
+            with self.subTest(error=error), self.assertRaisesRegex(ev.EvalError, error):
+                ev.freeze(s.dir, s.spec(split='dev', arms=arms, comparators=[], graders=['grader-claude']))
+        with self.assertRaisesRegex(ValueError, "may read local files: .*'codex'"):
+            ev.freeze(s.dir, s.spec(split='dev', arms=self.arms(s, 'codex'), graders=['claude'], allow_tool_backends=False))
+
+    def test_checker_is_frozen_and_runs_the_verdicts_pass(self):
+        s = Store(groups=2, fractions=(1, 0, 0))
+        names = []
+        def recording(name, store):
+            names.append(name)
+            return fake_identity(name, store)
+        with mock.patch.object(ev, 'identity', recording):
+            d = ev.freeze(s.dir, s.spec(split='dev', arms=self.arms(s, 'reviewer'), graders=['grader-claude'], runs=1))
+        self.assertIn('reviewer', names)
+        def call(b, system, message, timeout_s, model=None):
+            return ('r.1 KEEP', dict(USAGE)) if b['name'] == 'reviewer' else fake_call(b, system, message, timeout_s, model)
+        ev.run(s.dir, d, call_fn=call)
+        traces = sorted((s.dir / 'runs' / d / 'out').glob('*/cand.*/trace/trace.jsonl'))
+        self.assertEqual(len(traces), 2)
+        for t in traces:
+            ok = {r['step']: r['backend'] for r in map(json.loads, t.read_text().splitlines()) if r['status'] == 'ok'}
+            self.assertEqual(ok, {'r': 'good', 'k': 'reviewer'})
 
 
 class RunGradeDecideTest(unittest.TestCase):

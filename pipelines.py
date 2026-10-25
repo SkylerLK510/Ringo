@@ -13,13 +13,15 @@ Each pass has an `id`, a `prompt` file (in prompts/, or in the plan's `prompts_d
 - `proposal`: a design proposal (the result is the last proposal that ran);
 - `text`: any other non-empty reply (a table of numbers, notes).
 Optional fields: `inputs` (ids of earlier passes whose replies this pass reads), `batch` (verdicts only: findings
-per call), `when` (the id of an earlier `issues` pass; this pass runs only if that pass found issues), and `model`
-(a model for this pass on a claude-style backend, e.g. a cheaper one for checker batches). The built-in plans are
+per call; each findings reply then holds at most MAX_FINDINGS findings, so the checker's calls are known from the
+plan, never from what a model writes), `when` (the id of an earlier `issues` pass; this pass runs only if that pass found issues), and `model`
+(a model for this pass on a claude-style backend, e.g. a cheaper one for checker batches). A plan never names a
+backend: the verdicts pass can run on a second one only through harness --checker-backend, set by a person. The built-in plans are
 plans/review.json and plans/design.json.
 
 Every pass sees the same shared material (in the system prompt, so it is cached); its message holds only its
 instruction and the replies it lists. The first pass runs alone to write the cache, then each wave of passes whose
-inputs are ready runs in parallel, except under a dollar cap. Each per-pass model warms separately. A checker
+inputs are ready runs in parallel, except under a dollar cap. Each backend and per-pass model warms separately. A checker
 always runs, and at least one output pass must run unconditionally.
 
 Review assembly keeps findings verbatim, in source order. With two or more `findings` passes a `verdicts` pass
@@ -37,6 +39,7 @@ REPLIES = ('findings', 'verdicts', 'issues', 'proposal', 'text')
 PASS_KEYS = {'id', 'prompt', 'reply', 'inputs', 'batch', 'when', 'model'}
 PLAN_KEYS = {'version', 'kind', 'role', 'passes', 'prompts_dir'}
 ID = r'[A-Za-z][\w-]*'
+MAX_FINDINGS = 50  # per findings reply in a batched plan: its checker makes at most ceil(readers x 50 / batch) calls
 HEAD = re.compile(r'^#{2,4}\s*\**\s*[A-Za-z]{0,2}(\d+)\s*[.):]\s*(.*)$', re.M)
 SECTION = re.compile(r'^#{2,4}[ \t]*\**[ \t]*(open questions|not checked)'
                      r'(?:[ \t]*\([^\n)]*\))?[ \t]*\**[ \t]*:?[ \t]*$', re.M | re.I)
@@ -191,7 +194,9 @@ NO_DEFECTS = re.compile(r'^\W*no defects found\b', re.M | re.I)
 
 def check_reply(plan, p, text):
     """ValueError if a reply has the wrong shape for its pass (the harness then asks once more). In a plan with a
-    checker, a findings reply must use the headings or say "No defects found", so no reviewer is silently lost."""
+    checker, a findings reply must use the headings or say "No defects found", so no reviewer is silently lost. In
+    a plan with a batched checker it may hold at most MAX_FINDINGS findings: the checker makes one call per batch,
+    so this keeps its call count a plan-time number instead of whatever a runaway reply produces."""
     if not text.strip():
         raise ValueError(f'pass {p["id"]}: empty reply')
     if p['reply'] == 'verdicts' and not VERDICT.search(text):
@@ -204,6 +209,9 @@ def check_reply(plan, p, text):
             raise ValueError(f'pass {p["id"]}: finding headings appear after a terminal section')
         if not headings and not NO_DEFECTS.search(masked):
             raise ValueError(f'pass {p["id"]}: no finding headings and no "No defects found" line')
+        if len(headings) > MAX_FINDINGS and any(q['reply'] == 'verdicts' and q.get('batch') for q in plan['passes']):
+            raise ValueError(f'pass {p["id"]}: {len(headings)} findings, more than the {MAX_FINDINGS} a batched '
+                             f'checker plan allows per reply')
 
 
 def has_issues(text):

@@ -1,11 +1,14 @@
 """Offline checks of harness.py and pipelines.py: fake backends only, no model calls."""
+import io
 import json
 import os
 import shlex
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -66,8 +69,12 @@ class CallTest(unittest.TestCase):
         with self.assertRaisesRegex(backends.JudgeError, 'limit reached'):
             harness.call({'name': 'c', 'argv': [bad], 'style': 'claude'}, 's', 'm', 30)
         junk = self.fake_claude('print("not json")\n')
-        with self.assertRaisesRegex(backends.JudgeError, 'did not return JSON'):
+        with self.assertRaisesRegex(backends.JudgeError, 'did not return JSON') as caught:
             harness.call({'name': 'c', 'argv': [junk], 'style': 'claude'}, 's', 'm', 30)
+        self.assertEqual(caught.exception.raw.strip(), 'not json')  # kept for the trace
+        with self.assertRaises(harness.CallError) as caught:
+            harness.call({'name': 'c', 'argv': [bad], 'style': 'claude'}, 's', 'm', 30)
+        self.assertIn('limit reached', caught.exception.raw)
 
     def test_other_backends_get_system_then_message_on_stdin(self):
         argv = shlex.split(shlex.join([sys.executable, '-c', 'import sys; print(sys.stdin.read())']))
@@ -79,7 +86,8 @@ class CallTest(unittest.TestCase):
     def test_backend_styles_are_declared_not_guessed(self):
         self.assertEqual(harness.backend('claude'), {'name': 'claude', 'argv': shlex.split(backends.JUDGE_PRESETS['claude']),
                                                      'style': 'claude'})
-        self.assertEqual(harness.backend('codex')['style'], 'plain')
+        self.assertEqual(harness.backend('codex')['style'], 'codex')
+        self.assertEqual(harness.backend('codex --search exec --json -')['style'], 'plain')  # no name sniffing
         self.assertEqual(harness.backend('codex-chatgpt')['style'], 'codex')
         self.assertEqual(harness.backend('ollama:qwen3')['argv'], ['ollama', 'run', 'qwen3'])
         self.assertEqual(harness.backend('claude:my-wrapper -p')['style'], 'claude')
@@ -143,9 +151,82 @@ class CallTest(unittest.TestCase):
         self.assertIn('skip_host_skill_discovery', backend['argv'])
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             text, usage = harness.call(backend, 'SYS', 'MSG', 30)
-        invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, subscription_auth=True)
+        invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, codex_home=True, subscription_auth=True)
         self.assertEqual(text, 'No defects found.')
-        self.assertEqual(usage, {'input': 30, 'cache_read': 70, 'cache_write': 0, 'output': 12, 'cost_usd': None})
+        self.assertEqual(usage, {'input': 30, 'cache_read': 70, 'cache_write': 0, 'output': 12, 'cost_usd': None,
+                                 'items': {'agent_message': 1}, 'warnings': []})
+
+    @staticmethod
+    def event(item_type, **fields):
+        return json.dumps({'type': 'item.completed', 'item': {'type': item_type, **fields}})
+
+    def test_codex_warnings_and_progress_events_are_tolerated_and_recorded(self):
+        noise = [self.event('error', message='skip_host_skill_discovery is unstable'), self.event('reasoning', text='r'),
+                 self.event('todo_list', items=[]), json.dumps({'type': 'item.started', 'item': {'type': 'reasoning'}}),
+                 json.dumps({'type': 'item.updated', 'item': {'type': 'todo_list'}}),
+                 json.dumps({'type': 'thread.started'}), json.dumps({'type': 'turn.started'})]
+        text, usage = harness.codex_reply('\n'.join(noise) + '\n' + self.codex_events())
+        self.assertEqual(text, 'No defects found.')
+        self.assertEqual(usage['output'], 12)
+        self.assertEqual(usage['warnings'], ['skip_host_skill_discovery is unstable'])
+        self.assertEqual(usage['items'], {'error': 1, 'reasoning': 1, 'todo_list': 1, 'agent_message': 1})
+
+    def test_codex_rejection_names_the_reason_and_item_counts_and_keeps_raw(self):
+        cases = {'undeclared tool item command_execution': self.event('command_execution'),
+                 'undeclared tool item mcp_tool_call': self.event('mcp_tool_call'),
+                 'undeclared tool item web_search': self.event('web_search'),
+                 'undeclared tool item file_change': self.event('file_change'),
+                 'turn.failed: boom': json.dumps({'type': 'turn.failed', 'error': 'boom'}),
+                 'error: Reconnecting': json.dumps({'type': 'error', 'message': 'Reconnecting'}),
+                 '2 turn.completed events': json.dumps({'type': 'turn.completed', 'usage': {}}),
+                 'not a JSON event': 'not JSON'}
+        for reason, tail in cases.items():
+            raw = self.codex_events() + '\n' + tail
+            with self.subTest(reason=reason), self.assertRaises(harness.CallError) as caught:
+                harness.codex_reply(raw, 'codex-chatgpt')
+            self.assertIn(reason, str(caught.exception))
+            self.assertIn('agent_message=1', str(caught.exception))
+            self.assertEqual(caught.exception.raw, raw)
+            self.assertEqual(caught.exception.usage['output'], 12)
+        with self.assertRaisesRegex(harness.CallError, 'no final agent message'):
+            harness.codex_reply(json.dumps({'type': 'turn.completed', 'usage': {}}))
+
+    def test_codex_backends_are_declared_with_their_tools_and_auth(self):
+        plain = harness.backend('codex')
+        self.assertIn('--json', plain['argv'])
+        self.assertEqual((plain['subscription_auth'], plain['tools']), (False, ['command_execution']))
+        chatgpt = harness.backend('codex-chatgpt')
+        self.assertEqual((chatgpt['subscription_auth'], chatgpt['tools']), (True, []))
+        custom = harness.backend('codex:codex --search exec --skip-git-repo-check --json -')
+        self.assertEqual((custom['style'], custom['argv'][0], custom['subscription_auth'], custom['tools']),
+                         ('codex', 'codex', False, ['web_search']))
+        self.assertEqual(harness.backend('codex:codex exec --json -')['tools'], [])
+        for bad in ('codex:', 'codex:codex exec -'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                harness.backend(bad)
+
+    def test_codex_prefix_parses_tokens_and_allows_only_declared_search(self):
+        events = self.event('web_search', query='q') + '\n' + self.codex_events()
+        searching = harness.backend('codex:codex --search exec --json -')
+        with mock.patch.object(backends, 'run_isolated', return_value=events) as invoke:
+            text, usage = harness.call(searching, 'S', 'M', 30)
+        invoke.assert_called_once_with(searching['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=False)
+        self.assertEqual((text, usage['input'], usage['cache_read'], usage['output']), ('No defects found.', 30, 70, 12))
+        for spec in ('codex:codex exec --json -', 'codex-chatgpt'):
+            with self.subTest(spec=spec), mock.patch.object(backends, 'run_isolated', return_value=events), \
+                    self.assertRaisesRegex(harness.CallError, f'{spec} turn rejected: undeclared tool item web_search'):
+                harness.call(harness.backend(spec), 'S', 'M', 30)
+        shell = self.event('command_execution') + '\n' + self.codex_events()
+        with mock.patch.object(backends, 'run_isolated', return_value=shell), self.assertRaises(harness.CallError):
+            harness.call(searching, 'S', 'M', 30)
+        with mock.patch.object(backends, 'run_isolated', return_value=shell):  # the codex preset keeps its shell
+            self.assertEqual(harness.call(harness.backend('codex'), 'S', 'M', 30)[0], 'No defects found.')
+
+    def test_hand_built_codex_backend_keeps_key_stripping_and_private_home(self):
+        b = {'name': 'codex-chatgpt+model', 'argv': ['codex', 'exec', '--json', '-'], 'style': 'codex'}
+        with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
+            harness.call(b, 'S', 'M', 30)
+        invoke.assert_called_once_with(b['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=True)
 
     def test_native_turn_failures_preserve_reported_tokens_without_becoming_success(self):
         for tail in ('not JSON', json.dumps({'type': 'turn.failed'}),
@@ -163,6 +244,63 @@ class CallTest(unittest.TestCase):
                 self.assertRaises(harness.CallError) as caught:
             harness.call(harness.backend('codex-chatgpt'), 's', 'm', 1)
         self.assertEqual(caught.exception.usage['input'], 30)
+        self.assertEqual(caught.exception.raw, self.codex_events())
+
+    def test_codex_timeout_keeps_partial_usage_and_raw_events_in_the_trace(self):
+        # a stand-in Codex child: prints its events, then hangs past the timeout
+        events = self.codex_events()
+        child = f'import sys, time; sys.stdout.write({events!r} + "\\n"); sys.stdout.flush(); time.sleep(10)'
+        backend = {**harness.backend('codex-chatgpt'), 'argv': [sys.executable, '-c', child]}
+        with tempfile.TemporaryDirectory() as d, \
+                mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'codex'))}):  # no real login
+            run = harness.Run(Path(d, 't'))
+            with self.assertRaises(subprocess.TimeoutExpired):  # the type the retry rule sees is unchanged
+                harness.run_plan(pl.load_plan(None, 'review'), 'M', backend, run, timeout_s=1,
+                                 call_fn=harness.call)
+            rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
+            errors = [r for r in rows if r['status'] == 'error']
+            self.assertEqual(len(errors), 2)  # one retry, as before
+            self.assertEqual(errors[0]['usage']['input'], 30)
+            raw = Path(d, 't', 'steps', f"{errors[0]['step']}.1.raw.txt").read_text()
+            self.assertIn('No defects found.', raw)
+
+    def test_codex_empty_builtin_resource_listings_are_tolerated_but_nothing_else(self):
+        def listing(tool, text, server='codex'):
+            return json.dumps({'type': 'item.completed', 'item': {
+                'type': 'mcp_tool_call', 'server': server, 'tool': tool, 'arguments': {}, 'error': None,
+                'status': 'completed', 'result': {'content': [{'type': 'text', 'text': text}], 'structured_content': None}}})
+        done = [json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'review'}}),
+                json.dumps({'type': 'turn.completed', 'usage': {'input_tokens': 5, 'output_tokens': 2}})]
+        ok = [listing('list_mcp_resources', '{"resources":[]}'),
+              listing('list_mcp_resource_templates', '{"resourceTemplates":[]}')]
+        text, usage = harness.codex_reply('\n'.join(ok + done))
+        self.assertEqual((text, usage['items']['mcp_tool_call']), ('review', 2))
+        for bad in (listing('list_mcp_resources', '{"resources":[{"uri":"x"}]}'),
+                    listing('list_mcp_resources', '{"resources":[]}', server='other'),
+                    listing('read_mcp_resource', '{"resources":[]}')):
+            with self.subTest(bad=bad), self.assertRaisesRegex(harness.CallError, 'undeclared tool item mcp_tool_call'):
+                harness.codex_reply('\n'.join([bad, *done]))
+
+    def test_codex_failure_without_a_completed_turn_counts_as_untokened_not_zero(self):
+        cases = {'turn.failed': json.dumps({'type': 'turn.failed', 'error': 'usage limit'}),
+                 'stream cut': json.dumps({'type': 'thread.started'})}
+        for name, raw in cases.items():
+            with self.subTest(name=name), self.assertRaises(harness.CallError) as caught:
+                harness.codex_reply(raw)
+            self.assertNotIn('input', caught.exception.usage)
+        error = backends.JudgeError('codex exited with 1')
+        error.stdout = ''
+        with mock.patch.object(backends, 'run_isolated', side_effect=error), \
+                self.assertRaises(harness.CallError) as caught:
+            harness.call(harness.backend('codex-chatgpt'), 's', 'm', 1)
+        done = json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'ok'}})
+        _, usage = harness.codex_reply(done + '\n' + json.dumps({'type': 'turn.completed'}))
+        self.assertNotIn('input', usage)  # a completed turn that reports no usage is unknown, not zero
+        run = harness.Run()
+        run.record({'status': 'error', 'usage': caught.exception.usage})
+        run.record({'status': 'ok', 'usage': {'cost_usd': None, 'items': {}, 'warnings': []}})
+        summary = run.summary()
+        self.assertEqual((summary['untokened_calls'], summary['input'], summary['output']), (2, 0, 0))
 
     def test_model_override_replaces_attached_and_duplicate_options(self):
         self.assertEqual(harness.with_model(['c', '--model=large', '-p', '--model', 'other'], 'small'),
@@ -204,10 +342,58 @@ class RunTest(unittest.TestCase):
                 harness.Run(d)
             self.assertEqual(path.read_text(), 'earlier material')
 
-    def test_call_cap_must_be_a_positive_integer(self):
-        for bad in (True, 0, -1, 1.5, float('nan')):
-            with self.subTest(bad=bad), self.assertRaises(ValueError):
-                harness.Run(max_calls=bad)
+    def test_there_is_no_call_cap(self):
+        with self.assertRaises(TypeError):
+            harness.Run(max_calls=1)
+        run = harness.Run()
+        for _ in range(500):  # the plan bounds the calls, the accounting only counts them
+            run.reserve()
+        self.assertEqual(run.summary()['calls'], 500)
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d, 'm.txt')
+            path.write_text('M')
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as caught:
+                harness.main(['review', '--input', str(path), '--max-calls', '1'])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn('--max-calls was removed', err.getvalue())
+
+    def test_blocked_retry_reports_the_first_attempts_error_and_keeps_raw_output(self):
+        def reject(*args):
+            raise harness.CallError('codex-chatgpt turn rejected: no final agent message', dict(USAGE), 'R' * 1_500_000)
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d, 't'), max_cost=0.01, unpriced_call_usd=0.5)  # the first attempt spends it all
+            with self.assertRaises(harness.BudgetExceeded) as caught:  # the type callers catch is unchanged
+                harness.run_plan(pl.load_plan(None, 'review'), 'M', B, run, call_fn=reject)
+            self.assertIn('cost cap reached', str(caught.exception))
+            self.assertIn('retry not started after attempt 1 failed: CallError: codex-chatgpt turn rejected: '
+                          'no final agent message', str(caught.exception))
+            self.assertIsInstance(caught.exception.__cause__, harness.CallError)
+            rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
+            self.assertEqual([r['status'] for r in rows], ['started', 'error'])
+            raw = Path(d, 't', 'steps', f"{rows[1]['step']}.1.raw.txt")
+            self.assertEqual(raw.stat().st_size, harness.RAW_LIMIT)
+
+    def test_a_failed_call_whose_retry_cannot_start_names_its_error(self):
+        def timeout(*args):
+            raise backends.JudgeError('codex exited with 1: stream disconnected')
+        run = harness.Run(max_cost=1.0)  # no fallback price: the failed attempt's unknown cost blocks the retry
+        with self.assertRaisesRegex(harness.BudgetExceeded, 'attempt 1 failed: JudgeError: codex exited with 1'):
+            harness.run_plan(pl.load_plan(None, 'design'), 'M', B, run, call_fn=timeout)
+
+    def test_unknown_tokens_are_counted_not_reported_as_zero(self):
+        run = harness.Run()
+        for rec in ({'status': 'ok', 'usage': None}, {'status': 'error'}, {'status': 'malformed', 'usage': dict(USAGE)},
+                    {'status': 'started'}, {'status': 'skipped'}, {'status': 'fatal', 'error': 'x'}):
+            run.record(rec)
+        summary = run.summary()
+        self.assertEqual((summary['untokened_calls'], summary['unpriced_calls']), (2, 2))
+        self.assertEqual((summary['input'], summary['output']), (2, 10))  # sums stay ints
+        fn = lambda *args: (REVIEW, None)  # noqa: E731  a plain backend reports no usage
+        run = harness.Run()
+        harness.run_plan(pl.load_plan(None, 'review'), 'M', B, run, call_fn=fn)
+        self.assertEqual((run.summary()['untokened_calls'], run.summary()['input']), (1, 0))
 
     def test_a_conditional_reader_can_be_skipped(self):
         p = plan([{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'},
@@ -233,7 +419,7 @@ class RunTest(unittest.TestCase):
 
     def test_one_call_review_is_verbatim_with_cost(self):
         fn, seen = scripted({'Review the change': REVIEW})
-        run = harness.Run(max_calls=3)
+        run = harness.Run()
         text, stats = harness.run_plan(pl.load_plan(None, 'review'), 'THE CODE', B, run, call_fn=fn)
         self.assertEqual(text, REVIEW.strip())
         self.assertEqual((run.summary()['calls'], run.summary()['cost_usd']), (1, 0.01))
@@ -269,6 +455,24 @@ class RunTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no finding headings'):
             harness.run_plan(p, 'M', B, harness.Run(), call_fn=fn2)
 
+    def test_a_review_makes_exactly_its_structural_number_of_calls(self):
+        for kind in ('review', 'design'):  # the built-in plans: one call
+            run = harness.Run()
+            harness.run_plan(pl.load_plan(None, kind), 'M', B, run, call_fn=lambda *a: (REVIEW, dict(USAGE)))
+            self.assertEqual(run.summary()['calls'], 1)
+        p = plan([{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'}, {'id': 'b', 'prompt': 'b.md', 'reply': 'findings'},
+                  {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts', 'batch': 1}])
+
+        def verdicts(message):  # every batch answered, except b.2, which the repair call then answers
+            ids = message.split('in this batch: ', 1)[1].split('.\n', 1)[0].split(', ')
+            return '\n'.join(f'{i} KEEP - q' for i in ids if i != 'b.2') or 'a.1 KEEP - q'
+        fn, seen = scripted({'still need a verdict': 'b.2 KEEP - q', 'INSTRUCTION a': ['prose, no headings', REVIEW],
+                             'INSTRUCTION b': REVIEW, 'INSTRUCTION k': verdicts})
+        run = harness.Run()
+        text, stats = harness.run_plan(p, 'M', B, run, call_fn=fn)
+        # 2 readers + 4 checker batches (2 findings each, batch 1) + 1 retry of a's wrong shape + 1 repair = 8
+        self.assertEqual((run.summary()['calls'], len(seen), stats['kept']), (8, 8, 4))
+
     def test_a_command_that_cannot_start_is_not_retried(self):
         calls = []
 
@@ -279,11 +483,7 @@ class RunTest(unittest.TestCase):
             harness.run_plan(pl.load_plan(None, 'review'), 'M', B, harness.Run(), call_fn=fn)
         self.assertEqual(len(calls), 1)
 
-    def test_budget_caps_stop_new_calls(self):
-        run = harness.Run(max_calls=1)
-        run.reserve()
-        with self.assertRaisesRegex(harness.BudgetExceeded, 'call cap'):
-            run.reserve()
+    def test_a_cost_cap_stops_new_calls(self):
         run = harness.Run(max_cost=0.01)
         run.reserve()
         run.record({'step': 's', 'attempt': 1, 'status': 'ok', 'usage': dict(USAGE)})
@@ -473,6 +673,20 @@ class AssemblyTest(unittest.TestCase):
         self.assertIn('Bug three', text)
         self.assertEqual(stats['kept'], 3)
 
+    def test_a_batched_plan_bounds_findings_per_reply_so_checker_calls_come_from_the_plan(self):
+        many = ''.join(f'### {i}. Bug {i} (`a.py:{i}`)\n- Problem: p.\n\n' for i in range(1, pl.MAX_FINDINGS + 2))
+        with self.assertRaisesRegex(ValueError, f'more than the {pl.MAX_FINDINGS}'):
+            pl.check_reply(self.p, self.p['passes'][0], many)
+        unbatched = plan([{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'},
+                          {'id': 'b', 'prompt': 'b.md', 'reply': 'findings'},
+                          {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts'}])
+        pl.check_reply(unbatched, unbatched['passes'][0], many)  # one checker call however many findings
+        fn, seen = scripted({'INSTRUCTION a': many, 'INSTRUCTION b': REVIEW, 'INSTRUCTION k': 'a.1 KEEP'})
+        run = harness.Run()
+        with self.assertRaisesRegex(ValueError, 'more than the'):
+            harness.run_plan(self.p, 'M', B, run, call_fn=fn)
+        self.assertLessEqual(run.calls, 4)  # a and b, a retried once; never one checker call per runaway heading
+
     def test_batches_only_count_verdicts_for_their_own_findings(self):
         texts = ['a.1 KEEP\na.2 KEEP\nb.1 REFUTED', 'b.1 KEEP\nb.2 KEEP']  # batch 1 oversteps on b.1
         merged = pl.combine(self.p, self.p['passes'][2], self.replies, texts)
@@ -497,6 +711,118 @@ class AssemblyTest(unittest.TestCase):
                         Path(d, q['prompt']).write_text('x', encoding='utf-8')
                 pl.validate({'version': 1, 'kind': 'review', 'role': 'r', 'passes': passes}, d)
         self.assertEqual(pl.load_plan(None, 'design')['passes'][0]['reply'], 'proposal')
+
+
+class CheckerBackendTest(unittest.TestCase):
+    """--checker-backend: the verdicts pass and its repair run on a second backend under the same Run."""
+    FINDER = {'name': 'finder', 'argv': ['finder'], 'style': 'plain'}
+    CHECKER = {'name': 'checker', 'argv': ['checker'], 'style': 'plain'}
+
+    def passes(self, **checker):
+        return [{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'}, {'id': 'b', 'prompt': 'b.md', 'reply': 'findings'},
+                {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts', **checker}]
+
+    def test_verdicts_and_repair_go_to_the_checker_and_the_trace_names_each_backend(self):
+        d = Path(tempfile.mkdtemp()) / 'trace'
+        verdicts = ['a.1 KEEP\na.2 KEEP\nb.1 KEEP', 'b.2 KEEP']  # the first reply misses b.2: one repair
+        seen, lock = [], threading.Lock()
+        def fn(b, system, message, timeout_s, model=None):
+            with lock:
+                seen.append(b['name'])
+                return (verdicts.pop(0) if b['name'] == 'checker' else REVIEW), dict(USAGE)
+        run = harness.Run(d)
+        text, stats = harness.run_plan(plan(self.passes()), 'M', self.FINDER, run, call_fn=fn, checker_spec=self.CHECKER)
+        self.assertEqual(stats['kept'], 4)
+        self.assertEqual(sorted(seen), ['checker', 'checker', 'finder', 'finder'])
+        self.assertEqual(run.summary()['calls'], 4)
+        recs = [json.loads(line) for line in (d / 'trace.jsonl').read_text().splitlines()]
+        self.assertTrue(all('backend' in r for r in recs if r['status'] != 'skipped'))
+        self.assertEqual({r['step']: r['backend'] for r in recs if r['status'] == 'ok'},
+                         {'a': 'finder', 'b': 'finder', 'k': 'checker', 'k.repair': 'checker'})
+
+    def test_a_checker_without_a_verdicts_pass_is_refused_before_any_call(self):
+        calls = []
+        for p in (pl.load_plan(None, 'review'), pl.load_plan(None, 'design')):
+            with self.subTest(kind=p['kind']), self.assertRaisesRegex(ValueError, 'verdicts pass'):
+                harness.run_plan(p, 'M', B, harness.Run(), call_fn=lambda *a: calls.append(a), checker_spec=self.CHECKER)
+        self.assertEqual(calls, [])
+        with tempfile.TemporaryDirectory() as t, mock.patch.object(harness, 'call') as call, \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as err:
+            material = Path(t, 'm'); material.write_text('M')
+            self.assertEqual(harness.main(['review', '--input', str(material), '--checker-backend', 'checker']), 2)
+            call.assert_not_called()
+        self.assertIn('verdicts pass', err.getvalue())
+
+    def test_a_per_pass_model_follows_the_backend_that_runs_the_pass(self):
+        p = plan(self.passes(model='small'))
+        models = []
+        def fn(b, system, message, timeout_s, model=None):
+            models.append((b['name'], model))
+            return ('a.1 KEEP\na.2 KEEP\nb.1 KEEP\nb.2 KEEP' if b['name'] == 'checker' else REVIEW), dict(USAGE)
+        harness.run_plan(p, 'M', self.FINDER, harness.Run(), call_fn=fn, checker_spec={**self.CHECKER, 'style': 'claude'})
+        self.assertEqual(sorted(models), [('checker', 'small'), ('finder', None), ('finder', None)])
+        with self.assertRaisesRegex(ValueError, 'per-pass model'):
+            harness.run_plan(p, 'M', {**self.FINDER, 'style': 'claude'}, harness.Run(), call_fn=fn, checker_spec=self.CHECKER)
+
+    def test_each_backend_and_model_warms_its_own_cache_once(self):
+        p = plan([{'id': 'a', 'prompt': 'a.md', 'reply': 'findings', 'model': 'm'},
+                  {'id': 'b', 'prompt': 'b.md', 'reply': 'findings', 'model': 'm'},
+                  {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts', 'batch': 1, 'model': 'm'}])
+        cold, warmed, lock = [], set(), threading.Lock()
+        def fn(b, s, m, timeout_s, model=None):
+            key = (b['name'], model)
+            with lock:
+                if key not in warmed:
+                    cold.append(key)
+            time.sleep(.01)
+            with lock:
+                warmed.add(key)
+            return ('\n'.join(f'{x}.{n} KEEP' for x in 'ab' for n in [1, 2]) if b['name'] == 'checker' else REVIEW), USAGE
+        harness.run_plan(p, 'M', {**self.FINDER, 'style': 'claude'}, harness.Run(), call_fn=fn,
+                         checker_spec={**self.CHECKER, 'style': 'claude'})
+        self.assertEqual(sorted(cold), [('checker', 'm'), ('finder', 'm')])
+
+    def test_both_backends_share_one_cost_cap(self):
+        p = plan([{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'}, {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts'}])
+        def fn(b, system, message, timeout_s, model=None):  # the finder reports no price, the checker 0.02
+            return ('a.1 KEEP\na.2 KEEP', {**USAGE, 'cost_usd': 0.02}) if b['name'] == 'checker' else (REVIEW, None)
+        run = harness.Run(max_cost=1, unpriced_call_usd=0.05)
+        harness.run_plan(p, 'M', self.FINDER, run, call_fn=fn, checker_spec=self.CHECKER)
+        self.assertEqual((run.summary()['calls'], run.summary()['cost_usd']), (2, 0.07))
+        run = harness.Run(max_cost=0.05, unpriced_call_usd=0.05)
+        with self.assertRaisesRegex(harness.BudgetExceeded, 'cost cap'):
+            harness.run_plan(p, 'M', self.FINDER, run, call_fn=fn, checker_spec=self.CHECKER)
+        self.assertEqual(run.summary()['calls'], 1)
+
+    def test_cli_checker_gets_codex_isolation_and_the_trace_records_both_backends(self):
+        t = Path(tempfile.mkdtemp())
+        for name in ('a.md', 'k.md'):
+            (t / name).write_text(f'INSTRUCTION {name}')
+        (t / 'plan.json').write_text(json.dumps({'version': 1, 'kind': 'review', 'role': 'r', 'prompts_dir': '.',
+                                                 'passes': [{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'},
+                                                            {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts'}]}))
+        (t / 'm').write_text('M')
+        events = '\n'.join(json.dumps(x) for x in [
+            {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'a.1 KEEP\na.2 KEEP'}},
+            {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 2}}])
+        calls = []
+        def isolated(argv, stdin, timeout, **kw):
+            calls.append((argv[0], kw))
+            return events if kw.get('codex_home') else REVIEW
+        trace = Path(tempfile.mkdtemp()) / 'trace'
+        with mock.patch.object(backends, 'run_isolated', side_effect=isolated), \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as err, \
+                mock.patch('sys.stdout', new_callable=io.StringIO):
+            code = harness.main(['review', '--input', str(t / 'm'), '--pipeline', str(t / 'plan.json'),
+                                 '--backend', 'finder-cmd', '--checker-backend', 'codex-chatgpt', '--trace', str(trace)])
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(calls[0], ('finder-cmd', {}))
+        self.assertEqual(calls[1][1], {'codex_home': True, 'subscription_auth': True})
+        summary = json.loads(err.getvalue().strip().splitlines()[-1].split('harness: ', 1)[1])
+        self.assertEqual((summary['backend'], summary['checker_backend'], summary['calls']), ('finder-cmd', 'codex-chatgpt', 2))
+        self.assertEqual(json.loads((trace / 'backends.json').read_text()),
+                         {'backend': 'finder-cmd', 'checker_backend': 'codex-chatgpt'})
+        self.assertEqual(json.loads((trace / 'summary.json').read_text())['checker_backend'], 'codex-chatgpt')
 
 
 if __name__ == '__main__':

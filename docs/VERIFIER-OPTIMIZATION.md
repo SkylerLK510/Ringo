@@ -1,12 +1,12 @@
 # Verifier traversal optimization
 
-Research updated 2026-10-25. This change is implemented, tested and **active in the owners local Ringo installation** following explicit user adoption. The repository default runtime is still awaiting separate publication. A reviewable [implementation patch](patches/verifier-traversal.patch) is included for the prototype baseline; it is not an update applied to the repository default runtime.
+Research updated 2026-10-25. This change is implemented, tested and **active in the owners local Ringo installation** following explicit user adoption. The runtime implementation and matching tests are now included in the repository source. The earlier [implementation patch](patches/verifier-traversal.patch) is retained as historical evidence against its prototype baseline; it should not be reapplied to the current source.
 
 ## Local adoption on 2026-10-25
 
 The normal local release store now selects release `e777d95353ba6de294a3deec5f2e83b1c2c44533ec02f045a322c809f43ebe42`. It is the exact immutable candidate measured below, staged again with matching source and bytecode identity. The full suite was rerun before activation: 317 tests, OK, 2 skipped. The user explicitly requested future use after disclosure of the uncertain whole-command tails; that decision and rationale are recorded in the private approval. Activation recomputed the complete measured latency suite and retained all existing release gates. No RRSI quality claim or protected-policy change was made.
 
-New invocations through the stable `ringo.py` launcher use that local release. The optimized verifier remains part of the stable bootstrap and its separate hash is recorded in run provenance. Local activation does not deploy the runtime to other machines or apply the pending runtime sources to GitHub main.
+New invocations through the stable `ringo.py` launcher use that local release. The optimized verifier remains part of the stable bootstrap and its separate hash is recorded in run provenance. Local activation does not deploy the runtime to other machines. Source publication includes the matching runtime and tests without changing the already approved local bundle.
 
 ## Change and integrity contract
 
@@ -57,6 +57,6 @@ The actual Ringo review reported no defects. Its performance open question is an
 
 ## Evidence and publication scope
 
-Raw paired samples, warmups, commands, stderr, source snapshots and private fixture states remain outside the repository. The documentation summary and source patch are published; the separate unfinished runtime feature set is not bundled into this documentation update. The patch is against the local pre-optimization prototype, not the current default runtime. It can be inspected now and integrated when that runtime is published.
+Raw paired samples, warmups, commands, stderr, source snapshots and private fixture states remain outside the repository. Runtime sources and matching tests are published alongside these summaries. The preserved patch is against the local pre-optimization prototype and must not be applied again to the current source. The [optimization regression cases](OPTIMIZE-CASES.md) extend offline correctness coverage without changing these measurements or adding normal-path work.
 
 Do not compare unpaired absolute numbers from the [earlier feature-overhead study](LATENCY-RESULTS.md) to infer this change's effect. That study compared release features with the prior checkout; this study compares the same feature set immediately before and after the verifier optimization. The [optimization-options note](LATENCY-OPTIMIZATION.md) remains the historical component profile and proposal context.

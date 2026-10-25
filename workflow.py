@@ -2,6 +2,13 @@
 
 Writes candidates to a new run directory, never applies them to a source checkout.
 Task repair is not evidence that the underlying workflow improved on unseen tasks.
+
+Calls: each round makes one writer call and, when the reply is a well-formed new candidate, one judge call per
+council sample (whatever the checks say), so a run makes at most max_rounds x (1 + samples) calls. Calls are not
+retried and there is no call cap; max_seconds, timeout_s and max_cost bound time and money.
+
+The writer replies with complete files or with exact search/replace edits. Edits are turned into complete files
+before anything else, so the digest, checks, mutation check and judges always see full text.
 """
 import argparse
 import hashlib
@@ -47,6 +54,73 @@ def file_map(files, label):
     return files
 
 
+def near_miss(text, old):
+    """Say where the longest prefix of an unmatched anchor does occur, so the next round can fix it."""
+    lo, hi = 0, len(old)  # Prefix occurrence is monotonic: if a prefix occurs, every shorter one does.
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if old[:mid] in text:
+            lo = mid
+        else:
+            hi = mid - 1
+    if lo == 0:
+        return 'not even its first character occurs'
+    at = text.find(old[:lo])
+    line = text.count('\n', 0, at) + 1
+    shown = text.split('\n')[line - 1][:200]
+    return f'its first {lo} of {len(old)} characters match at line {line}: {shown!r}'
+
+
+def materialize(current, declared, reply):
+    """Turn a writer reply into complete files, all or nothing.
+
+    A reply carries either 'files' (complete text of exactly the declared paths) or 'edits' (a list of
+    {path, old, new}); never both. Every old must occur exactly once in the text the writer was shown, and
+    edits never overlap. Edits are matched against that shown text, not applied one after another, so the
+    result does not depend on their order. Strict matching: a near match is an error, never a guess.
+    """
+    if not isinstance(reply, dict) or not isinstance(reply.get('rationale'), str) \
+            or set(reply) not in ({'files', 'rationale'}, {'edits', 'rationale'}):
+        raise ValueError('reply needs rationale and either files or edits, not both')
+    if 'files' in reply:
+        file_map(reply['files'], 'candidate files')
+        if set(reply['files']) != set(declared):
+            raise ValueError('files must supply exactly the declared editable files; use edits to change some')
+        return reply['files']
+    edits = reply['edits']
+    if not isinstance(edits, list):
+        raise ValueError('edits must be a list of {path, old, new}')
+    spans = {}
+    for i, edit in enumerate(edits, 1):
+        if not isinstance(edit, dict) or set(edit) != {'path', 'old', 'new'} \
+                or not all(isinstance(v, str) for v in edit.values()):
+            raise ValueError(f'edit {i}: needs string path, old and new only')
+        path, old = edit['path'], edit['old']
+        if path not in declared:
+            raise ValueError(f'edit {i}: {path!r} is not a declared editable file')
+        if not old:
+            raise ValueError(f'edit {i}: old is empty; send the whole file with files instead')
+        first = current[path].find(old)
+        if first < 0:
+            raise ValueError(f'edit {i} ({path}): old matches 0 places, it must match exactly once; '
+                             + near_miss(current[path], old))
+        if current[path].find(old, first + 1) >= 0:  # Overlap-aware, unlike str.count.
+            raise ValueError(f'edit {i} ({path}): old matches more than one place, it must match exactly once; '
+                             'include more surrounding text')
+        spans.setdefault(path, []).append((first, first + len(old), edit['new'], i))
+    files = dict(current)
+    for path, found in spans.items():
+        found.sort()
+        for a, b in zip(found, found[1:]):
+            if b[0] < a[1]:
+                raise ValueError(f'edits {a[3]} and {b[3]} overlap in {path}')
+        text = current[path]
+        for start, end, new, _ in reversed(found):
+            text = text[:start] + new + text[end:]
+        files[path] = text
+    return file_map(files, 'candidate files')  # The size limits apply to the result.
+
+
 def positive(value, name, integer=False):
     if (integer and type(value) is not int) or harness.valid_price(value) is None or value <= 0:
         raise ValueError(f'{name} must be positive' + (' integer' if integer else ''))
@@ -56,8 +130,10 @@ def positive(value, name, integer=False):
 def load_spec(path):
     spec = strict_json(Path(path).read_text(encoding='utf-8'))
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
-               'writer', 'judge', 'samples', 'max_rounds', 'max_calls', 'max_seconds', 'timeout_s',
+               'writer', 'judge', 'samples', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution'}
+    if isinstance(spec, dict) and 'max_calls' in spec:
+        raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
     if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
         raise ValueError('a workflow needs version 1 and only documented fields')
     for key in ('brief', 'writer', 'judge', 'rubric'):
@@ -72,8 +148,8 @@ def load_spec(path):
     names = sorted([*spec['files'], *spec['fixtures']])
     if any(str(parent) in names for name in names for parent in PurePosixPath(name).parents):
         raise ValueError('a file cannot also be a directory')
-    for key, default in (('samples', 2), ('max_rounds', 3), ('max_calls', 9), ('max_seconds', 600), ('timeout_s', 120)):
-        positive(spec.setdefault(key, default), key, integer=key in ('samples', 'max_rounds', 'max_calls'))
+    for key, default in (('samples', 6), ('max_rounds', 3), ('max_seconds', 600), ('timeout_s', 120)):
+        positive(spec.setdefault(key, default), key, integer=key in ('samples', 'max_rounds'))
     if not 2 <= spec['samples'] <= 25:
         raise ValueError('samples must be from 2 to 25')
     for key in ('allow_execution', 'allow_tool_backends'):
@@ -170,17 +246,23 @@ def checks(spec, root, logdir, remaining):
 
 
 def run(spec_path, out, call_fn=harness.call):
+    import releases
+    started = time.perf_counter_ns()
     spec = load_spec(spec_path)
     out = harness.outside_repo(out, 'workflow run')
-    accounting = harness.Run(out, max_calls=spec['max_calls'], max_cost=spec.get('max_cost'),
-                             unpriced_call_usd=spec.get('unpriced_call_usd'))
+    accounting = harness.Run(out, max_cost=spec.get('max_cost'), unpriced_call_usd=spec.get('unpriced_call_usd'))
     write_json(out / 'spec.json', spec)
-    write_json(out / 'source.json', {'workflow_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()})
+    implementation = {**releases.identity(HERE), 'effective_quality_claim': None}
+    write_json(out / 'source.json', {'workflow_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                                   'implementation': implementation})
     deadline = time.monotonic() + spec['max_seconds']
     remaining = lambda: deadline - time.monotonic()
-    report = {'version': 1, 'status': 'needs_revision', 'rounds': [], 'final': None}
-    current, feedback, seen = dict(spec['files']), {}, set()
+    report = {'version': 1, 'status': 'needs_revision', 'rounds': [], 'final': None,
+              'implementation': implementation, 'task_sha256': releases.sha(spec)}
+    # Seeding seen with the shown files makes an unchanged reply end the run in round 1 as in later rounds.
+    current, feedback, seen = dict(spec['files']), {}, {digest(spec['files'])}
     writer_prompt = (HERE / 'prompts' / 'work.md').read_text(encoding='utf-8')
+    report['writer_prompt_sha256'] = hashlib.sha256(writer_prompt.encode()).hexdigest()
 
     def bridge_timeout():
         timeout = min(spec['timeout_s'], remaining())
@@ -218,7 +300,8 @@ def run(spec_path, out, call_fn=harness.call):
             raise
         except BaseException as exc:
             accounting.record({**record, 'status': 'error', 'usage': getattr(exc, 'usage', None),
-                               'error': f'{type(exc).__name__}: {exc}'})
+                               'error': f'{type(exc).__name__}: {exc}'},
+                              raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
             raise
         accounting.record({**record, 'status': 'ok', 'usage': usage}, reply)
         return reply
@@ -239,23 +322,21 @@ def run(spec_path, out, call_fn=harness.call):
             text = call(f'writer-{n}', spec['writer'], writer_prompt, message)
             try:
                 candidate = strict_json(text)
-                if not isinstance(candidate, dict) or set(candidate) != {'files', 'rationale'} \
-                        or not isinstance(candidate['rationale'], str):
-                    raise ValueError('reply needs exactly files and rationale')
-                file_map(candidate['files'], 'candidate files')
-                if set(candidate['files']) != set(spec['files']):
-                    raise ValueError('candidate must supply exactly the declared editable files')
+                files = materialize(current, spec['files'], candidate)
             except ValueError as exc:
-                feedback = {'protocol_error': str(exc)}
-                entry.update(status='malformed', feedback=feedback)
+                # Keep the earlier check and council feedback: a bad anchor should not erase it.
+                feedback = {**{k: v for k, v in feedback.items() if k != 'protocol_error'},
+                            'protocol_error': str(exc)}
+                entry.update(status='malformed', feedback={'protocol_error': str(exc)})
                 continue
-            key = digest(candidate['files'])
+            key = digest(files)
             if key in seen:
                 entry['status'] = report['status'] = 'repeated_candidate'
                 break
             seen.add(key)
-            current = candidate['files']
-            write_json(folder / 'proposal.json', candidate)
+            current = files
+            write_json(folder / 'proposal.json', {'files': current, 'rationale': candidate['rationale'],
+                                                  **({'edits': candidate['edits']} if 'edits' in candidate else {})})
             root = folder / 'candidate'
             root.mkdir()
             expected = {**current, **spec['fixtures']}
@@ -307,6 +388,7 @@ def run(spec_path, out, call_fn=harness.call):
         raise
     finally:
         report['usage'] = accounting.summary()
+        report['elapsed_s'] = (time.perf_counter_ns() - started) / 1_000_000_000
         write_json(out / 'report.json', report)
         write_json(out / 'shortcomings.json', {'development_only': True, 'feedback': feedback,
                                               'status': report['status']})

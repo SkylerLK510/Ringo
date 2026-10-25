@@ -1,6 +1,7 @@
 """Bounded revision, execution integrity and failure checks, using offline fixtures."""
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import harness
 import workflow
 from unittest import mock
 
@@ -37,7 +39,7 @@ class WorkflowTest(unittest.TestCase):
                      'checks': [{'name': 'reference', 'argv': [sys.executable, '-I', '-B', 'check.py']}],
                      'writer': 'fake', 'judge': 'fake', 'allow_tool_backends': True, 'allow_execution': True,
                      'council': [sys.executable, str(self.root / 'bridge.py')], 'rubric': 'unused.json',
-                     'max_calls': 9, 'max_rounds': 3, 'max_seconds': 30}
+                     'max_rounds': 3, 'max_seconds': 30, 'samples': 2}
 
     def execute(self, outputs, **changes):
         path = self.root / 'task.json'
@@ -68,11 +70,116 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual((self.root / 'run/final/value.py').read_text(), good['files']['value.py'])
         self.assertTrue(json.loads((self.root / 'run/shortcomings.json').read_text())['development_only'])
 
-    def test_call_cap_counts_writers_and_council_samples_together(self):
-        report, _ = self.execute([self.proposal('def f(x): return x'), self.proposal('def f(x): return 2*x')], max_calls=4)
-        self.assertEqual(report['status'], 'budget_exhausted')
-        self.assertEqual(report['usage']['calls'], 4)
+    def test_calls_are_max_rounds_times_one_writer_plus_samples(self):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**self.spec, 'max_rounds': 2, 'samples': 3}))
+        drafts = iter(['def f(x): return x\n', 'def f(x): return 3*x\n'])
+
+        def call(_backend, system, message, timeout_s):  # the council never recommends
+            if system.startswith('Implement the task'):
+                return json.dumps(self.proposal(next(drafts))), {'cost_usd': 0.01}
+            return json.dumps({'accept': False}), {'cost_usd': 0.01}
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['status'], 'needs_revision')
+        self.assertEqual(report['usage']['calls'], 2 * (1 + 3))
         self.assertIsNone(report['final'])
+
+    def test_default_samples_match_the_council_default_of_six(self):
+        spec = dict(self.spec)
+        del spec['samples']
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(spec))
+        self.assertEqual(workflow.load_spec(path)['samples'], 6)
+        report = workflow.run(path, self.root / 'run', call_fn=lambda _b, system, *a: (json.dumps(
+            self.proposal('def f(x): return 2*x\n') if system.startswith('Implement the task') else {'accept': True}), {}))
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 1 + 6)
+
+    @staticmethod
+    def edits(*triples, rationale='Targeted change.'):
+        return {'edits': [{'path': p, 'old': o, 'new': n} for p, o, n in triples], 'rationale': rationale}
+
+    def test_edit_reply_is_applied_as_complete_files_before_checks_and_judging(self):
+        source = FAKE_BRIDGE.replace("'JUDGE '+str(n)", "'JUDGE '+r['proposal']")
+        (self.root / 'bridge.py').write_text(source)
+        bad = self.proposal('# keep\ndef f(x): return x\n')
+        report, seen = self.execute([bad, self.edits(('value.py', 'return x', 'return 2*x'))])
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 6)
+        applied = '# keep\ndef f(x): return 2*x\n'
+        self.assertEqual((self.root / 'run/final/value.py').read_text(), applied)
+        self.assertEqual(json.loads(seen[4][1].removeprefix('JUDGE '))['files'], {'value.py': applied})
+        saved = json.loads((self.root / 'run/round-2/proposal.json').read_text())
+        self.assertEqual(saved['files'], {'value.py': applied})
+        self.assertEqual(saved['edits'][0]['old'], 'return x')
+        self.assertNotIn('edits', json.loads((self.root / 'run/round-1/proposal.json').read_text()))
+
+    def test_failed_anchor_is_malformed_and_keeps_the_earlier_check_and_council_feedback(self):
+        bad = self.proposal('def f(x): return x\n')
+        miss = self.edits(('value.py', 'return 2*x', 'return x+x'))
+        good = self.edits(('value.py', 'return x', 'return 2*x'))
+        report, seen = self.execute([bad, miss, good])
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'malformed', 'ready_for_review'])
+        self.assertEqual(report['usage']['calls'], 3 + 1 + 3)  # The malformed round makes no judge calls.
+        self.assertFalse((self.root / 'run/round-2/candidate').exists())
+        error = report['rounds'][1]['feedback']['protocol_error']
+        self.assertIn('edit 1 (value.py): old matches 0 places', error)
+        self.assertIn("first 7 of 10 characters match at line 1: 'def f(x): return x'", error)
+        third = json.loads(seen[4][1])
+        self.assertEqual(third['files'], bad['files'])
+        self.assertEqual(set(third['feedback']), {'checks', 'decision', 'scored', 'protocol_error'})
+        self.assertEqual(third['feedback']['checks'][0]['status'], 'fail')
+
+    def test_edit_validation_is_strict_and_all_or_nothing(self):
+        current = {'a.txt': 'aaa\nxyz\n', 'b.txt': 'one two\n'}
+        cases = {
+            'old matches more than one place': self.edits(('a.txt', 'aa', 'b')),  # Overlapping matches count.
+            'edits 1 and 2 overlap': self.edits(('a.txt', 'aaa', 'c'), ('a.txt', 'a\nx', 'd')),
+            'edit 2 (a.txt): old matches 0 places': self.edits(('a.txt', 'xyz', 'NEW'), ('a.txt', 'NEW', 'z')),
+            'edit 1 (b.txt): old matches 0 places': self.edits(('b.txt', 'zz', '')),
+            'not a declared editable file': self.edits(('../a.txt', 'aaa', 'b')),
+            'old is empty': self.edits(('b.txt', '', 'x')),
+            'needs string path, old and new only': {'edits': [{'path': 'a.txt', 'old': 'x'}], 'rationale': 'x'},
+            'not both': {**self.edits(('a.txt', 'xyz', 'q')), 'files': current},
+            'exactly the declared editable files': {'files': {'a.txt': 'x'}, 'rationale': 'x'},
+            'oversized file: a.txt': self.edits(('a.txt', 'xyz', 'x' * (workflow.LIMIT + 1))),
+            'edits must be a list': {'edits': {}, 'rationale': 'x'},
+        }
+        for message, reply in cases.items():
+            with self.subTest(message=message), self.assertRaises(ValueError) as caught:
+                workflow.materialize(current, current, reply)
+            self.assertIn(message, str(caught.exception))
+        self.assertEqual(current, {'a.txt': 'aaa\nxyz\n', 'b.txt': 'one two\n'})
+        files = workflow.materialize(current, current, self.edits(('a.txt', 'xyz', 'XYZ'), ('a.txt', 'aaa', 'A')))
+        self.assertEqual(files, {'a.txt': 'A\nXYZ\n', 'b.txt': 'one two\n'})  # Order-independent; b untouched.
+
+    def test_unchanged_reply_ends_the_run_in_any_round(self):
+        report, _ = self.execute([{'edits': [], 'rationale': 'Nothing to change.'}])
+        self.assertEqual(report['status'], 'repeated_candidate')
+        self.assertEqual(report['usage']['calls'], 1)
+        shutil.rmtree(self.root / 'run')
+        report, _ = self.execute([self.proposal('')])  # A full-file echo of the shown files.
+        self.assertEqual(report['status'], 'repeated_candidate')
+        self.assertEqual(report['usage']['calls'], 1)
+        shutil.rmtree(self.root / 'run')
+        bad = self.proposal('def f(x): return x')
+        report, _ = self.execute([bad, self.edits(('value.py', 'x)', 'y)')), self.edits(('value.py', 'y)', 'x)'))])
+        self.assertEqual(report['status'], 'repeated_candidate')
+        self.assertEqual(report['usage']['calls'], 3 + 3 + 1)
+
+    def test_edit_that_makes_a_check_mutate_a_fixture_still_stops(self):
+        first = self.proposal('def f(x): return x\n')
+        mutate = self.edits(('value.py', 'def f', "from pathlib import Path\nPath('check.py').write_text('pass')\ndef f"))
+        report, _ = self.execute([first, mutate])
+        self.assertEqual(report['status'], 'error')
+        self.assertIn('mutated', report['error'])
+        self.assertIsNone(report['final'])
+
+    def test_an_old_spec_with_max_calls_is_refused_clearly(self):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**self.spec, 'max_calls': 9}))
+        with self.assertRaisesRegex(ValueError, 'max_calls was removed: calls are set by max_rounds and samples'):
+            workflow.load_spec(path)
 
     def test_malformed_output_can_be_revised_but_never_applied(self):
         report, seen = self.execute(['not json', self.proposal('def f(x): return 2*x')])
@@ -157,6 +264,17 @@ class WorkflowTest(unittest.TestCase):
             self.assertEqual(report['status'], 'budget_exhausted' if expired else 'error')
             self.assertEqual(report['usage']['calls'], 1)
             self.assertEqual(report['usage']['unpriced_calls'], 1)
+
+    def test_failed_call_keeps_its_raw_output_in_the_trace(self):
+        def call(*args):
+            raise harness.CallError('codex-chatgpt turn rejected: no final agent message', None, '{"type":"turn.failed"}')
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(self.spec))
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['status'], 'error')
+        self.assertEqual(report['usage']['untokened_calls'], 1)
+        raws = list((self.root / 'run' / 'steps').glob('*.raw.txt'))
+        self.assertEqual([r.read_text() for r in raws], ['{"type":"turn.failed"}'])
 
     def test_invalid_real_council_brief_fails_before_inference(self):
         if not os.environ.get('RINGO_COUNCIL_ROOT'):

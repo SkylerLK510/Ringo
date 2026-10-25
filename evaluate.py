@@ -1,5 +1,6 @@
-"""Ringo eval runner: runs arms (a pipeline plan on a backend) over a pool of cases, grades the outputs blind,
-and decides, fail-closed, whether a candidate beats its comparators, under guardrails against overfitting.
+"""Ringo eval runner: runs arms (a pipeline plan on a backend, and optionally a `checker_backend` for its verdicts
+pass) over a pool of cases, grades the outputs blind, and decides, fail-closed, whether a candidate beats its
+comparators, under guardrails against overfitting.
 
 Store (one folder; whoever can read it can read the answer keys):
   cases.json, cases/<id>/material.txt, cases/<id>/gold.md   the pool; each gold file carries a canary line
@@ -78,7 +79,7 @@ RANK = {'dev': 0, 'validation': 1, 'test': 2}  # a case only ever moves toward d
 METRICS = ('T', 'W', 'U', 'R')  # gold defects found, invalid findings, T - W, recall; per review
 SPEC_DEFAULTS = {'runs': 2, 'objective': 'quality', 'margins': {'U': 0.5, 'W': 0.25}, 'max_cost_ratio': 2.0,
                  'min_saving': 0.2, 'min_groups': 10, 'bootstrap': 10000, 'seed': 1, 'budget_usd': None,
-                 'max_calls_per_review': 40, 'kind': 'review', 'sample': None, 'unpriced_call_usd': None,
+                 'kind': 'review', 'sample': None, 'unpriced_call_usd': None,
                  'allow_tool_backends': False, 'grading_reserve_usd': 0, 'timeout_s': harness.TIMEOUT_S,
                  'grade_timeout_s': 1800}
 POLICY_DEFAULTS = {'alpha': 0.05, 'max_validation_submissions': 5, 'min_superiority_U': 0.5,
@@ -315,6 +316,8 @@ def load_spec(path):
     spec = json.loads(Path(path).read_text(encoding='utf-8'))
     if not isinstance(spec, dict):
         raise EvalError('a spec must be a JSON object')
+    if 'max_calls_per_review' in spec:
+        raise EvalError('max_calls_per_review was removed: each plan makes the calls its passes need')
     unknown = set(spec) - SPEC_KEYS
     if unknown:
         raise EvalError(f'unknown spec keys: {sorted(unknown)}')
@@ -322,10 +325,12 @@ def load_spec(path):
     if spec.get('split') not in SPLITS or not isinstance(spec.get('arms'), dict) or not spec['arms']:
         raise EvalError('a spec needs split (dev, validation or test) and arms')
     if any(not re.fullmatch(pipelines.ID, name) or not isinstance(arm, dict)
-           or set(arm) - {'plan', 'backend'} or not isinstance(arm.get('backend'), str)
+           or set(arm) - {'plan', 'backend', 'checker_backend'} or not isinstance(arm.get('backend'), str)
            or (arm.get('plan') is not None and not isinstance(arm['plan'], str))
+           or ('checker_backend' in arm and not (isinstance(arm['checker_backend'], str) and arm['checker_backend'].strip()))
            for name, arm in spec['arms'].items()):
-        raise EvalError('each arm needs a safe id and {"plan": FILE or null, "backend": BACKEND}')
+        raise EvalError('each arm needs a safe id and {"plan": FILE or null, "backend": BACKEND}, '
+                        'optionally "checker_backend": BACKEND')
     spec.setdefault('comparators', [])
     if not isinstance(spec.get('candidate'), str) or spec['candidate'] not in spec['arms'] \
             or not isinstance(spec['comparators'], list) or not all(isinstance(c, str) for c in spec['comparators']) \
@@ -338,7 +343,7 @@ def load_spec(path):
             or not all(isinstance(g, str) and g.strip() for g in spec['graders']) \
             or len(set(spec['graders'])) != len(spec['graders']):
         raise EvalError('a spec needs at least one grader backend')
-    for k, minimum in (('min_groups', 10), ('bootstrap', 1), ('max_calls_per_review', 1)):
+    for k, minimum in (('min_groups', 10), ('bootstrap', 1)):
         if type(spec[k]) is not int or spec[k] < minimum:
             raise EvalError(f'{k} must be an integer >= {minimum}')
     if type(spec['seed']) is not int or spec['kind'] != 'review':
@@ -356,7 +361,7 @@ def load_spec(path):
         raise EvalError('a budget needs unpriced_call_usd: any backend can fail to report cost, including a timeout')
     if type(spec['allow_tool_backends']) is not bool:
         raise EvalError('allow_tool_backends must be a bool')
-    harness.check_backends([*(a['backend'] for a in spec['arms'].values()), *spec['graders']], spec['allow_tool_backends'])
+    harness.check_backends([*arm_backends(spec), *spec['graders']], spec['allow_tool_backends'])
     for k in ('timeout_s', 'grade_timeout_s'):
         if harness.valid_price(spec[k]) is None or spec[k] <= 0:
             raise EvalError(f'{k} must be finite and positive')
@@ -369,8 +374,19 @@ def load_spec(path):
     for arm in spec['arms'].values():
         if arm.get('plan'):
             arm['plan'] = str((base / arm['plan']).resolve())
+        if arm.get('checker_backend'):  # fail at freeze, not in every slot
+            try:
+                harness.checker_pass(pipelines.load_plan(arm.get('plan'), spec['kind']), arm['checker_backend'])
+            except ValueError as exc:
+                raise EvalError(str(exc)) from None
     spec.setdefault('campaign', spec.get('name', 'default'))
     return spec
+
+
+def arm_backends(spec):
+    """Every backend an arm calls: its run backend and, if set, its checker backend (spec authors set it, never
+    a plan file, so the improver cannot reach it)."""
+    return [b for a in spec['arms'].values() for b in (a['backend'], a.get('checker_backend')) if b]
 
 
 def file_sha(path):
@@ -441,7 +457,7 @@ def digest(store, spec):
     for arm in sorted(spec['arms']):
         plan = pipelines.load_plan(spec['arms'][arm].get('plan'), spec['kind'])
         parts.append(json.dumps(plan, sort_keys=True))  # plan with every prompt's text loaded
-    names = sorted({a['backend'] for a in spec['arms'].values()} | set(spec['graders']))
+    names = sorted(set(arm_backends(spec)) | set(spec['graders']))
     parts.append(json.dumps([identity(n, store) for n in names], sort_keys=True))
     for cid in split_cases(store, spec['split'], spec):
         parts.append(f"{cid} {pool[cid]['group']}")
@@ -701,8 +717,7 @@ def run(store, d, parallel=3, call_fn=harness.call, stop_on_failure=False):
                                                    encoding='utf-8')
                 return
         a = spec['arms'][arm]
-        tracker = harness.Run(where / 'trace', max_calls=spec['max_calls_per_review'], max_cost=left,
-                              unpriced_call_usd=spec['unpriced_call_usd'])
+        tracker = harness.Run(where / 'trace', max_cost=left, unpriced_call_usd=spec['unpriced_call_usd'])
         def review_call(*args):
             text, usage = call_fn(*args)
             if leaked(store, text):
@@ -715,7 +730,9 @@ def run(store, d, parallel=3, call_fn=harness.call, stop_on_failure=False):
             text, stats = harness.run_plan(pipelines.load_plan(a.get('plan'), spec['kind']),
                                            (store / 'cases' / cid / 'material.txt').read_text(encoding='utf-8'),
                                            harness.backend(a['backend']), tracker, call_fn=review_call,
-                                           timeout_s=spec['timeout_s'], scope=sha(f'{d}:{cid}:{arm}:{r}'))
+                                           timeout_s=spec['timeout_s'], scope=sha(f'{d}:{cid}:{arm}:{r}'),
+                                           checker_spec=harness.backend(a['checker_backend'])
+                                           if a.get('checker_backend') else None)
             if leaked(store, text):
                 raise EvalError('an answer-key canary appeared in a reviewer output')
         except Exception as exc:  # recorded, never retried: a rerun after seeing a failure is a selective rerun

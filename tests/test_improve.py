@@ -282,7 +282,7 @@ class ScreenTest(unittest.TestCase):
         many = {'hypothesis': 'h', 'plan': {'version': 1, 'kind': 'review', 'role': 'r', 'passes': [
             {'id': f'p{k}', 'prompt': 'review.md', 'reply': 'findings'} for k in range(4)] + [
             {'id': 'k', 'prompt': 'review.md', 'reply': 'verdicts', 'batch': 3}]}}
-        self.assertIn('calls per review', self.problems(many))
+        self.assertNotIn('calls', self.problems(many))  # no call cap: the cost allowance prices extra calls
         with self.assertRaisesRegex(ev.EvalError, 'contamination'):
             self.problems(edit(BASE_PROMPT + ' canary' + '0' * 27 + '5'))
 

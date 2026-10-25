@@ -17,34 +17,55 @@ For a code change, implement it, run the project's checks, then obtain one bound
 Ringo review before presenting it as finished. Verify each finding against the
 code and fix confirmed defects. For a substantial architecture decision, use
 `design`; for generating/revising a declared set of text files, read
-`docs/COUNCIL-WORKFLOW.md` and use `work` with the separate council bridge.
+`docs/COUNCIL-WORKFLOW.md` and use `work` with the separate council bridge. Pick
+the rubric that fits the artifact (the council's `rubrics/report.json` for
+documents and reports, `artifact_design.json` for visual artifacts) and keep the
+default of 6 samples; 2 samples is a smoke test whose verdicts do not count.
 
 Locate the checkout through `RINGO_HOME` when provided, or resolve this skill's
 symlink: the checkout is two parents above `skills/ringo-harness/`. Invoke its
 `ringo.py` by absolute path when working in another repository. Keep material,
 reports and traces in a private run folder outside both project checkouts.
 
-For native ChatGPT login, use `--backend codex-chatgpt --max-calls 1 --timeout 180`
-for the initial review/design run. This preset forces ChatGPT authentication,
-removes API-key/endpoint overrides, disables nested tools/skill discovery and
-records reported token usage. It consumes subscription allowance; dollar cost
-remains unknown. A one-call cap prevents automatic retry from starting a second
-call. Use a different backend only within the user's authentication and spending
-preferences. If login, budget or permissions prevent a run, report that explicitly;
+Use the stable checkout's `ringo.py` entrypoint so an explicitly activated local
+release is selected before runtime imports. Each CLI run records its release or
+dirty-checkout identity and effective plan; in-flight runs stay pinned. Management
+commands are `ringo.py release ...`; see `docs/RELEASES.md`. Staging and preview do
+not activate a release. Do not accept uncertain latency on the user's behalf:
+activation requires their explicit decision/rationale; clear slowdowns block it.
+RRSI candidate activation additionally requires an existing sealed-test pass and
+human adoption. These release checks do not replace the protected evaluator.
+
+For native ChatGPT login, use `--backend codex-chatgpt --timeout 180` for the
+initial review/design run. This preset forces ChatGPT authentication,
+removes API-key/endpoint overrides, disables the shell and records reported token
+usage. Like every Codex backend it runs with a private CODEX_HOME and HOME, so the
+owner's global Codex instructions and skills do not load in the child. It consumes subscription allowance; dollar cost
+remains unknown. The default plans make one call; Ringo tries a failed or
+wrong-shaped call once more, so at most two. There is no call cap to set. Use a
+different backend only within the user's authentication and spending preferences. If login, budget or permissions prevent a run, report that explicitly;
 do not describe offline fixtures as a real model assessment.
 
 Keep the run bounded. Do not start improvement campaigns or additional inference
 rounds merely because this skill is selected. Child writer/judge/reviewer calls
-must not invoke Ringo again. The harness's isolated prompts and disabled discovery
-on `codex-chatgpt` keep the routine review from recursively loading this skill.
+must not invoke Ringo again. The private CODEX_HOME/HOME of Codex children keeps
+them from loading this skill, and a turn that uses an undeclared tool is rejected.
+A rejected or timed-out turn names its reason; its raw events are kept in `TRACE/steps/*.raw.txt`.
 Report the actual command, report path, call count and any known usage at completion.
 
 ## 1. Collect the material
 
 The material is the text the harness supplies. Codex and custom commands may also read local files; their contents can reach the provider. An empty working folder is not filesystem isolation.
-- **Review:** the change description, the unified diff (`=== change.diff ===`), the full text of every changed
-  file after the change (`=== path (after the change) ===`), and the README. Give the whole changed files, not
-  only the hunks: half the real defects sit outside the diff.
+- **Review (preferred): let Ringo build it with `--repo PATH --base SHA --head SHA`**, plus `--pr-text FILE` with
+  the change description. It reads git objects at those commits (commit the change first; uncommitted and
+  untracked files are not included) and adds, after the diff, changed files and README, the unchanged
+  definitions, subclasses, callers and tests of the changed symbols as `=== path (unchanged, at head) ===`
+  blocks, and a `=== context manifest ===` of what it added and what the budget (`--context-budget`, default
+  400000 bytes) left out. It never fetches: a partial clone missing objects is refused, so fetch them first.
+- **Review with `--input`:** only when there is no repository. Give the change description, the unified diff
+  (`=== change.diff ===`), the full text of every changed file after the change (`=== path (after the change)
+  ===`), and the README. Give the whole changed files, not only the hunks: half the real defects sit outside the
+  diff.
 - **Design:** the decision brief with its hard constraints and every number it has (today's load, the load that is
   coming, limits, deadlines).
 - Leave out secrets. Everything in the material is sent to the chosen backend's provider.
@@ -52,24 +73,38 @@ The material is the text the harness supplies. Codex and custom commands may als
 ## 2. Run it
 
 ```bash
-python3 ringo.py review --input MATERIAL.txt --backend codex-chatgpt --max-calls 1 --trace NEW_DIR --out REVIEW.md
-python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --max-calls 1 --trace NEW_DIR --out PROPOSAL.md
+python3 ringo.py review --repo REPO --base BASE_SHA --head HEAD_SHA --pr-text PR.txt --backend codex-chatgpt --timeout 180 --trace NEW_DIR --out REVIEW.md
+python3 ringo.py review --input MATERIAL.txt --backend codex-chatgpt --timeout 180 --trace NEW_DIR --out REVIEW.md
+python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --timeout 180 --trace NEW_DIR --out PROPOSAL.md
 ```
 
 - `--backend`: `claude` (CLI default: caches the material across passes and reports cost), `codex`, `codex-chatgpt`, `ollama:MODEL`,
-  `claude:<command>` for another Claude-style command, or any command that reads stdin.
+  `claude:<command>` for another Claude-style command, `codex:<command>` for your own Codex command line (must pass
+  `--json`; web search only if it passes `--search`), or any command that reads stdin.
+- `--findings-json FILE` (review) also writes the findings as ReviewBench contract JSON, files checked at
+  head with `--repo`; see `adapters/reviewbench/` for the benchmark image.
+- `--checker-backend SPEC` (same forms as `--backend`) runs the plan's verdicts pass and its repair on another
+  backend, so a different model or provider checks the findings. The plan must have a verdicts pass; the default
+  plans do not, so the flag is refused with them. Plan files cannot name backends.
 - `--pipeline PLAN.json` runs another plan; the default is one strong call. Multi-pass plans exist for experiments;
   use one only if an evaluation showed it pays (step 4).
-- `--max-calls` and `--max-cost` cap new calls. Under `--max-cost`, calls run one at a time and `--unpriced-call-usd USD` is required for every backend, including attempts that time out without reporting cost. Choose a conservative fallback; the final call may exceed the remainder.
+- Calls are set by the plan, not by a cap: one per pass (one per batch of findings for a batched checker, whose readers may
+  list at most 50 findings each), a failed or wrong-shaped call tried once more, and at most one checker repair. The default plans make one call,
+  at most two. `work` makes one writer call plus one judge call per sample each round, at most
+  `max_rounds x (1 + samples)`. `--max-calls` was removed.
+- `--max-cost` stops new calls once spent. Under `--max-cost`, calls run one at a time and `--unpriced-call-usd USD` is required for every backend, including attempts that time out without reporting cost. Choose a conservative fallback; the final call may exceed the remainder.
 - `--trace` needs a new or empty folder outside the repository. Use a plan whose kind matches the task.
-- For review/design, the last stderr line is `harness: ` followed by a JSON summary; parse after that prefix. Report calls, cost and tokens. If `unpriced_calls > 0`, cost is unknown, not zero.
+- For review/design, the last stderr line is `harness: ` followed by a JSON summary; parse after that prefix. Report calls, cost, tokens and the `backend` and `checker_backend` it names. If `unpriced_calls > 0`, cost is unknown, not zero; if `untokened_calls > 0`, the token sums leave those calls out.
 - Review/design: exit 0 is finished; exit 2 is failure. A late output-write failure prints the completed result and cost as recovery output.
 
 ## 3. Report the result
 
 Give the user the review or proposal as written; it is assembled verbatim from the model's findings. Say which
 backend and plan ran and what it cost. If `--trace` was used, point to the trace folder (it holds the material,
-so it is created private). Open questions in a review are not findings; keep them separate.
+so it is created private). Open questions in a review are not findings. Before reporting, settle each one
+against the repository yourself (you can read what the review call could not): promote a confirmed one to a
+verified finding and say it was promoted from an open question, drop a refuted one and say why, and report the
+rest as still open, separate from the findings.
 
 ## 4. Evaluating a pipeline change
 
