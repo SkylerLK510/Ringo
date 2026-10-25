@@ -1,0 +1,256 @@
+diff --git a/bench_latency.py b/bench_latency.py
+index dfed20e..b39b5f4 100644
+--- a/bench_latency.py
++++ b/bench_latency.py
+@@ -20,7 +20,7 @@ import latency
+ import releases
+ 
+ 
+-def baseline_setup(baseline=None, release_id=None, state=None):
++def baseline_setup(baseline=None, release_id=None, state=None, launcher=None):
+     if (baseline is None) == (release_id is None):
+         raise ValueError('choose exactly one baseline checkout or baseline release')
+     if release_id:
+@@ -28,9 +28,14 @@ def baseline_setup(baseline=None, release_id=None, state=None):
+             raise ValueError('a baseline release needs its state directory')
+         state = releases.state_root(state)
+         bundle, manifest = releases.verify(state, release_id)
+-        prefix = [sys.executable, str(releases.HERE / 'ringo.py'), 'release', '--state', str(state),
++        entry = Path(launcher).resolve() if launcher else releases.HERE / 'ringo.py'
++        if not entry.is_file():
++            raise ValueError('baseline launcher must be an existing Python entrypoint')
++        prefix = [sys.executable, str(entry), 'release', '--state', str(state),
+                   'preview', '--release', release_id, '--']
+         return release_id, manifest['default_review_sha256'], prefix
++    if launcher is not None:
++        raise ValueError('a custom baseline launcher requires --baseline-release')
+     baseline = Path(baseline).resolve()
+     identity = 'checkout:' + latency.sha({name: releases.file_hash(baseline / name)
+                                         for name in releases.RUNTIME if (baseline / name).is_file()})
+@@ -62,8 +67,9 @@ def selection_fixture(state, rid, count):
+ 
+ 
+ def run(baseline, out, pairs=100, warmups=5, absolute_ms=5, relative=.05, workloads=None,
+-        baseline_release=None, baseline_state=None, execution='preview'):
+-    baseline_id, baseline_config, baseline_prefix = baseline_setup(baseline, baseline_release, baseline_state)
++        baseline_release=None, baseline_state=None, execution='preview', baseline_launcher=None):
++    baseline_id, baseline_config, baseline_prefix = baseline_setup(
++        baseline, baseline_release, baseline_state, baseline_launcher)
+     out = Path(out).resolve()
+     import harness
+     harness.outside_repo(out, 'latency experiment')
+@@ -76,7 +82,9 @@ def run(baseline, out, pairs=100, warmups=5, absolute_ms=5, relative=.05, worklo
+         if not releases.pointer(base_state)['active'] \
+                 or releases.pointer(base_state)['active']['release'] != baseline_release:
+             raise ValueError('active-path baseline must match its state pointer')
+-        baseline_prefix = [sys.executable,str(releases.HERE/'ringo.py')]
++        # Bootstrap changes must use the before-version launcher too; selecting
++        # the old bundle through the new launcher would time the new verifier.
++        baseline_prefix = baseline_prefix[:2]
+     workloads = workloads or ['startup', 'review', 'review-trace', 'review-large', 'design', 'work',
+                              'review-delay', 'review-override', 'review-failure']
+     known = releases.LATENCY_WORKLOADS | {'review-delay', 'review-override', 'review-failure'}
+@@ -204,6 +212,8 @@ def main(argv=None):
+     baselines.add_argument('--baseline', type=Path)
+     baselines.add_argument('--baseline-release')
+     parser.add_argument('--baseline-state', type=Path)
++    parser.add_argument('--baseline-launcher', type=Path,
++                        help='before-version ringo.py for comparing stable-bootstrap changes')
+     parser.add_argument('--out', type=Path, required=True)
+     parser.add_argument('--pairs', type=int, default=100)
+     parser.add_argument('--warmups', type=int, default=5)
+@@ -214,7 +224,7 @@ def main(argv=None):
+     args = parser.parse_args(argv)
+     try:
+         run(args.baseline, args.out, args.pairs, args.warmups, args.absolute_ms, args.relative,
+-            args.workloads, args.baseline_release, args.baseline_state,args.execution)
++            args.workloads, args.baseline_release, args.baseline_state,args.execution,args.baseline_launcher)
+         return 0
+     except (ValueError, OSError) as exc:
+         print(f'latency experiment: {exc}', file=sys.stderr)
+diff --git a/releases.py b/releases.py
+index e27b3b1..c5a850b 100644
+--- a/releases.py
++++ b/releases.py
+@@ -234,19 +234,43 @@ def verify(root, rid):
+             or not IDENT.fullmatch(manifest['default_review_sha256']) \
+             or not set(RUNTIME).issubset(manifest['files']):
+         raise ValueError('release manifest integrity failure')
+-    actual = set()
+-    for path in bundle.rglob('*'):
+-        if path.is_symlink():
+-            raise ValueError('bundle contains a symlink')
+-        if path.is_file():
+-            actual.add(path.relative_to(bundle).as_posix())
+-    if actual != set(manifest['files']) | {'release.json'}:
+-        raise ValueError('bundle file inventory changed')
++    # Validate every manifest path before opening inventory members. Keep paths
++    # canonical so one physical file cannot satisfy two differently spelled keys.
+     for name, expected in manifest['files'].items():
++        if not isinstance(name, str):
++            raise ValueError('invalid bundle manifest path')
+         parts = PurePosixPath(name)
+-        if parts.is_absolute() or '..' in parts.parts or not isinstance(expected, str) \
+-                or not IDENT.fullmatch(expected) or file_hash(bundle / name) != expected:
+-            raise ValueError('bundle content integrity failure')
++        if parts.is_absolute() or '..' in parts.parts or parts.as_posix() != name \
++                or name in ('', '.', 'release.json') or not isinstance(expected, str) \
++                or not IDENT.fullmatch(expected):
++            raise ValueError('invalid bundle manifest path or hash')
++    # DirEntry reuses directory-entry type information instead of asking pathlib
++    # for fresh symlink/file metadata for every path. Hash contents in the same
++    # walk: there is still one full SHA-256 read per expected file, every call.
++    remaining = set(manifest['files'])
++    pending, saw_manifest = [(os.fspath(bundle), '')], False
++    while pending:
++        directory, prefix = pending.pop()
++        with os.scandir(directory) as entries:
++            for entry in entries:
++                if entry.is_symlink():
++                    raise ValueError('bundle contains a symlink')
++                name = prefix + entry.name
++                if entry.is_dir(follow_symlinks=False):
++                    pending.append((entry.path, name + '/'))
++                elif entry.is_file(follow_symlinks=False):
++                    if name == 'release.json':
++                        saw_manifest = True
++                        continue
++                    if name not in remaining:
++                        raise ValueError('bundle file inventory changed')
++                    if file_hash(entry.path) != manifest['files'][name]:
++                        raise ValueError('bundle content integrity failure')
++                    remaining.remove(name)
++                else:
++                    raise ValueError('bundle contains an unsupported file type')
++    if remaining or not saw_manifest:
++        raise ValueError('bundle file inventory changed')
+     return bundle, manifest
+ 
+ 
+diff --git a/tests/test_releases.py b/tests/test_releases.py
+index 05397c8..85ca759 100644
+--- a/tests/test_releases.py
++++ b/tests/test_releases.py
+@@ -125,6 +125,102 @@ print('No defects found.')
+         with self.assertRaises(ValueError):
+             rel.verify(self.state, self.rid)
+ 
++    def rewrite_manifest(self, manifest):
++        """Construct a self-consistent test release id for manifest validation cases."""
++        self.bundle.chmod(0o755)
++        path = self.bundle / 'release.json'
++        path.chmod(0o644)
++        path.write_bytes(rel.canonical(manifest) + b'\n')
++        rid = rel.sha(manifest)
++        target = self.state / 'bundles' / rid
++        if target != self.bundle:
++            self.bundle.rename(target)
++        self.bundle, self.rid, self.manifest = target, rid, manifest
++
++    def test_verification_accepts_registered_nested_unicode_and_whitespace_names(self):
++        self.bundle.chmod(0o755)
++        name = 'fixtures/nested folder/café\tvalue.txt'
++        path = self.bundle / name
++        path.parent.mkdir(parents=True)
++        path.write_bytes(b'complete fixture content\n')
++        manifest = copy.deepcopy(self.manifest)
++        manifest['files'][name] = rel.file_hash(path)
++        self.rewrite_manifest(manifest)
++        bundle, observed = rel.verify(self.state, self.rid)
++        self.assertEqual(bundle, self.bundle)
++        self.assertEqual(observed, manifest)
++
++    def test_missing_non_runtime_inventory_file_is_rejected(self):
++        parent = self.bundle / 'prompts'
++        parent.chmod(0o755)
++        (parent / 'work.md').unlink()
++        with self.assertRaises(ValueError):
++            rel.verify(self.state, self.rid)
++
++    def test_unexpected_deep_file_is_rejected(self):
++        self.bundle.chmod(0o755)
++        path = self.bundle / 'extra' / 'nested' / 'unexpected.txt'
++        path.parent.mkdir(parents=True)
++        path.write_text('unregistered')
++        with self.assertRaises(ValueError):
++            rel.verify(self.state, self.rid)
++
++    def test_empty_unregistered_directory_remains_compatible(self):
++        self.bundle.chmod(0o755)
++        (self.bundle / 'empty' / 'nested').mkdir(parents=True)
++        self.assertEqual(rel.verify(self.state, self.rid)[1], self.manifest)
++
++    def test_directory_and_dangling_symlinks_are_rejected(self):
++        self.bundle.chmod(0o755)
++        for destination in (self.root, self.root / 'does-not-exist'):
++            path = self.bundle / 'linked-directory'
++            path.symlink_to(destination, target_is_directory=True)
++            with self.subTest(destination=str(destination)), self.assertRaises(ValueError):
++                rel.verify(self.state, self.rid)
++            path.unlink()
++
++    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'POSIX special-file fixture')
++    def test_unregistered_special_file_is_rejected_without_opening_it(self):
++        self.bundle.chmod(0o755)
++        os.mkfifo(self.bundle / 'unexpected.fifo')
++        with self.assertRaises(ValueError):
++            rel.verify(self.state, self.rid)
++
++    def test_verification_does_not_reuse_a_previous_success_for_changed_bytecode(self):
++        rel.verify(self.state, self.rid)
++        path = next((self.bundle / '__pycache__').glob('harness.*.pyc'))
++        path.chmod(0o644)
++        original = path.read_bytes()
++        path.write_bytes(original[:-1] + bytes([original[-1] ^ 1]))
++        with self.assertRaises(ValueError):
++            rel.verify(self.state, self.rid)
++
++    def test_canonical_manifest_paths_and_hashes_are_required_before_inventory_reads(self):
++        original = copy.deepcopy(self.manifest)
++        cases = [('../outside', 'a'*64), ('/absolute', 'a'*64), ('nested/../value', 'a'*64),
++                 ('./value', 'a'*64), ('nested//value', 'a'*64), ('release.json', 'a'*64),
++                 ('', 'a'*64), ('.', 'a'*64), ('extra.txt', None), ('extra.txt', 'A'*64),
++                 ('extra.txt', 'short')]
++        for name, digest in cases:
++            manifest = copy.deepcopy(original)
++            manifest['files'][name] = digest
++            self.rewrite_manifest(manifest)
++            with self.subTest(name=name, digest=digest), self.assertRaises(ValueError):
++                rel.verify(self.state, self.rid)
++
++    def test_directory_enumeration_and_content_read_errors_fail_closed(self):
++        with mock.patch.object(rel.os, 'scandir', side_effect=PermissionError('fixture directory denied')):
++            with self.assertRaises(OSError):
++                rel.verify(self.state, self.rid)
++        original_hash = rel.file_hash
++        def read_error(path):
++            if Path(path).name == 'harness.py':
++                raise OSError('fixture content read failed')
++            return original_hash(path)
++        with mock.patch.object(rel, 'file_hash', side_effect=read_error):
++            with self.assertRaises(OSError):
++                rel.verify(self.state, self.rid)
++
+     def test_invalid_id_and_pointer_json_fail_closed(self):
+         for value in ('../escape', '', 'g'*64):
+             with self.subTest(value=value), self.assertRaises(ValueError):
+@@ -327,6 +423,19 @@ else:
+             with self.subTest(args=args), self.assertRaises(ValueError):
+                 bench_latency.baseline_setup(**args)
+ 
++    def test_benchmark_can_select_the_before_version_bootstrap(self):
++        import bench_latency
++        launcher = self.source / 'ringo.py'
++        rid, config, command = bench_latency.baseline_setup(
++            release_id=self.rid, state=self.state, launcher=launcher)
++        self.assertEqual(rid,self.rid)
++        self.assertEqual(config,self.manifest['default_review_sha256'])
++        self.assertEqual(command[:2],[sys.executable,str(launcher)])
++        with self.assertRaises(ValueError):
++            bench_latency.baseline_setup(baseline=self.source,launcher=launcher)
++        with self.assertRaises(ValueError):
++            bench_latency.baseline_setup(release_id=self.rid,state=self.state,launcher=self.root/'missing.py')
++
+     def test_selection_benchmark_approval_is_explicitly_a_private_test_fixture(self):
+         import bench_latency
+         state = bench_latency.selection_fixture(self.state,self.rid,30)
