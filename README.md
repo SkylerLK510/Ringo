@@ -81,6 +81,11 @@ allowance or API billing according to authentication and plan settings. Unknown
 cost is not zero. `--trace` uses a new folder outside this checkout; it contains
 private material. Opening the CLI help or running tests makes no provider calls.
 
+Routine usage reports use [token counts](docs/TOKEN-USAGE.md): uncached input,
+cached input, cache writes, output and their reported total, with missing usage
+identified explicitly. Dollar estimates are omitted unless requested or needed
+for an explicit spending limit; existing budget and evaluation gates remain.
+
 ## Evaluation and improvement
 
 See [the harness guide](docs/HARNESS.md) and [the agent skill](skills/ringo-harness/SKILL.md).

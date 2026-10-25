@@ -6,7 +6,7 @@ description: "Use Ringo for substantive coding and design workflows: review chan
 # Ringo harness
 
 Ringo is a harness you run as a CLI. Each task is a pipeline of isolated, single-turn model calls (a plan
-file plus prompts), assembled in code, with a trace of every call's tokens and cost. Run it from the repository
+file plus prompts), assembled in code, with a trace of every call's token usage. Run it from the repository
 root. You never paste its prompts yourself: the prompts live in `prompts/` and the plans in `plans/`.
 
 ## Routine coding and design
@@ -51,7 +51,13 @@ rounds merely because this skill is selected. Child writer/judge/reviewer calls
 must not invoke Ringo again. The private CODEX_HOME/HOME of Codex children keeps
 them from loading this skill, and a turn that uses an undeclared tool is rejected.
 A rejected or timed-out turn names its reason; its raw events are kept in `TRACE/steps/*.raw.txt`.
-Report the actual command, report path, call count and any known usage at completion.
+Report the actual command, report path, call count and token usage at completion.
+Use tokens as the default efficiency measure: uncached input, cache-read input,
+cache-write input, output, and their reported total. Mark totals partial when any
+attempt lacks usage; unavailable tokens are unknown, not zero. Do not estimate
+or lead with dollar costs unless the user asks or an explicit monetary budget
+requires reporting them. Preserve explicit spending limits and protected
+evaluation gates. See `docs/TOKEN-USAGE.md` for the existing normalized fields.
 
 ## 1. Collect the material
 
@@ -94,13 +100,13 @@ python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --timeout 180 
   `max_rounds x (1 + samples)`. `--max-calls` was removed.
 - `--max-cost` stops new calls once spent. Under `--max-cost`, calls run one at a time and `--unpriced-call-usd USD` is required for every backend, including attempts that time out without reporting cost. Choose a conservative fallback; the final call may exceed the remainder.
 - `--trace` needs a new or empty folder outside the repository. Use a plan whose kind matches the task.
-- For review/design, the last stderr line is `harness: ` followed by a JSON summary; parse after that prefix. Report calls, cost, tokens and the `backend` and `checker_backend` it names. If `unpriced_calls > 0`, cost is unknown, not zero; if `untokened_calls > 0`, the token sums leave those calls out.
+- For review/design, the last stderr line is `harness: ` followed by a JSON summary; parse after that prefix. Report calls, tokens and the `backend` and `checker_backend` it names. If `untokened_calls > 0`, token sums leave those calls out and the reported total is partial. Monetary fields remain available for explicit budgets; if reporting them, `unpriced_calls > 0` means cost is unknown, not zero.
 - Review/design: exit 0 is finished; exit 2 is failure. A late output-write failure prints the completed result and cost as recovery output.
 
 ## 3. Report the result
 
 Give the user the review or proposal as written; it is assembled verbatim from the model's findings. Say which
-backend and plan ran and what it cost. If `--trace` was used, point to the trace folder (it holds the material,
+backend and plan ran and the token usage. If `--trace` was used, point to the trace folder (it holds the material,
 so it is created private). Open questions in a review are not findings. Before reporting, settle each one
 against the repository yourself (you can read what the review call could not): promote a confirmed one to a
 verified finding and say it was promoted from an open question, drop a refuted one and say why, and report the
