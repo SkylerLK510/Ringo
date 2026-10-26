@@ -51,5 +51,20 @@
    "writer",
    "judge"
   ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Faster review context on large repositories",
+  "kind": "latency",
+  "change": [
+   10
+  ],
+  "scope": "Building the review material for a change ran one git process per file read and per changed file, and its reference search made git scan every line once per changed symbol. It now reads every object through one cat-file process, takes the changed lines from one diff, and searches with one compiled alternation. The material is byte-identical to before on every measured commit. Real git on a public repository, each commit built against its parent; no provider calls.",
+  "evidence": {
+   "2026-10-26-context-git/django-context.json": "0fbf96447d5aa15861528c5330d426443c8c75ced0623990ffb7687bae7a21ce"
+  },
+  "claim": [
+   "django-recent-commits"
+  ]
  }
 ]

@@ -263,5 +263,48 @@ class CliTest(unittest.TestCase):
             self.assertIn('review cannot start', err.getvalue())
 
 
+class GrepFallbackTest(unittest.TestCase):
+    def test_word_matches_are_the_same_with_and_without_pcre(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'a.py').write_text('foo_bar = 1\nfoo = 2\nx = foo(foo_bar)\nbarfoo()\nbar\n')
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x'], check=True)
+            fast = context.grep(repo, 'HEAD', ['foo', 'bar'])
+            real = context.git
+            def no_pcre(r, *args, **kw):
+                if '-P' in args:
+                    raise context.ContextError('git grep failed: fatal: cannot use Perl-compatible regexes')
+                return real(r, *args, **kw)
+            with mock.patch.object(context, 'git', side_effect=no_pcre):
+                plain = context.grep(repo, 'HEAD', ['foo', 'bar'])
+            self.assertEqual(fast, plain)
+            self.assertEqual([r.split('\0')[1] for r in fast.split('\n') if r], ['2', '3', '5'])
+            self.assertEqual(context.grep(repo, 'HEAD', ['café']), '')  # non-ASCII names take the -F -w path
+
+    def test_word_boundaries_beside_unicode_letters_match_git_w_in_a_utf8_locale(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'LC_ALL': 'en_US.UTF-8'}):
+            repo = Path(d)
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'a.py').write_text('caf\u00e9foo()\nfoo\u00e9 = 1\nfoo()\nna\u00efve_foo\n\u03a3foo\n', encoding='utf-8')
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x'], check=True)
+            fast = context.grep(repo, 'HEAD', ['foo'])
+            plain = context.git(repo, 'grep', '-n', '-I', '-z', '--no-color', '--no-column', '-w', '-F', '-e', 'foo',
+                                'HEAD', '--', ok=(0, 1))
+            self.assertEqual(fast, plain)  # git -w counts only ASCII letters, digits and _ as word characters
+
+    def test_a_truncated_batch_object_is_refused(self):
+        class Cut:
+            def __init__(self):
+                self.stdin, self.stdout = io.BytesIO(), io.BytesIO(b'0123456789abcdef0123456789abcdef01234567 blob 10\nshort')
+        objects = context.Objects(Path('.'))
+        objects.proc = Cut()
+        with self.assertRaisesRegex(context.ContextError, 'truncated'):
+            objects.read('HEAD', 'a.py')
+        objects.proc = None
+
+
 if __name__ == '__main__':
     unittest.main()
