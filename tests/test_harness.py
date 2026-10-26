@@ -151,7 +151,8 @@ class CallTest(unittest.TestCase):
         self.assertIn('skip_host_skill_discovery', backend['argv'])
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             text, usage = harness.call(backend, 'SYS', 'MSG', 30)
-        invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, codex_home=True, subscription_auth=True)
+        invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, codex_home=True, subscription_auth=True,
+                                       lean=True)
         self.assertEqual(text, 'No defects found.')
         self.assertEqual(usage, {'input': 30, 'cache_read': 70, 'cache_write': 0, 'output': 12, 'cost_usd': None,
                                  'items': {'agent_message': 1}, 'warnings': []})
@@ -210,7 +211,8 @@ class CallTest(unittest.TestCase):
         searching = harness.backend('codex:codex --search exec --json -')
         with mock.patch.object(backends, 'run_isolated', return_value=events) as invoke:
             text, usage = harness.call(searching, 'S', 'M', 30)
-        invoke.assert_called_once_with(searching['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=False)
+        invoke.assert_called_once_with(searching['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=False,
+                                       lean=False)
         self.assertEqual((text, usage['input'], usage['cache_read'], usage['output']), ('No defects found.', 30, 70, 12))
         for spec in ('codex:codex exec --json -', 'codex-chatgpt'):
             with self.subTest(spec=spec), mock.patch.object(backends, 'run_isolated', return_value=events), \
@@ -226,7 +228,8 @@ class CallTest(unittest.TestCase):
         b = {'name': 'codex-chatgpt+model', 'argv': ['codex', 'exec', '--json', '-'], 'style': 'codex'}
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             harness.call(b, 'S', 'M', 30)
-        invoke.assert_called_once_with(b['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=True)
+        invoke.assert_called_once_with(b['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=True,
+                                       lean=False)
 
     def test_native_turn_failures_preserve_reported_tokens_without_becoming_success(self):
         for tail in ('not JSON', json.dumps({'type': 'turn.failed'}),
@@ -817,7 +820,7 @@ class CheckerBackendTest(unittest.TestCase):
                                  '--backend', 'finder-cmd', '--checker-backend', 'codex-chatgpt', '--trace', str(trace)])
         self.assertEqual(code, 0, err.getvalue())
         self.assertEqual(calls[0], ('finder-cmd', {}))
-        self.assertEqual(calls[1][1], {'codex_home': True, 'subscription_auth': True})
+        self.assertEqual(calls[1][1], {'codex_home': True, 'subscription_auth': True, 'lean': True})
         summary = json.loads(err.getvalue().strip().splitlines()[-1].split('harness: ', 1)[1])
         self.assertEqual((summary['backend'], summary['checker_backend'], summary['calls']), ('finder-cmd', 'codex-chatgpt', 2))
         self.assertEqual(json.loads((trace / 'backends.json').read_text()),

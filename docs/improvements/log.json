@@ -1,0 +1,55 @@
+[
+ {
+  "date": "2026-10-25",
+  "title": "Faster release verification",
+  "kind": "latency",
+  "change": [
+   2,
+   4
+  ],
+  "scope": "The stable launcher verifies every release file on each command. One iterative directory walk now checks the inventory and contents, and every expected file still gets a complete content hash. Measured in process with a warm cache on the same immutable bundle: this is the verifier component, not a whole command.",
+  "evidence": {
+   "2026-10-25-verifier-traversal/original-30-files.json": "8fc07cd1a1c9c07fc51dd172d576cfafad9e5d729262294a8e8fdcfe1efb9721",
+   "2026-10-25-verifier-traversal/scaled-150-files.json": "1b357d20f73c7a9e398e015edcb5e3f0322fd59e7b55bdf329257e94c7993570"
+  },
+  "claim": [
+   "original-30-files",
+   "scaled-150-files"
+  ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Shorter launch for one-call plans",
+  "kind": "latency",
+  "change": [
+   7
+  ],
+  "scope": "Ringo no longer imports the thread pool, and the logging and traceback modules it pulls in, at start-up; plans that make a single call never use it. Fresh-process commands with simulated backends, both arms selected through equal private fixture approvals, no provider calls. Local machine overhead, not live-provider latency.",
+  "evidence": {
+   "2026-10-26-launch-latency/suite.json": "e99126a83af93300c88c656cf30b084d351c282e7df24fbde0309546375a3b50"
+  },
+  "claim": [
+   "review",
+   "review-trace",
+   "review-large",
+   "design",
+   "review-override"
+  ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Lean Codex calls",
+  "kind": "tokens",
+  "change": [
+   8
+  ],
+  "scope": "Ringo's Codex calls are single tool-free turns, yet each carried the Codex agent prompt, the code-mode and multi-agent tool schemas, and skills, permission and environment blocks. The codex-chatgpt preset now replaces the agent prompt with one line and drops those blocks; Ringo's own prompt is unchanged byte for byte. Same model and reasoning effort on both sides, native ChatGPT login. Spot check: the lean writer's answer scored the same as before on the pilot's own checker; one sample does not establish equal quality, and whole benchmark runs were not repeated.",
+  "evidence": {
+   "2026-10-26-lean-codex/calls.json": "5174724dc49fced577ad624a60728826ab967a710886378c941585efe8dfa1c2"
+  },
+  "claim": [
+   "writer",
+   "judge"
+  ]
+ }
+]
