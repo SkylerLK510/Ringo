@@ -6,6 +6,7 @@ import contextlib
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -72,20 +73,52 @@ def _object(pairs):
     return obj
 
 
+# Where an object can start under json's own grammar: '{', its whitespace, then a key or '}'. Any other '{' fails
+# at once, but building that failure's JSONDecodeError counts lines up to it, so prose full of braces cost time
+# quadratic in its length.
+OBJECT_START = re.compile(r'\{[ \t\n\r]*["}]')
+FAILED_PARSE = 64      # failed attempts may parse this many times the text's length in all
+FAILED_STARTS = 1_000  # and number at most this many; each builds an error message that counts lines up to it
+
+
 def top_level_objects(text):
     """Every top-level JSON object in text, bare or inside prose or a code fence. An object nested in another is
-    never yielded on its own, and each object records whether it repeats a key (repeats_a_key)."""
-    decoder = json.JSONDecoder(parse_constant=_no_constant, parse_float=_finite_float, object_pairs_hook=_object)
-    start = 0
-    while (start := text.find('{', start)) != -1:
+    never yielded on its own, and each object records whether it repeats a key (repeats_a_key). Linear in the
+    text's length: a '{' that cannot start an object is skipped without parsing, nesting too deep to parse is a
+    failed attempt, not an error, and failed attempts are bounded in the distance they parse (FAILED_PARSE times
+    the length) and in number (FAILED_STARTS). Past either bound the scan ends, so a long unterminated reply
+    costs linear time instead of quadratic, and objects after that point are not found."""
+    refused = []  # NaN, Infinity or a number that overflows: noted, so the attempt still ends at a known position
+    def constant(name):
+        refused.append(name)
+        return 0.0
+    def number(token):
+        value = float(token)
+        if not math.isfinite(value):
+            refused.append(token)
+        return value
+    decoder = json.JSONDecoder(parse_constant=constant, parse_float=number, object_pairs_hook=_object)
+    parse, starts, start = FAILED_PARSE * (len(text) + 1), FAILED_STARTS, 0
+    while (m := OBJECT_START.search(text, start)):
+        at = m.start()
+        refused.clear()
         try:
-            obj, end = decoder.raw_decode(text, start)
-        except ValueError:
-            start += 1
-            continue
-        start = end  # skip the object's inside: a nested object is never the answer
-        if isinstance(obj, dict):
-            yield obj
+            obj, end = decoder.raw_decode(text, at)
+        except json.JSONDecodeError as exc:
+            parse -= exc.pos - at
+        except RecursionError:
+            parse -= len(text) - at
+        else:
+            if not refused:
+                start = end  # skip the object's inside: a nested object is never the answer
+                if isinstance(obj, dict):
+                    yield obj
+                continue
+            parse -= end - at  # it parsed, but a refused number makes it no answer
+        starts -= 1
+        if parse < 0 or starts < 0:
+            return
+        start = at + 1
 
 
 def _owner_auth():

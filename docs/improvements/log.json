@@ -51,5 +51,21 @@
    "writer",
    "judge"
   ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Reply scanning that cannot be stalled",
+  "kind": "latency",
+  "change": [
+   11
+  ],
+  "scope": "Finding the JSON answer in a model's reply tried a parse at every brace. Each failed attempt built an error message that counts lines from the start of the reply, and an unterminated nested reply made every attempt run to the end, so hostile or garbled replies cost time quadratic in their length, and very deep nesting crashed the run. Braces that cannot start an object under the JSON grammar are now skipped without parsing, deep nesting is a failed attempt, and failed attempts are bounded in total. Both arms find the same objects. In process, no provider calls.",
+  "evidence": {
+   "2026-10-26-json-scan/scan-suite.json": "d66bb9f80073522b3976ab2f52aa0c7fabae8f5056954c13972dd2e49605ea02"
+  },
+  "claim": [
+   "hostile-nesting-20KB",
+   "typical-reply-20KB"
+  ]
  }
 ]
