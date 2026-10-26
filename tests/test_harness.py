@@ -152,7 +152,7 @@ class CallTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             text, usage = harness.call(backend, 'SYS', 'MSG', 30)
         invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, codex_home=True, subscription_auth=True,
-                                       lean=True)
+                                       lean=True, watch=None)
         self.assertEqual(text, 'No defects found.')
         self.assertEqual(usage, {'input': 30, 'cache_read': 70, 'cache_write': 0, 'output': 12, 'cost_usd': None,
                                  'items': {'agent_message': 1}, 'warnings': []})
@@ -212,7 +212,7 @@ class CallTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', return_value=events) as invoke:
             text, usage = harness.call(searching, 'S', 'M', 30)
         invoke.assert_called_once_with(searching['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=False,
-                                       lean=False)
+                                       lean=False, watch=None)
         self.assertEqual((text, usage['input'], usage['cache_read'], usage['output']), ('No defects found.', 30, 70, 12))
         for spec in ('codex:codex exec --json -', 'codex-chatgpt'):
             with self.subTest(spec=spec), mock.patch.object(backends, 'run_isolated', return_value=events), \
@@ -229,7 +229,7 @@ class CallTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             harness.call(b, 'S', 'M', 30)
         invoke.assert_called_once_with(b['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=True,
-                                       lean=False)
+                                       lean=False, watch=None)
 
     def test_native_turn_failures_preserve_reported_tokens_without_becoming_success(self):
         for tail in ('not JSON', json.dumps({'type': 'turn.failed'}),
@@ -255,14 +255,17 @@ class CallTest(unittest.TestCase):
         child = f'import sys, time; sys.stdout.write({events!r} + "\\n"); sys.stdout.flush(); time.sleep(10)'
         backend = {**harness.backend('codex-chatgpt'), 'argv': [sys.executable, '-c', child]}
         with tempfile.TemporaryDirectory() as d, \
-                mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'codex'))}):  # no real login
+                mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'codex'))}), \
+                mock.patch.object(harness, 'HARD_FLOOR_S', 0), mock.patch('sys.stderr', new_callable=io.StringIO):
             run = harness.Run(Path(d, 't'))
-            with self.assertRaises(subprocess.TimeoutExpired):  # the type the retry rule sees is unchanged
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:  # soft at 1s, stopped at 2s
                 harness.run_plan(pl.load_plan(None, 'review'), 'M', backend, run, timeout_s=1,
                                  call_fn=harness.call)
+            self.assertTrue(caught.exception.limit)
             rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
-            errors = [r for r in rows if r['status'] == 'error']
-            self.assertEqual(len(errors), 2)  # one retry, as before
+            errors = [r for r in rows if r['status'] == 'error' and r['step'] == 'review']
+            self.assertEqual(len(errors), 1)  # the whole window was used: no retry after the hard limit
+            self.assertEqual((errors[0]['stopped'], errors[0]['soft_s'], errors[0]['limit_s']), ('limit', 1, 2))
             self.assertEqual(errors[0]['usage']['input'], 30)
             raw = Path(d, 't', 'steps', f"{errors[0]['step']}.1.raw.txt").read_text()
             self.assertIn('No defects found.', raw)
@@ -810,6 +813,7 @@ class CheckerBackendTest(unittest.TestCase):
             {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 2}}])
         calls = []
         def isolated(argv, stdin, timeout, **kw):
+            assert isinstance(kw.pop('watch'), harness.Watch)  # every pass gets a soft limit
             calls.append((argv[0], kw))
             return events if kw.get('codex_home') else REVIEW
         trace = Path(tempfile.mkdtemp()) / 'trace'

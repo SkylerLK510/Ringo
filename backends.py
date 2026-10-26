@@ -10,6 +10,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 try:
@@ -35,11 +37,17 @@ JUDGE_PRESETS = {
                      '''-c 'model_provider="openai"' -c 'web_search="disabled"' '''
                      '--skip-git-repo-check --ephemeral -s read-only --color never --json -'),
 }
+RAW_PEEK = 1_000_000  # bytes of a running call's output read for its soft-limit checks
 # Replaces Codex's agent prompt (about 22 KB) for lean calls; Ringo's own instructions travel in the message.
 CODEX_INSTRUCTIONS = 'Follow the instructions in the user message exactly.\n'
 # Catalog fields that attach the code-mode `exec` tool, the multi-agent tools and their instructions to every
 # request; no config flag removes them in codex-cli 0.164.
 CATALOG_TOOL_FIELDS = ('tool_mode', 'multi_agent_version', 'multi_agent_reasoning_effort', 'apply_patch_tool_type')
+
+
+class Stopped(subprocess.TimeoutExpired):
+    """A call stopped on the person's request after it passed its soft limit. It is a TimeoutExpired, so the
+    one-retry rule applies; a call killed at its hard limit raises a plain TimeoutExpired with .limit set."""
 
 
 class JudgeError(Exception):
@@ -115,7 +123,7 @@ def _codex_home(root, env):
     return owner, snapshot, copy
 
 
-def _lean_codex(argv, private, env):
+def _lean_codex(argv, private, env, timeout_s=15):
     """argv with Codex's agent prompt replaced by CODEX_INSTRUCTIONS and, when the installed CLI can print its
     model catalog, a copy without the tool modes, inserted before the trailing stdin marker. Both files live
     in the call's private CODEX_HOME. A CLI without `debug models`, or a catalog in another format, keeps only
@@ -125,7 +133,7 @@ def _lean_codex(argv, private, env):
     extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
     try:
         listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=15, check=True).stdout
+                                capture_output=True, timeout=timeout_s, check=True).stdout
         catalog = json.loads(listed)
         for model in catalog['models']:
             for field in CATALOG_TOOL_FIELDS:
@@ -193,15 +201,40 @@ def _sync_codex_auth(owner, snapshot, copy):
               'run `codex login` if later calls are refused', file=sys.stderr)
 
 
-def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False):
+def _wait(proc, timeout_s, watch, snapshot, started, threads):
+    """How the wait ended: None (the command exited), 'limit' or 'stop'. Times count from started, setup
+    included. Without a watch, timeout_s is a hard limit. With one it is soft: past it the command keeps running,
+    watch.soft(elapsed, snapshot) runs once in a thread (appended to threads, for the caller to join), and the
+    command is stopped when watch.stop is set or at watch.limit_s."""
+    limit = watch.limit_s if watch else timeout_s
+    fired = False
+    while True:
+        elapsed = time.monotonic() - started
+        if elapsed >= limit:
+            return 'limit'
+        if watch and watch.stop.is_set():
+            return 'stop'
+        if watch and not fired and elapsed >= timeout_s:
+            fired = True
+            threads.append(threading.Thread(target=watch.soft, args=(elapsed, snapshot), daemon=True))
+            threads[-1].start()
+        try:
+            proc.wait(limit - elapsed if watch is None else min(0.25, limit - elapsed))
+            return None
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False, watch=None):
     """stdout of one run. The working folder is empty, so no project instructions or files
     load from it; it is not a file-system boundary. The command gets the caller's
     environment without the TypeSafe key, in a session of its own, so a timeout kills it and
     everything it started, not only the direct child. codex_home: the command is a Codex CLI, so it
     gets a private CODEX_HOME and HOME (see _codex_home); a refreshed login is written back even
     when the call fails or times out. lean (with codex_home): the call is a single tool-free Codex turn, so
-    Codex's agent prompt and tool modes are replaced (see _lean_codex). A failure (JudgeError) or timeout
-    (TimeoutExpired) carries the stdout written so far as .stdout."""
+    Codex's agent prompt and tool modes are replaced (see _lean_codex). watch: timeout_s becomes a soft limit
+    (see _wait); the call is never killed at it. A failure (JudgeError), a stop (Stopped) or a timeout
+    (TimeoutExpired, .limit True) carries the stdout written so far as .stdout."""
     # ceiling: stdout is read whole; a command that floods it fills disk and memory
     env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
     if subscription_auth:
@@ -210,37 +243,49 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
             'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID'}}
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
+    # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.
     with tempfile.TemporaryDirectory(prefix='council-judge-') as tmp, tempfile.TemporaryFile() as out, \
-            tempfile.TemporaryFile() as err:
+            tempfile.TemporaryFile() as err, tempfile.TemporaryFile() as stdin:
+        stdin.write(prompt.encode('utf-8'))
+        stdin.seek(0)
         cwd = Path(tmp) / 'work'
         cwd.mkdir()
+        started, ended, threads = time.monotonic(), None, []  # the limit counts setup too
+        limit = watch.limit_s if watch else timeout_s
         login = _codex_home(Path(tmp), env) if codex_home else None
-        if codex_home and lean:
-            argv = _lean_codex(argv, Path(tmp) / 'codex', env)
-        timed_out = None
+        snapshot = lambda: tuple(os.pread(f.fileno(), RAW_PEEK, 0).decode('utf-8', 'replace') for f in (out, err))
         try:
-            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,
-                                    start_new_session=True)
-            try:
-                proc.communicate(prompt.encode('utf-8'), timeout=timeout_s)
-            except subprocess.TimeoutExpired as exc:  # raised below, once what it wrote before the kill is read
-                timed_out = exc
-            finally:
+            if codex_home and lean:
+                argv = _lean_codex(argv, Path(tmp) / 'codex', env, max(0.1, min(15, limit)))
+            if time.monotonic() - started >= limit:
+                ended = 'limit'  # setup used the whole window: the model is never launched
+            else:
+                proc = subprocess.Popen(argv, stdin=stdin, stdout=out, stderr=err, cwd=cwd, env=env,
+                                        start_new_session=True)
                 try:
-                    os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
-                except (ProcessLookupError, PermissionError):
-                    pass
-                proc.wait()
+                    ended = _wait(proc, timeout_s, watch, snapshot, started, threads)
+                finally:
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    proc.wait()
         finally:
+            if watch:
+                watch.done.set()
+            for thread in threads:  # its probe stops on done, and is recorded, before this call returns
+                thread.join()
             if login:
                 _sync_codex_auth(*login)
         out.seek(0)
         err.seek(0)
         stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
-    if timed_out:
-        timed_out.stdout = stdout  # the events before the kill: what the call cost, and why it hung
-        raise timed_out
-    if proc.returncode:
+    if ended:
+        exc = (Stopped if ended == 'stop' else subprocess.TimeoutExpired)(argv, round(time.monotonic() - started, 1))
+        exc.limit = ended == 'limit'
+        exc.stdout = stdout  # the events before the kill: what the call cost, and why it hung
+        raise exc
+    if proc.returncode:  # proc exists: without a launch, ended is 'limit' and the call raised above
         tail = ' '.join(stderr.split())[-300:]
         exc = JudgeError(f'{Path(argv[0]).name} exited with {proc.returncode}' + (f': {tail}' if tail else ''))
         exc.stdout = stdout  # a CLI can report on stdout what the failed call cost

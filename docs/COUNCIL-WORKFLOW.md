@@ -112,15 +112,17 @@ folder off `sys.path`.
 | `samples` | 6 | Judge calls per assessed round, 2 to 25. 6 is the council's default; 2 is a smoke-test value only (see below). |
 | `max_rounds` | 3 | Writer rounds, including malformed ones. With `samples` it sets the calls (see below). |
 | `max_seconds` | 600 | Wall-clock bound for the whole run. |
-| `timeout_s` | 120 | Bound for each model call, capped by the time left. |
+| `timeout_s` | 120 | Soft limit for each model call: past it the call is checked, probed and kept running; it is stopped at twice this, never under 900 seconds, capped by the time left. |
 | `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and fallback price for calls reporting none. A dollar cap requires a declared fallback. |
 
 **Calls.** There is no call cap: the task's rounds and samples decide the calls.
 Each round makes one writer call; a well-formed, new candidate then gets one judge
 call per council sample, whatever its checks report. A malformed reply skips the
-judges for that round, and a repeated candidate ends the run. Calls are not
-retried. So a run makes at most `max_rounds x (1 + samples)` calls: the example
-above makes at most 2 x (1 + 6) = 14. A spec that still sets the removed
+judges for that round, and a repeated candidate ends the run. A call is retried
+only when the person stops it after its soft limit, once. So a run makes at most
+`max_rounds x (1 + samples)` calls when nothing is stopped: the example above makes
+at most 2 x (1 + 6) = 14. Each stopped call adds one retry, and each attempt that
+passes its soft limit adds at most one probe, so the bound is four times that. A spec that still sets the removed
 `max_calls` field is refused ("max_calls was removed: calls are set by max_rounds
 and samples"). `max_seconds`, `timeout_s` and `max_cost` bound time and money.
 

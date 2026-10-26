@@ -285,26 +285,44 @@ def run(spec_path, out, call_fn=harness.call):
         return prepared
 
     def call(label, backend, system, message):
-        timeout = min(spec['timeout_s'], remaining())
-        if timeout <= 0:
-            raise harness.BudgetExceeded('workflow wall-clock limit reached')
-        accounting.reserve()
-        record = {'step': label, 'attempt': 1, 'system_sha256': harness.sha(system),
-                  'message_sha256': harness.sha(message)}
-        accounting.record({**record, 'status': 'reserved'})
-        try:
-            reply, usage = call_fn(harness.backend(backend), system, message, timeout)
-        except harness.AdmissionRefused as exc:
-            accounting.refuse_reservation()
-            accounting.record({**record, 'status': 'admission_refused', 'error': str(exc)})
-            raise
-        except BaseException as exc:
-            accounting.record({**record, 'status': 'error', 'usage': getattr(exc, 'usage', None),
-                               'error': f'{type(exc).__name__}: {exc}'},
-                              raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
-            raise
-        accounting.record({**record, 'status': 'ok', 'usage': usage}, reply)
-        return reply
+        """One model call. timeout_s is soft: past it the call is checked and probed, not killed (harness.Watch);
+        it is stopped at twice timeout_s (never under harness.HARD_FLOOR_S) or at the run deadline. A call the
+        person stops is retried once; nothing else is."""
+        spec_b, kind = harness.backend(backend), label.split('-')[0]
+        for attempt in (1, 2):
+            left = remaining()  # read once, so the limit is never below the soft limit
+            soft, limit = min(spec['timeout_s'], left), min(harness.limit_for(spec['timeout_s']), left)
+            if soft <= 0:
+                raise harness.BudgetExceeded('workflow wall-clock limit reached')
+            accounting.reserve()
+            record = {'step': label, 'attempt': attempt, 'system_sha256': harness.sha(system),
+                      'message_sha256': harness.sha(message)}
+            watch = None
+            if harness.accepts_watch(call_fn):
+                watch = harness.Watch(accounting, label, attempt, spec_b, soft, limit, kind,
+                                      lambda done, a=attempt: harness.probe(accounting, spec_b, f'{label}.{a}', call_fn, done))
+                record.update(soft_s=soft, limit_s=limit)
+            accounting.record({**record, 'status': 'reserved'})
+            t0 = time.monotonic()
+            try:
+                reply, usage = call_fn(spec_b, system, message, soft, **({'watch': watch} if watch else {}))
+            except harness.AdmissionRefused as exc:
+                accounting.refuse_reservation()
+                accounting.record({**record, 'status': 'admission_refused', 'error': str(exc)})
+                raise
+            except BaseException as exc:
+                stopped = harness.stop_reason(exc, watch)
+                accounting.record({**record, 'status': 'error', 'usage': getattr(exc, 'usage', None),
+                                   'error': f'{type(exc).__name__}: {exc}',
+                                   **({'stopped': stopped} if stopped else {})},
+                                  raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
+                if stopped == 'person' and attempt == 1:
+                    continue
+                raise
+            seconds = round(time.monotonic() - t0, 3)
+            accounting.record({**record, 'status': 'ok', 'usage': usage, 'seconds': seconds}, reply)
+            accounting.finish(kind, seconds, usage)
+            return reply
 
     try:
         # Validate the bridge, rubric and brief offline before any inference.
