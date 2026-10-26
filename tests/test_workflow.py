@@ -95,7 +95,9 @@ class WorkflowTest(unittest.TestCase):
         report = workflow.run(path, self.root / 'run', call_fn=lambda _b, system, *a: (json.dumps(
             self.proposal('def f(x): return 2*x\n') if system.startswith('Implement the task') else {'accept': True}), {}))
         self.assertEqual(report['status'], 'ready_for_review')
-        self.assertEqual(report['usage']['calls'], 1 + 6)
+        self.assertEqual(report['usage']['calls'], 1 + 3)  # three agreeing judges already recommend
+        self.assertEqual((report['council_judges'], report['council_samples']), (3, 6))
+        self.assertEqual(report['rounds'][0]['council_stages'], [{'judges': 3, 'action': 'recommend'}])
 
     @staticmethod
     def edits(*triples, rationale='Targeted change.'):
@@ -212,13 +214,72 @@ class WorkflowTest(unittest.TestCase):
         good = self.proposal('def f(x): return 2*x\n')
         report, seen = self.execute([bad, good], max_rounds=2, samples=6)
         self.assertEqual(report['status'], 'ready_for_review')
-        self.assertEqual(report['usage']['calls'], 2 + 6)
+        self.assertEqual(report['usage']['calls'], 2 + 3)
         self.assertEqual(sum(system.startswith('Implement the task') for system, _ in seen), 2)
         self.assertTrue(all(system.startswith('You are an independent council judge') for system, _ in seen[2:]))
         feedback = json.loads(seen[1][1])['feedback']
         self.assertEqual(feedback['checks'][0]['status'], 'fail')
         self.assertNotIn('decision', feedback)
         self.assertEqual((self.root / 'run/final/value.py').read_text(), good['files']['value.py'])
+
+    STRICT_BRIDGE = '''import json, sys
+r = json.load(sys.stdin)
+if r['operation'] == 'prepare':
+    out = {'version': 1, 'fingerprint': 'f' + str(r['samples']), 'policy_sha256': 'a' * 64,
+           'requests': ['JUDGE ' + str(n) for n in range(r['samples'])]}
+else:
+    assert r['fingerprint'] == 'f' + str(r['samples']) and len(r['replies']) == r['samples']
+    yes = sum(json.loads(x)['accept'] for x in r['replies'])
+    ok = yes == r['samples'] if r['samples'] < 6 else yes >= 5
+    out = {'version': 1, 'report': {'complete': True, 'scored': [],
+           'decision': {'action': 'recommend' if ok else 'escalate', 'reasons': []}}}
+print(json.dumps(out))
+'''
+
+    def judged(self, verdicts, **changes):
+        (self.root / 'strict.py').write_text(self.STRICT_BRIDGE)
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**self.spec, 'council': [sys.executable, str(self.root / 'strict.py')],
+                                    'max_rounds': 1, 'samples': 6, **changes}))
+        verdicts, seen = iter(verdicts), []
+        def call(_backend, system, message, timeout_s):
+            if system.startswith('Implement the task'):
+                return json.dumps(self.proposal('def f(x): return 2*x\n')), {}
+            seen.append(message)
+            return json.dumps({'accept': next(verdicts)}), {}
+        return workflow.run(path, self.root / 'run', call_fn=call), seen
+
+    def test_a_first_stage_that_does_not_recommend_calls_the_remaining_judges(self):
+        report, seen = self.judged([False] + [True] * 5)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(seen, [f'JUDGE {n}' for n in range(6)])  # the first three are the full gate's first three
+        self.assertEqual(report['rounds'][0]['council_stages'],
+                         [{'judges': 3, 'action': 'escalate'}, {'judges': 6, 'action': 'recommend'}])
+        self.assertEqual((report['council_judges'], report['usage']['calls']), (6, 7))
+
+    def test_first_judges_equal_to_samples_always_runs_the_full_gate(self):
+        report, seen = self.judged([True] * 6, first_judges=6)
+        self.assertEqual((len(seen), report['council_judges']), (6, 6))
+        self.assertEqual(report['rounds'][0]['council_stages'], [{'judges': 6, 'action': 'recommend'}])
+
+    def test_first_judges_must_lie_between_two_and_samples(self):
+        for bad in (1, 7, 2.5, True):
+            with self.subTest(bad=bad):
+                path = self.root / 'task.json'
+                path.write_text(json.dumps({**self.spec, 'samples': 6, 'first_judges': bad}))
+                with self.assertRaises(ValueError):
+                    workflow.load_spec(path)
+
+    def test_a_council_whose_staged_requests_differ_is_refused(self):
+        (self.root / 'shifty.py').write_text(self.STRICT_BRIDGE.replace("'JUDGE ' + str(n)", "'JUDGE ' + str(n) + str(r['samples'])"))
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**self.spec, 'council': [sys.executable, str(self.root / 'shifty.py')],
+                                    'max_rounds': 1, 'samples': 6}))
+        report = workflow.run(path, self.root / 'run', call_fn=lambda _b, system, *a: (json.dumps(
+            self.proposal('def f(x): return 2*x\n') if system.startswith('Implement the task') else {'accept': True}), {}))
+        self.assertEqual(report['status'], 'error')
+        self.assertIn('same first judge requests', report['error'])
+        self.assertEqual(report['usage']['calls'], 1)  # refused before any judge call
 
     def test_all_failed_candidates_use_only_the_declared_writer_rounds(self):
         report, seen = self.execute([self.proposal('def f(x): return '+expr+'\n')
@@ -449,6 +510,22 @@ print(json.dumps({key:max(levels,key=levels.get) if levels else qid.startswith('
         self.assertEqual(report['status'], 'ready_for_review', report)
         self.assertEqual(report['usage']['calls'], 3)
         self.assertEqual(report['rounds'][0]['decision']['action'], 'recommend')
+
+    def test_real_bridge_gives_the_same_first_judge_requests_at_three_and_six_samples(self):
+        if not os.environ.get('RINGO_COUNCIL_ROOT'):
+            self.skipTest('set RINGO_COUNCIL_ROOT for real bridge smoke')
+        council_root = Path(os.environ['RINGO_COUNCIL_ROOT']).resolve()
+        rubric = str(council_root / 'rubrics/code_change.json')
+        proposal = json.dumps({'files': {'value.py': 'def f(x): return 2*x'}, 'rationale': 'r'})
+        prepared = {}
+        for samples in (3, 6):
+            out = workflow.bridge({'council': [sys.executable, str(council_root / 'bridge.py')]},
+                                  {'operation': 'prepare', 'brief': self.spec['brief'], 'proposal': proposal,
+                                   'rubric': rubric, 'samples': samples}, 60)
+            prepared[samples] = out
+        self.assertEqual(prepared[3]['requests'], prepared[6]['requests'][:3])
+        self.assertEqual(prepared[3]['policy_sha256'], prepared[6]['policy_sha256'])
+        self.assertNotEqual(prepared[3]['fingerprint'], prepared[6]['fingerprint'])
 
 
 if __name__ == '__main__':

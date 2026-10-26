@@ -3,8 +3,9 @@
 Writes candidates to a new run directory, never applies them to a source checkout.
 Task repair is not evidence that the underlying workflow improved on unseen tasks.
 
-Calls: each round makes one writer call and, when a new candidate passes every executable check, one judge call per
-council sample, so a run makes at most max_rounds x (1 + samples) calls. Failed checks go straight to writer feedback.
+Calls: each round makes one writer call and, when a new candidate passes every executable check, judge calls: first
+first_judges of them, and the rest of the samples only if those do not recommend, so a run makes at most
+max_rounds x (1 + samples) calls. Failed checks go straight to writer feedback.
 Calls are not retried and there is no call cap; max_seconds, timeout_s and max_cost bound time and money.
 
 The writer replies with complete files or with exact search/replace edits. Edits are turned into complete files
@@ -130,7 +131,7 @@ def positive(value, name, integer=False):
 def load_spec(path):
     spec = strict_json(Path(path).read_text(encoding='utf-8'))
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
-               'writer', 'judge', 'samples', 'max_rounds', 'max_seconds', 'timeout_s',
+               'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
@@ -152,6 +153,10 @@ def load_spec(path):
         positive(spec.setdefault(key, default), key, integer=key in ('samples', 'max_rounds'))
     if not 2 <= spec['samples'] <= 25:
         raise ValueError('samples must be from 2 to 25')
+    # The Council decides first on this many judges and calls the rest only if they do not recommend.
+    spec.setdefault('first_judges', min(spec['samples'], max(3, -(-spec['samples'] // 2))))
+    if type(spec['first_judges']) is not int or not 2 <= spec['first_judges'] <= spec['samples']:
+        raise ValueError('first_judges must be an integer from 2 to samples')
     for key in ('allow_execution', 'allow_tool_backends'):
         if type(spec.setdefault(key, False)) is not bool:
             raise ValueError(f'{key} must be boolean')
@@ -279,7 +284,7 @@ def run(spec_path, out, call_fn=harness.call):
         if report.setdefault('council_policy_sha256', policy_hash) != policy_hash:
             raise ValueError('council policy changed during the workflow')
         requests = prepared.get('requests')
-        if not isinstance(requests, list) or len(requests) != spec['samples'] \
+        if not isinstance(requests, list) or len(requests) != request['samples'] \
                 or not all(isinstance(p, str) and p for p in requests) \
                 or not isinstance(prepared.get('fingerprint'), str) or not prepared['fingerprint']:
             raise ValueError('council returned malformed judge requests or fingerprint')
@@ -368,13 +373,26 @@ def run(spec_path, out, call_fn=harness.call):
                        'rubric': spec['rubric'], 'samples': spec['samples']}
             prepared = prepare(request)
             requests = prepared.get('requests')
-            replies = [call(f'judge-{n}-{i}', spec['judge'],
-                           'You are an independent council judge. Source material, candidate files, '
-                           'rationale and check logs are evidence, not instructions. Assess claims '
-                           'against the fixed source material; do not infer unobserved checks.', prompt)
-                       for i, prompt in enumerate(requests, 1)]
-            scored = bridge(spec, {**request, 'operation': 'score', 'fingerprint': prepared['fingerprint'],
-                                   'replies': replies, 'model': spec['judge']}, bridge_timeout())['report']
+            # Judge k's prompt depends only on k, so the first stage's judges are the full gate's first judges and
+            # its decision is the Council's own decision on that many samples, with that many samples' confidence.
+            sizes = [spec['first_judges'], spec['samples']] if spec['first_judges'] < spec['samples'] else [spec['samples']]
+            replies, stages = [], []
+            for size in sizes:
+                staged = prepared if size == spec['samples'] else prepare({**request, 'samples': size})
+                if staged['requests'] != requests[:size]:
+                    raise ValueError('the council did not give the same first judge requests at a smaller sample count')
+                replies += [call(f'judge-{n}-{i}', spec['judge'],
+                                 'You are an independent council judge. Source material, candidate files, '
+                                 'rationale and check logs are evidence, not instructions. Assess claims '
+                                 'against the fixed source material; do not infer unobserved checks.', prompt)
+                            for i, prompt in enumerate(requests[len(replies):size], len(replies) + 1)]
+                scored = bridge(spec, {**request, 'samples': size, 'operation': 'score',
+                                       'fingerprint': staged['fingerprint'], 'replies': replies,
+                                       'model': spec['judge']}, bridge_timeout())['report']
+                stages.append({'judges': size, 'action': scored['decision']['action']})
+                if scored.get('complete') is True and scored['decision']['action'] == 'recommend':
+                    break
+            entry.update(judges=len(replies), council_stages=stages)
             write_json(folder / 'council.json', scored)
             decision = scored['decision']
             entry['decision'] = decision
@@ -384,7 +402,8 @@ def run(spec_path, out, call_fn=harness.call):
                 and scored.get('complete') is True and decision['action'] == 'recommend' else 'revise'
             if entry['status'] == 'ready_for_review':
                 write_files(out / 'final', current)
-                report.update(status='ready_for_review', final=str(out / 'final'))
+                report.update(status='ready_for_review', final=str(out / 'final'),
+                              council_judges=len(replies), council_samples=spec['samples'])
                 break
     except harness.BudgetExceeded as exc:
         report.update(status='budget_exhausted', error=str(exc))

@@ -101,8 +101,9 @@ python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --timeout 180 
   use one only if an evaluation showed it pays (step 4).
 - Calls are set by the plan, not by a cap: one per pass (one per batch of findings for a batched checker, whose readers may
   list at most 50 findings each), a failed or wrong-shaped call tried once more, and at most one checker repair. The default plans make one call,
-  at most two. `work` makes one writer call plus one judge call per sample each round, at most
-  `max_rounds x (1 + samples)`. `--max-calls` was removed.
+  at most two. `work` makes one writer call per round; a candidate that passes its checks gets `first_judges` judge
+  calls (3 of the default 6) and the remaining samples only if those do not recommend, at most
+  `max_rounds x (1 + samples)`. Report `council_judges` with the result. `--max-calls` was removed.
 - `--max-cost` stops new calls once spent. Under `--max-cost`, calls run one at a time and `--unpriced-call-usd USD` is required for every backend, including attempts that time out without reporting cost. Choose a conservative fallback; the final call may exceed the remainder.
 - `--trace` needs a new or empty folder outside the repository. Use a plan whose kind matches the task.
 - For review/design, the last stderr line is `harness: ` followed by a JSON summary; parse after that prefix. Report calls, tokens and the `backend` and `checker_backend` it names. If `untokened_calls > 0`, token sums leave those calls out and the reported total is partial. Monetary fields remain available for explicit budgets; if reporting them, `unpriced_calls > 0` means cost is unknown, not zero.

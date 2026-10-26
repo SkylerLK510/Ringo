@@ -116,7 +116,8 @@ folder off `sys.path`.
 | `rubric` | required | Rubric file, absolute or relative to the spec's folder. See "Choosing a rubric" below. |
 | `writer`, `judge` | required | Backends: `claude`, `codex`, `codex-chatgpt`, `ollama:MODEL`, `claude:<command>`, `codex:<command>` or any command that reads stdin. |
 | `allow_tool_backends` | `false` | Must be `true` for any backend except `claude`, `codex-chatgpt` and `ollama:MODEL`, since the others may read local files. |
-| `samples` | 6 | Judge calls per assessed round, 2 to 25. 6 is the council's default; 2 is a smoke-test value only (see below). |
+| `samples` | 6 | The most judge calls per assessed round, 2 to 25. 6 is the council's default; 2 is a smoke-test value only (see below). |
+| `first_judges` | half of `samples`, at least 3 | Judges the Council decides on first; the remaining samples are called only if those do not give a complete `recommend`. Set it to `samples` to always run every sample. |
 | `max_rounds` | 3 | Writer rounds, including malformed ones and check failures. Allow at least 2 for a correction after the first answer. With `samples` it bounds the calls (see below). |
 | `max_seconds` | 600 | Wall-clock bound for the whole run. |
 | `timeout_s` | 120 | Bound for each model call, capped by the time left. |
@@ -124,11 +125,20 @@ folder off `sys.path`.
 
 **Calls.** There is no call cap: the task's rounds and samples decide the calls.
 Each round makes one writer call; a new candidate that passes every executable
-check then gets one judge call per Council sample. Failed or timed-out checks
+check then gets `first_judges` judge calls. If the Council's decision on those is
+a complete `recommend`, the round stops there; otherwise the remaining samples are
+called and the Council decides on all of them. Judge k's prompt depends only on k,
+so the first stage's judges are the full gate's first judges, and Ringo refuses a
+council that gives different first requests at the smaller sample count. A
+first-stage decision is the Council's own decision on that many samples: its
+probabilities and confidence come from those samples, not from `samples`. Each
+assessed round records `judges` and `council_stages`, and a ready report records
+`council_judges` and `council_samples`. Failed or timed-out checks
 and malformed replies skip judges for that round; a repeated candidate ends the run. Calls are not
 retried. So a run makes at most `max_rounds x (1 + samples)` calls: the example
 above makes at most 2 x (1 + 6) = 14. If the first candidate fails checks and the
-second passes, it uses 2 writer + 6 judge calls = 8. If both fail checks, it uses
+second passes and the first three judges recommend, it uses 2 writer + 3 judge
+calls = 5; if they do not, 2 + 6 = 8. If both fail checks, it uses
 only 2 writer calls and remains `needs_revision`. No correction or judge calls
 are added beyond the declared round/time bounds. A spec that still sets the removed
 `max_calls` field is refused ("max_calls was removed: calls are set by max_rounds
