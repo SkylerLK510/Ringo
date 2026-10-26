@@ -23,6 +23,17 @@ attempts lack usage. Do not estimate missing usage from text length or treat it
 as zero consumption. Tokens from different model tokenizers are model-specific;
 record the backend/model when comparing efficiency.
 
+## Codex call overhead
+
+A native Codex call carries more than Ringo's prompt. In codex-cli 0.164 the
+stock request added the Codex agent prompt, code-mode and multi-agent tool
+schemas, skills, permission and environment blocks to every call, about 52 KB per
+request and roughly ten thousand input tokens, before Ringo's own text. A work
+round with one writer and six judges paid it seven times. The `codex-chatgpt`
+preset now removes it (see `docs/HARNESS.md`, **Codex children**); the measured
+effect is in the [improvement log](IMPROVEMENT-LOG.md). The remaining cost of a
+Council round is Ringo's own evidence, sent whole to each judge.
+
 ## Optimization objective
 
 The current user objective is for Ringo plus its agent to consume fewer total

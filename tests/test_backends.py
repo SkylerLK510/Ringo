@@ -169,5 +169,61 @@ class CodexHomeTest(unittest.TestCase):
         self.assertIn('could not be saved', ''.join(c.args[0] for c in err.write.call_args_list))
 
 
+# A stand-in Codex CLI: `debug models` prints a two-model catalog (or fails with FAKE_CATALOG=fail);
+# any other command prints the argv it received and the instructions file it was pointed at.
+FAKE_CODEX = r"""
+import json, os, sys
+if sys.argv[1:3] == ['debug', 'models']:
+    if os.environ.get('FAKE_CATALOG') == 'fail':
+        sys.exit(2)
+    print(json.dumps({'models': [{'slug': 'a', 'tool_mode': 'code_mode_only', 'multi_agent_version': 'v2',
+        'multi_agent_reasoning_effort': 'xhigh', 'apply_patch_tool_type': 'freeform',
+        'experimental_supported_tools': ['clock'], 'context_window': 9}, {'slug': 'b'}]}))
+    sys.exit(0)
+args = sys.argv[1:]
+files = {}
+for k, a in enumerate(args):
+    if a == '-c' and '=' in args[k + 1]:
+        key, value = args[k + 1].split('=', 1)
+        if key in ('model_instructions_file', 'model_catalog_json'):
+            files[key] = open(json.loads(value), encoding='utf-8').read()
+print(json.dumps({'argv': args, 'files': files, 'stdin': sys.stdin.read()}))
+"""
+
+
+class LeanCodexTest(unittest.TestCase):
+    def run_fake(self, **env):
+        with tempfile.TemporaryDirectory() as d:
+            script = Path(d, 'codex.py')
+            script.write_text(FAKE_CODEX, encoding='utf-8')
+            launcher = Path(d, 'codex')
+            launcher.write_text(f'#!/bin/sh\nexec {sys.executable} {script} "$@"\n', encoding='utf-8')
+            launcher.chmod(0o755)
+            with mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'owner')), **env}):
+                out = backends.run_isolated([str(launcher), 'exec', '--json', '-'], 'PROMPT', 10,
+                                            codex_home=True, lean=True)
+        return json.loads(out)
+
+    def test_lean_call_replaces_the_agent_prompt_and_strips_catalog_tool_modes(self):
+        seen = self.run_fake()
+        argv = seen['argv']
+        self.assertEqual((argv[:2], argv[-1], seen['stdin']), (['exec', '--json'], '-', 'PROMPT'))  # stdin stays last
+        self.assertEqual(seen['files']['model_instructions_file'], backends.CODEX_INSTRUCTIONS)
+        catalog = json.loads(seen['files']['model_catalog_json'])
+        self.assertEqual(catalog, {'models': [{'slug': 'a', 'experimental_supported_tools': [], 'context_window': 9},
+                                              {'slug': 'b', 'experimental_supported_tools': []}]})
+
+    def test_cli_without_a_catalog_keeps_only_the_instructions_override(self):
+        seen = self.run_fake(FAKE_CATALOG='fail')
+        self.assertEqual(set(seen['files']), {'model_instructions_file'})
+        self.assertNotIn('model_catalog_json', ' '.join(seen['argv']))
+
+    def test_only_the_chatgpt_preset_is_lean(self):
+        import harness
+        self.assertTrue(harness.backend('codex-chatgpt')['lean'])
+        self.assertFalse(harness.backend('codex').get('lean'))  # keeps its shell and Codex's agent prompt
+        self.assertFalse(harness.backend('codex:codex exec --json -').get('lean'))
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -26,10 +26,20 @@ JUDGE_PRESETS = {
     'codex-chatgpt': ('codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins '
                      '--disable hooks --disable shell_tool --disable unified_exec --disable skill_search '
                      '--enable skip_host_skill_discovery --disable unbounded_connection_retries '
+                     # Ringo's calls are single tool-free turns: drop the agent scaffolding Codex adds to each one
+                     '--disable sleep_tool --disable goals --disable view_image --disable image_generation '
+                     '--disable default_mode_request_user_input -c include_environment_context=false '
+                     '-c include_permissions_instructions=false -c skills.include_instructions=false '
+                     '-c include_collaboration_mode_instructions=false '
                      '''-c 'project_doc_max_bytes=0' -c 'forced_login_method="chatgpt"' '''
                      '''-c 'model_provider="openai"' -c 'web_search="disabled"' '''
                      '--skip-git-repo-check --ephemeral -s read-only --color never --json -'),
 }
+# Replaces Codex's agent prompt (about 22 KB) for lean calls; Ringo's own instructions travel in the message.
+CODEX_INSTRUCTIONS = 'Follow the instructions in the user message exactly.\n'
+# Catalog fields that attach the code-mode `exec` tool, the multi-agent tools and their instructions to every
+# request; no config flag removes them in codex-cli 0.164.
+CATALOG_TOOL_FIELDS = ('tool_mode', 'multi_agent_version', 'multi_agent_reasoning_effort', 'apply_patch_tool_type')
 
 
 class JudgeError(Exception):
@@ -105,6 +115,31 @@ def _codex_home(root, env):
     return owner, snapshot, copy
 
 
+def _lean_codex(argv, private, env):
+    """argv with Codex's agent prompt replaced by CODEX_INSTRUCTIONS and, when the installed CLI can print its
+    model catalog, a copy without the tool modes, inserted before the trailing stdin marker. Both files live
+    in the call's private CODEX_HOME. A CLI without `debug models`, or a catalog in another format, keeps only
+    the instructions override."""
+    instructions = private / 'ringo-instructions.md'
+    instructions.write_text(CODEX_INSTRUCTIONS, encoding='utf-8')
+    extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
+    try:
+        listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=15, check=True).stdout
+        catalog = json.loads(listed)
+        for model in catalog['models']:
+            for field in CATALOG_TOOL_FIELDS:
+                model.pop(field, None)
+            model['experimental_supported_tools'] = []
+        path = private / 'ringo-catalog.json'
+        path.write_text(json.dumps(catalog), encoding='utf-8')
+        extra += ['-c', f'model_catalog_json={json.dumps(str(path))}']
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    at = len(argv) - 1 if argv[-1:] == ['-'] else len(argv)
+    return [*argv[:at], *extra, *argv[at:]]
+
+
 @contextlib.contextmanager
 def _owner_lock(owner):
     """Serializes write-backs between Ringo processes. The owner's own Codex does not take it, so a login it
@@ -158,14 +193,15 @@ def _sync_codex_auth(owner, snapshot, copy):
               'run `codex login` if later calls are refused', file=sys.stderr)
 
 
-def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False):
+def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False):
     """stdout of one run. The working folder is empty, so no project instructions or files
     load from it; it is not a file-system boundary. The command gets the caller's
     environment without the TypeSafe key, in a session of its own, so a timeout kills it and
     everything it started, not only the direct child. codex_home: the command is a Codex CLI, so it
     gets a private CODEX_HOME and HOME (see _codex_home); a refreshed login is written back even
-    when the call fails or times out. A failure (JudgeError) or timeout (TimeoutExpired) carries the stdout
-    written so far as .stdout."""
+    when the call fails or times out. lean (with codex_home): the call is a single tool-free Codex turn, so
+    Codex's agent prompt and tool modes are replaced (see _lean_codex). A failure (JudgeError) or timeout
+    (TimeoutExpired) carries the stdout written so far as .stdout."""
     # ceiling: stdout is read whole; a command that floods it fills disk and memory
     env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
     if subscription_auth:
@@ -179,6 +215,8 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
         cwd = Path(tmp) / 'work'
         cwd.mkdir()
         login = _codex_home(Path(tmp), env) if codex_home else None
+        if codex_home and lean:
+            argv = _lean_codex(argv, Path(tmp) / 'codex', env)
         timed_out = None
         try:
             proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=env,

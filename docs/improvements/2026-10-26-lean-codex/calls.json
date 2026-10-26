@@ -1,0 +1,506 @@
+{
+ "version": 1,
+ "redaction": "Agent message texts are replaced by their byte length and temporary folder paths in CLI warnings are removed; raw_events_sha256 identifies each unredacted stream in the private archive.",
+ "calls": [
+  {
+   "id": "pilot-writer",
+   "step": "writer",
+   "arm": "before",
+   "source": "frontier pilot, previous preset",
+   "measured_at": "2026-10-26T19:15:18Z",
+   "argv": [
+    "codex",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "hooks",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "skill_search",
+    "--enable",
+    "skip_host_skill_discovery",
+    "--disable",
+    "unbounded_connection_retries",
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "forced_login_method=\"chatgpt\"",
+    "-c",
+    "model_provider=\"openai\"",
+    "-c",
+    "web_search=\"disabled\"",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "-s",
+    "read-only",
+    "--color",
+    "never",
+    "--json",
+    "--model",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "-"
+   ],
+   "lean_overrides": false,
+   "stdin_sha256": "1f5196b72412a4b11fe80d52f85ec2037adeaac3a7c76f3b680d0a5440be1297",
+   "stdin_bytes": 8699,
+   "raw_events_sha256": "a5294b68c89a951cdf7eed60a885e244b16f2b99ee7a77e722d6f58bbadaacc4",
+   "events": [
+    {
+     "type": "thread.started",
+     "thread_id": "01a179a3-75ef-7233-a881-93739e4378df"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_0",
+      "type": "error",
+      "message": "Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in <private temporary folder>"
+     }
+    },
+    {
+     "type": "turn.started"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_1",
+      "type": "agent_message",
+      "text": "[redacted agent message, 116 bytes]"
+     }
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_2",
+      "type": "agent_message",
+      "text": "[redacted agent message, 2379 bytes]"
+     }
+    },
+    {
+     "type": "turn.completed",
+     "usage": {
+      "input_tokens": 12617,
+      "cached_input_tokens": 0,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 1002,
+      "reasoning_output_tokens": 194
+     }
+    }
+   ]
+  },
+  {
+   "id": "pilot-judge",
+   "step": "judge",
+   "arm": "before",
+   "source": "frontier pilot, previous preset",
+   "measured_at": "2026-10-26T19:15:36Z",
+   "argv": [
+    "codex",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "hooks",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "skill_search",
+    "--enable",
+    "skip_host_skill_discovery",
+    "--disable",
+    "unbounded_connection_retries",
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "forced_login_method=\"chatgpt\"",
+    "-c",
+    "model_provider=\"openai\"",
+    "-c",
+    "web_search=\"disabled\"",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "-s",
+    "read-only",
+    "--color",
+    "never",
+    "--json",
+    "--model",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "-"
+   ],
+   "lean_overrides": false,
+   "stdin_sha256": "733138b15bc1ec148685dfbed5b6094c45a0eb2741d352f6e6b053139535f3cd",
+   "stdin_bytes": 20345,
+   "raw_events_sha256": "11c135baf724673692d947833f53907ffce33fa567cef06031328dcbba0f366a",
+   "events": [
+    {
+     "type": "thread.started",
+     "thread_id": "01a179a3-bf0f-71b1-a6f3-5b60977f8a29"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_0",
+      "type": "error",
+      "message": "Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in <private temporary folder>"
+     }
+    },
+    {
+     "type": "turn.started"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_1",
+      "type": "agent_message",
+      "text": "[redacted agent message, 99 bytes]"
+     }
+    },
+    {
+     "type": "turn.completed",
+     "usage": {
+      "input_tokens": 16104,
+      "cached_input_tokens": 3840,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 1262,
+      "reasoning_output_tokens": 1205
+     }
+    }
+   ]
+  },
+  {
+   "id": "repeat-judge",
+   "step": "judge",
+   "arm": "before",
+   "source": "repeat of the pilot judge call, previous preset",
+   "measured_at": "2026-10-26T20:06:23Z",
+   "argv": [
+    "codex",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "hooks",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "skill_search",
+    "--enable",
+    "skip_host_skill_discovery",
+    "--disable",
+    "unbounded_connection_retries",
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "forced_login_method=\"chatgpt\"",
+    "-c",
+    "model_provider=\"openai\"",
+    "-c",
+    "web_search=\"disabled\"",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "-s",
+    "read-only",
+    "--color",
+    "never",
+    "--json",
+    "--model",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "-"
+   ],
+   "lean_overrides": false,
+   "stdin_sha256": "733138b15bc1ec148685dfbed5b6094c45a0eb2741d352f6e6b053139535f3cd",
+   "stdin_bytes": 20345,
+   "raw_events_sha256": "4f37ec453e702fe9ea87e42b9ec61849696cbd009bf7bcc67c79c0b6e4bc9559",
+   "events": [
+    {
+     "type": "thread.started",
+     "thread_id": "01a179d2-3bab-7a70-b19d-433ffc24d692"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_0",
+      "type": "error",
+      "message": "Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in <private temporary folder>"
+     }
+    },
+    {
+     "type": "turn.started"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_1",
+      "type": "agent_message",
+      "text": "[redacted agent message, 100 bytes]"
+     }
+    },
+    {
+     "type": "turn.completed",
+     "usage": {
+      "input_tokens": 16104,
+      "cached_input_tokens": 3840,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 994,
+      "reasoning_output_tokens": 937
+     }
+    }
+   ]
+  },
+  {
+   "id": "lean-writer",
+   "step": "writer",
+   "arm": "after",
+   "source": "lean preset through harness.call",
+   "measured_at": "2026-10-26T20:17:11Z",
+   "argv": [
+    "codex",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "hooks",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "skill_search",
+    "--enable",
+    "skip_host_skill_discovery",
+    "--disable",
+    "unbounded_connection_retries",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "goals",
+    "--disable",
+    "view_image",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "default_mode_request_user_input",
+    "-c",
+    "include_environment_context=false",
+    "-c",
+    "include_permissions_instructions=false",
+    "-c",
+    "skills.include_instructions=false",
+    "-c",
+    "include_collaboration_mode_instructions=false",
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "forced_login_method=\"chatgpt\"",
+    "-c",
+    "model_provider=\"openai\"",
+    "-c",
+    "web_search=\"disabled\"",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "-s",
+    "read-only",
+    "--color",
+    "never",
+    "--json",
+    "--model",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "-"
+   ],
+   "lean_overrides": true,
+   "stdin_sha256": "1f5196b72412a4b11fe80d52f85ec2037adeaac3a7c76f3b680d0a5440be1297",
+   "stdin_bytes": 8699,
+   "raw_events_sha256": "21bf105dbb6290ab3a3a76efa1c5613ab5c08672cc193950d43e6e8a53266b74",
+   "events": [
+    {
+     "type": "thread.started",
+     "thread_id": "01a179dc-223d-71c0-974b-ea1b329b02e8"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_0",
+      "type": "error",
+      "message": "Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in <private temporary folder>"
+     }
+    },
+    {
+     "type": "turn.started"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_1",
+      "type": "agent_message",
+      "text": "[redacted agent message, 2260 bytes]"
+     }
+    },
+    {
+     "type": "turn.completed",
+     "usage": {
+      "input_tokens": 2479,
+      "cached_input_tokens": 0,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 978,
+      "reasoning_output_tokens": 229
+     }
+    }
+   ]
+  },
+  {
+   "id": "lean-judge",
+   "step": "judge",
+   "arm": "after",
+   "source": "lean preset through harness.call",
+   "measured_at": "2026-10-26T20:16:33Z",
+   "argv": [
+    "codex",
+    "exec",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--disable",
+    "apps",
+    "--disable",
+    "plugins",
+    "--disable",
+    "hooks",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "unified_exec",
+    "--disable",
+    "skill_search",
+    "--enable",
+    "skip_host_skill_discovery",
+    "--disable",
+    "unbounded_connection_retries",
+    "--disable",
+    "sleep_tool",
+    "--disable",
+    "goals",
+    "--disable",
+    "view_image",
+    "--disable",
+    "image_generation",
+    "--disable",
+    "default_mode_request_user_input",
+    "-c",
+    "include_environment_context=false",
+    "-c",
+    "include_permissions_instructions=false",
+    "-c",
+    "skills.include_instructions=false",
+    "-c",
+    "include_collaboration_mode_instructions=false",
+    "-c",
+    "project_doc_max_bytes=0",
+    "-c",
+    "forced_login_method=\"chatgpt\"",
+    "-c",
+    "model_provider=\"openai\"",
+    "-c",
+    "web_search=\"disabled\"",
+    "--skip-git-repo-check",
+    "--ephemeral",
+    "-s",
+    "read-only",
+    "--color",
+    "never",
+    "--json",
+    "--model",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"high\"",
+    "-"
+   ],
+   "lean_overrides": true,
+   "stdin_sha256": "733138b15bc1ec148685dfbed5b6094c45a0eb2741d352f6e6b053139535f3cd",
+   "stdin_bytes": 20345,
+   "raw_events_sha256": "ef77ac38fb25d3f5d212864bd79a9e80119e1a3727fd5f75ae22d2803c097a36",
+   "events": [
+    {
+     "type": "thread.started",
+     "thread_id": "01a179db-8ca7-7af1-a8aa-77ef6811736d"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_0",
+      "type": "error",
+      "message": "Under-development features enabled: skip_host_skill_discovery. Under-development features are incomplete and may behave unpredictably. To suppress this warning, set `suppress_unstable_features_warning = true` in <private temporary folder>"
+     }
+    },
+    {
+     "type": "turn.started"
+    },
+    {
+     "type": "item.completed",
+     "item": {
+      "id": "item_1",
+      "type": "agent_message",
+      "text": "[redacted agent message, 100 bytes]"
+     }
+    },
+    {
+     "type": "turn.completed",
+     "usage": {
+      "input_tokens": 5969,
+      "cached_input_tokens": 0,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 1031,
+      "reasoning_output_tokens": 974
+     }
+    }
+   ]
+  }
+ ],
+ "pairs": [
+  [
+   "pilot-writer",
+   "lean-writer"
+  ],
+  [
+   "pilot-judge",
+   "lean-judge"
+  ]
+ ],
+ "repeats": [
+  [
+   "pilot-judge",
+   "repeat-judge"
+  ]
+ ]
+}

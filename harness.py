@@ -100,7 +100,8 @@ def backend(spec):
     """{'name', 'argv', 'style'} for a backend spec. The style says how a call is made, declared by the spec and
     never guessed from the executable's name: 'claude' (system-prompt file, JSON reply with usage), 'codex'
     (Codex `exec --json` events, private CODEX_HOME and HOME) or 'plain'. A codex backend also declares
-    'subscription_auth' (strip API keys and endpoint overrides) and 'tools', the tool item types its turns may
+    'subscription_auth' (strip API keys and endpoint overrides), 'lean' (the codex-chatgpt preset: Codex's agent
+    prompt and tool modes are removed, see backends._lean_codex) and 'tools', the tool item types its turns may
     contain: the `codex` preset keeps its shell, a `codex:` command may search the web only when its own argv
     passes --search, and every other tool item fails the turn."""
     extra = {}
@@ -110,7 +111,7 @@ def backend(spec):
         argv, style = shlex.split(spec[7:]), 'claude'
     elif spec in ('codex', 'codex-chatgpt'):
         argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'codex'
-        extra = {'subscription_auth': spec == 'codex-chatgpt',
+        extra = {'subscription_auth': spec == 'codex-chatgpt', 'lean': spec == 'codex-chatgpt',
                  'tools': ['command_execution'] if spec == 'codex' else []}
     elif spec.startswith('codex:'):
         argv, style = shlex.split(spec[6:]), 'codex'
@@ -245,7 +246,8 @@ def call(backend, system, message, timeout_s, model=None):
         tools = backend.get('tools', ())
         try:
             output = backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, codex_home=True,
-                                           subscription_auth=backend.get('subscription_auth', True))
+                                           subscription_auth=backend.get('subscription_auth', True),
+                                           lean=backend.get('lean', False))
         except (backends.JudgeError, subprocess.TimeoutExpired) as exc:
             stdout = getattr(exc, 'stdout', '') or ''
             try:

@@ -69,7 +69,10 @@ login the child refreshes is written back to your `auth.json` only if that file
 did not change during the call. Ringo parses the CLI's JSON events and records
 reported tokens; a turn that uses a tool its backend does not declare is rejected.
 `codex-chatgpt` also forces native ChatGPT authentication, strips API-key and
-endpoint overrides and disables the shell. The `codex` preset keeps its shell and
+endpoint overrides and disables the shell. Its calls are single tool-free turns, so
+it also replaces the Codex agent prompt with one line and drops the code-mode,
+multi-agent, skills and environment blocks Codex adds to every request (see the
+[improvement log](docs/IMPROVEMENT-LOG.md)). The `codex` preset keeps its shell and
 the caller's configured authentication. `codex:<command>` runs your own Codex
 command line, which must pass `--json`; it may use web search only if that command
 line passes `--search`. Codex dollar cost remains unknown.
@@ -91,6 +94,11 @@ Dollar estimates are omitted; protected evaluation gates remain unchanged.
 ## Evaluation and improvement
 
 See [the harness guide](docs/HARNESS.md) and [the agent skill](skills/ringo-harness/SKILL.md).
+
+The [improvement log](docs/IMPROVEMENT-LOG.md) records each measured improvement,
+when it was measured and the change that made it. Every number in it is recomputed
+by `improvement_log.py` from raw evidence committed under `docs/improvements/`, and
+an entry whose evidence does not show the improvement is refused by the tests.
 
 [Approved releases and latency checks](docs/RELEASES.md) describes local versioned
 bundles, explicit activation/rollback, pinned runs and a separate offline latency
