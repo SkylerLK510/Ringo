@@ -207,7 +207,10 @@ def _wait(proc, timeout_s, watch, snapshot, started, threads):
     watch.soft(elapsed, snapshot) runs once in a thread (appended to threads, for the caller to join), and the
     command is stopped when watch.stop is set or at watch.limit_s."""
     limit = watch.limit_s if watch else timeout_s
-    fired = False
+    fired, exited = False, threading.Event()
+    # A blocking wait in a thread wakes the moment the command exits; Popen.wait(timeout) would poll with sleeps
+    # of up to 50 ms and add that to every call.
+    threading.Thread(target=lambda: (proc.wait(), exited.set()), daemon=True).start()
     while True:
         elapsed = time.monotonic() - started
         if elapsed >= limit:
@@ -218,11 +221,8 @@ def _wait(proc, timeout_s, watch, snapshot, started, threads):
             fired = True
             threads.append(threading.Thread(target=watch.soft, args=(elapsed, snapshot), daemon=True))
             threads[-1].start()
-        try:
-            proc.wait(limit - elapsed if watch is None else min(0.25, limit - elapsed))
+        if exited.wait(limit - elapsed if watch is None else min(0.25, limit - elapsed)):
             return None
-        except subprocess.TimeoutExpired:
-            pass
 
 
 def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False, watch=None):
