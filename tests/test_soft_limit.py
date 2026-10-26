@@ -136,6 +136,15 @@ class SoftLimitTest(unittest.TestCase):
             return args
         self.assertFalse(harness.accepts_watch(review_call))
         self.assertTrue(harness.accepts_watch(harness.call))
+        self.assertTrue(harness.accepts_watch(lambda b, s, m, t, watch=None: None))
+        self.assertFalse(harness.accepts_watch(lambda b, s, m, t: [b for watch in ()]))  # a local, not a parameter
+
+    def test_harness_import_does_not_load_inspect(self):
+        import subprocess
+        code = 'import sys, harness; print("inspect" in sys.modules)'
+        out = subprocess.run([sys.executable, '-c', code], cwd=Path(harness.__file__).parent,
+                             capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.stdout.strip(), 'False', out.stderr)
 
     def test_the_call_waits_for_its_probe_and_counts_it(self):
         trace = self.root / 't'

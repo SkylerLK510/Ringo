@@ -297,12 +297,10 @@ def limit_for(soft_s):
 
 
 def accepts_watch(fn):
-    """True when a call function takes watch=; stand-in call functions without it keep a hard timeout."""
-    import inspect
-    try:
-        return 'watch' in inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
+    """True when a call function takes watch=; stand-in call functions without it keep a hard timeout. Reads the
+    code object instead of importing inspect, which would add about 3 ms to every launch."""
+    code = getattr(fn, '__code__', None)
+    return code is not None and 'watch' in code.co_varnames[:code.co_argcount + code.co_kwonlyargcount]
 
 
 RECONNECT = re.compile(r'reconnect|disconnect|stream error|retrying', re.I)
