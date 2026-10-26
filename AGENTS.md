@@ -5,7 +5,8 @@ improvement. The separate Design Council owns scoring and decision gates.
 
 Use `skills/ringo-harness/SKILL.md` for substantive coding/design work. Run the
 actual harness for the final code review when inference is authorized; retain
-reports outside this checkout and report the command and call count. Calls made
+reports outside this checkout and report the command and call count. Wait on a background run with
+`python3 ringo.py wait DIR`, never by sleeping and polling from the model loop. Calls made
 inside the harness must not recursively launch another harness.
 
 Ringo has no call cap: a task makes the calls its plan needs (one per pass or

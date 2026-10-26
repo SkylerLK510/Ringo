@@ -42,6 +42,9 @@ council sample each round: at most `max_rounds x (1 + samples)`. There is no cal
 cap: the plan or the round count decides the calls, and `--max-cost` and timeouts
 bound money and time.
 
+A run with `--trace` (and every `work` run) keeps a small `state.json`; `python3 ringo.py wait DIR` blocks until
+it finishes and prints it, so an agent waits with one command instead of polling.
+
 `work` revises a declared set of text files: a writer model returns complete
 files or exact search/replace edits, which Ringo turns into complete files; fixed
 executable checks run on them, and a separate council assessment decides whether
