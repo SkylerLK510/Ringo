@@ -83,8 +83,10 @@ private material. Opening the CLI help or running tests makes no provider calls.
 
 Routine usage reports use [token counts](docs/TOKEN-USAGE.md): uncached input,
 cached input, cache writes, output and their reported total, with missing usage
-identified explicitly. Dollar estimates are omitted unless requested or needed
-for an explicit spending limit; existing budget and evaluation gates remain.
+identified explicitly. The optimization goal is fewer whole-task tokens than the
+same agent working alone at equal or better quality, including harness/Council
+overhead and retries. No monetary spending cap has been set for this work.
+Dollar estimates are omitted; protected evaluation gates remain unchanged.
 
 ## Evaluation and improvement
 

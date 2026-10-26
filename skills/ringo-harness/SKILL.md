@@ -56,8 +56,13 @@ Use tokens as the default efficiency measure: uncached input, cache-read input,
 cache-write input, output, and their reported total. Mark totals partial when any
 attempt lacks usage; unavailable tokens are unknown, not zero. Do not estimate
 or lead with dollar costs unless the user asks or an explicit monetary budget
-requires reporting them. Preserve explicit spending limits and protected
-evaluation gates. See `docs/TOKEN-USAGE.md` for the existing normalized fields.
+requires reporting them. The current user has set no monetary spending cap;
+the goal is lower whole-task token use than the same agent working alone, at
+the same or better quality. Count the outer agent, Ringo/Council calls, retries,
+failures and corrections; internal CLI counts alone are partial system coverage.
+Do not invent limits or claim savings without a matched comparison. Honor any
+explicit limits supplied later and preserve protected evaluation gates. See
+`docs/TOKEN-USAGE.md` for fields and the comparison objective.
 
 ## 1. Collect the material
 

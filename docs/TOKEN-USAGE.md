@@ -23,10 +23,31 @@ attempts lack usage. Do not estimate missing usage from text length or treat it
 as zero consumption. Tokens from different model tokenizers are model-specific;
 record the backend/model when comparing efficiency.
 
-Do not convert tokens into an inferred dollar price in ordinary reports.
-Explicit spending limits remain enforced, and protected evaluator/campaign cost
-gates are unchanged. This preference changes presentation and the default
-reported efficiency measure, not those gates or stored accounting records.
+## Optimization objective
+
+The current user objective is for Ringo plus its agent to consume fewer total
+tokens than the same agent working alone on matched tasks, through more efficient
+execution while preserving or improving result quality. No monetary spending cap
+has been set for this work. Do not invent a cap or convert tokens into dollar
+estimates. If the user later supplies explicit limits, honor them.
+
+Measure total tokens per successfully completed task, including the outer agent,
+all Ringo and Council calls, retries, failed attempts and corrections. Keep failed
+tasks in the evaluation denominator and report their tokens too. Ringo's internal
+CLI counters alone do not measure the whole system: if outer-agent usage is
+unavailable, report partial coverage and leave the full comparison unresolved.
+
+Use the same model/version, tasks, tool access and independently fixed quality
+criteria in the standalone and Ringo arms. Report task success, quality, elapsed
+time and the token breakdown together. Include setup overhead or explicitly
+declare how it is amortized. Reduced quality, omitted failures or work shifted
+outside the measured process cannot establish an efficiency gain. A saving is
+an empirical result to demonstrate, not a property already established here.
+
+Protected evaluator/campaign dollar-based gates and existing accounting records
+are unchanged by this reporting clarification. They are not an active monetary
+limit for ordinary reviews. A future token-based evaluation gate requires its
+own declared protocol; this objective does not start an unbounded campaign.
 
 Example: the preceding runtime publication's two native reviews reported
 269,849 uncached input + 17,920 cached input + 0 cache-write + 1,184 output =
