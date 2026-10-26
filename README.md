@@ -37,8 +37,10 @@ replies in the wrong shape is tried once more, so at most two. Custom plans are 
 files under `plans/`, with instructions under `prompts/`; a plan makes one call per
 pass (one per batch of findings for a batched checker, at most 50 findings per
 reader reply), each retried at most once,
-plus at most one checker repair. `work` makes one writer call and one judge call per
-council sample each round: at most `max_rounds x (1 + samples)`. There is no call
+plus at most one checker repair. `work` makes one writer call per round and one
+judge call per Council sample only after every executable check passes. Failed
+checks feed the next writer round directly. The bound remains
+`max_rounds x (1 + samples)`. There is no call
 cap: the plan or the round count decides the calls, and `--max-cost` and timeouts
 bound money and time.
 

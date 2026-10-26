@@ -53,11 +53,18 @@ Each round:
    `round-N/candidate/`, and each check command runs there in order. A check
    passes when it exits with 0. Afterwards every submitted file and fixture must
    be unchanged and not a symlink; otherwise the run stops with `error`.
+   If any check fails or times out, the round is `revise` with
+   `assessment_skipped: checks_failed`. Ringo sends the observed check results
+   straight to the next writer round without making Council model calls. Earlier
+   Council feedback, if any, is retained as `previous_council`, identified by the
+   hash of the candidate it assessed. An exhausted round limit leaves the task
+   `needs_revision`; failed checks never authorize a final artifact.
 4. **Assess.** Ringo asks the bridge to `prepare` judge prompts, makes one judge
    call per sample, and asks the bridge to `score` the replies. The judges see
    the source material, the candidate files, the rationale and the observed check
    results with log excerpts. They do not see the fixture source. The council
-   assesses every well-formed new candidate, including one whose checks failed.
+   assesses new candidates only after every executable check passes. Passing
+   checks alone does not authorize a final artifact: the full Council gate remains.
 5. **Decide.** A round is `ready_for_review` only when every check passed, the
    council report is complete and its decision is `recommend`. Ringo then copies
    the editable files, not the fixtures, to `final/` and stops. Otherwise the check
@@ -110,17 +117,20 @@ folder off `sys.path`.
 | `writer`, `judge` | required | Backends: `claude`, `codex`, `codex-chatgpt`, `ollama:MODEL`, `claude:<command>`, `codex:<command>` or any command that reads stdin. |
 | `allow_tool_backends` | `false` | Must be `true` for any backend except `claude`, `codex-chatgpt` and `ollama:MODEL`, since the others may read local files. |
 | `samples` | 6 | Judge calls per assessed round, 2 to 25. 6 is the council's default; 2 is a smoke-test value only (see below). |
-| `max_rounds` | 3 | Writer rounds, including malformed ones. With `samples` it sets the calls (see below). |
+| `max_rounds` | 3 | Writer rounds, including malformed ones and check failures. Allow at least 2 for a correction after the first answer. With `samples` it bounds the calls (see below). |
 | `max_seconds` | 600 | Wall-clock bound for the whole run. |
 | `timeout_s` | 120 | Bound for each model call, capped by the time left. |
 | `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and fallback price for calls reporting none. A dollar cap requires a declared fallback. |
 
 **Calls.** There is no call cap: the task's rounds and samples decide the calls.
-Each round makes one writer call; a well-formed, new candidate then gets one judge
-call per council sample, whatever its checks report. A malformed reply skips the
-judges for that round, and a repeated candidate ends the run. Calls are not
+Each round makes one writer call; a new candidate that passes every executable
+check then gets one judge call per Council sample. Failed or timed-out checks
+and malformed replies skip judges for that round; a repeated candidate ends the run. Calls are not
 retried. So a run makes at most `max_rounds x (1 + samples)` calls: the example
-above makes at most 2 x (1 + 6) = 14. A spec that still sets the removed
+above makes at most 2 x (1 + 6) = 14. If the first candidate fails checks and the
+second passes, it uses 2 writer + 6 judge calls = 8. If both fail checks, it uses
+only 2 writer calls and remains `needs_revision`. No correction or judge calls
+are added beyond the declared round/time bounds. A spec that still sets the removed
 `max_calls` field is refused ("max_calls was removed: calls are set by max_rounds
 and samples"). `max_seconds`, `timeout_s` and `max_cost` bound time and money.
 
@@ -178,6 +188,11 @@ exception, so no report is printed. Each round records `malformed`,
 `repeated_candidate`, `revise` or `ready_for_review`. A round stopped by a bound,
 an error or an interruption has no status; the top-level `status` and `error`
 say why.
+
+Rounds with failed checks record `assessment_skipped: checks_failed`, their
+candidate and full check logs, but no Council decision or `council.json` for
+that round. Feedback distinguishes these observed failures from any earlier
+Council assessment; a skipped assessment is never represented as a recommendation.
 
 The run folder holds `spec.json` (the loaded spec, with defaults filled in for
 the bounds, switches and check timeouts), `source.json`
