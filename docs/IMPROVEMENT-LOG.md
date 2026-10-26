@@ -16,6 +16,7 @@ repository.
 |---|---|---|---|
 | 2026-10-26 | Shorter launch for one-call plans | [#7](https://github.com/SkylerLK510/Ringo/pull/7) | mean −2.64 to −3.00 ms on 5 workloads |
 | 2026-10-26 | Lean Codex calls | [#8](https://github.com/SkylerLK510/Ringo/pull/8) | writer input 12,617 → 2,479 (−80.4%); judge input 16,104 → 5,969 (−62.9%) |
+| 2026-10-26 | Calls end when the backend exits | [#9](https://github.com/SkylerLK510/Ringo/pull/9) | mean −2.78 to −37.60 ms on 7 workloads |
 | 2026-10-25 | Faster release verification | [#2](https://github.com/SkylerLK510/Ringo/pull/2), [#4](https://github.com/SkylerLK510/Ringo/pull/4) | mean −0.46 to −2.42 ms on 2 workloads |
 
 ## 2026-10-26 · Shorter launch for one-call plans
@@ -47,6 +48,24 @@ Input tokens include cached input. Output varies between samples and is not clai
 Repeat check: the same judge input sent again reported 16,104 input tokens, the same as the first call.
 
 Evidence: [`2026-10-26-lean-codex/calls.json`](improvements/2026-10-26-lean-codex/calls.json) (sha256 `5174724dc49f`).
+
+## 2026-10-26 · Calls end when the backend exits
+
+Ringo used to notice that a backend process had exited only at Popen's next poll, whose sleeps grow to fifty milliseconds. A blocking wait in a helper thread now wakes the call at once, within the new soft time limits. Fresh-process commands with simulated backends against the release active at the time, equal private fixture approvals, no provider calls. Local machine overhead, not live-provider latency.
+
+| Workload | Pairs | Before p50 ms | After p50 ms | Mean change ms (simultaneous interval) |
+|---|---:|---:|---:|---|
+| review | 100 | 62.96 | 59.81 | −3.20 [−3.50, −2.88] |
+| review-trace | 100 | 64.62 | 61.43 | −2.99 [−3.37, −2.55] |
+| review-large | 100 | 65.26 | 62.47 | −2.78 [−3.50, −1.96] |
+| design | 100 | 63.23 | 60.18 | −2.97 [−3.46, −2.57] |
+| work | 100 | 275.30 | 249.03 | −37.60 [−45.33, −31.18] |
+| review-delay | 100 | 123.63 | 120.21 | −10.22 [−14.59, −6.32] |
+| review-override | 100 | 63.23 | 60.35 | −3.06 [−4.02, −2.32] |
+
+Measured in the same run but not claimed (interval includes no change, or the arm failed by design): startup +0.08 [−0.09, +0.30] ms; review-failure −10.04 [−13.09, −7.28] ms.
+
+Evidence: [`2026-10-26-event-wait/suite.json`](improvements/2026-10-26-event-wait/suite.json) (sha256 `5ec6a7cab921`).
 
 ## 2026-10-25 · Faster release verification
 
