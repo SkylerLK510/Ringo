@@ -164,7 +164,13 @@ an approver labeled `OFFLINE TEST FIXTURE — NOT HUMAN ADOPTION`. Those dummy
 observations are test setup, never measured results or adoption evidence. The
 actual paired samples are collected afterwards; reports identify the execution
 mode. The normal user's release state is never changed. A later active-release
-baseline is verified against its explicitly supplied state pointer.
+baseline is verified against its explicitly supplied state pointer, then its bundle
+is mirrored into the experiment's private state with the same synthetic approval as
+the candidate. Every launch parses and hashes the active approval, and a real one
+embeds its whole latency suite (about 108 KB against 58 KB for the fixture at 100
+pairs), so timing the owner's own approval against the fixture would measure
+approval size rather than code. Creating that approval reruns activation's checks, so an RRSI
+baseline is mirrored only while its sealed-test evidence still re-verifies.
 
 The runner writes raw execution commands, all outcomes/durations, per-workload
 reports and `suite.json` outside the checkout. Diagnostic failure workloads remain

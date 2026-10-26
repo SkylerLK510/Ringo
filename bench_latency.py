@@ -12,6 +12,7 @@ from pathlib import Path
 import platform
 import random
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -135,8 +136,17 @@ print(json.dumps({'version':1, **result}))
     state = out / 'state'
     rid = releases.stage(releases.HERE, state)
     _, manifest = releases.verify(state, rid)
+    base_state = None
     if execution == 'active-fixture':
         selection_fixture(state,rid,pairs)
+        if baseline_release:
+            # Time code, not approval size: every launch parses and hashes the active approval,
+            # and a real one embeds its whole latency suite. Give both arms the same synthetic
+            # approval by mirroring the verified baseline bundle into private experiment state.
+            bundle, _ = releases.verify(releases.state_root(baseline_state), baseline_release)
+            base_state = releases.private_root(out / 'baseline-state')
+            shutil.copytree(bundle, base_state / 'bundles' / baseline_release)
+            selection_fixture(base_state, baseline_release, pairs)
     env = {**os.environ, 'RINGO_RELEASE_HOME': str(out / 'no-active')}
     rng, reports = random.Random(42), []
 
@@ -148,7 +158,7 @@ print(json.dumps({'version':1, **result}))
             if arm == 'candidate':
                 local_env['RINGO_RELEASE_HOME'] = str(state)
             elif baseline_release:
-                local_env['RINGO_RELEASE_HOME'] = str(releases.state_root(baseline_state))
+                local_env['RINGO_RELEASE_HOME'] = str(base_state)
         if workload == 'startup':
             args = ['--help']
         elif workload == 'work':

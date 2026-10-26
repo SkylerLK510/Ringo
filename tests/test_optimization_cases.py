@@ -179,5 +179,49 @@ class OptimizationCases(unittest.TestCase):
         self.assertEqual(json.loads((out / 'suite.json').read_text()), suite)
 
 
+    def test_active_baseline_release_gets_an_equal_private_fixture_approval(self):
+        # The real approval embeds a whole latency suite and is parsed and hashed on every
+        # launch, so timing it against a small synthetic approval measures approval size.
+        case = self.fixture()
+        case.activate()
+        owner_before = (case.state / 'active.json').read_bytes()
+        out, commands, real_run = case.root / 'mirror', [], subprocess.run
+
+        def execute(command, **kwargs):
+            if 'env' not in kwargs:  # staging and activation helpers, not a timed arm
+                return real_run(command, **kwargs)
+            commands.append((command, kwargs['env']['RINGO_RELEASE_HOME']))
+            return subprocess.CompletedProcess(command, 0, b'', b'')
+
+        clock = itertools.count(1_000_000, 1_000_000)
+        with mock.patch.object(bench_latency.subprocess, 'run', side_effect=execute), \
+                mock.patch.object(bench_latency.time, 'perf_counter_ns', side_effect=lambda: next(clock)), \
+                mock.patch.object(bench_latency.platform, 'platform', return_value='fixture-host'), \
+                contextlib.redirect_stdout(io.StringIO()):
+            suite = bench_latency.run(None, out, pairs=30, warmups=0, workloads=['startup'],
+                                      baseline_release=case.rid, baseline_state=case.state,
+                                      execution='active-fixture')
+        self.assertEqual((case.state / 'active.json').read_bytes(), owner_before)
+        self.assertEqual(len(commands), 60)
+        self.assertTrue(all('preview' not in command for command, _ in commands))
+        self.assertEqual({home for _, home in commands}, {str(out / 'state'), str(out / 'baseline-state')})
+        approvals = {}
+        for name in ('state', 'baseline-state'):
+            root = releases.state_root(out / name)
+            entry = releases.pointer(root)['active']
+            record = releases.approved(root, entry)
+            self.assertIn('NOT HUMAN ADOPTION', record['approved_by'])
+            approvals[name] = (root / 'approvals' / (entry['approval'] + '.json')).stat().st_size
+        self.assertEqual(releases.pointer(releases.state_root(out / 'baseline-state'))['active']['release'], case.rid)
+        self.assertEqual(approvals['state'], approvals['baseline-state'])
+        self.assertEqual(suite['reports'][0]['measurement']['baseline'], case.rid)
+
+    def test_harness_import_defers_thread_pool_and_logging(self):
+        code = 'import sys, harness; print(sorted(m for m in ("concurrent.futures", "logging") if m in sys.modules))'
+        result = subprocess.run([fixtures.sys.executable, '-c', code], cwd=releases.HERE,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '[]')
+
 if __name__ == '__main__':
     unittest.main()

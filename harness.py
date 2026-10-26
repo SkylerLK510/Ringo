@@ -37,7 +37,6 @@ that fails or replies in the wrong shape is tried once more; a missing verdict a
 no call cap: the built-in plans make exactly one call when it succeeds, at most two.
 """
 import argparse
-import concurrent.futures
 import hashlib
 import json
 import math
@@ -443,6 +442,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                 gate.set()
 
     def parallel(fn, values, workers):
+        import concurrent.futures  # deferred: it imports logging and traceback, ~3-4 ms per launch that one-call plans never use
         with concurrent.futures.ThreadPoolExecutor(workers) as pool:
             try:
                 return list(pool.map(fn, values))
