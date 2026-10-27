@@ -17,6 +17,7 @@ repository.
 | 2026-10-26 | Shorter launch for one-call plans | [#7](https://github.com/SkylerLK510/Ringo/pull/7) | mean −2.64 to −3.00 ms on 5 workloads |
 | 2026-10-26 | Lean Codex calls | [#8](https://github.com/SkylerLK510/Ringo/pull/8) | writer input 12,617 → 2,479 (−80.4%); judge input 16,104 → 5,969 (−62.9%) |
 | 2026-10-26 | Calls end when the backend exits | [#9](https://github.com/SkylerLK510/Ringo/pull/9) | mean −2.78 to −37.60 ms on 7 workloads |
+| 2026-10-26 | Faster review context on large repositories | [#10](https://github.com/SkylerLK510/Ringo/pull/10) | mean −911.58 ms on 1 workload |
 | 2026-10-25 | Faster release verification | [#2](https://github.com/SkylerLK510/Ringo/pull/2), [#4](https://github.com/SkylerLK510/Ringo/pull/4) | mean −0.46 to −2.42 ms on 2 workloads |
 
 ## 2026-10-26 · Shorter launch for one-call plans
@@ -66,6 +67,16 @@ Ringo used to notice that a backend process had exited only at Popen's next poll
 Measured in the same run but not claimed (interval includes no change, or the arm failed by design): startup +0.08 [−0.09, +0.30] ms; review-failure −10.04 [−13.09, −7.28] ms.
 
 Evidence: [`2026-10-26-event-wait/suite.json`](improvements/2026-10-26-event-wait/suite.json) (sha256 `5ec6a7cab921`).
+
+## 2026-10-26 · Faster review context on large repositories
+
+Building the review material for a change ran one git process per file read and per changed file, and its reference search made git scan every line once per changed symbol. It now reads every object through one cat-file process, takes the changed lines from one diff, and searches with one compiled alternation. The material is byte-identical to before on every measured commit. Real git on a public repository, each commit built against its parent; no provider calls.
+
+| Workload | Pairs | Before p50 ms | After p50 ms | Mean change ms (simultaneous interval) |
+|---|---:|---:|---:|---|
+| django-recent-commits | 120 | 281.59 | 158.51 | −911.58 [−1460.53, −471.71] |
+
+Evidence: [`2026-10-26-context-git/django-context.json`](improvements/2026-10-26-context-git/django-context.json) (sha256 `0fbf96447d5a`).
 
 ## 2026-10-25 · Faster release verification
 

@@ -14,7 +14,7 @@ submodule (gitlink) has no text here, so it shows as its new commit and is liste
 
 Symbols: for Python, the innermost function, method or class around each changed line on both sides (the old side
 matters: callers of a removed or renamed function break), plus changed UPPER_CASE constants; for other languages,
-names on definition-like changed lines and in hunk headers. References come from `git grep -w` at head, so they are
+names on definition-like changed lines and in hunk headers. References come from word matches at head (git grep), so they are
 word matches on names, not resolved bindings: common names can pull in unrelated files, which ranking demotes.
 """
 import ast
@@ -90,15 +90,66 @@ def tree_entry(repo, rev, path):
     return tuple(out.split('\t', 1)[0].split(' ')) if out else None
 
 
-def blob(repo, rev, path):
-    """A file's text at rev, or None if it is binary, not UTF-8, or not a file (a submodule or a folder)."""
-    try:
-        data = git(repo, 'cat-file', 'blob', f'{rev}:{path}', binary=True)
-    except ContextError:
-        e = tree_entry(repo, rev, path)
-        if e and e[1] != 'blob':
-            return None
-        raise
+class Objects:
+    """Every object read of one build through a single `git cat-file --batch`, each read once: a git process per
+    file cost about 25 ms, which dominated large changes. A path containing a newline cannot go through the
+    line-based protocol, so it is read on its own."""
+
+    def __init__(self, repo):
+        self.repo, self.cache, self.proc = repo, {}, None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        if self.proc:
+            self.proc.stdin.close()
+            self.proc.stdout.close()
+            self.proc.wait()
+
+    def read(self, rev, path):
+        """(type, bytes) of rev:path, or None when it does not resolve to an object in this repository."""
+        key = (rev, path)
+        if key not in self.cache:
+            self.cache[key] = self._single(rev, path) if '\n' in path else self._batch(rev, path)
+        return self.cache[key]
+
+    def _single(self, rev, path):
+        try:
+            return 'blob', git(self.repo, 'cat-file', 'blob', f'{rev}:{path}', binary=True)
+        except ContextError:
+            e = tree_entry(self.repo, rev, path)
+            return (e[1], b'') if e and e[1] != 'blob' else None
+
+    def _batch(self, rev, path):
+        if self.proc is None:
+            self.proc = subprocess.Popen(['git', '-C', str(self.repo), 'cat-file', '--batch'], stdin=subprocess.PIPE,
+                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={**os.environ, **ENV})
+        self.proc.stdin.write(f'{rev}:{path}\n'.encode('utf-8', 'surrogateescape'))
+        self.proc.stdin.flush()
+        header = self.proc.stdout.readline()
+        if not header.endswith(b'\n'):
+            raise ContextError(f'git cat-file --batch stopped while reading {rev}:{path}')
+        fields = header[:-1].split(b' ')
+        if fields[-1] in (b'missing', b'ambiguous'):  # a gitlink's commit is not in this repository either
+            e = tree_entry(self.repo, rev, path)
+            return (e[1], b'') if e and e[1] != 'blob' else None
+        kind, size = fields[1].decode(), int(fields[2])
+        data = self.proc.stdout.read(size)
+        if len(data) != size or self.proc.stdout.read(1) != b'\n':  # never accept a cut-off object
+            raise ContextError(f'git cat-file --batch returned a truncated object for {rev}:{path}')
+        return kind, data
+
+
+def blob(repo, rev, path, objects=None):
+    """A file's text at rev, or None if it is binary, not UTF-8, or not a file (a submodule or a folder).
+    objects: the build's Objects reader; without one, the file is read by a git process of its own."""
+    found = objects.read(rev, path) if objects else Objects(repo)._single(rev, path)
+    if found is None:
+        raise ContextError(f'git cat-file failed: {rev}:{path} does not exist')
+    kind, data = found
+    if kind != 'blob':
+        return None
     if b'\0' in data:
         return None
     try:
@@ -123,10 +174,12 @@ def changes(repo, mb, head):
     return out
 
 
-def hunks(repo, mb, head, old, new):
-    """(old changed line numbers, new changed line numbers, hunk header contexts, removed lines, added lines)."""
-    paths = [p for p in dict.fromkeys((old, new)) if p]
-    text = git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head, '--', *paths)
+def hunks(repo, mb, head, old, new, text=None):
+    """(old changed line numbers, new changed line numbers, hunk header contexts, removed lines, added lines).
+    text: this pair's section of the whole -U0 diff, when it was read once for every pair (see all_hunks)."""
+    if text is None:
+        paths = [p for p in dict.fromkeys((old, new)) if p]
+        text = git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head, '--', *paths)
     olds, news, headers, minus, plus = set(), set(), [], [], []
     started = False
     for line in text.splitlines():
@@ -142,6 +195,20 @@ def hunks(repo, mb, head, old, new):
         elif started and line[:1] == '+':
             plus.append(line[1:])
     return olds, news, headers, minus, plus
+
+
+def all_hunks(repo, mb, head, pairs):
+    """hunks() of every pair from one -U0 diff instead of one git process per changed file. git prints one
+    'diff --git' section per entry of changes(), in the same order; if the sections do not line up with the
+    pairs (count, or a plain path missing from its header), every pair is read on its own as before."""
+    text = git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head)
+    sections = re.split(r'^(?=diff --git )', text, flags=re.M)[1:]
+    plain = re.compile(r'[^"\\\s\x00-\x1f\x7f]+')  # names git prints unquoted
+    if len(sections) == len(pairs) and all(
+            not plain.fullmatch(path or '') or f' b/{path}' in section.split('\n', 1)[0]
+            for (old, new), section in zip(pairs, sections) for path in [new or old]):
+        return [hunks(repo, mb, head, old, new, text=section) for (old, new), section in zip(pairs, sections)]
+    return [hunks(repo, mb, head, old, new) for old, new in pairs]
 
 
 def python_symbols(source, lines):
@@ -196,17 +263,16 @@ def text_symbols(headers, changed):
     return found
 
 
-def symbols(repo, mb, head, pairs):
+def symbols(repo, mb, head, pairs, objects=None):
     """(changed symbol names, classes searched for subclasses only), each sorted, with common words and names
     under three characters left out."""
     found, owners = set(), set()
-    for old, new in pairs:
-        olds, news, headers, minus, plus = hunks(repo, mb, head, old, new)
+    for (old, new), (olds, news, headers, minus, plus) in zip(pairs, all_hunks(repo, mb, head, pairs)):
         sides = [(old, mb, olds, minus), (new, head, news, plus)]
         for path, rev, lines, changed in sides:
             if not path or not lines or PurePosixPath(path).suffix.lower() in PROSE:
                 continue
-            names = python_symbols(blob(repo, rev, path) or '', lines) if path.endswith('.py') else None
+            names = python_symbols(blob(repo, rev, path, objects) or '', lines) if path.endswith('.py') else None
             if names is None:
                 found |= text_symbols(headers, changed)
             else:
@@ -238,15 +304,27 @@ def kind(line, sym):
     return 'reference'
 
 
+def grep(repo, head, names):
+    """`git grep` lines with a word match of any name at head. One PCRE2 alternation is a single JIT-compiled pass;
+    one -F -w pattern per name made git scan each line once per name (7.3 s against 0.27 s for 54 names over a
+    large repository, with the same output). A git without PCRE, or a name outside [A-Za-z0-9_], uses the -F -w
+    patterns, whose word rule is the same."""
+    common = ['grep', '-n', '-I', '-z', '--no-color', '--no-column']
+    if all(re.fullmatch(r'[A-Za-z0-9_]+', n) for n in names):
+        pattern = rf'(?<![A-Za-z0-9_])(?:{"|".join(names)})(?![A-Za-z0-9_])'
+        try:
+            return git(repo, *common, '-P', '-e', pattern, head, '--', ok=(0, 1))  # 1: no match
+        except ContextError:
+            pass  # git built without PCRE, or a pattern too large for it
+    return git(repo, *common, '-w', '-F', *[x for n in names for x in ('-e', n)], head, '--', ok=(0, 1))
+
+
 def matches(repo, head, syms, owners, exclude):
     """{path: {'lines': {lineno}, 'why': {(kind, sym)}}} for word matches of syms at head outside exclude; an owner
     class counts only where a line subclasses it."""
     if not syms and not owners:
         return {}
-    args = ['grep', '-n', '-w', '-F', '-I', '-z', '--no-color', '--no-column']
-    for s in [*syms, *owners]:
-        args += ['-e', s]
-    out = git(repo, *args, head, '--', ok=(0, 1))  # 1: no match
+    out = grep(repo, head, [*syms, *owners])
     word = re.compile(r'(?<![A-Za-z0-9_])(' + '|'.join(map(re.escape, [*syms, *owners])) + r')(?![A-Za-z0-9_])')
     only_subclass = set(owners)
     found = {}
@@ -332,6 +410,11 @@ def build(repo, base, head, pr_text=None, budget=BUDGET):
         raise ContextError('the context budget must be a positive number of bytes')
     if not repo.is_dir():
         raise ContextError(f'{repo} is not a folder')
+    with Objects(repo) as objects:
+        return _build(repo, base, head, pr_text, budget, objects)
+
+
+def _build(repo, base, head, pr_text, budget, objects):
     base_id, head_id = commit(repo, base, 'base'), commit(repo, head, 'head')
     mb = git(repo, 'merge-base', base_id, head_id).strip()
     complete(repo, *dict.fromkeys((head_id, mb, base_id)))
@@ -345,7 +428,7 @@ def build(repo, base, head, pr_text=None, budget=BUDGET):
     parts.append(f'=== change.diff ===\n{diff}')
     submodules = []
     for path in changed:
-        text = blob(repo, head_id, path)
+        text = blob(repo, head_id, path, objects)
         if text is None:
             e = tree_entry(repo, head_id, path)
             if e and e[1] == 'commit':
@@ -354,13 +437,13 @@ def build(repo, base, head, pr_text=None, budget=BUDGET):
             else:
                 text = '(binary or not UTF-8 text; not shown)\n'
         parts.append(f'=== {path} (after the change) ===\n{text}')
-    readme = next((r for r in READMES if r not in changed and (tree_entry(repo, head_id, r) or ('', ''))[1] == 'blob'), None)
+    readme = next((r for r in READMES if r not in changed and (objects.read(head_id, r) or ('',))[0] == 'blob'), None)
     if readme:
-        text = blob(repo, head_id, readme)
+        text = blob(repo, head_id, readme, objects)
         if text is not None:
             parts.append(f'=== {readme} ===\n{text}')
     required = '\n'.join(parts)
-    syms, owners = symbols(repo, mb, head_id, pairs)
+    syms, owners = symbols(repo, mb, head_id, pairs, objects)
     found = matches(repo, head_id, syms, owners, set(changed) | ({readme} if readme else set()))
 
     added, skipped, unreadable = [], [], []
@@ -394,7 +477,7 @@ def build(repo, base, head, pr_text=None, budget=BUDGET):
             used += note(skipped, f'{path}: {why}')
             continue
         try:
-            text = blob(repo, head_id, path)
+            text = blob(repo, head_id, path, objects)
         except ContextError:
             text = None
         if text is None:
