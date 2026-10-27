@@ -789,6 +789,13 @@ def run(spec_path, out, call_fn=harness.call):
                 entry['samples'] = errors + [{'sample': x['i'], 'checks_pass': score(x)[0], 'spec_passed': score(x)[1]}
                                              for x in samples]
                 if not samples:
+                    scripted = next((cand for _, cand, _ in parsed if cand.get('script')), None)
+                    if scripted and spec.get('scripts'):  # every reply only sent a script: run one and show its output
+                        last_script = run_script(folder, current, scripted['script'])
+                        entry.update(status='script', script={name: last_script[name] for name in ('status', 'seconds')})
+                        feedback = {**{name: v for name, v in answering.items() if name != 'protocol_error'},
+                                    'script': last_script}
+                        continue
                     entry['status'] = report['status'] = 'repeated_candidate'
                     break
                 best = max(samples, key=lambda x: (score(x), -x['i']))

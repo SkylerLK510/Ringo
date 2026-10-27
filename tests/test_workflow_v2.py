@@ -167,6 +167,14 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'rejected', 'ready_for_review'])
         self.assertEqual(report['rounds'][1]['rejected_for'], 'checks')
 
+    def test_script_only_candidates_run_the_script_and_go_on(self):
+        doc = {'files': {'REPORT.md': ''}, 'fixtures': {'check.py': "assert 'total' in open('REPORT.md').read()\n"},
+               'spec_tests': None, 'scripts': {'python': sys.executable}, 'candidates': 2}
+        only = '@@@ SCRIPT\nprint("total", 6)\n'
+        report, seen = self.run_with([only, only, '@@@ FILE REPORT.md\ntotal: 6\n'], **doc)
+        self.assertEqual([r['status'] for r in report['rounds']], ['script', 'ready_for_review'])
+        self.assertIn('total 6', seen[2][1])
+
     def test_a_suite_that_cannot_load_is_dropped(self):
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'],
                                   '```python\nfrom value import g\n\nimport unittest\nclass T(unittest.TestCase):\n'
