@@ -1,0 +1,12 @@
+{
+ "version": 1,
+ "kind": "review",
+ "role": "You review documents against their sources. Reply in plain text.",
+ "passes": [
+  {
+   "id": "review",
+   "prompt": "review-doc.md",
+   "reply": "findings"
+  }
+ ]
+}
