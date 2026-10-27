@@ -128,6 +128,13 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
         self.assertIn('disputed by the writer: Brief.test_doubles_integers', seen[-1][0])
 
+    def test_an_unchanged_reply_to_spec_failures_disputes_them_and_reaches_the_review(self):
+        wrong = SPEC_TESTS.replace('self.assertEqual(f(5), 10)', 'self.assertEqual(f(5), 11)')
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        report, seen = self.run_with([good, good], wrong)
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
+        self.assertIn('the writer left the code unchanged', seen[-1][0] + seen[-1][1])
+
     def test_a_suite_that_cannot_load_is_dropped(self):
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'],
                                   '```python\nfrom value import g\n\nimport unittest\nclass T(unittest.TestCase):\n'

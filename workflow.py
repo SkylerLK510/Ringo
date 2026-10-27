@@ -636,7 +636,8 @@ def run(spec_path, out, call_fn=harness.call):
         failing = [{'id': tid, 'error': r['error'][-1200:], 'source': spec_suite['sources'].get(tid, '')}
                    for tid, r in outcome['tests'].items() if not r['ok'] and tid not in disputed]
         return {'status': 'pass' if not failing else 'fail', 'passed': outcome['passed'], 'total': outcome['total'],
-                'failing': failing[:15], 'failing_count': len(failing), 'disputed': sorted(disputed)}
+                'failing': failing[:15], 'failing_count': len(failing), 'failing_ids': [t['id'] for t in failing],
+                'disputed': sorted(disputed)}
 
     try:
         if council:
@@ -780,9 +781,15 @@ def run(spec_path, out, call_fn=harness.call):
                 for tid, why in (candidate.get('disputes') or {}).items():
                     disputed.setdefault(tid, why)
                 key = digest(files)
-                # A reply that only disputes spec tests or sends a script re-checks the same candidate; anything else
-                # unchanged ends the run.
-                if key in seen and not (text_protocol and (candidate['disputes'] or candidate['script']) and files == current):
+                # Leaving the code unchanged after spec-test failures stands by it: those tests count as disputed.
+                stands = text_protocol and files == current and bool((feedback.get('spec_tests') or {}).get('failing'))
+                if stands:
+                    for tid in feedback['spec_tests']['failing_ids']:
+                        disputed.setdefault(tid, 'the writer left the code unchanged')
+                # A reply that only disputes spec tests, sends a script or stands by the code re-checks the same
+                # candidate; anything else unchanged ends the run.
+                if key in seen and not (text_protocol and (candidate['disputes'] or candidate['script'] or stands)
+                                        and files == current):
                     entry['status'] = report['status'] = 'repeated_candidate'
                     break
             seen.add(key)
