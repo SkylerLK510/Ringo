@@ -341,7 +341,7 @@ print('No defects found.')
             self.assertFalse(t.is_alive())
         self.assertCountEqual(outcomes, ['activated', 'stale'])
 
-    def test_preview_work_uses_exactly_one_writer_and_six_judges(self):
+    def test_preview_work_uses_one_writer_and_the_first_three_judges_when_they_recommend(self):
         from tests.test_workflow import FAKE_BRIDGE
         bridge = self.root / 'bridge.py'
         bridge.write_text(FAKE_BRIDGE)
@@ -365,9 +365,9 @@ else:
                            '--out',str(self.root/'work-run')])
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         report = json.loads((self.root/'work-run/report.json').read_text())
-        self.assertEqual(report['usage']['calls'], 7)
+        self.assertEqual(report['usage']['calls'], 4)
         self.assertEqual(report['implementation']['id'], self.rid)
-        self.assertEqual(len(Path(str(self.backend)+'.calls').read_text().splitlines()), 7)
+        self.assertEqual(len(Path(str(self.backend)+'.calls').read_text().splitlines()), 4)
 
     def test_quality_requires_test_pass_and_matching_candidate(self):
         import evaluate

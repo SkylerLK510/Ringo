@@ -101,8 +101,9 @@ python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --timeout 180 
   use one only if an evaluation showed it pays (step 4).
 - Calls are set by the plan, not by a cap: one per pass (one per batch of findings for a batched checker, whose readers may
   list at most 50 findings each), a failed or wrong-shaped call tried once more, and at most one checker repair. The default plans make one call,
-  at most two. `work` makes one writer call plus one judge call per sample each round, at most
-  `max_rounds x (1 + samples)`. `--max-calls` was removed.
+  at most two. `work` makes one writer call per round; a candidate that passes its checks gets `first_judges` judge
+  calls (3 of the default 6) and the remaining samples only if those do not recommend, at most
+  `max_rounds x (1 + samples)`. Report `council_judges` with the result. `--max-calls` was removed.
 - `--timeout` (review/design, default 900) and `timeout_s` (work, default 120) are soft: a call past it is not killed. Ringo checks it for free, sends one tiny probe call to the same backend (none under a cost cap), writes `incidents/<step>.<attempt>.json` in the trace (a private temporary folder without one) and prints one line, recommending a stop only when the evidence suggests a stall: the backend still answers and comparable calls in the run finished in a third of the time, or the output shows reconnects. Writing `stop` to the printed decision file stops the call and retries it once; nothing decides for you. Every call is stopped at twice its soft limit, never under 900 seconds (and, in `work`, at the run deadline), and is not retried after that. When an agent runs Ringo in the foreground it sees the line only afterwards, so the limiter decides;
   report incidents and probe calls with the call count.
 - `--max-cost` stops new calls once spent. Under `--max-cost`, calls run one at a time and `--unpriced-call-usd USD` is required for every backend, including attempts that time out without reporting cost. Choose a conservative fallback; the final call may exceed the remainder.
