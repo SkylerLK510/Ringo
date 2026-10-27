@@ -139,8 +139,15 @@ folder off `sys.path`.
 | `max_seconds` | 600 | Wall-clock bound for the whole run. |
 | `timeout_s` | 120 | Soft limit for each model call: past it the call is checked, probed and kept running; it is stopped at twice this, never under 900 seconds, capped by the time left. |
 | `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and fallback price for calls reporting none. A dollar cap requires a declared fallback. |
+| `protocol` | `json` | `text` replaces the JSON writer protocol with `@@@` blocks (`prompts/work-code.md`, or `work-doc.md` when every editable file is a document): code is not JSON-escaped, and revisions send `REPLACE` edits. A JSON reply is still read. |
+| `roles` | `{}` | Model and reasoning effort per call role: `writer` (round 1), `revision`, `escalate` (a round after failed checks; falls back to `revision`), `tests` and `review`, each `{"model", "effort"}`. Codex takes both; a Claude backend takes a model only. |
+| `spec_tests` | none | `{"python", "timeout_s"}`: one call (role `tests`) writes a unittest module from the brief and the starting files alone, never a candidate. It runs after the checks pass; its failures drive one revision before the review, and the writer may `DISPUTE` a test with the brief sentence it contradicts. A suite that cannot load is dropped. Code tasks only; not with `council`. |
+| `candidates` | 1 | 1 to 4. Round 1 makes this many writer calls on the same input (in parallel unless a cost cap is set); each distinct candidate runs the checks and the spec tests, and the one passing the checks with the most spec tests continues. Not with `council`. |
+| `scripts` | none | `{"python", "timeout_s"}` (text protocol; default 60 s): a document writer adds one `@@@ SCRIPT` that computes its numbers from the fixtures (`prompts/work-doc-script.md`). Ringo runs it in a scratch copy, shows the output to the writer in the next round (one round, while the review still fits) and to the review. The script is never delivered. |
 
-**Calls.** There is no call cap: the task's rounds decide the calls. Each round
+**Calls.** With `candidates`, round 1 makes that many writer calls, so a run makes at most
+`max_rounds - 1 + candidates` writer calls, plus one `spec_tests` call when set; scripts and checks are not model
+calls. There is no call cap: the task's rounds decide the calls. Each round
 makes one writer call, and one review call follows the first candidate that passes
 every check. The review call is retried once if it fails or comes back empty, like
 any harness pass. So a run makes at most `max_rounds + 2` calls: the example above
