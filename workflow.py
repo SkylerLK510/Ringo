@@ -275,6 +275,9 @@ def checks(spec, root, logdir, remaining):
                         proc.kill()
                 except ProcessLookupError:
                     pass
+                except PermissionError:  # macOS reports EPERM for a group that holds only zombies
+                    if proc.poll() is None:  # a live check we may not signal: never wait on it unbounded
+                        raise
                 proc.wait()
         entry = {'name': check['name'], 'status': status, 'returncode': code,
                  'seconds': round(time.monotonic() - started, 3)}

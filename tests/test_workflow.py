@@ -611,6 +611,29 @@ print(json.dumps(out))
                 kill.assert_called_once()
                 self.assertEqual(proc.wait.call_count, 2)
 
+    def test_cleanup_of_a_group_that_holds_only_zombies_does_not_fail_the_check(self):
+        # macOS killpg raises EPERM, not ESRCH, when the check's group holds only unreaped zombies.
+        spec = {**self.spec, 'checks': [{'name': 'check', 'argv': ['check'], 'timeout_s': 1}]}
+        for error in (ProcessLookupError(), PermissionError(1, 'Operation not permitted')):
+            proc = mock.Mock(pid=123)
+            proc.wait.side_effect = [0, 0]
+            proc.poll.return_value = 0  # the check itself has exited and been reaped
+            with self.subTest(error=error), mock.patch.object(workflow.subprocess, 'Popen', return_value=proc), \
+                    mock.patch('os.killpg', side_effect=error), mock.patch.object(workflow.os, 'name', 'posix'):
+                self.assertEqual(workflow.checks(spec, self.root, self.root, lambda: 10)[0]['status'], 'pass')
+                self.assertEqual(proc.wait.call_count, 2)
+
+    def test_a_live_check_that_cannot_be_signalled_stops_instead_of_waiting_forever(self):
+        spec = {**self.spec, 'checks': [{'name': 'check', 'argv': ['check'], 'timeout_s': 1}]}
+        proc = mock.Mock(pid=123)
+        proc.wait.side_effect = [subprocess.TimeoutExpired('check', 1)]  # a second wait would hang
+        proc.poll.return_value = None
+        with mock.patch.object(workflow.subprocess, 'Popen', return_value=proc), \
+                mock.patch('os.killpg', side_effect=PermissionError(1, 'Operation not permitted')), \
+                mock.patch.object(workflow.os, 'name', 'posix'), self.assertRaises(PermissionError):
+            workflow.checks(spec, self.root, self.root, lambda: 10)
+        self.assertEqual(proc.wait.call_count, 1)
+
     @unittest.skipUnless(os.environ.get('RINGO_COUNCIL_ROOT'), 'set RINGO_COUNCIL_ROOT for real bridge smoke')
     def test_real_cross_repository_bridge_with_deterministic_judge_replies(self):
         council_root = Path(os.environ['RINGO_COUNCIL_ROOT']).resolve()
