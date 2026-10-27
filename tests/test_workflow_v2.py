@@ -192,6 +192,16 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual((self.root / 'run/final/REPORT.md').read_text(), 'total: 6\n')
         self.assertFalse((self.root / 'run/final/_writer_script.py').exists())
 
+    def test_protocol_repair_spends_one_call_not_the_round(self):
+        bad = '@@@ REPLACE value.py\nnot there\n@@@ WITH\nx\n@@@ END\n'
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        report, seen = self.run_with([bad, good], protocol_repair=True)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(len(report['rounds']), 1)
+        self.assertIn('repair', report['rounds'][0])
+        self.assertIn('could not be applied', seen[2][1])  # the repair call sees the exact error
+        self.assertEqual(report['usage']['calls'], 4)  # spec tests, writer, repair, review
+
     def test_script_and_candidate_options_are_validated(self):
         base = {**self.spec, 'spec_tests': None}
         for changes, message in (({'candidates': 5}, 'candidates'), ({'candidates': 0}, 'candidates'),

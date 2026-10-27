@@ -310,7 +310,7 @@ def load_spec(path):
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
                'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
-               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts'}
+               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
     if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
@@ -364,6 +364,8 @@ def load_spec(path):
                 or not isinstance(tests.get('python'), str) or not tests['python']:
             raise ValueError('spec_tests needs the python executable that runs the generated unittest module')
         positive(tests.setdefault('timeout_s', 120), 'spec_tests timeout_s')
+    if type(spec.setdefault('protocol_repair', False)) is not bool:
+        raise ValueError('protocol_repair must be boolean')
     if not 1 <= positive(spec.setdefault('candidates', 1), 'candidates', integer=True) <= 4:
         raise ValueError('candidates must be from 1 to 4')
     if spec['candidates'] > 1 and council:
@@ -698,6 +700,12 @@ def run(spec_path, out, call_fn=harness.call):
                          root, folder, remaining)[0]
             return {**ran, 'source': script}
 
+        def writer_message(feedback):
+            if text_protocol:
+                return text_message(spec, current, feedback)
+            return json.dumps({'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
+                               'fixtures': spec['fixtures'], 'feedback': feedback}, ensure_ascii=False)
+
         def score(sample):
             """Selection among round-1 candidates: passing the declared checks first, then spec tests passed."""
             result = sample['spec']
@@ -709,12 +717,7 @@ def run(spec_path, out, call_fn=harness.call):
             folder.mkdir()
             entry = {'round': n}
             report['rounds'].append(entry)
-            if text_protocol:
-                message = text_message(spec, current, feedback)
-            else:
-                message = json.dumps({'brief': spec['brief'], 'material': spec.get('material', ''),
-                                      'files': current, 'fixtures': spec['fixtures'], 'feedback': feedback},
-                                     ensure_ascii=False)
+            message = writer_message(feedback)
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
             k = spec['candidates'] if n == 1 else 1
@@ -734,6 +737,16 @@ def run(spec_path, out, call_fn=harness.call):
                     parsed.append((i, *parse(text)))
                 except ValueError as exc:
                     errors.append({'sample': i, 'protocol_error': str(exc)})
+            if not parsed and spec['protocol_repair']:
+                # One immediate repair call with the exact error, so a reply that cannot be applied costs a call,
+                # not the round (and the review or check feedback it was answering).
+                entry['repair'] = errors[0]['protocol_error']
+                repaired = call(f'writer-{n}.repair', spec['writer'], writer_prompt,
+                                writer_message({**feedback, 'protocol_error': errors[0]['protocol_error']}), role=role)
+                try:
+                    parsed.append((k + 1, *parse(repaired)))
+                except ValueError as exc:
+                    errors.append({'sample': 'repair', 'protocol_error': str(exc)})
             if not parsed:
                 # Keep the earlier check and council feedback: a bad anchor should not erase it.
                 error = errors[0]['protocol_error']

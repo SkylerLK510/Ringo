@@ -143,11 +143,12 @@ folder off `sys.path`.
 | `roles` | `{}` | Model and reasoning effort per call role: `writer` (round 1), `revision`, `escalate` (a round after failed checks; falls back to `revision`), `tests` and `review`, each `{"model", "effort"}`. Codex takes both; a Claude backend takes a model only. |
 | `spec_tests` | none | `{"python", "timeout_s"}`: one call (role `tests`) writes a unittest module from the brief and the starting files alone, never a candidate. It runs after the checks pass; its failures drive one revision before the review, and the writer may `DISPUTE` a test with the brief sentence it contradicts. A suite that cannot load is dropped. Code tasks only; not with `council`. |
 | `candidates` | 1 | 1 to 4. Round 1 makes this many writer calls on the same input (in parallel unless a cost cap is set); each distinct candidate runs the checks and the spec tests, and the one passing the checks with the most spec tests continues. Not with `council`. |
+| `protocol_repair` | `false` | When no reply of a round can be applied (a bad anchor, a missing block), make one immediate repair call to the same role with the exact error instead of spending the round. At most one per round. |
 | `scripts` | none | `{"python", "timeout_s"}` (text protocol; default 60 s): a document writer adds one `@@@ SCRIPT` that computes its numbers from the fixtures (`prompts/work-doc-script.md`). Ringo runs it in a scratch copy, shows the output to the writer in the next round (one round, while the review still fits) and to the review. The script is never delivered. |
 
 **Calls.** With `candidates`, round 1 makes that many writer calls, so a run makes at most
-`max_rounds - 1 + candidates` writer calls, plus one `spec_tests` call when set; scripts and checks are not model
-calls. There is no call cap: the task's rounds decide the calls. Each round
+`max_rounds - 1 + candidates` writer calls (plus at most one repair call per round with `protocol_repair`), plus
+one `spec_tests` call when set; scripts and checks are not model calls. There is no call cap: the task's rounds decide the calls. Each round
 makes one writer call, and one review call follows the first candidate that passes
 every check. The review call is retried once if it fails or comes back empty, like
 any harness pass. So a run makes at most `max_rounds + 2` calls: the example above
