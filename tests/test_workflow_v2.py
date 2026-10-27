@@ -135,6 +135,38 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
         self.assertIn('the writer left the code unchanged', seen[-1][0] + seen[-1][1])
 
+    def test_a_spec_test_every_candidate_fails_stops_gating(self):
+        wrong = SPEC_TESTS.replace('self.assertEqual(f(5), 10)', 'self.assertEqual(f(5), 11)')
+        a, b = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n', '@@@ FILE value.py\ndef f(x):\n    return x*2\n'
+        report, seen = self.run_with([a, b], wrong, candidates=2)
+        self.assertEqual([r['status'] for r in report['rounds']], ['ready_for_review'])
+        self.assertEqual(report['rounds'][0]['agreement_disputed'], ['Brief.test_doubles_integers'])
+        self.assertEqual(report['usage']['calls'], 4)  # spec tests, two writers, review: no revision for a suspect test
+
+    def test_a_revision_that_breaks_a_passing_spec_test_is_set_aside(self):
+        three = SPEC_TESTS[:-3].rstrip() + '\n\n    def test_negative(self):\n        self.assertEqual(f(-2), -4)\n```'
+        first = '@@@ FILE value.py\ndef f(x):\n    return int(2*x)\n'           # fails floats only
+        breaks = '@@@ FILE value.py\ndef f(x):\n    return 2*abs(x) if x != 5 else 10\n'  # fixes floats, breaks negatives
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        report, seen = self.run_with([first, breaks, good], three, no_regression=True)
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'rejected', 'ready_for_review'])
+        self.assertEqual(report['rounds'][1]['rejected_for'], ['Brief.test_negative'])
+        self.assertTrue((self.root / 'run/round-2/rejected').is_dir())
+        self.assertFalse((self.root / 'run/round-2/candidate').exists())
+        writer3 = [m for system, m, _ in seen if system.startswith('Implement the brief')][2]
+        self.assertIn('set aside', writer3)
+        self.assertIn('return int(2*x)', writer3)  # the earlier code comes back
+        self.assertIn('Brief.test_keeps_floats', writer3)  # with the feedback the revision was answering
+        self.assertEqual((self.root / 'run/final/value.py').read_text(), 'def f(x):\n    return 2*x\n')
+
+    def test_a_revision_that_fails_the_checks_is_set_aside_with_no_regression(self):
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        report, seen = self.run_with([good, '@@@ FILE value.py\ndef f(x):\n    return x\n', good.replace('2*x', 'x*2')],
+                                     reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK),
+                                     no_regression=True)
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'rejected', 'ready_for_review'])
+        self.assertEqual(report['rounds'][1]['rejected_for'], 'checks')
+
     def test_a_suite_that_cannot_load_is_dropped(self):
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'],
                                   '```python\nfrom value import g\n\nimport unittest\nclass T(unittest.TestCase):\n'

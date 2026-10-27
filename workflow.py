@@ -186,6 +186,15 @@ def render_feedback(feedback):
                    'Failing (fix the code, or DISPUTE a test that contradicts the brief):')
         for t in spec_tests['failing']:
             out.append(f"--- {t['id']}\n{t['source']}\nResult: {t['error']}")
+    regression = feedback.get('regression')
+    if regression:
+        out.append('Your last revision was set aside: it broke what the earlier code passed. The files shown are the '
+                   'earlier code. Make the requested change again without breaking:')
+        for c in regression['checks']:
+            if c['status'] != 'pass':
+                out.append(f"Check {c['name']!r} {c['status']}:\n{(c['stdout'] + c['stderr'])[-4000:]}")
+        for t in regression['tests']:
+            out.append(f"--- {t['id']}\n{t['source']}\nResult: {t['error']}")
     script = feedback.get('script')
     if script:
         out.append(f"Your script {script['status']} (it ran with the sources and your files in its folder). Output:\n"
@@ -311,7 +320,7 @@ def load_spec(path):
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
                'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
-               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair'}
+               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair', 'no_regression'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
     if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
@@ -365,8 +374,9 @@ def load_spec(path):
                 or not isinstance(tests.get('python'), str) or not tests['python']:
             raise ValueError('spec_tests needs the python executable that runs the generated unittest module')
         positive(tests.setdefault('timeout_s', 120), 'spec_tests timeout_s')
-    if type(spec.setdefault('protocol_repair', False)) is not bool:
-        raise ValueError('protocol_repair must be boolean')
+    for key in ('protocol_repair', 'no_regression'):
+        if type(spec.setdefault(key, False)) is not bool:
+            raise ValueError(f'{key} must be boolean')
     if not 1 <= positive(spec.setdefault('candidates', 1), 'candidates', integer=True) <= 4:
         raise ValueError('candidates must be from 1 to 4')
     if spec['candidates'] > 1 and council:
@@ -657,6 +667,7 @@ def run(spec_path, out, call_fn=harness.call):
             except (ValueError, SyntaxError) as exc:  # no usable suite: the run continues without one
                 report['spec_tests'] = {'error': f'{type(exc).__name__}: {exc}'}
         failed_checks, last_script = False, None
+        adopted = None  # the last candidate that passed the checks: {'files', 'failing' spec-test ids}
 
         def parse(text):
             """(candidate, files) of a writer reply; ValueError when it cannot be applied."""
@@ -708,6 +719,14 @@ def run(spec_path, out, call_fn=harness.call):
             return json.dumps({'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
                                'fixtures': spec['fixtures'], 'feedback': feedback}, ensure_ascii=False)
 
+        def undisputed(result):
+            """A spec-test result without the tests disputed since it ran."""
+            if not result or result['status'] == 'broken':
+                return result
+            ids = [tid for tid in result['failing_ids'] if tid not in disputed]
+            return {**result, 'failing': [t for t in result['failing'] if t['id'] not in disputed], 'failing_ids': ids,
+                    'failing_count': len(ids), 'status': 'pass' if not ids else 'fail', 'disputed': sorted(disputed)}
+
         def score(sample):
             """Selection among round-1 candidates: passing the declared checks first, then spec tests passed."""
             result = sample['spec']
@@ -719,6 +738,7 @@ def run(spec_path, out, call_fn=harness.call):
             folder.mkdir()
             entry = {'round': n}
             report['rounds'].append(entry)
+            answering = feedback  # what this round's writer answers; a rejected revision answers it again
             message = writer_message(feedback)
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
@@ -773,8 +793,16 @@ def run(spec_path, out, call_fn=harness.call):
                     break
                 best = max(samples, key=lambda x: (score(x), -x['i']))
                 entry['selected'] = best['i']
+                ran = [x['spec'] for x in samples if x['spec'] and x['spec']['status'] != 'broken']
+                if len(ran) >= 2:
+                    # Dual agreement: a spec test that every independent candidate fails is more likely wrong than
+                    # all of them; it stops gating, and the review still sees it.
+                    shared = sorted(set.intersection(*(set(r['failing_ids']) for r in ran)))
+                    for tid in shared:
+                        disputed.setdefault(tid, f'failed by all {len(ran)} independent candidates')
+                    entry['agreement_disputed'] = shared
                 candidate, files, key = best['candidate'], best['files'], best['key']
-                observed, spec_result = best['observed'], best['spec']
+                observed, spec_result = best['observed'], undisputed(best['spec'])
                 write_files(folder / 'candidate', {**files, **spec['fixtures']})  # where a person looks for the round's pick
             else:
                 _, candidate, files = parsed[0]
@@ -807,8 +835,23 @@ def run(spec_path, out, call_fn=harness.call):
                 last_script = run_script(folder, current, candidate['script'])
                 entry['script'] = {key: last_script[key] for key in ('status', 'seconds')}
             if spec_result is not None:
-                last_spec = spec_result
                 entry['spec_tests'] = {key: spec_result.get(key) for key in ('status', 'passed', 'total', 'failing_count', 'broken')}
+            graded = spec_result is not None and spec_result['status'] != 'broken'
+            broke = sorted(set(spec_result['failing_ids']) - adopted['failing']) if adopted and graded and not failed_checks else []
+            if adopted and spec['no_regression'] and (failed_checks or broke):
+                # A revision may not undo what the adopted candidate achieved. It is set aside, and the writer gets the
+                # earlier code back with what the revision broke and the feedback it was answering.
+                (folder / 'candidate').rename(folder / 'rejected')
+                entry.update(status='rejected', rejected_for='checks' if failed_checks else broke[:15])
+                current = adopted['files']
+                feedback = {**{name: v for name, v in answering.items() if name not in ('protocol_error', 'regression')},
+                            'regression': {'checks': observed if failed_checks else [],
+                                           'tests': [t for t in spec_result['failing'] if t['id'] in broke] if broke else []}}
+                continue
+            if spec_result is not None:
+                last_spec = spec_result
+            if not failed_checks:
+                adopted = {'files': current, 'failing': set(spec_result['failing_ids']) if graded else set()}
             # Spec failures and a new script's output drive a revision only while a review and its revision still fit.
             spec_failing = bool(spec_result and spec_result['failing'])
             if not failed_checks and (spec_failing or fresh_script) and n < spec['max_rounds'] - 1 and reviewed is None:
