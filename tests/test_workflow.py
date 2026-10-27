@@ -179,6 +179,139 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn('mutated', report['error'])
         self.assertIsNone(report['final'])
 
+    FINDING = ('What this change does: adds f.\n\n### 1. Floats are truncated (`value.py:1`)\n'
+               '- Code: `return int(2*x)`\n- Problem: f(0.5) returns 1, should return 1.0.\n- Fix: return 2*x.\n')
+
+    def work(self, writer, reviews, **changes):
+        """A default (review) run: no council bridge, rubric or samples in the spec."""
+        spec = {k: v for k, v in {**self.spec, **changes}.items() if k not in ('council', 'rubric', 'samples')}
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(spec))
+        seen, writer, reviews = [], iter(writer), iter(reviews)
+
+        def call(_backend, system, message, timeout_s):
+            seen.append((system, message))
+            if system.startswith('Implement the task'):
+                return json.dumps(next(writer)), {'cost_usd': 0.01}
+            return next(reviews), {'cost_usd': 0.01}
+        return workflow.run(path, self.root / 'run', call_fn=call), seen
+
+    def test_default_reviews_a_passing_candidate_once_and_its_findings_drive_one_revision(self):
+        first = self.proposal('def f(x): return int(2*x)\n')
+        fixed = self.proposal('def f(x): return 2*x\n')
+        report, seen = self.work([first, fixed], [self.FINDING])
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['assessment'], 'review')
+        self.assertEqual(report['usage']['calls'], 3)  # writer, review, writer: the revision is not reviewed again
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
+        self.assertEqual(report['rounds'][0]['review_findings'], 1)
+        self.assertNotIn('review_findings', report['rounds'][1])
+        system, message = seen[1]
+        self.assertTrue(system.startswith('You review code changes.'))
+        for evidence in (self.spec['brief'], 'value.py (after the change)', 'int(2*x)', 'check.py (read-only fixture)',
+                         'observed check: reference (pass)', 'Author rationale: Implement the exact function'):
+            self.assertIn(evidence, system)
+        self.assertIn('Review the change in the material', message)
+        feedback = json.loads(seen[2][1])['feedback']
+        self.assertEqual(feedback['review'], self.FINDING.strip())
+        self.assertEqual(feedback['checks'][0]['status'], 'pass')
+        self.assertEqual(Path(report['review']).read_text(), self.FINDING.strip() + '\n')
+        self.assertEqual((self.root / 'run/final/value.py').read_text(), fixed['files']['value.py'])
+        self.assertFalse((self.root / 'run/round-1/council.json').exists())
+
+    def test_a_review_without_findings_delivers_the_reviewed_candidate(self):
+        good = self.proposal('def f(x): return 2*x\n')
+        report, _ = self.work([good], ['What this change does: adds f.\n\nNo defects found.'])
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 2)
+        self.assertEqual(report['rounds'][0]['review_findings'], 0)
+        self.assertEqual((self.root / 'run/final/value.py').read_text(), good['files']['value.py'])
+
+    def test_an_unreadable_review_counts_as_a_finding(self):
+        self.assertEqual(workflow.review_findings('Looks fine, but x may overflow.'), 1)
+        self.assertEqual(workflow.review_findings('Summary.\n\nNo defects found.'), 0)
+        self.assertEqual(workflow.review_findings(self.FINDING + '\n### 2. Other (`a:1`)\n- Code: x\n'), 2)
+
+    def test_failed_checks_after_the_review_keep_it_and_the_next_passing_candidate_ships(self):
+        first = self.proposal('def f(x): return int(2*x)\n')
+        broken = self.proposal('def f(x): return x\n')
+        fixed = self.proposal('def f(x): return 2*x\n')
+        report, seen = self.work([first, broken, fixed], [self.FINDING])
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 4)  # one review only
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'revise', 'ready_for_review'])
+        feedback = json.loads(seen[3][1])['feedback']
+        self.assertEqual(feedback['checks'][0]['status'], 'fail')
+        self.assertEqual(feedback['previous_review'], self.FINDING.strip())
+
+    def test_review_findings_with_no_round_left_publish_nothing(self):
+        report, _ = self.work([self.proposal('def f(x): return int(2*x)\n')], [self.FINDING], max_rounds=1)
+        self.assertEqual(report['status'], 'needs_revision')
+        self.assertEqual(report['usage']['calls'], 2)
+        self.assertIsNone(report['final'])
+        self.assertFalse((self.root / 'run/final').exists())
+        self.assertTrue(Path(report['review']).is_file())
+
+    def test_a_failed_review_call_is_retried_once_then_ends_the_run_with_error(self):
+        spec = {k: v for k, v in self.spec.items() if k not in ('council', 'rubric', 'samples')}
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(spec))
+        calls = []
+
+        def call(_backend, system, message, timeout_s):
+            calls.append(system[:20])
+            if system.startswith('Implement the task'):
+                return json.dumps(self.proposal('def f(x): return 2*x\n')), {'cost_usd': 0.01}
+            raise harness.CallError('codex-chatgpt turn rejected', {'cost_usd': 0.01}, 'raw')
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['status'], 'error')
+        self.assertIn('turn rejected', report['error'])
+        self.assertEqual(report['usage']['calls'], 3)  # writer, review, review retry
+        self.assertIsNone(report['final'])
+
+    def test_a_review_past_the_deadline_is_refused_before_any_call(self):
+        spec = {k: v for k, v in self.spec.items() if k not in ('council', 'rubric', 'samples')}
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**spec, 'max_seconds': 30}))
+        clock = [100.0]
+
+        def call(_backend, system, message, timeout_s):
+            self.assertTrue(system.startswith('Implement the task'), 'no review call may start after the deadline')
+            return json.dumps(self.proposal('def f(x): return 2*x\n')), {'cost_usd': 0.01}
+        real = workflow.checks
+
+        def checks(*args):  # the passing checks use up the rest of the 30 s
+            observed = real(*args)
+            clock[0] = 131.0
+            return observed
+        with mock.patch.object(workflow.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(workflow, 'checks', side_effect=checks):
+            report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['status'], 'budget_exhausted')
+        self.assertEqual(report['usage']['calls'], 1)
+        self.assertEqual(report['usage']['admission_refusals'], 1)
+        self.assertEqual(report['usage']['unpriced_calls'], 0)
+
+    def test_the_review_sees_a_diff_for_a_file_that_started_nonempty(self):
+        spec = {'brief': 'b', 'files': {'a.py': 'x = 1\ny = 2\n', 'new.py': ''}, 'fixtures': {}}
+        material = workflow.review_material(spec, {'a.py': 'x = 1\ny = 3\n', 'new.py': 'z = 0\n'}, 'r', [])
+        self.assertIn('=== a.py (diff from the initial file) ===\n--- a/a.py\n+++ b/a.py\n', material)
+        self.assertIn('-y = 2\n+y = 3\n', material)
+        self.assertNotIn('new.py (diff', material)
+        self.assertIn('=== new.py (after the change) ===\nz = 0\n', material)
+
+    def test_council_settings_without_a_council_bridge_are_refused(self):
+        base = {k: v for k, v in self.spec.items() if k not in ('council', 'rubric', 'samples')}
+        path = self.root / 'task.json'
+        for extra in ({'rubric': 'r.json'}, {'samples': 6}, {'first_judges': 3}):
+            path.write_text(json.dumps({**base, **extra}))
+            with self.subTest(extra=extra), self.assertRaisesRegex(ValueError, 'configure the Council'):
+                workflow.load_spec(path)
+        path.write_text(json.dumps(base))
+        spec = workflow.load_spec(path)
+        self.assertNotIn('samples', spec)
+        self.assertNotIn('rubric', spec)
+
     def test_an_old_spec_with_max_calls_is_refused_clearly(self):
         path = self.root / 'task.json'
         path.write_text(json.dumps({**self.spec, 'max_calls': 9}))

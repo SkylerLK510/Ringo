@@ -1,6 +1,6 @@
 # Ringo
 
-A local harness for code review, design proposals, bounded council-guided
+A local harness for code review, design proposals, bounded checked and reviewed
 artifact work, and guarded improvement of its own prompts and pipelines. Ringo
 runs model CLIs and assembles their results; it uses frozen provider models and
 does not train model weights.
@@ -37,14 +37,15 @@ replies in the wrong shape is tried once more, so at most two. Custom plans are 
 files under `plans/`, with instructions under `prompts/`; a plan makes one call per
 pass (one per batch of findings for a batched checker, at most 50 findings per
 reader reply), each retried at most once,
-plus at most one checker repair. `work` makes one writer call per round and, only
-after every executable check passes, judge calls: the first `first_judges`
-(3 of the default 6), and the rest only if those do not recommend. Failed
-checks feed the next writer round directly. The bound remains
-`max_rounds x (1 + samples)`, plus at most one retry of a call you stop. A call
-that passes its time limit can add one probe call. There is no call cap: the plan
-or the round count decides the calls, and `--max-cost` and time limits bound money
-and time.
+plus at most one checker repair. `work` makes one writer call per round and one
+review call after the first candidate that passes every executable check, at most
+`max_rounds + 2` with the review's one retry. Failed checks and review findings
+feed the next writer round directly. A task that opts into the Council makes judge
+calls instead: the first `first_judges` (3 of the default 6), and the rest only if
+those do not recommend, at most `max_rounds x (1 + samples)`. A call you stop can
+add one retry, and a call that passes its time limit can add one probe call. There
+is no call cap: the plan or the round count decides the calls, and `--max-cost` and
+time limits bound money and time.
 
 `--timeout` (review/design, default 900) and `timeout_s` (work, default 120) are soft: a call past it is not killed. Ringo checks it for free, sends one tiny probe call to the same backend (none under a cost cap), writes `incidents/<step>.<attempt>.json` in the trace (a private temporary folder without one) and prints one line, recommending a stop only when the evidence suggests a stall: the backend still answers and comparable calls in the run finished in a third of the time, or the output shows reconnects. Writing `stop` to the printed decision file stops the call and retries it once; nothing decides for you. Every call is stopped at twice its soft limit, never under 900 seconds (and, in `work`, at the run deadline), and is not retried after that.
 
@@ -53,14 +54,18 @@ it finishes and prints it, so an agent waits with one command instead of polling
 
 `work` revises a declared set of text files: a writer model returns complete
 files or exact search/replace edits, which Ringo turns into complete files; fixed
-executable checks run on them, and a separate council assessment decides whether
-to revise or stop. A result that passes every check and is recommended is written
-to the run's `final/` folder for human review; nothing is applied, adopted or
-published. The task names the council bridge and rubric explicitly (the council's
+executable checks run on them. The first candidate that passes them gets one
+review, and its findings drive one revision. A result that passes every check
+after that is written to the run's `final/` folder for human review, with the
+review it answered; nothing is applied, adopted or published. The Design Council
+is opt-in: a task that names a council bridge and rubric (the council's
 `rubrics/report.json` for documents and reports, `artifact_design.json` for visual
-artifacts). Each round is judged with 6 samples by default; 2 is for smoke tests
-only. See [the council workflow guide](docs/COUNCIL-WORKFLOW.md) for the task
-format, outputs, budgets and trust limits.
+artifacts) gets a council decision instead of the review, judged with 6 samples by
+default. In a controlled code test the Council cost 7x the tokens of checks alone
+with no significant quality gain, and one review plus one revision delivered every
+candidate passing all acceptance tests at a third of the Council's tokens. See
+[the work guide](docs/COUNCIL-WORKFLOW.md) for the measurement, the task format,
+outputs, budgets and trust limits.
 
 `review --findings-json FILE` also writes the findings as
 [ReviewBench](https://github.com/review-bench/ReviewBench) agent-contract JSON,
@@ -160,9 +165,10 @@ See the guide for the implemented limits and required confirmation.
 The runtime has no import or hardcoded path dependency on the council checkout.
 `backends.py` contains the minimal extracted subprocess, command-preset and JSON
 parsing helpers. Council judging remains in its own repository and is not bundled
-into this CLI. `work` requires an explicitly supplied external council bridge
-command and rubric: the council scores the replies it is given and makes no model
-calls, while Ringo makes the writer and judge calls and owns their budget.
+into this CLI. A `work` task that opts into the Council supplies an external
+council bridge command and rubric explicitly: the council scores the replies it is
+given and makes no model calls, while Ringo makes the writer and judge calls and
+owns their budget.
 Existing evaluation stores must be re-frozen for this source layout; do not reuse
 old digests or copy sealed data into this repository.
 
@@ -185,6 +191,6 @@ The target includes intensive ML and finance research. See the
 [research requirements](docs/RESEARCH-REQUIREMENTS.md) for evidence, reproducibility,
 numerical testing and domain validation goals. The selected direction uses Design
 Council for structured assessment, with Ringo providing execution and validation.
-Basic integration exists: `work` combines generated files, fixed checks and council
-assessment. The research workflow those requirements describe is future work, and
+Basic integration exists: `work` combines generated files, fixed checks and an
+opt-in council assessment. The research workflow those requirements describe is future work, and
 the current harness has not been validated for that workload.

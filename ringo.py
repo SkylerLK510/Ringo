@@ -62,7 +62,7 @@ def main(argv=None):
         parser = argparse.ArgumentParser(prog='ringo.py', description=__doc__)
         commands = parser.add_subparsers(dest='command')
         for name, help_text in [('review', 'review code'), ('design', 'propose a design'),
-                                ('work', 'revise artifacts with checks and council assessment'),
+                                ('work', 'revise artifacts with checks and one review'),
                                 ('wait', 'block until a traced run finishes and print its state'),
                                 ('release', 'stage, activate, inspect or roll back local releases')]:
             commands.add_parser(name, help=help_text)

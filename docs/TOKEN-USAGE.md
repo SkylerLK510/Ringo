@@ -32,7 +32,8 @@ request and roughly ten thousand input tokens, before Ringo's own text. A work
 round with one writer and six judges paid it seven times. The `codex-chatgpt`
 preset now removes it (see `docs/HARNESS.md`, **Codex children**); the measured
 effect is in the [improvement log](IMPROVEMENT-LOG.md). The remaining cost of a
-Council round is Ringo's own evidence, sent whole to each judge.
+Council round is Ringo's own evidence, sent whole to each judge; `work` now runs the Council only when a task
+opts in, and makes one review call by default.
 
 ## Optimization objective
 

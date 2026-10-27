@@ -10,8 +10,8 @@ finance specialization remains to be selected.
 
 This document defines a target, not implemented capabilities or a quality claim.
 Ringo currently runs review/design pipelines, searches review prompts/plans, and
-runs bounded council-guided artifact work (`ringo.py work`, described in the
-[council workflow guide](COUNCIL-WORKFLOW.md)). It has not demonstrated
+runs bounded checked and reviewed artifact work (`ringo.py work`, described in the
+[work guide](COUNCIL-WORKFLOW.md)). It has not demonstrated
 end-to-end scientific or financial research reliability.
 
 ## Selected direction
@@ -28,11 +28,13 @@ a method, executing it and evaluating its results.
 
 Basic integration is implemented. `work` has a writer model return complete text
 files or exact edits that Ringo applies to complete files, runs fixed executable checks on them, sends the fixed source material,
-files, rationale and check results to a council rubric through an offline bridge,
-and revises from the feedback within its round count and shared cost and time bounds. A
-candidate reaches `final/` only after every check passes and the council
-recommends it; a person decides what to adopt. Ringo makes the model calls and
-owns their budget; the council scores the replies and owns the decision gate.
+files, rationale and check results to one review, and revises once from its findings within its round count and shared
+cost and time bounds. A candidate reaches `final/` only after every check passes; a person decides what to adopt.
+A task can opt into a council decision instead, sent through an offline bridge to a council rubric: the candidate
+then reaches `final/` only when the council also recommends it. Ringo makes the model calls and owns their budget;
+the council scores the replies and owns its decision gate. In a controlled code test the Council did not
+significantly improve delivered quality over checks alone at 7x the tokens (see the work guide), so its value for
+research assessment is unproven.
 The research execution loop described below remains future work: inspecting and
 editing an existing workspace, running experiments with data provenance, and
 enforceable workspace permissions.
