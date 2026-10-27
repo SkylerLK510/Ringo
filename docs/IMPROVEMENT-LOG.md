@@ -18,6 +18,7 @@ repository.
 | 2026-10-26 | Lean Codex calls | [#8](https://github.com/SkylerLK510/Ringo/pull/8) | writer input 12,617 → 2,479 (−80.4%); judge input 16,104 → 5,969 (−62.9%) |
 | 2026-10-26 | Calls end when the backend exits | [#9](https://github.com/SkylerLK510/Ringo/pull/9) | mean −2.78 to −37.60 ms on 7 workloads |
 | 2026-10-26 | Faster review context on large repositories | [#10](https://github.com/SkylerLK510/Ringo/pull/10) | mean −911.58 ms on 1 workload |
+| 2026-10-26 | Reply scanning that cannot be stalled | [#11](https://github.com/SkylerLK510/Ringo/pull/11) | mean −1.07 to −218.69 ms on 2 workloads |
 | 2026-10-25 | Faster release verification | [#2](https://github.com/SkylerLK510/Ringo/pull/2), [#4](https://github.com/SkylerLK510/Ringo/pull/4) | mean −0.46 to −2.42 ms on 2 workloads |
 
 ## 2026-10-26 · Shorter launch for one-call plans
@@ -77,6 +78,17 @@ Building the review material for a change ran one git process per file read and 
 | django-recent-commits | 120 | 281.59 | 158.51 | −911.58 [−1460.53, −471.71] |
 
 Evidence: [`2026-10-26-context-git/django-context.json`](improvements/2026-10-26-context-git/django-context.json) (sha256 `0fbf96447d5a`).
+
+## 2026-10-26 · Reply scanning that cannot be stalled
+
+Finding the JSON answer in a model's reply tried a parse at every brace. Each failed attempt built an error message that counts lines from the start of the reply, and an unterminated nested reply made every attempt run to the end, so hostile or garbled replies cost time quadratic in their length, and very deep nesting crashed the run. Braces that cannot start an object under the JSON grammar are now skipped without parsing, deep nesting is a failed attempt, and failed attempts are bounded in total. Both arms find the same objects. In process, no provider calls.
+
+| Workload | Pairs | Before p50 ms | After p50 ms | Mean change ms (simultaneous interval) |
+|---|---:|---:|---:|---|
+| hostile-nesting-20KB | 100 | 226.88 | 8.26 | −218.69 [−219.27, −218.20] |
+| typical-reply-20KB | 100 | 2.22 | 1.14 | −1.07 [−1.08, −1.07] |
+
+Evidence: [`2026-10-26-json-scan/scan-suite.json`](improvements/2026-10-26-json-scan/scan-suite.json) (sha256 `d66bb9f80073`).
 
 ## 2026-10-25 · Faster release verification
 

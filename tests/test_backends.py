@@ -225,5 +225,60 @@ class LeanCodexTest(unittest.TestCase):
         self.assertFalse(harness.backend('codex:codex exec --json -').get('lean'))
 
 
+def reference_objects(text):  # the scanner before it was made linear: every '{' is tried
+    decoder = json.JSONDecoder(parse_constant=backends._no_constant, parse_float=backends._finite_float,
+                               object_pairs_hook=backends._object)
+    start = 0
+    while (start := text.find('{', start)) != -1:
+        try:
+            obj, end = decoder.raw_decode(text, start)
+        except ValueError:
+            start += 1
+            continue
+        start = end
+        if isinstance(obj, dict):
+            yield obj
+
+
+class ObjectScanTest(unittest.TestCase):
+    def test_same_objects_as_trying_every_brace_on_random_replies(self):
+        import random
+        rng = random.Random(5)
+        pieces = ['{', '}', '{"a": 1}', '{"a": {"b": [1, 2]}}', '"', '\\"', ' ', '\n', 'prose ', ':', ',', '[', ']',
+                  '{ "k" : "v" }', '{}', '{"x": NaN}', '{"x": 1e999}', '{"a": 1, "a": 2}', '{"a": "{"}', '```json\n',
+                  '{"q1": "c", "q2": true}', "{'single': 1}", '{ a: 1 }', '{"t": 1,}', '\t{\r"n": null}']
+        for _ in range(4000):
+            text = ''.join(rng.choice(pieces) for _ in range(rng.randrange(1, 40)))
+            with self.subTest(text=text):
+                new = [(o, o.repeats_a_key) for o in backends.top_level_objects(text)]
+                old = [(o, o.repeats_a_key) for o in reference_objects(text)]
+                self.assertEqual(new, old)
+
+    def test_hostile_replies_are_linear_and_never_raise(self):
+        import time
+        cases = {'brace every 100 bytes': ('x' * 99 + '{') * 10_000,
+                 'unterminated nesting': '{"a": ' * 33_000,
+                 'deep nesting': '{"a": ' * 170_000,
+                 'key-like starts': '{"' * 250_000,
+                 'answer after hostile prose': ('x' * 99 + '{') * 5_000 + '{"answer": 1}'}
+        for name, text in cases.items():
+            with self.subTest(name):
+                started = time.perf_counter()
+                found = list(backends.top_level_objects(text))
+                self.assertLess(time.perf_counter() - started, 2.0)
+                self.assertEqual(found, [{'answer': 1}] if name.startswith('answer') else [])
+
+    def test_refused_numbers_are_charged_only_the_distance_parsed(self):
+        text = '{"x": NaN}\n' * 70 + ' ' * 100_000 + '{"answer": 1}'
+        self.assertEqual(list(backends.top_level_objects(text)), [{'answer': 1}])
+        self.assertEqual(list(backends.top_level_objects(text)), list(reference_objects(text)))
+        self.assertEqual(list(backends.top_level_objects('{"a": {"b": 1e999}, "c": {"d": 1}}')),
+                         list(reference_objects('{"a": {"b": 1e999}, "c": {"d": 1}}')))
+
+    def test_an_answer_after_failed_json_like_snippets_is_still_found(self):
+        snippets = ''.join(f'see {{"k{i}": 1,}} and ' for i in range(500))  # each passes the start filter and fails
+        self.assertEqual(list(backends.top_level_objects(snippets + '{"q1": "a"}')), [{'q1': 'a'}])
+
+
 if __name__ == '__main__':
     unittest.main()
