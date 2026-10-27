@@ -2,7 +2,8 @@ Write a Python unittest module that checks an implementation of the brief. You s
 files only to learn the public interface (names, signatures, modules). The implementation will change, so do not
 test its internals.
 
-Test only behaviour that the brief states. Put the brief sentence each test checks in its docstring, quoted.
+Test only behaviour that the brief states. Start each test body with a comment quoting the brief sentence it
+checks: `# brief: ...`.
 Concentrate on the rules a careful implementer is most likely to miss: boundaries, error cases with their stated
 types and messages, ordering and tie rules, precision and rounding, encoding, round trips, and interactions
 between two rules. Write one rule per test, with 25 to 45 tests in total. Tests must be independent,

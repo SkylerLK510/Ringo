@@ -209,7 +209,9 @@ def parse_text_reply(text):
         lines = lines[1:-1]
     blocks = []
     for line in lines:
-        if line.startswith(MARK) or line.rstrip('\r\n') in ('@@@ WITH', '@@@ END', '@@@ RATIONALE'):
+        if line.rstrip('\r\n') == '@@@':  # a bare marker: WITH right after a REPLACE body, else END
+            blocks.append(['WITH' if blocks and blocks[-1][0] == 'REPLACE' else 'END', '', []])
+        elif line.startswith(MARK) or line.rstrip('\r\n') in ('@@@ WITH', '@@@ END', '@@@ RATIONALE'):
             kind, _, arg = line[4:].strip().partition(' ')
             blocks.append([kind.upper(), arg.strip(), []])
         elif blocks:
@@ -275,7 +277,12 @@ def spec_test_file(text):
     import re
     blocks = re.findall(r'```(?:python|py)?[^\n]*\n(.*?)```', text, flags=re.S)
     source = max(blocks, key=len) if blocks else text
-    tree = ast.parse(source)
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # A brief sentence quoted as a four-quote docstring does not compile; read its quotes as three.
+        source = re.sub(r'"{4}(.*?)"{4}', r'"""\1"""', source)
+        tree = ast.parse(source)
     ids = [f'{node.name}.{item.name}' for node in tree.body if isinstance(node, ast.ClassDef)
            for item in node.body if isinstance(item, ast.FunctionDef) and item.name.startswith('test')]
     if not ids:

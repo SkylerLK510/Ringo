@@ -48,6 +48,18 @@ class TextProtocolTest(unittest.TestCase):
         reply = workflow.parse_text_reply(json.dumps({'files': {'a.py': 'y\n'}, 'rationale': 'r'}))
         self.assertEqual((reply['files'], reply['rationale']), ({'a.py': 'y\n'}, 'r'))
 
+    def test_a_bare_marker_is_with_after_a_replace_and_end_elsewhere(self):
+        reply = workflow.parse_text_reply('@@@ REPLACE a.py\nx = 1\n@@@\nx = 2\n@@@ END\n@@@ FILE b.py\ny\n@@@\n')
+        self.assertEqual(reply['edits'], [{'path': 'a.py', 'old': 'x = 1', 'new': 'x = 2'}])
+        self.assertEqual(reply['files'], {'b.py': 'y\n'})
+
+    def test_a_four_quote_docstring_suite_still_loads(self):
+        q4 = '"' * 4
+        source, ids = workflow.spec_test_file('```python\nimport unittest\nclass T(unittest.TestCase):\n'
+                                              f'    def test_a(self):\n        {q4}Say it.{q4}\n        pass\n```')
+        self.assertEqual(ids, ['T.test_a'])
+        compile(source, 'spec', 'exec')
+
     def test_malformed_replies_are_refused(self):
         for text in ('no blocks at all', '@@@ REPLACE a.py\nx\n@@@ END\n', '@@@ SHELL rm -rf /\n'):
             with self.assertRaises(ValueError, msg=text):
