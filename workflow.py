@@ -18,6 +18,7 @@ The writer replies with complete files or with exact search/replace edits. Edits
 before anything else, so the digest, checks, mutation check and judges always see full text.
 """
 import argparse
+import concurrent.futures
 import contextlib
 import hashlib
 import json
@@ -184,6 +185,10 @@ def render_feedback(feedback):
                    'Failing (fix the code, or DISPUTE a test that contradicts the brief):')
         for t in spec_tests['failing']:
             out.append(f"--- {t['id']}\n{t['source']}\nResult: {t['error']}")
+    script = feedback.get('script')
+    if script:
+        out.append(f"Your script {script['status']} (it ran with the sources and your files in its folder). Output:\n"
+                   f"{(script['stdout'] + script['stderr'])[-6000:]}")
     for key, title in (('review', 'Review of your last candidate'), ('previous_review', 'Earlier review')):
         if feedback.get(key):
             out.append(f'{title}:\n{feedback[key]}')
@@ -191,14 +196,14 @@ def render_feedback(feedback):
 
 
 def parse_text_reply(text):
-    """{'rationale', 'files', 'edits', 'disputes'} from the @@@ block reply (prompts/work-code.md). A reply that
+    """{'rationale', 'files', 'edits', 'disputes', 'script'} from the @@@ block reply (prompts/work-code.md). A reply that
     is a JSON object is read with the JSON protocol instead, so either form is accepted."""
     stripped = text.strip()
     if stripped.startswith('{'):
         reply = strict_json(stripped)
         if isinstance(reply, dict):
             return {'rationale': reply.get('rationale', ''), 'files': reply.get('files', {}),
-                    'edits': reply.get('edits', []), 'disputes': reply.get('disputes', {})}
+                    'edits': reply.get('edits', []), 'disputes': reply.get('disputes', {}), 'script': None}
     lines = stripped.splitlines(keepends=True)
     if lines and lines[0].startswith('```') and lines[-1].strip() == '```':  # a fence around the whole reply
         lines = lines[1:-1]
@@ -211,7 +216,7 @@ def parse_text_reply(text):
             blocks[-1][2].append(line)  # text before the first block is ignored
     if not blocks:
         raise ValueError('no @@@ blocks in the reply')
-    reply = {'rationale': '', 'files': {}, 'edits': [], 'disputes': {}}
+    reply = {'rationale': '', 'files': {}, 'edits': [], 'disputes': {}, 'script': None}
     i = 0
     while i < len(blocks):
         kind, arg, body = blocks[i]
@@ -232,6 +237,10 @@ def parse_text_reply(text):
             i += 2
         elif kind == 'END':  # a terminator after a FILE or DISPUTE block is harmless; text after it is not a file
             pass
+        elif kind == 'SCRIPT':
+            if reply['script'] is not None:
+                raise ValueError(f'SCRIPT block {i + 1}: give at most one script')
+            reply['script'] = content.strip('\n') + '\n'
         elif kind == 'DISPUTE':
             if not arg:
                 raise ValueError(f'DISPUTE block {i + 1}: needs a test id')
@@ -250,7 +259,7 @@ def materialize_text(current, declared, reply):
             raise ValueError(f'FILE {path!r} is not a declared editable file')
     if any(e['path'] in reply['files'] for e in reply['edits']):
         raise ValueError('a file cannot be both replaced whole and edited in one reply')
-    if not reply['files'] and not reply['edits'] and not reply['disputes']:
+    if not reply['files'] and not reply['edits'] and not reply['disputes'] and not reply.get('script'):
         raise ValueError('the reply changes no file')
     files = dict(current)
     if reply['edits']:
@@ -294,7 +303,7 @@ def load_spec(path):
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
                'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
-               'roles', 'protocol', 'spec_tests'}
+               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
     if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
@@ -348,6 +357,18 @@ def load_spec(path):
                 or not isinstance(tests.get('python'), str) or not tests['python']:
             raise ValueError('spec_tests needs the python executable that runs the generated unittest module')
         positive(tests.setdefault('timeout_s', 120), 'spec_tests timeout_s')
+    if not 1 <= positive(spec.setdefault('candidates', 1), 'candidates', integer=True) <= 4:
+        raise ValueError('candidates must be from 1 to 4')
+    if spec['candidates'] > 1 and council:
+        raise ValueError('candidates select by checks and spec tests; they do not combine with the Council')
+    scripts = spec.get('scripts')
+    if scripts is not None:
+        if not isinstance(scripts, dict) or set(scripts) - {'python', 'timeout_s'} \
+                or not isinstance(scripts.get('python'), str) or not scripts['python']:
+            raise ValueError('scripts needs the python executable that runs a writer script')
+        if spec['protocol'] != 'text':
+            raise ValueError('scripts need the text protocol')
+        positive(scripts.setdefault('timeout_s', 60), 'scripts timeout_s')
     if spec.get('max_cost') is not None and spec.get('unpriced_call_usd') is None:
         raise ValueError('max_cost needs unpriced_call_usd for attempts that report no cost')
     command = spec.get('council')
@@ -490,7 +511,8 @@ def run(spec_path, out, call_fn=harness.call):
     report['assessment'] = 'council' if council else 'review'
     kind = artifact_kind(spec)
     text_protocol = spec['protocol'] == 'text'
-    writer_prompt = (HERE / 'prompts' / (f'work-{kind}.md' if text_protocol else 'work.md')).read_text(encoding='utf-8')
+    prompt_name = f'work-{kind}-script.md' if kind == 'doc' and spec.get('scripts') else f'work-{kind}.md'
+    writer_prompt = (HERE / 'prompts' / (prompt_name if text_protocol else 'work.md')).read_text(encoding='utf-8')
     report.update(protocol=spec['protocol'], artifact_kind=kind)
     report['writer_prompt_sha256'] = hashlib.sha256(writer_prompt.encode()).hexdigest()
 
@@ -566,6 +588,9 @@ def run(spec_path, out, call_fn=harness.call):
         material = review_material(spec, files, rationale, observed)
         if spec_suite:
             material += '\n\n=== spec tests written from the brief alone ===\n' + spec_summary(last_spec)
+        if last_script:
+            material += (f"\n\n=== the writer's script ({last_script['status']}) ===\n{last_script['source']}"
+                         f"\n=== its output ===\n{(last_script['stdout'] + last_script['stderr'])[-6000:]}")
         text, _ = harness.run_plan(plan, material, role_backend(harness.backend(spec['judge']), spec['roles'].get('review')),
                                    accounting, call_fn=bounded, timeout_s=spec['timeout_s'])
         return text
@@ -620,7 +645,58 @@ def run(spec_path, out, call_fn=harness.call):
                 report['spec_tests'] = {'tests': len(ids)}
             except (ValueError, SyntaxError) as exc:  # no usable suite: the run continues without one
                 report['spec_tests'] = {'error': f'{type(exc).__name__}: {exc}'}
-        failed_checks = False
+        failed_checks, last_script = False, None
+
+        def parse(text):
+            """(candidate, files) of a writer reply; ValueError when it cannot be applied."""
+            if text_protocol:
+                candidate = parse_text_reply(text)
+                return candidate, materialize_text(current, spec['files'], candidate)
+            candidate = strict_json(text)
+            return candidate, materialize(current, spec['files'], candidate)
+
+        def evaluate(folder, files):
+            """Write files and fixtures into folder/candidate, run the declared checks and, when they pass, the spec
+            tests: (observed checks, spec-test result or None)."""
+            nonlocal spec_suite
+            root = folder / 'candidate'
+            root.mkdir(parents=True)
+            expected = {**files, **spec['fixtures']}
+            write_files(root, expected)
+            observed = checks(spec, root, folder, remaining)
+            # Checks may execute candidate code. Refuse changed/symlinked submitted
+            # files or fixtures, including mutations that would falsify a test pass.
+            for name, original in expected.items():
+                path = root / name
+                if any(p.is_symlink() for p in [path, *path.parents] if p != root.parent) \
+                        or not path.is_file() or path.read_text(encoding='utf-8') != original:
+                    raise ValueError('a check mutated a submitted file or protected fixture')
+            result = None
+            if spec_suite and all(c['status'] == 'pass' for c in observed):
+                result = run_spec_tests(root, folder)
+                if result['status'] == 'broken':
+                    report['spec_tests']['dropped'] = result['broken']
+                    spec_suite = None
+            return observed, result
+
+        def run_script(folder, files, script):
+            """Run the writer's script in a scratch copy of its files and the fixtures. Its output is feedback for the
+            writer and evidence for the review; it never changes a file that is delivered."""
+            root = folder / 'script'
+            root.mkdir()
+            write_files(root, {**files, **spec['fixtures']})
+            (root / '_writer_script.py').write_text(script, encoding='utf-8')
+            argv = [spec['scripts']['python'], '-I', '-B', '_writer_script.py']
+            ran = checks({'checks': [{'name': 'writer script', 'argv': argv, 'timeout_s': spec['scripts']['timeout_s']}]},
+                         root, folder, remaining)[0]
+            return {**ran, 'source': script}
+
+        def score(sample):
+            """Selection among round-1 candidates: passing the declared checks first, then spec tests passed."""
+            result = sample['spec']
+            return (all(c['status'] == 'pass' for c in sample['observed']),
+                    result['passed'] if result and result['status'] != 'broken' else 0)
+
         for n in range(1, spec['max_rounds'] + 1):
             folder = out / f'round-{n}'
             folder.mkdir()
@@ -634,61 +710,87 @@ def run(spec_path, out, call_fn=harness.call):
                                      ensure_ascii=False)
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
-            text = call(f'writer-{n}', spec['writer'], writer_prompt, message, role=role)
-            try:
-                if text_protocol:
-                    candidate = parse_text_reply(text)
-                    files = materialize_text(current, spec['files'], candidate)
-                    for tid, why in candidate['disputes'].items():
-                        disputed.setdefault(tid, why)
-                else:
-                    candidate = strict_json(text)
-                    files = materialize(current, spec['files'], candidate)
-            except ValueError as exc:
+            k = spec['candidates'] if n == 1 else 1
+            if k == 1:
+                texts = [call(f'writer-{n}', spec['writer'], writer_prompt, message, role=role)]
+            else:  # round 1 draws k independent candidates from the same input and keeps the best by execution
+                def ask(i):
+                    return call(f'writer-{n}.{i}', spec['writer'], writer_prompt, message, role=role)
+                if spec.get('max_cost') is None:
+                    with concurrent.futures.ThreadPoolExecutor(k) as pool:
+                        texts = list(pool.map(ask, range(1, k + 1)))
+                else:  # under a cost cap, calls run one at a time
+                    texts = [ask(i) for i in range(1, k + 1)]
+            parsed, errors = [], []
+            for i, text in enumerate(texts, 1):
+                try:
+                    parsed.append((i, *parse(text)))
+                except ValueError as exc:
+                    errors.append({'sample': i, 'protocol_error': str(exc)})
+            if not parsed:
                 # Keep the earlier check and council feedback: a bad anchor should not erase it.
-                feedback = {**{k: v for k, v in feedback.items() if k != 'protocol_error'},
-                            'protocol_error': str(exc)}
-                entry.update(status='malformed', feedback={'protocol_error': str(exc)})
+                error = errors[0]['protocol_error']
+                feedback = {**{key: v for key, v in feedback.items() if key != 'protocol_error'}, 'protocol_error': error}
+                entry.update(status='malformed', feedback={'protocol_error': error})
                 continue
-            key = digest(files)
-            # A reply that only disputes spec tests re-checks the same candidate without them; anything else unchanged ends the run.
-            if key in seen and not (text_protocol and candidate['disputes'] and files == current):
-                entry['status'] = report['status'] = 'repeated_candidate'
-                break
+            if k > 1:
+                samples, keys = [], set()
+                for i, cand, files in parsed:
+                    key = digest(files)
+                    if key in seen or key in keys:
+                        continue
+                    keys.add(key)
+                    observed, result = evaluate(folder / f'sample-{i}', files)
+                    samples.append({'i': i, 'candidate': cand, 'files': files, 'key': key, 'observed': observed,
+                                    'spec': result})
+                entry['samples'] = errors + [{'sample': x['i'], 'checks_pass': score(x)[0], 'spec_passed': score(x)[1]}
+                                             for x in samples]
+                if not samples:
+                    entry['status'] = report['status'] = 'repeated_candidate'
+                    break
+                best = max(samples, key=lambda x: (score(x), -x['i']))
+                entry['selected'] = best['i']
+                candidate, files, key = best['candidate'], best['files'], best['key']
+                observed, spec_result = best['observed'], best['spec']
+                write_files(folder / 'candidate', {**files, **spec['fixtures']})  # where a person looks for the round's pick
+            else:
+                _, candidate, files = parsed[0]
+                for tid, why in (candidate.get('disputes') or {}).items():
+                    disputed.setdefault(tid, why)
+                key = digest(files)
+                # A reply that only disputes spec tests or sends a script re-checks the same candidate; anything else
+                # unchanged ends the run.
+                if key in seen and not (text_protocol and (candidate['disputes'] or candidate['script']) and files == current):
+                    entry['status'] = report['status'] = 'repeated_candidate'
+                    break
             seen.add(key)
             current = files
             write_json(folder / 'proposal.json', {'files': current, 'rationale': candidate['rationale'],
                                                   **({'edits': candidate['edits']} if candidate.get('edits') else {}),
-                                                  **({'disputes': candidate['disputes']} if candidate.get('disputes') else {})})
-            root = folder / 'candidate'
-            root.mkdir()
-            expected = {**current, **spec['fixtures']}
-            write_files(root, expected)
-            observed = checks(spec, root, folder, remaining)
-            # Checks may execute candidate code. Refuse changed/symlinked submitted
-            # files or fixtures, including mutations that would falsify a test pass.
-            for name, original in expected.items():
-                path = root / name
-                if any(p.is_symlink() for p in [path, *path.parents] if p != root.parent) \
-                        or not path.is_file() or path.read_text(encoding='utf-8') != original:
-                    raise ValueError('a check mutated a submitted file or protected fixture')
+                                                  **({'disputes': candidate['disputes']} if candidate.get('disputes') else {}),
+                                                  **({'script': candidate['script']} if candidate.get('script') else {})})
+            if k == 1:
+                observed, spec_result = evaluate(folder, files)
             entry.update(candidate_sha256=key, checks=observed)
             failed_checks = not all(c['status'] == 'pass' for c in observed)
-            if not failed_checks and spec_suite:
-                last_spec = run_spec_tests(root, folder)
-                entry['spec_tests'] = {k: last_spec.get(k) for k in ('status', 'passed', 'total', 'failing_count', 'broken')}
-                if last_spec['status'] == 'broken':
-                    report['spec_tests']['dropped'] = last_spec['broken']
-                    spec_suite = None
-                # Spec failures drive a revision only while a review and its revision still fit in the rounds.
-                elif last_spec['failing'] and n < spec['max_rounds'] - 1 and reviewed is None:
-                    feedback = {'checks': observed, 'spec_tests': last_spec}
-                    entry['status'] = 'revise'
-                    continue
+            fresh_script = bool(candidate.get('script') and spec.get('scripts'))
+            if fresh_script:
+                last_script = run_script(folder, current, candidate['script'])
+                entry['script'] = {key: last_script[key] for key in ('status', 'seconds')}
+            if spec_result is not None:
+                last_spec = spec_result
+                entry['spec_tests'] = {key: spec_result.get(key) for key in ('status', 'passed', 'total', 'failing_count', 'broken')}
+            # Spec failures and a new script's output drive a revision only while a review and its revision still fit.
+            spec_failing = bool(spec_result and spec_result['failing'])
+            if not failed_checks and (spec_failing or fresh_script) and n < spec['max_rounds'] - 1 and reviewed is None:
+                feedback = {'checks': observed, **({'spec_tests': spec_result} if spec_failing else {}),
+                            **({'script': last_script} if fresh_script else {})}
+                entry['status'] = 'revise'
+                continue
             if failed_checks:
                 # A known failing candidate cannot be ready for review. Spend the
                 # next allowed round on correction, not on assessing that failure.
-                feedback = {'checks': observed}
+                feedback = {'checks': observed, **({'script': last_script} if fresh_script else {})}
                 if last_council is not None:
                     feedback['previous_council'] = last_council
                 if reviewed is not None:
@@ -705,7 +807,8 @@ def run(spec_path, out, call_fn=harness.call):
                     if entry['review_findings'] or spec_failing:
                         reviewed = review_text
                         feedback = {'checks': observed, 'review': review_text,
-                                    **({'spec_tests': last_spec} if spec_failing else {})}
+                                    **({'spec_tests': last_spec} if spec_failing else {}),
+                                    **({'script': last_script} if fresh_script else {})}
                         entry['status'] = 'revise'
                         continue
                 # Passing checks after the review's one revision, or a review with no findings: ready for a person.

@@ -144,5 +144,54 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertIn('model_reasoning_effort="high"', writers[1])
 
 
+    def test_candidates_draw_k_writers_in_round_one_and_keep_the_one_that_passes(self):
+        good, bad = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n', '@@@ FILE value.py\ndef f(x):\n    return x\n'
+        report, seen = self.run_with([bad, good, bad], candidates=3)
+        self.assertEqual(report['status'], 'ready_for_review')
+        first = report['rounds'][0]
+        self.assertEqual(sorted(x['checks_pass'] for x in first['samples'] if 'checks_pass' in x), [False, True])
+        self.assertEqual(len(first['samples']), 2)  # the two equal replies are evaluated once
+        self.assertEqual((self.root / 'run/round-1/candidate/value.py').read_text(), 'def f(x):\n    return 2*x\n')
+        # spec tests + 3 writers + review: the bound is (max_rounds - 1) + candidates writer calls
+        self.assertEqual(report['usage']['calls'], 5)
+        self.assertEqual(sum(system.startswith('Implement the brief') for system, _, _ in seen), 3)
+
+    def test_candidates_never_exceed_their_bound(self):
+        bad = ['@@@ FILE value.py\ndef f(x):\n    return x + %d\n' % i for i in range(6)]
+        report, seen = self.run_with(bad, candidates=2)
+        self.assertEqual(report['status'], 'needs_revision')
+        self.assertEqual(sum(system.startswith('Implement the brief') for system, _, _ in seen), 2 + 2)
+        self.assertEqual(report['usage']['calls'], 1 + 4)  # spec tests + (max_rounds - 1) + candidates
+
+    def test_a_script_runs_and_its_output_reaches_the_writer_and_the_review(self):
+        doc = {'files': {'REPORT.md': ''}, 'fixtures': {'data.csv': 'a,b\n1,2\n3,4\n',
+                                                         'check.py': "assert 'total' in open('REPORT.md').read()\n"},
+               'spec_tests': None, 'scripts': {'python': sys.executable}}
+        script = ('@@@ SCRIPT\nimport csv\nrows = list(csv.DictReader(open("data.csv")))\n'
+                  'print("total", sum(int(r["b"]) for r in rows))\n@@@ FILE REPORT.md\ntotal: 5\n')
+        fixed = '@@@ REPLACE REPORT.md\ntotal: 5\n@@@ WITH\ntotal: 6\n@@@ END\n'
+        report, seen = self.run_with([script, fixed], **doc)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertTrue(seen[0][0].startswith('Write the document') and 'SCRIPT' in seen[0][0])
+        self.assertEqual(report['rounds'][0]['script']['status'], 'pass')
+        self.assertIn('total 6', seen[1][1])  # the writer sees the output before it finishes
+        self.assertIn("the writer's script", seen[2][0] + seen[2][1])  # and so does the review
+        self.assertEqual(report['usage']['calls'], 3)  # writer, writer, review; the script is not a model call
+        self.assertEqual((self.root / 'run/final/REPORT.md').read_text(), 'total: 6\n')
+        self.assertFalse((self.root / 'run/final/_writer_script.py').exists())
+
+    def test_script_and_candidate_options_are_validated(self):
+        base = {**self.spec, 'spec_tests': None}
+        for changes, message in (({'candidates': 5}, 'candidates'), ({'candidates': 0}, 'candidates'),
+                                 ({'scripts': {'python': sys.executable}, 'protocol': 'json'}, 'text protocol'),
+                                 ({'scripts': {}}, 'python executable')):
+            path = self.root / 'bad.json'
+            path.write_text(json.dumps({k: v for k, v in {**base, **changes}.items() if v is not None}))
+            with self.assertRaisesRegex(ValueError, message):
+                workflow.load_spec(path)
+        with self.assertRaisesRegex(ValueError, 'at most one script'):
+            workflow.parse_text_reply('@@@ SCRIPT\nprint(1)\n@@@ SCRIPT\nprint(2)\n')
+
+
 if __name__ == '__main__':
     unittest.main()
