@@ -37,11 +37,13 @@ replies in the wrong shape is tried once more, so at most two. Custom plans are 
 files under `plans/`, with instructions under `prompts/`; a plan makes one call per
 pass (one per batch of findings for a batched checker, at most 50 findings per
 reader reply), each retried at most once,
-plus at most one checker repair. `work` makes one writer call and one judge call per
-council sample each round: at most `max_rounds x (1 + samples)`, plus at most one
-retry of a call you stop. A call that passes its time limit can add one probe call.
-There is no call cap: the plan or the round count decides the calls, and
-`--max-cost` and time limits bound money and time.
+plus at most one checker repair. `work` makes one writer call per round and one
+judge call per Council sample only after every executable check passes. Failed
+checks feed the next writer round directly. The bound remains
+`max_rounds x (1 + samples)`, plus at most one retry of a call you stop. A call
+that passes its time limit can add one probe call. There is no call cap: the plan
+or the round count decides the calls, and `--max-cost` and time limits bound money
+and time.
 
 `--timeout` (review/design, default 900) and `timeout_s` (work, default 120) are soft: a call past it is not killed. Ringo checks it for free, sends one tiny probe call to the same backend (none under a cost cap), writes `incidents/<step>.<attempt>.json` in the trace (a private temporary folder without one) and prints one line, recommending a stop only when the evidence suggests a stall: the backend still answers and comparable calls in the run finished in a third of the time, or the output shows reconnects. Writing `stop` to the printed decision file stops the call and retries it once; nothing decides for you. Every call is stopped at twice its soft limit, never under 900 seconds (and, in `work`, at the run deadline), and is not retried after that.
 

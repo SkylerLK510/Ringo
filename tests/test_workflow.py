@@ -64,16 +64,18 @@ class WorkflowTest(unittest.TestCase):
         good = self.proposal('def f(x): return 2*x\n')
         report, seen = self.execute([bad, good])
         self.assertEqual(report['status'], 'ready_for_review')
-        self.assertEqual(report['usage']['calls'], 6)
+        self.assertEqual(report['usage']['calls'], 4)
         self.assertEqual([r['checks'][0]['status'] for r in report['rounds']], ['fail', 'pass'])
-        self.assertIn('fail', seen[3][1])
+        self.assertEqual(report['rounds'][0]['assessment_skipped'], 'checks_failed')
+        self.assertNotIn('decision', report['rounds'][0])
+        self.assertIn('fail', seen[1][1])
         self.assertEqual((self.root / 'run/final/value.py').read_text(), good['files']['value.py'])
         self.assertTrue(json.loads((self.root / 'run/shortcomings.json').read_text())['development_only'])
 
     def test_calls_are_max_rounds_times_one_writer_plus_samples(self):
         path = self.root / 'task.json'
         path.write_text(json.dumps({**self.spec, 'max_rounds': 2, 'samples': 3}))
-        drafts = iter(['def f(x): return x\n', 'def f(x): return 3*x\n'])
+        drafts = iter(['def f(x): return 2*x\n', 'def f(x): return x+x\n'])
 
         def call(_backend, system, message, timeout_s):  # the council never recommends
             if system.startswith('Implement the task'):
@@ -105,29 +107,29 @@ class WorkflowTest(unittest.TestCase):
         bad = self.proposal('# keep\ndef f(x): return x\n')
         report, seen = self.execute([bad, self.edits(('value.py', 'return x', 'return 2*x'))])
         self.assertEqual(report['status'], 'ready_for_review')
-        self.assertEqual(report['usage']['calls'], 6)
+        self.assertEqual(report['usage']['calls'], 4)
         applied = '# keep\ndef f(x): return 2*x\n'
         self.assertEqual((self.root / 'run/final/value.py').read_text(), applied)
-        self.assertEqual(json.loads(seen[4][1].removeprefix('JUDGE '))['files'], {'value.py': applied})
+        self.assertEqual(json.loads(seen[2][1].removeprefix('JUDGE '))['files'], {'value.py': applied})
         saved = json.loads((self.root / 'run/round-2/proposal.json').read_text())
         self.assertEqual(saved['files'], {'value.py': applied})
         self.assertEqual(saved['edits'][0]['old'], 'return x')
         self.assertNotIn('edits', json.loads((self.root / 'run/round-1/proposal.json').read_text()))
 
-    def test_failed_anchor_is_malformed_and_keeps_the_earlier_check_and_council_feedback(self):
+    def test_failed_anchor_is_malformed_and_keeps_the_earlier_check_feedback(self):
         bad = self.proposal('def f(x): return x\n')
         miss = self.edits(('value.py', 'return 2*x', 'return x+x'))
         good = self.edits(('value.py', 'return x', 'return 2*x'))
         report, seen = self.execute([bad, miss, good])
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'malformed', 'ready_for_review'])
-        self.assertEqual(report['usage']['calls'], 3 + 1 + 3)  # The malformed round makes no judge calls.
+        self.assertEqual(report['usage']['calls'], 1 + 1 + 3)  # Failed/malformed rounds make no judge calls.
         self.assertFalse((self.root / 'run/round-2/candidate').exists())
         error = report['rounds'][1]['feedback']['protocol_error']
         self.assertIn('edit 1 (value.py): old matches 0 places', error)
         self.assertIn("first 7 of 10 characters match at line 1: 'def f(x): return x'", error)
-        third = json.loads(seen[4][1])
+        third = json.loads(seen[2][1])
         self.assertEqual(third['files'], bad['files'])
-        self.assertEqual(set(third['feedback']), {'checks', 'decision', 'scored', 'protocol_error'})
+        self.assertEqual(set(third['feedback']), {'checks', 'protocol_error'})
         self.assertEqual(third['feedback']['checks'][0]['status'], 'fail')
 
     def test_edit_validation_is_strict_and_all_or_nothing(self):
@@ -165,7 +167,7 @@ class WorkflowTest(unittest.TestCase):
         bad = self.proposal('def f(x): return x')
         report, _ = self.execute([bad, self.edits(('value.py', 'x)', 'y)')), self.edits(('value.py', 'y)', 'x)'))])
         self.assertEqual(report['status'], 'repeated_candidate')
-        self.assertEqual(report['usage']['calls'], 3 + 3 + 1)
+        self.assertEqual(report['usage']['calls'], 1 + 1 + 1)
 
     def test_edit_that_makes_a_check_mutate_a_fixture_still_stops(self):
         first = self.proposal('def f(x): return x\n')
@@ -191,8 +193,75 @@ class WorkflowTest(unittest.TestCase):
         bad = self.proposal('def f(x): return x')
         report, _ = self.execute([bad, bad])
         self.assertEqual(report['status'], 'repeated_candidate')
-        self.assertEqual(report['usage']['calls'], 4)
+        self.assertEqual(report['usage']['calls'], 2)
         self.assertIsNone(report['final'])
+
+    def test_failed_last_round_never_spends_council_calls_or_publishes(self):
+        report, seen = self.execute([self.proposal('def f(x): return x\n')], max_rounds=1, samples=6)
+        self.assertEqual(report['status'], 'needs_revision')
+        self.assertEqual(report['usage']['calls'], 1)
+        self.assertEqual(len(seen), 1)
+        self.assertIsNone(report['final'])
+        self.assertFalse((self.root / 'run/round-1/council.json').exists())
+        self.assertFalse((self.root / 'run/final').exists())
+        feedback = json.loads((self.root / 'run/shortcomings.json').read_text())['feedback']
+        self.assertEqual(feedback['checks'][0]['status'], 'fail')
+
+    def test_six_sample_council_only_sees_corrected_candidate(self):
+        bad = self.proposal('def f(x): return x\n')
+        good = self.proposal('def f(x): return 2*x\n')
+        report, seen = self.execute([bad, good], max_rounds=2, samples=6)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 2 + 6)
+        self.assertEqual(sum(system.startswith('Implement the task') for system, _ in seen), 2)
+        self.assertTrue(all(system.startswith('You are an independent council judge') for system, _ in seen[2:]))
+        feedback = json.loads(seen[1][1])['feedback']
+        self.assertEqual(feedback['checks'][0]['status'], 'fail')
+        self.assertNotIn('decision', feedback)
+        self.assertEqual((self.root / 'run/final/value.py').read_text(), good['files']['value.py'])
+
+    def test_all_failed_candidates_use_only_the_declared_writer_rounds(self):
+        report, seen = self.execute([self.proposal('def f(x): return '+expr+'\n')
+                                     for expr in ('x', '3*x', '4*x')], max_rounds=3, samples=6)
+        self.assertEqual(report['status'], 'needs_revision')
+        self.assertEqual(report['usage']['calls'], 3)
+        self.assertEqual(len(seen), 3)
+        self.assertTrue(all(row['assessment_skipped'] == 'checks_failed' for row in report['rounds']))
+        self.assertFalse((self.root / 'run/final').exists())
+
+    def test_timed_out_check_drives_correction_without_judging_failed_candidate(self):
+        self.spec['fixtures']['check.py'] += "\nif n['f'](5) == 10 and 'slow' in Path('value.py').read_text():\n    import time\n    time.sleep(3)\n"
+        self.spec['checks'][0]['timeout_s'] = .3
+        report, seen = self.execute([self.proposal('def f(x): return 2*x  # slow\n'),
+                                     self.proposal('def f(x): return 2*x\n')], max_rounds=2)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 4)
+        self.assertEqual(report['rounds'][0]['checks'][0]['status'], 'timeout')
+        self.assertEqual(json.loads(seen[1][1])['feedback']['checks'][0]['status'], 'timeout')
+
+    def test_prior_council_feedback_is_retained_and_bound_to_its_candidate(self):
+        drafts = iter(['def f(x): return 2*x\n', 'def f(x): return x\n', 'def f(x): return x+x\n'])
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(self.spec))
+        writer_messages = []
+
+        def call(_backend, system, message, timeout_s):
+            if system.startswith('Implement the task'):
+                writer_messages.append(json.loads(message))
+                reply = self.proposal(next(drafts))
+            else:
+                reply = {'accept': len(writer_messages) == 3}
+            return json.dumps(reply), {}
+
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 3 + 2 * self.spec['samples'])
+        feedback = writer_messages[2]['feedback']
+        self.assertEqual(feedback['checks'][0]['status'], 'fail')
+        self.assertNotIn('decision', feedback)
+        self.assertEqual(feedback['previous_council']['candidate_sha256'], report['rounds'][0]['candidate_sha256'])
+        self.assertEqual(feedback['previous_council']['decision']['action'], 'escalate')
+        self.assertNotEqual(feedback['previous_council']['candidate_sha256'], report['rounds'][1]['candidate_sha256'])
 
     def test_check_cannot_mutate_a_protected_fixture_and_claim_success(self):
         code = "from pathlib import Path\nPath('check.py').write_text('pass')\ndef f(x): return 2*x\n"
