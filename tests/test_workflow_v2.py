@@ -39,6 +39,10 @@ class TextProtocolTest(unittest.TestCase):
         files = workflow.materialize_text({'a.py': '', 'b.py': 'x = 1\ny = 0\n'}, {'a.py': '', 'b.py': ''}, reply)
         self.assertEqual(files['b.py'], 'x = 2\ny = 0\n')
 
+    def test_an_end_line_after_a_file_block_closes_it(self):
+        reply = workflow.parse_text_reply('@@@ FILE a.py\nx = 1\n@@@ END\n@@@ FILE b.py\ny = 2\n@@@ END\n')
+        self.assertEqual(reply['files'], {'a.py': 'x = 1\n', 'b.py': 'y = 2\n'})
+
     def test_a_fenced_reply_and_a_json_reply_are_both_read(self):
         self.assertEqual(workflow.parse_text_reply('```\n@@@ FILE a.py\nx\n```')['files'], {'a.py': 'x\n'})
         reply = workflow.parse_text_reply(json.dumps({'files': {'a.py': 'y\n'}, 'rationale': 'r'}))

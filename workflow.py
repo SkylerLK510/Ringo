@@ -230,6 +230,8 @@ def parse_text_reply(text):
             reply['edits'].append({'path': arg, 'old': content.rstrip('\n'),
                                    'new': ''.join(blocks[i + 1][2]).rstrip('\n')})
             i += 2
+        elif kind == 'END':  # a terminator after a FILE or DISPUTE block is harmless; text after it is not a file
+            pass
         elif kind == 'DISPUTE':
             if not arg:
                 raise ValueError(f'DISPUTE block {i + 1}: needs a test id')
@@ -585,7 +587,7 @@ def run(spec_path, out, call_fn=harness.call):
         folder = folder / 'spec-tests'
         folder.mkdir()
         result_path = folder / 'result.json'
-        argv = [spec['spec_tests']['python'], '-I', str(HERE / 'spec_runner.py'), str(root), str(spec_suite['path']),
+        argv = [spec['spec_tests']['python'], '-I', '-B', str(HERE / 'spec_runner.py'), str(root), str(spec_suite['path']),
                 '--json', str(result_path)]
         observed = checks({'checks': [{'name': 'spec tests', 'argv': argv, 'timeout_s': spec['spec_tests']['timeout_s']}]},
                           root, folder, remaining)[0]
