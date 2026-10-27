@@ -11,6 +11,7 @@ The writer replies with complete files or with exact search/replace edits. Edits
 before anything else, so the digest, checks, mutation check and judges always see full text.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -251,10 +252,15 @@ def run(spec_path, out, call_fn=harness.call):
     spec = load_spec(spec_path)
     out = harness.outside_repo(out, 'workflow run')
     accounting = harness.Run(out, max_cost=spec.get('max_cost'), unpriced_call_usd=spec.get('unpriced_call_usd'))
-    write_json(out / 'spec.json', spec)
-    implementation = {**releases.identity(HERE), 'effective_quality_claim': None}
-    write_json(out / 'source.json', {'workflow_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                                   'implementation': implementation})
+    try:
+        write_json(out / 'spec.json', spec)
+        implementation = {**releases.identity(HERE), 'effective_quality_claim': None}
+        write_json(out / 'source.json', {'workflow_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                                       'implementation': implementation})
+    except BaseException as exc:  # the state already says running; a waiter must learn the run is over
+        with contextlib.suppress(OSError):
+            accounting.state('failed', error=f'cannot start: {type(exc).__name__}: {exc}'[:500])
+        raise
     deadline = time.monotonic() + spec['max_seconds']
     remaining = lambda: deadline - time.monotonic()
     report = {'version': 1, 'status': 'needs_revision', 'rounds': [], 'final': None,
@@ -410,7 +416,18 @@ def run(spec_path, out, call_fn=harness.call):
         write_json(out / 'report.json', report)
         write_json(out / 'shortcomings.json', {'development_only': True, 'feedback': feedback,
                                               'status': report['status']})
+        accounting.state(report['status'], report=str(out / 'report.json'), final=report['final'],
+                         rounds=len(report['rounds']), error=report.get('error'))
     return report
+
+
+def outcome(report, out):
+    """The few fields an agent needs from a finished run; everything else stays in report.json."""
+    return {'status': report['status'], 'final': report['final'], 'report': str(Path(out).resolve() / 'report.json'),
+            'rounds': len(report['rounds']), 'error': report.get('error'),
+            'usage': {k: report['usage'].get(k) for k in ('calls', 'untokened_calls', 'input', 'cache_read',
+                                                         'cache_write', 'output')},
+            'elapsed_s': round(report['elapsed_s'], 1)}
 
 
 def main(argv=None):
@@ -424,7 +441,7 @@ def main(argv=None):
     except (ValueError, OSError) as exc:
         print(f'ringo work: {exc}', file=sys.stderr)
         return 2
-    print(json.dumps(report, indent=2))
+    print(json.dumps(outcome(report, args.out)))  # the full report is in report.json
     return 0 if report['status'] == 'ready_for_review' else 1
 
 

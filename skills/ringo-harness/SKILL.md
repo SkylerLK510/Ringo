@@ -109,6 +109,15 @@ python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --timeout 180 
 - `--trace` needs a new or empty folder outside the repository. Use a plan whose kind matches the task.
 - For review/design, the last stderr line is `harness: ` followed by a JSON summary; parse after that prefix. Report calls, tokens and the `backend` and `checker_backend` it names. If `untokened_calls > 0`, token sums leave those calls out and the reported total is partial. Monetary fields remain available for explicit budgets; if reporting them, `unpriced_calls > 0` means cost is unknown, not zero.
 - Review/design: exit 0 is finished; exit 2 is failure. A late output-write failure prints the completed result and cost as recovery output.
+- `work` prints one compact JSON line (status, final, report path, rounds, usage); the full report is `report.json`.
+
+**Waiting without re-entering your model.** Every model turn you spend checking on a run re-sends your whole
+conversation. Run Ringo in the foreground when your tool's time limit covers the run. Otherwise start it in the
+background with `--trace DIR` (review/design) or `--out DIR` (work) and block on
+`python3 ringo.py wait DIR --timeout 540`: one call that returns when the run finishes, fails or its process is
+gone, printing the small `state.json` (status, last step, calls, tokens, artifact paths, error). Repeat it only on
+exit 3 (still running). Never sleep-and-poll, tail traces or reread logs to watch progress; when it finishes, read
+the result file named in the state once and cite trace paths instead of pasting logs.
 
 ## 3. Report the result
 

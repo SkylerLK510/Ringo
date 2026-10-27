@@ -45,6 +45,9 @@ There is no call cap: the plan or the round count decides the calls, and
 
 `--timeout` (review/design, default 900) and `timeout_s` (work, default 120) are soft: a call past it is not killed. Ringo checks it for free, sends one tiny probe call to the same backend (none under a cost cap), writes `incidents/<step>.<attempt>.json` in the trace (a private temporary folder without one) and prints one line, recommending a stop only when the evidence suggests a stall: the backend still answers and comparable calls in the run finished in a third of the time, or the output shows reconnects. Writing `stop` to the printed decision file stops the call and retries it once; nothing decides for you. Every call is stopped at twice its soft limit, never under 900 seconds (and, in `work`, at the run deadline), and is not retried after that.
 
+A run with `--trace` (and every `work` run) keeps a small `state.json`; `python3 ringo.py wait DIR` blocks until
+it finishes and prints it, so an agent waits with one command instead of polling.
+
 `work` revises a declared set of text files: a writer model returns complete
 files or exact search/replace edits, which Ringo turns into complete files; fixed
 executable checks run on them, and a separate council assessment decides whether

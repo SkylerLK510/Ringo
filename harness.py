@@ -37,6 +37,7 @@ that fails or replies in the wrong shape is tried once more; a missing verdict a
 no call cap: the built-in plans make exactly one call when it succeeds, at most two.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -444,6 +445,14 @@ def stop_reason(exc, watch):
 def total_tokens(usage):
     return sum(usage[k] for k in TOKEN_KEYS) if isinstance(usage, dict) and all(k in usage for k in TOKEN_KEYS) else None
 
+def write_state(folder, state):
+    """Atomically replace folder/state.json: the small run state an agent waits on (`ringo.py wait`) and reads
+    instead of the trace or logs."""
+    path = Path(folder) / 'state.json'
+    tmp = path.with_name(f'.state.{os.getpid()}.{threading.get_ident()}.tmp')
+    tmp.write_text(json.dumps(state, separators=(',', ':')) + '\n', encoding='utf-8')
+    os.replace(tmp, path)
+
 
 class Run:
     """Cost budget, totals and trace of one pipeline run; shared by the parallel steps, so it holds a lock. It
@@ -468,6 +477,8 @@ class Run:
                 raise ValueError('the trace folder must be new or empty')
             (self.trace / 'steps').mkdir(parents=True)  # exclusive creation also refuses concurrent trace writers
             os.chmod(self.trace, 0o700)  # it holds the material
+        self.started, self.last = time.time(), None
+        self.state('running')
 
     def reserve(self):
         """Count a call about to start, or raise BudgetExceeded under a cost cap. A cost cap needs every earlier
@@ -510,6 +521,8 @@ class Run:
             if self.trace:
                 with open(self.trace / 'trace.jsonl', 'a', encoding='utf-8') as f:
                     f.write(json.dumps(rec) + '\n')
+                self.last = {k: rec[k] for k in ('step', 'attempt', 'status') if k in rec}
+                self._state('running')
                 if reply is not None:
                     (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.txt").write_text(reply, encoding='utf-8')
                 if raw:
@@ -538,6 +551,17 @@ class Run:
                 else:
                     self.incident_dir = Path(tempfile.mkdtemp(prefix='ringo-incidents-'))
             return self.incident_dir
+
+    def state(self, status, **extra):
+        """Write state.json with status ('running', 'done', 'failed' or a work report status) and artifact paths."""
+        with self.lock:
+            self._state(status, **extra)
+
+    def _state(self, status, **extra):
+        if self.trace:
+            write_state(self.trace, {'version': 1, 'status': status, 'pid': os.getpid(), 'started': round(self.started, 3),
+                                     'updated': round(time.time(), 3), 'last': self.last, **self.summary(),
+                                     **{k: v for k, v in extra.items() if v is not None}})
 
     def summary(self):
         return {'calls': self.calls, 'cost_usd': round(self.cost, 6), 'unpriced_calls': self.unpriced,
@@ -766,6 +790,7 @@ def write_findings(args, text, run):
 
 
 def task(args, kind):
+    run = None
     try:
         import releases
         started = time.perf_counter_ns()
@@ -802,13 +827,20 @@ def task(args, kind):
             (run.trace / 'implementation.json').write_text(json.dumps(names['implementation'], indent=1), encoding='utf-8')
     except (ValueError, OSError) as exc:
         print(f'harness: {kind} cannot start: {exc}', file=sys.stderr)
+        if run is not None:  # its state already says running; a waiter must learn the run is over
+            with contextlib.suppress(OSError):
+                run.state('failed', error=f'cannot start: {exc}'[:500])
         return 2
     try:
         text, stats = run_plan(plan, material, b, run, timeout_s=args.timeout, checker_spec=c)
     except (backends.JudgeError, ValueError, OSError, subprocess.TimeoutExpired, BudgetExceeded, pipelines.NeedVerdicts) as exc:
         print(f'harness: {kind} failed: {exc}', file=sys.stderr)
         print(f'harness: {json.dumps({**run.summary(), **names})}', file=sys.stderr)
+        run.state('failed', error=f'{type(exc).__name__}: {exc}'[:500])
         return 2
+    except BaseException:
+        run.state('interrupted')
+        raise
     summary = {**run.summary(), **stats, **names}
     summary['elapsed_s'] = (time.perf_counter_ns() - started) / 1_000_000_000
     try:
@@ -825,8 +857,12 @@ def task(args, kind):
         print(text)
         print(f'harness: {kind} cannot write the result: {exc}', file=sys.stderr)
         print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+        run.state('failed', error=f'cannot write the result: {exc}'[:500])
         return 2
     print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+    if run.trace:
+        run.state('done', result=str(Path(args.out).resolve()) if args.out else str(run.trace / 'result.md'),
+                  summary=str(run.trace / 'summary.json'))
     return 0
 
 

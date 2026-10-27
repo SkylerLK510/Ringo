@@ -173,6 +173,12 @@ command calls the selected models and uses their accounts.
 | 1 | `error` | For example a mutated file, bridge failure, unreadable judge reply, changed council policy, or a per-operation timeout before the overall deadline. |
 | 2 | none | The spec or output folder was refused before the run started. |
 
+The command prints one compact JSON line: status, `final`, the `report.json` path,
+rounds, usage, elapsed time and any error; everything else is in `report.json`.
+The `--out` folder also holds `state.json`, updated after every call, so a caller
+can block on `python3 ringo.py wait OUT` instead of polling (see `docs/HARNESS.md`,
+**Run state**).
+
 Deeply nested writer JSON is treated as malformed protocol output and can be
 revised. An interrupted run, or one stopped by an exception the workflow does not
 handle, writes `report.json` with status `interrupted` and then re-raises the
