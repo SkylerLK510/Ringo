@@ -200,6 +200,7 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual(len(report['rounds']), 1)
         self.assertIn('repair', report['rounds'][0])
         self.assertIn('could not be applied', seen[2][1])  # the repair call sees the exact error
+        self.assertIn('complete FILE block', seen[2][1])  # and is asked for whole files, which cannot mis-anchor
         self.assertEqual(report['usage']['calls'], 4)  # spec tests, writer, repair, review
 
     def test_script_and_candidate_options_are_validated(self):

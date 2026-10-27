@@ -131,6 +131,7 @@ def materialize(current, declared, reply):
 
 
 MARK = '@@@ '
+REPAIR = ' Send every file you change as one complete FILE block this time; use no REPLACE blocks.'
 ROLES = ('writer', 'revision', 'escalate', 'tests', 'review')
 EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
 DOC_SUFFIXES = ('.md', '.txt', '.rst', '.adoc')
@@ -742,7 +743,8 @@ def run(spec_path, out, call_fn=harness.call):
                 # not the round (and the review or check feedback it was answering).
                 entry['repair'] = errors[0]['protocol_error']
                 repaired = call(f'writer-{n}.repair', spec['writer'], writer_prompt,
-                                writer_message({**feedback, 'protocol_error': errors[0]['protocol_error']}), role=role)
+                                writer_message({**feedback, 'protocol_error': errors[0]['protocol_error'] + REPAIR}),
+                                role=role)
                 try:
                     parsed.append((k + 1, *parse(repaired)))
                 except ValueError as exc:
