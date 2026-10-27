@@ -175,6 +175,12 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual([r['status'] for r in report['rounds']], ['script', 'ready_for_review'])
         self.assertIn('total 6', seen[2][1])
 
+    def test_a_rationale_only_reply_stands_by_the_code(self):
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        report, _ = self.run_with([good, '@@@ RATIONALE\nThe review is mistaken: f already doubles x.\n'],
+                                  reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK))
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
+
     def test_a_suite_that_cannot_load_is_dropped(self):
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'],
                                   '```python\nfrom value import g\n\nimport unittest\nclass T(unittest.TestCase):\n'

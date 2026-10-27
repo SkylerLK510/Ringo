@@ -271,8 +271,6 @@ def materialize_text(current, declared, reply):
             raise ValueError(f'FILE {path!r} is not a declared editable file')
     if any(e['path'] in reply['files'] for e in reply['edits']):
         raise ValueError('a file cannot be both replaced whole and edited in one reply')
-    if not reply['files'] and not reply['edits'] and not reply['disputes'] and not reply.get('script'):
-        raise ValueError('the reply changes no file')
     files = dict(current)
     if reply['edits']:
         files = materialize(current, declared, {'edits': reply['edits'], 'rationale': reply['rationale']})
@@ -817,8 +815,11 @@ def run(spec_path, out, call_fn=harness.call):
                     disputed.setdefault(tid, why)
                 key = digest(files)
                 # Leaving the code unchanged after spec-test failures stands by it: those tests count as disputed.
-                stands = text_protocol and files == current and bool((feedback.get('spec_tests') or {}).get('failing'))
-                if stands:
+                spec_feedback = bool((feedback.get('spec_tests') or {}).get('failing'))
+                # A reply with only a rationale also stands by the code it was shown (it disagrees with the feedback).
+                noop = not any(candidate.get(part) for part in ('files', 'edits', 'disputes', 'script'))
+                stands = text_protocol and files == current and (spec_feedback or noop)
+                if stands and spec_feedback:
                     for tid in feedback['spec_tests']['failing_ids']:
                         disputed.setdefault(tid, 'the writer left the code unchanged')
                 # A reply that only disputes spec tests, sends a script or stands by the code re-checks the same
