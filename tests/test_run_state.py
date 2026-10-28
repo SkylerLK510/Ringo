@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -32,7 +33,7 @@ class RunStateTest(unittest.TestCase):
         err = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             code = harness.main(['review', '--input', str(self.root / 'm.txt'), '--backend',
-                                 f'{sys.executable} -c {json.dumps(child)}',
+                                 shlex.join([sys.executable, '-c', child]),
                                  '--trace', str(self.root / 't'), *extra])
         return code, err.getvalue()
 

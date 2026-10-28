@@ -17,6 +17,7 @@ from unittest import mock
 import latency
 import pipelines
 import releases as rel
+from tests.support import NO_SYMLINKS, POSIX_MODES, SYMLINKS
 from tests.test_latency import data, POLICY
 
 
@@ -82,11 +83,14 @@ print('No defects found.')
         return ['review', '--input', str(material), '--backend', shlex.join([sys.executable, str(self.backend)]),
                 '--trace', str(trace), '--out', str(trace.parent / (trace.name + '.md'))]
 
-    def test_stage_is_reproducible_readonly_private_and_does_not_activate(self):
+    def test_stage_is_reproducible_readonly_and_does_not_activate(self):
         self.assertEqual(rel.stage(self.source, self.state), self.rid)
         self.assertFalse((self.state / 'active.json').exists())
+        self.assertEqual((self.bundle / 'ringo.py').stat().st_mode & 0o222, 0)  # Windows: the read-only attribute
+
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_release_state_is_private(self):
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.bundle / 'ringo.py').stat().st_mode & 0o222, 0)
 
     def test_source_prompt_changes_change_identity_and_actual_default_plan_hash(self):
         next_id = self.next_release()
@@ -107,6 +111,7 @@ print('No defects found.')
         self.assertNotIn('spec_runner.py', manifest['files'])
         self.assertIn('spec_runner.py', self.manifest['files'])  # a new bundle carries it
 
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
     def test_symlink_source_and_bundle_are_refused(self):
         p = self.source / 'context.py'
         p.unlink()
@@ -115,6 +120,7 @@ print('No defects found.')
             rel.stage(self.source, self.state)
         q = self.bundle / 'context.py'
         self.bundle.chmod(0o755)
+        q.chmod(0o644)  # Windows refuses to delete a read-only file
         q.unlink()
         q.symlink_to(rel.HERE / 'context.py')
         with self.assertRaises(ValueError):
@@ -161,6 +167,7 @@ print('No defects found.')
     def test_missing_non_runtime_inventory_file_is_rejected(self):
         parent = self.bundle / 'prompts'
         parent.chmod(0o755)
+        (parent / 'work.md').chmod(0o644)  # Windows refuses to delete a read-only file
         (parent / 'work.md').unlink()
         with self.assertRaises(ValueError):
             rel.verify(self.state, self.rid)
@@ -178,6 +185,7 @@ print('No defects found.')
         (self.bundle / 'empty' / 'nested').mkdir(parents=True)
         self.assertEqual(rel.verify(self.state, self.rid)[1], self.manifest)
 
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
     def test_directory_and_dangling_symlinks_are_rejected(self):
         self.bundle.chmod(0o755)
         for destination in (self.root, self.root / 'does-not-exist'):

@@ -80,6 +80,16 @@ class CallTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'claude-style'):
             harness.call({'name': 'py', 'argv': argv, 'style': 'plain'}, 'SYS', 'MSG', 30, model='haiku')
 
+    def test_windows_command_strings_keep_backslashes_and_split_like_posix(self):
+        cases = {r'C:\Tools\cli.exe -p': [r'C:\Tools\cli.exe', '-p'],
+                 r'"C:\Program Files\cli.exe" --x "a b" c#d': [r'C:\Program Files\cli.exe', '--x', 'a b', 'c#d'],
+                 shlex.join([r'C:\py\python.exe', '-c', "print('a # b')"]): [r'C:\py\python.exe', '-c', "print('a # b')"]}
+        with mock.patch.object(harness.os, 'name', 'nt'):
+            for command, argv in cases.items():
+                self.assertEqual(harness.split_command(command), argv)
+            for preset in backends.JUDGE_PRESETS.values():  # POSIX-quoted, without backslashes: split alike
+                self.assertEqual(harness.split_command(preset), shlex.split(preset))
+
     def test_backend_styles_are_declared_not_guessed(self):
         self.assertEqual(harness.backend('claude'), {'name': 'claude', 'argv': shlex.split(backends.JUDGE_PRESETS['claude']),
                                                      'style': 'claude'})
