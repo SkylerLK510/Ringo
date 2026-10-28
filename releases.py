@@ -14,6 +14,9 @@ from latency import canonical, read_json, sha
 HERE = Path(__file__).resolve().parent
 RUNTIME = ('ringo.py', 'harness.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
            'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
+# Files that joined the runtime after releases already existed. New bundles always include them; a bundle staged
+# before one joined still verifies without it, since that bundle has no feature that runs it.
+LATER_RUNTIME = {'spec_runner.py'}
 IDENT = re.compile(r'[0-9a-f]{64}')
 LATENCY_WORKLOADS = {'startup', 'review', 'review-trace', 'review-large', 'design', 'work'}
 
@@ -272,7 +275,7 @@ def verify(root, rid):
             or not isinstance(manifest['files'], dict) or not isinstance(manifest['quality'], dict) \
             or not isinstance(manifest['default_review_sha256'], str) \
             or not IDENT.fullmatch(manifest['default_review_sha256']) \
-            or not set(RUNTIME).issubset(manifest['files']):
+            or not (set(RUNTIME) - LATER_RUNTIME).issubset(manifest['files']):
         raise ValueError('release manifest integrity failure')
     # Validate every manifest path before opening inventory members. Keep paths
     # canonical so one physical file cannot satisfy two differently spelled keys.
