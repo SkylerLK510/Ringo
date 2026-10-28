@@ -234,6 +234,21 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertFalse(tests['Broken.test_never']['ok'])
         self.assertIn('fixture down', tests['Broken.test_never']['error'])
 
+    def test_spec_runner_runs_module_fixtures_and_fails_tests_on_a_teardown_error(self):
+        import subprocess
+        module = self.root / 'module_tests.py'
+        module.write_text('import unittest\nSTATE = {}\n\ndef setUpModule():\n    STATE["ready"] = True\n\n'
+                          'class UsesModule(unittest.TestCase):\n    def test_ready(self):\n        self.assertTrue(STATE.get("ready"))\n\n'
+                          'class BadTeardown(unittest.TestCase):\n    @classmethod\n    def tearDownClass(cls):\n'
+                          '        raise RuntimeError("close failed")\n\n    def test_passes_first(self):\n        pass\n')
+        out = self.root / 'out2.json'
+        subprocess.run([sys.executable, '-I', '-B', str(Path(workflow.__file__).parent / 'spec_runner.py'),
+                        str(self.root), str(module), '--json', str(out)], capture_output=True, timeout=60)
+        tests = json.loads(out.read_text())['tests']
+        self.assertTrue(tests['UsesModule.test_ready']['ok'])
+        self.assertFalse(tests['BadTeardown.test_passes_first']['ok'])
+        self.assertIn('close failed', tests['BadTeardown.test_passes_first']['error'])
+
     def test_a_spec_runner_that_produces_no_result_drops_the_suite(self):
         hang = '```python\nimport time, unittest\ntime.sleep(30)\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n```'
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'], hang,

@@ -4,8 +4,8 @@ usage: python3 -I spec_runner.py <candidate_root> <tests.py> --json OUT
 
 The candidate root goes first on sys.path and becomes the working directory. The module's suite runs as unittest runs
 it, so class and module fixtures (setUpClass, setUpModule) apply; each test gets a 10 s alarm. Test ids are
-'<Class>.<test>'; a test a failed fixture kept from running fails with that error; a module that fails to load is
-reported as the single id '<import>'.
+'<Class>.<test>'; a failed class or module fixture fails every test it covers with its error; a module that fails
+to load is reported as the single id '<import>'.
 """
 import importlib.util
 import json
@@ -62,6 +62,7 @@ def main(argv):
     try:
         spec = importlib.util.spec_from_file_location('spec_tests', path)
         module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module  # unittest finds setUpModule and tearDownModule through sys.modules
         spec.loader.exec_module(module)
         suite = unittest.defaultTestLoader.loadTestsFromModule(module)
     except BaseException:
@@ -74,9 +75,19 @@ def main(argv):
         suite.run(record)
     except BaseException as exc:  # a timeout or SystemExit that escaped unittest
         record.errors.append((None, repr(exc)))
-    fixture_errors = [error for holder, error in record.errors if not isinstance(holder, unittest.TestCase)]
-    for tid in ids:  # a test a failed setUpClass or setUpModule kept from running
-        results[tid] = record.outcomes.get(tid) or {'ok': False, 'error': ('not run: ' + (fixture_errors or ['unknown'])[0])[-2000:]}
+    for holder, error in record.errors:
+        if isinstance(holder, unittest.TestCase):
+            continue
+        # A class or module fixture failed: "setUpClass (spec_tests.Name)" or "tearDownModule (spec_tests)". Its error
+        # fails every test it covers, run or not, as a failed fixture fails the suite in unittest.
+        desc = getattr(holder, 'description', '')
+        name = desc.rsplit('.', 1)[-1].rstrip(')') if '.' in desc else None
+        for tid in ids:
+            if name is None or tid.split('.')[0] == name:
+                if record.outcomes.get(tid, {}).get('ok', True):
+                    record.outcomes[tid] = {'ok': False, 'error': f'{desc or "suite"}: {error}'[-2000:]}
+    for tid in ids:
+        results[tid] = record.outcomes.get(tid) or {'ok': False, 'error': 'not run'}
     passed = sum(r['ok'] for r in results.values())
     out.write_text(json.dumps({'passed': passed, 'total': len(results), 'tests': results}, indent=1))
     print(f'{passed}/{len(results)} spec tests pass')
