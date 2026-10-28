@@ -62,12 +62,6 @@ class BackendRuntimeTest(unittest.TestCase):
             time.sleep(0.5)
             self.assertEqual(marker.stat().st_size, ticks)  # the grandchild died with the call
 
-    def test_a_bare_command_name_is_found_on_path(self):  # on Windows also as the .cmd file npm installs
-        with tempfile.TemporaryDirectory() as d:
-            python_cli(Path(d, 'ringo-fake-cli'), 'import sys; print("found", sys.stdin.read())')
-            with mock.patch.dict(os.environ, {'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}'}):
-                self.assertEqual(backends.run_isolated(['ringo-fake-cli'], 'it', 10).strip(), 'found it')
-
     def test_codex_home_false_keeps_the_callers_home(self):
         code = 'import json, os; print(json.dumps([os.environ.get("HOME"), os.environ.get("CODEX_HOME")]))'
         with mock.patch.dict(os.environ, {'HOME': '/fixture/home', 'CODEX_HOME': '/fixture/codex'}):

@@ -9,7 +9,6 @@ import json
 import math
 import os
 import re
-import shutil
 import signal
 import subprocess
 import sys
@@ -119,23 +118,14 @@ def _win32():
     return ctypes, k32, nt, Accounting
 
 
-def _found(argv, env=None):
-    """argv with argv[0] looked up on env's PATH with PATHEXT on Windows, as a shell finds it (CreateProcess adds only
-    .exe), so a `claude` or `codex` that npm installed as a .cmd file runs. Unchanged elsewhere."""
-    if os.name != 'nt' or not argv:
-        return argv
-    return [shutil.which(argv[0], path=(env or os.environ).get('PATH')) or argv[0], *argv[1:]]
-
-
 def spawn(argv, **kw):
     """subprocess.Popen(argv, **kw) in a process tree of its own, which kill_tree ends with everything it started.
     POSIX: a new session. Windows: a new process group inside a job object; the command starts suspended and runs
-    only once it is in the job, so every process it starts is in the job too, and argv[0] is looked up as _found
-    does."""
+    only once it is in the job, so every process it starts is in the job too. A bare name is not looked up with
+    PATHEXT: a .cmd or .bat file would get its arguments through cmd.exe, which Popen does not quote for."""
     if os.name != 'nt':
         return subprocess.Popen(argv, start_new_session=True, **kw)
     ctypes, k32, nt, _ = _win32()
-    argv = _found(argv, kw.get('env'))
     job = k32.CreateJobObjectW(None, None)
     if not job:
         raise ctypes.WinError(ctypes.get_last_error())
@@ -274,6 +264,7 @@ def _codex_home(root, env):
     global $CODEX_HOME/AGENTS.md, ~/.codex/skills, its memories or ~/.agents/skills; a fresh home does. Returns
     (owner path, snapshot bytes or None, private copy path) for the write-back after the call."""
     home, private = root / 'home', root / 'codex'
+    # Windows ignores these modes; the folders keep the access list of %TEMP%, which is the user's own.
     home.mkdir(mode=0o700)
     private.mkdir(mode=0o700)
     owner = _owner_auth()
@@ -301,7 +292,7 @@ def _lean_codex(argv, private, env, timeout_s=15):
     instructions.write_text(CODEX_INSTRUCTIONS, encoding='utf-8', newline='')  # LF on Windows too
     extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
     try:
-        listed = subprocess.run(_found([argv[0], 'debug', 'models'], env), env=env, cwd=private, stdin=subprocess.DEVNULL,
+        listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=timeout_s, check=True).stdout
         catalog = json.loads(listed)
         for model in catalog['models']:

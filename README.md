@@ -391,9 +391,10 @@ so this is a confirmation, not a clean held-out test.
   bounds it.
 - **Release bundles:** these left out `spec_runner.py`. It is now in the bundle.
 - **CI:** it runs on Ubuntu, macOS and Windows, and the whole offline suite passes natively on Windows. The native
-  port locks with `msvcrt`, ends a call's or check's process tree through a job object, finds npm `.cmd` CLIs with
-  `PATHEXT`, and splits backend commands without treating `\` in Windows paths as an escape. Tests of POSIX-only
-  properties (permission bits, `os.killpg`, FIFOs, the Linux ReviewBench image) are skipped there.
+  port locks with `msvcrt`, ends a call's or check's process tree through a job object, and splits backend commands
+  without treating `\` in Windows paths as an escape. Tests of POSIX-only properties (permission bits, `os.killpg`,
+  FIFOs, the Linux ReviewBench image) are skipped there. Mode 0700 does not apply on Windows: a trace, store or
+  release state keeps its parent folder's access list, which is owner-only under the user profile.
 
 ### 8. Ideas we considered and did not adopt
 

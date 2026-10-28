@@ -132,6 +132,7 @@ def _ledger(store):
 def private_store(store):
     """Create the store private from the first instant; tighten an existing root before opening files."""
     path = outside_repo(store, 'store')
+    # Windows ignores the mode bits: the store keeps its parent folder's access list.
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
     return path

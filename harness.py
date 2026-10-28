@@ -494,7 +494,7 @@ class Run:
             if self.trace.exists() and any(self.trace.iterdir()):
                 raise ValueError('the trace folder must be new or empty')
             (self.trace / 'steps').mkdir(parents=True)  # exclusive creation also refuses concurrent trace writers
-            os.chmod(self.trace, 0o700)  # it holds the material
+            os.chmod(self.trace, 0o700)  # it holds the material; Windows ignores the mode, the parent's ACL applies
         self.started, self.last = time.time(), None
         self.state('running')
 

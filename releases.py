@@ -86,6 +86,7 @@ def state_root(path=None):
 
 def private_root(path=None):
     root = state_root(path)
+    # Windows ignores the mode bits: the state keeps its parent folder's access list (the user's own by default).
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     for name in ('bundles', 'approvals'):
