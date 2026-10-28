@@ -49,8 +49,8 @@ Ubuntu 24.04 and later ship Python 3.12. On an older release, install Python 3.1
 ### Windows
 
 The offline test suite passes natively on Windows (CI runs it on `windows-latest` with Python 3.11 and 3.14), so
-Ringo runs with a native Python 3.11 or newer. Real model calls have not been tried natively yet; WSL 2, the Windows
-Subsystem for Linux, remains the tested path for them:
+Ringo runs with a native Python 3.11 or newer. Real model calls have so far been run only on macOS, so they are
+untested natively. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
 
 1. Open PowerShell as Administrator, run `wsl --install`, then restart Windows. This installs WSL 2 with Ubuntu.
 2. Open **Ubuntu** from the Start menu and follow the Linux steps above inside it.
