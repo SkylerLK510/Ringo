@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -160,6 +161,14 @@ class WaitTest(unittest.TestCase):
         child.communicate(b'')
         with self.assertRaises(ProcessLookupError):
             ringo.check_pid(child.pid)
+
+    def test_a_waiter_reading_the_state_does_not_fail_the_run_that_writes_it(self):
+        harness.write_state(self.folder, {'version': 1, 'status': 'running', 'pid': os.getpid()})
+        reader = open(self.folder / 'state.json', encoding='utf-8')  # on Windows this blocks a replace
+        self.addCleanup(reader.close)
+        threading.Timer(0.2, reader.close).start()
+        harness.write_state(self.folder, {'version': 1, 'status': 'done'})
+        self.assertEqual(state(self.folder)['status'], 'done')
 
     def test_no_state_yet_is_not_started(self):
         self.assertEqual(self.wait('--timeout', '0'), (3, {'status': 'not_started', 'folder': str(self.folder)}))

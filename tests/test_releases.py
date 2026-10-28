@@ -153,7 +153,8 @@ print('No defects found.')
 
     def test_verification_accepts_registered_nested_unicode_and_whitespace_names(self):
         self.bundle.chmod(0o755)
-        name = 'fixtures/nested folder/café\tvalue.txt'
+        # Windows file names cannot hold control characters such as a tab, so whitespace there is a space.
+        name = 'fixtures/nested folder/café' + (' ' if os.name == 'nt' else '\t') + 'value.txt'
         path = self.bundle / name
         path.parent.mkdir(parents=True)
         path.write_bytes(b'complete fixture content\n')
