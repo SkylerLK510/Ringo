@@ -567,7 +567,7 @@ class Run:
             if self.incident_dir is None:
                 if self.trace:
                     folder = self.trace / 'incidents'
-                    folder.mkdir(mode=0o700, exist_ok=True)
+                    backends.private_directory(folder, create=True, mode=0o700, exist_ok=True)
                 else:
                     with backends.private_tempdir(prefix='ringo-incidents-', cleanup=False) as tmp:
                         folder = Path(tmp)

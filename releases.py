@@ -93,7 +93,8 @@ def private_root(path=None):
         target = root / name
         if target.is_symlink():
             raise ValueError('release state directories cannot be symlinks')
-        target.mkdir(mode=0o700, exist_ok=True)
+        # not mkdir(mode=0o700): on Windows, Python 3.13+ gives that its own DACL (SYSTEM, administrators, owner)
+        backends.private_directory(target, create=True, mode=0o700, exist_ok=True)
     return root
 
 

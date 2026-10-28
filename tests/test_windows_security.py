@@ -375,13 +375,15 @@ class NativeWindowsPrivacyTest(unittest.TestCase):
             self.assert_private(evaluate.private_store(root / 'store'))
             run = harness.Run(root / 'trace')
             self.assert_private(run.trace)
-            for path in (run.trace / 'steps', run.incident_folder()):
-                self.assert_private(path, protected=False)
+            self.assert_private(run.trace / 'steps', protected=False)  # plain mkdir inside: inherits the root's ACE
+            # Folders made with mode 0o700 go through the helper: on Windows, Python 3.13+ would give
+            # mkdir(mode=0o700) its own DACL (SYSTEM, administrators, owner) instead of the root's.
+            self.assert_private(run.incident_folder())
             self.assert_private(run.trace / 'state.json', directory=False)
             state = releases.private_root(root / 'state')
             self.assert_private(state)
             for path in (state / 'bundles', state / 'approvals'):
-                self.assert_private(path, protected=False)
+                self.assert_private(path)
             with mock.patch.object(backends, '_owner_auth', return_value=root / 'absent'):
                 backends._codex_home(root, {})
             for path in (root / 'codex', root / 'home'):
