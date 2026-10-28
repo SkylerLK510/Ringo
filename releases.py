@@ -13,7 +13,7 @@ from latency import canonical, read_json, sha
 
 HERE = Path(__file__).resolve().parent
 RUNTIME = ('ringo.py', 'harness.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
-           'workflow.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
+           'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
 IDENT = re.compile(r'[0-9a-f]{64}')
 LATENCY_WORKLOADS = {'startup', 'review', 'review-trace', 'review-large', 'design', 'work'}
 

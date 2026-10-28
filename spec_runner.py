@@ -44,10 +44,12 @@ class Record(unittest.TestResult):
     def startTest(self, test):
         super().startTest(test)
         self.before = len(self.failures), len(self.errors)
-        signal.alarm(PER_TEST_S)
+        if hasattr(signal, 'alarm'):
+            signal.alarm(PER_TEST_S)
 
     def stopTest(self, test):
-        signal.alarm(0)
+        if hasattr(signal, 'alarm'):
+            signal.alarm(0)
         bad = self.failures[self.before[0]:] + self.errors[self.before[1]:]
         self.outcomes[test_id(test)] = {'ok': not bad, 'error': bad[0][1][-2000:] if bad else ''}
         super().stopTest(test)
@@ -71,7 +73,8 @@ def main(argv):
     # Before running (a suite drops its tests as it runs them): each test's module and class, as unittest names them.
     owners = {test_id(t): (type(t).__module__, f'{type(t).__module__}.{type(t).__qualname__}') for t in tests_in(suite)}
     ids = list(owners)
-    signal.signal(signal.SIGALRM, _alarm)
+    if hasattr(signal, 'SIGALRM'):  # POSIX; on Windows the caller's timeout for the whole suite bounds a hung test
+        signal.signal(signal.SIGALRM, _alarm)
     record = Record()
     try:
         suite.run(record)

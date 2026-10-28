@@ -22,7 +22,8 @@ def wait(argv):
             state = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):  # not written yet
             state = None
-        if state and state.get('status') == 'running':
+        # On Windows os.kill(pid, 0) would terminate the process, so only the state file or the timeout ends the wait.
+        if state and state.get('status') == 'running' and os.name != 'nt':
             try:
                 os.kill(state['pid'], 0)
             except ProcessLookupError:  # it may have finished between the read and the check: read again
