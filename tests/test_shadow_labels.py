@@ -3,7 +3,6 @@ import json
 import sys
 import tempfile
 import unittest
-import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +27,7 @@ class ShadowLabelTest(unittest.TestCase):
                      'max_rounds': 3, 'max_seconds': 60, 'protocol': 'text'}
         self.n = 0
 
-    def work(self, replies, review, draw=.5, **changes):
+    def work(self, replies, review, **changes):
         self.n += 1
         path = self.root / f'task{self.n}.json'
         path.write_text(json.dumps({**self.spec, **changes}))
@@ -39,23 +38,17 @@ class ShadowLabelTest(unittest.TestCase):
                 return next(writer), {'input': 100, 'output': 10}
             return review, {'input': 50, 'output': 5}
         out = self.root / f'run{self.n}'
-        with unittest.mock.patch.object(workflow.random, 'random', return_value=draw):
-            workflow.run(path, out, call_fn=call)
+        workflow.run(path, out, call_fn=call)
         return out
 
     def test_a_revision_that_changes_the_files_is_a_change_and_its_tokens_count_after_round_one(self):
         row = shadow_labels.row(self.work([GOOD, OTHER], FINDING))
-        self.assertEqual((row['eligible'], row['ran_suffix'], row['identical']), (True, True, False))
+        self.assertEqual((row['eligible'], row['identical']), (True, False))
         self.assertEqual((row['round1_tokens'], row['after_tokens']), (110, 165))  # review 55 + revision 110
 
     def test_a_clean_review_delivers_round_one_unchanged(self):
         row = shadow_labels.row(self.work([GOOD], CLEAN))
         self.assertTrue(row['identical'])
-
-    def test_a_stopped_run_is_eligible_but_has_no_suffix_to_compare(self):
-        row = shadow_labels.row(self.work([GOOD], FINDING, draw=.99, stop_on_checks={'retain': .1}))
-        self.assertEqual((row['stopped'], row['ran_suffix'], row['identical'], row['after_tokens']),
-                         (True, False, None, 0))
 
     def test_grades_give_harm_and_avoided_regressions(self):
         harmed, avoided = self.work([GOOD, OTHER], FINDING), self.work([GOOD, OTHER], FINDING)

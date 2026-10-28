@@ -3,7 +3,6 @@ import json
 import sys
 import tempfile
 import unittest
-import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -396,76 +395,6 @@ class SpecTestLoopTest(unittest.TestCase):
                 workflow.load_spec(path)
         with self.assertRaisesRegex(ValueError, 'at most one script'):
             workflow.parse_text_reply('@@@ SCRIPT\nprint(1)\n@@@ SCRIPT\nprint(2)\n')
-
-
-
-class StopOnChecksTest(unittest.TestCase):
-    """stop_on_checks only removes calls: a round-1 pass skips the review unless the logged draw retains the run."""
-    GOOD = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
-    BAD = '@@@ FILE value.py\ndef f(x):\n    return x\n'
-
-    def setUp(self):
-        temp = tempfile.TemporaryDirectory()
-        self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
-        self.spec = {'version': 1, 'brief': 'Implement f(x).\n\nReturn twice x.\n', 'files': {'value.py': ''},
-                     'fixtures': {'check.py': "from value import f\nassert f(5) == 10\n"},
-                     'checks': [{'name': 'reference', 'argv': [sys.executable, '-B', 'check.py']}],
-                     'writer': 'fake', 'judge': 'fake', 'allow_tool_backends': True, 'allow_execution': True,
-                     'max_rounds': 3, 'max_seconds': 60, 'protocol': 'text'}
-
-    def run_with(self, replies, draw, **changes):
-        self.n = getattr(self, 'n', 0) + 1
-        path = self.root / 'task.json'
-        path.write_text(json.dumps({**self.spec, **changes}))
-        writer, roles = iter(replies), []
-
-        def call(backend, system, message, timeout_s):
-            if system.startswith('Implement the brief'):
-                roles.append('writer')
-                return next(writer), {}
-            roles.append('review')
-            return 'What this change does: adds f.\n\n### 1. Wrong\n- Problem: x.\n', {}
-        with unittest.mock.patch.object(workflow.random, 'random', return_value=draw):
-            return workflow.run(path, self.root / f'run{self.n}', call_fn=call), roles
-
-    def test_a_round_one_pass_that_is_not_retained_skips_the_review_and_any_revision(self):
-        report, roles = self.run_with([self.GOOD], .99, stop_on_checks={'retain': .1})
-        self.assertEqual(roles, ['writer'])
-        self.assertEqual(report['usage']['calls'], 1)
-        self.assertEqual(report['status'], 'ready_for_review')
-        self.assertEqual(report['rounds'][0]['review_skipped'], 'stop_on_checks')
-        self.assertEqual(report['stop'], {'retain': .1, 'eligible': True, 'draw': .99, 'retained': False})
-        self.assertEqual((self.root / 'run1/final/value.py').read_text(), 'def f(x):\n    return 2*x\n')
-
-    def test_a_retained_run_goes_on_exactly_as_without_the_option(self):
-        replies = [self.GOOD, '@@@ FILE value.py\ndef f(x):\n    return x + x\n']
-        report, roles = self.run_with(replies, .05, stop_on_checks={'retain': .1})
-        plain, plain_roles = self.run_with(replies, .05)
-        self.assertEqual(roles, plain_roles)
-        self.assertEqual(roles, ['writer', 'review', 'writer'])  # the review's finding gets its one revision
-        self.assertEqual(report['stop'], {'retain': .1, 'eligible': True, 'draw': .05, 'retained': True})
-        self.assertNotIn('stop', plain)
-
-    def test_retain_one_records_eligibility_and_changes_nothing(self):
-        report, roles = self.run_with([self.GOOD, self.GOOD], .999999, stop_on_checks={'retain': 1})
-        self.assertEqual(roles[:2], ['writer', 'review'])
-        self.assertTrue(report['stop']['retained'])
-
-    def test_only_round_one_is_eligible(self):
-        report, roles = self.run_with([self.BAD, self.GOOD, self.GOOD], .99, stop_on_checks={'retain': .1})
-        self.assertEqual(roles, ['writer', 'writer', 'review', 'writer'])
-        self.assertEqual(report['stop'], {'retain': .1, 'eligible': False})
-
-    def test_retain_must_keep_a_cohort_and_the_council_is_excluded(self):
-        for bad in ({'retain': .01}, {'retain': True}, {'retain': 2}, {}, {'retain': .5, 'extra': 1}, .5):
-            path = self.root / 'bad.json'
-            path.write_text(json.dumps({**self.spec, 'stop_on_checks': bad}))
-            with self.assertRaisesRegex(ValueError, 'stop_on_checks', msg=bad):
-                workflow.load_spec(path)
-        path.write_text(json.dumps({**self.spec, 'stop_on_checks': {'retain': .5}, 'council': ['x'], 'rubric': 'r'}))
-        with self.assertRaisesRegex(ValueError, 'Council'):
-            workflow.load_spec(path)
 
 
 if __name__ == '__main__':

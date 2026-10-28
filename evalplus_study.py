@@ -2,8 +2,8 @@
 
 Each HumanEval+ task becomes a `work` spec: the writer completes solution.py from its signature and docstring, the
 original HumanEval tests are the public check, and EvalPlus's extra inputs (about 80 times as many) are hidden tests
-graded locally after the run. Runs use the checkout's workflow.py, the code under evaluation, in shadow mode
-(stop_on_checks retain 1): every run is the full baseline and also records whether round 1 was eligible to stop.
+graded locally after the run. Runs use the checkout's workflow.py, the code under evaluation: every run is the full
+baseline, and round 1 is eligible to stop when it passes the public check.
 
   run     prepare and run tasks, J at a time (model calls: at most max_rounds + 1 per task)
   grade   score round 1 and the delivered files against the hidden tests (no model calls)
@@ -84,8 +84,7 @@ def task_spec(task, template, backend=None):
     spec.update(brief=f"Complete `{task['entry_point']}` in solution.py. Its signature and docstring are the "
                       'specification. Keep the signature, use only the standard library, and do not print.\n',
                 files={'solution.py': task['prompt']}, fixtures={'check_base.py': check},
-                checks=[{'name': 'base tests', 'argv': ['{python}', '-B', 'check_base.py'], 'timeout_s': 60}],
-                stop_on_checks={'retain': 1})
+                checks=[{'name': 'base tests', 'argv': ['{python}', '-B', 'check_base.py'], 'timeout_s': 60}])
     if backend:
         spec.update(writer=backend, judge=backend)
     for name in (spec['writer'], spec['judge']):
@@ -324,7 +323,9 @@ def seed_all(out, limit, jobs, reviewer=None):
             continue
         grade_result = json.loads((run / 'grade.json').read_text())
         report = json.loads((run / 'report.json').read_text(encoding='utf-8'))
-        if not (report.get('stop') or {}).get('eligible') or not grade_result['round1_pass'] or grade_result.get('suspect'):
+        first = (report.get('rounds') or [{}])[0].get('checks')
+        if not first or any(c['status'] != 'pass' for c in first) or not grade_result['round1_pass'] \
+                or grade_result.get('suspect'):
             continue  # only correct, eligible drafts: the planted defect is then the only defect
         if (out / 'seeded' / run.name / 'solution.py').is_file():  # seeded already: reuse the same draft
             chosen.append(run.name)

@@ -63,9 +63,9 @@ class SpecTest(unittest.TestCase):
             spec = workflow.load_spec(path)
             self.assertTrue(study.base_passes(spec, task['prompt'] + GOOD[len(TASK['prompt']):]))
 
-    def test_a_task_is_a_v3_work_spec_in_shadow_mode(self):
+    def test_a_task_is_a_v3_work_spec(self):
         spec = study.task_spec(TASK, study.HERE / 'examples' / 'v3-codex.json')
-        self.assertEqual(spec['stop_on_checks'], {'retain': 1})
+        self.assertNotIn('stop_on_checks', spec)
         self.assertEqual(spec['files'], {'solution.py': TASK['prompt']})
         self.assertIn('check(largest)', spec['fixtures']['check_base.py'])
         self.assertNotIn('plus_input', json.dumps(spec))  # hidden inputs never enter the spec
@@ -142,8 +142,8 @@ class ReviewFindingTest(unittest.TestCase):
 
     def test_a_flagged_run_counts_toward_neither_bound(self):
         import shadow_labels
-        base = {'regime': 'r', 'implementation': 'x', 'artifact_kind': 'code', 'eligible': True, 'stopped': False,
-                'ran_suffix': True, 'round1_tokens': 1, 'after_tokens': 1, 'avoided': False, 'harm': False}
+        base = {'regime': 'r', 'implementation': 'x', 'artifact_kind': 'code', 'eligible': True,
+                'round1_tokens': 1, 'after_tokens': 1, 'avoided': False, 'harm': False}
         rows = [{**base, 'identical': False, 'suspect': False}, *[{**base, 'identical': True, 'suspect': True}] * 50]
         text = shadow_labels.summary(rows, .05)
         self.assertIn('change rate after round 1: 1/1', text)
@@ -156,7 +156,7 @@ class ReviewFindingTest(unittest.TestCase):
                 run = out / 'runs' / f'HumanEval-{i}'
                 run.mkdir(parents=True)
                 (run / 'grade.json').write_text(json.dumps({'round1_pass': True, 'delivered_pass': True}))
-                (run / 'report.json').write_text(json.dumps({'stop': {'eligible': True}, 'rounds': []}))
+                (run / 'report.json').write_text(json.dumps({'rounds': [{'checks': [{'status': 'pass'}]}]}))
                 (out / 'seeded' / run.name).mkdir(parents=True)
                 (out / 'seeded' / run.name / 'solution.py').write_text(GOOD)
                 (out / 'seeded' / run.name / 'result.json').write_text('{}')

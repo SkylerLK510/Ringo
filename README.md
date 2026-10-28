@@ -166,9 +166,6 @@ Opt-in spec fields tune `work` for cost and safety, and the defaults are unchang
 - `scripts`: a document writer computes its numbers with a script that Ringo runs and shows to the writer and the
   review.
 - `spec_tests` and `candidates`: blind tests written from the brief, and best-of-k first drafts selected by execution.
-- `stop_on_checks`: a round-1 candidate that passes every check skips the review, except for a logged random share
-  (`retain`, at least 5%) kept as a retention cohort. It only removes calls. It is the first policy of
-  [AGCL](docs/AGCL.md) and is not yet backed by release evidence; `retain: 1` only records eligibility.
 
 `candidates` adds k - 1 writer calls in round 1, `protocol_repair` at most one call per round and `spec_tests` one.
 

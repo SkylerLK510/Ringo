@@ -4,7 +4,7 @@ One row per run folder (it holds report.json and spec.json):
 - regime: a hash of the harness configuration: the exact implementation, writer prompt, artifact kind, backends,
   roles and loop settings, never the task. Rows from different regimes are never pooled; a model, prompt or release
   change starts a new regime (docs/AGCL.md, "declared drift").
-- eligible: round 1 passed every check, so stop_on_checks could have stopped there.
+- eligible: round 1 passed every check, so a policy that stops on passing checks could have stopped there.
 - identical: the delivered editable files are byte-identical to round 1's, so stopping would have delivered the same
   files. A run whose files never change cannot be harmed by stopping, so the change rate bounds the harm rate.
 - tokens in round 1 and after it, from the trace.
@@ -12,9 +12,8 @@ One row per run folder (it holds report.json and spec.json):
   hidden tests): harm, meaning round 1 failed the hidden tests and the delivered files passed them.
 
 The summary gives, per regime, exact one-sided upper bounds (Clopper-Pearson) on the change rate among the eligible
-runs that ran the full suffix, and on the harm rate among eligible graded runs. A run the option stopped has no suffix
-to compare, so it counts toward neither rate; with a constant retain the runs that ran the suffix are a uniform
-sample of the eligible ones.
+runs and on the harm rate among eligible graded runs. Every run here ran the full baseline: the stop rule these labels
+were collected for was measured and rejected (docs/AGCL.md), so no run skips its review.
 
 usage: python3 shadow_labels.py RUN_OR_FOLDER... [--jsonl OUT] [--alpha 0.05]
 """
@@ -79,15 +78,12 @@ def row(run):
     spec = json.loads((run / 'spec.json').read_text(encoding='utf-8'))
     rounds = report.get('rounds') or []
     first = rounds[0] if rounds else {}
-    stop = report.get('stop')
-    eligible = stop['eligible'] if stop else bool(first.get('checks')) and all(
-        c['status'] == 'pass' for c in first['checks'])
-    ran_suffix = eligible and (stop is None or stop.get('retained', True))
+    eligible = bool(first.get('checks')) and all(c['status'] == 'pass' for c in first['checks'])
     names = sorted(spec['files'])
     read = lambda folder, name: (folder / name).read_bytes() if (folder / name).is_file() else None
     delivered = run / 'final' if report.get('final') else None
     identical = None
-    if eligible and ran_suffix and delivered and (run / 'round-1/candidate').is_dir():
+    if eligible and delivered and (run / 'round-1/candidate').is_dir():
         identical = all(read(run / 'round-1/candidate', n) == read(delivered, n) for n in names)
     first_tokens = after_tokens = 0
     for step, usage in usage_events(run / 'trace.jsonl'):
@@ -98,14 +94,13 @@ def row(run):
             after_tokens += size
     out = {'run': str(run), 'regime': regime(report, spec), 'implementation': (report.get('implementation') or {}).get('id'),
            'artifact_kind': kind(report, spec), 'status': report.get('status'), 'rounds': len(rounds),
-           'eligible': eligible, 'stopped': bool(stop and stop.get('eligible') and not stop.get('retained')),
-           'retain': stop['retain'] if stop else 1, 'ran_suffix': ran_suffix, 'identical': identical,
+           'eligible': eligible, 'identical': identical,
            'round1_tokens': first_tokens, 'after_tokens': after_tokens}
     if (run / 'grade.json').is_file():
         grade = json.loads((run / 'grade.json').read_text(encoding='utf-8'))
         out.update(round1_pass=grade['round1_pass'], delivered_pass=grade['delivered_pass'], suspect=grade.get('suspect', False),
-                   harm=bool(eligible and ran_suffix and not grade['round1_pass'] and grade['delivered_pass']),
-                   avoided=bool(eligible and ran_suffix and grade['round1_pass'] and not grade['delivered_pass']))
+                   harm=bool(eligible and not grade['round1_pass'] and grade['delivered_pass']),
+                   avoided=bool(eligible and grade['round1_pass'] and not grade['delivered_pass']))
     return out
 
 
@@ -123,12 +118,12 @@ def summary(rows, alpha):
         eligible = [r for r in rs if r['eligible'] and not r.get('suspect')]  # a flagged run counts toward no bound
         compared = [r for r in eligible if r['identical'] is not None]
         changed = sum(not r['identical'] for r in compared)
-        graded = [r for r in eligible if 'harm' in r and r['ran_suffix']]  # a stopped run has no suffix
+        graded = [r for r in eligible if 'harm' in r]
         harms = sum(r['harm'] for r in graded)
-        suffix = [r['after_tokens'] for r in eligible if r['ran_suffix']]
+        suffix = [r['after_tokens'] for r in eligible]
         total = sum(r['round1_tokens'] + r['after_tokens'] for r in rs)
         lines.append(f"regime {key} ({(rs[0]['implementation'] or '?')[:21]}, {rs[0]['artifact_kind']}): {len(rs)} runs, "
-                     f"{len(eligible)} eligible, {sum(r['stopped'] for r in rs)} stopped")
+                     f"{len(eligible)} eligible")
         lines.append(f'  change rate after round 1: {changed}/{len(compared)}, upper bound '
                      f'{upper_bound(changed, len(compared), alpha):.1%} (bounds the harm of stopping)')
         suspect = sum(bool(r.get('suspect')) for r in rs)
@@ -138,7 +133,7 @@ def summary(rows, alpha):
             lines.append(f'  graded harm: {harms}/{len(graded)}, upper bound {upper_bound(harms, len(graded), alpha):.1%}; '
                          f"stopping would have avoided {sum(r['avoided'] for r in graded)} regressions")
         if suffix and total:
-            lines.append(f'  tokens after round 1 on eligible runs that ran it: mean {sum(suffix) / len(suffix):,.0f}; '
+            lines.append(f'  tokens after round 1 on eligible runs: mean {sum(suffix) / len(suffix):,.0f}; '
                          f"{sum(r['after_tokens'] for r in eligible) / total:.0%} of this regime's tokens")
     lines.append(f'(one-sided {1 - alpha:.0%} upper bounds; rows from different regimes are not pooled)')
     return '\n'.join(lines)

@@ -14,8 +14,7 @@ why the Council is opt-in).
 Writer and judge calls are not retried and there is no call cap; max_seconds, timeout_s and max_cost bound time
 and money. Opt-in spec fields (docs/COUNCIL-WORKFLOW.md) add bounded calls: candidates adds k - 1 writer calls in
 round 1, protocol_repair at most one call per round, spec_tests one call; roles, protocol, no_regression and
-scripts add none. stop_on_checks only removes calls: a round-1 candidate that passes every check skips the review
-(and so any revision) unless a random draw keeps it, at the logged rate `retain`, for the retention cohort.
+scripts add none.
 
 The writer replies with complete files or with exact search/replace edits. Edits are turned into complete files
 before anything else, so the digest, checks, mutation check and judges always see full text.
@@ -27,7 +26,6 @@ import decimal
 import hashlib
 import json
 import os
-import random
 import re
 import subprocess
 import sys
@@ -347,8 +345,7 @@ def load_spec(path):
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
                'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
-               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair', 'no_regression',
-               'stop_on_checks'}
+               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair', 'no_regression'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
     if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
@@ -417,16 +414,6 @@ def load_spec(path):
         if spec['protocol'] != 'text':
             raise ValueError('scripts need the text protocol')
         positive(scripts.setdefault('timeout_s', 60), 'scripts timeout_s')
-    stop = spec.get('stop_on_checks')
-    if stop is not None:
-        if council:
-            raise ValueError('stop_on_checks skips the review; it does not combine with the Council')
-        # retain is the retention cohort: eligible runs that still get the full review, so the runs it skips keep a
-        # measured comparison. Below 5% the cohort is too small to show a change; 1 records eligibility only.
-        if not isinstance(stop, dict) or set(stop) != {'retain'} or type(stop['retain']) not in (int, float) \
-                or not 0.05 <= stop['retain'] <= 1:
-            raise ValueError('stop_on_checks takes retain, the share of eligible runs that still get the review, '
-                             'from 0.05 to 1')
     if spec.get('max_cost') is not None and spec.get('unpriced_call_usd') is None:
         raise ValueError('max_cost needs unpriced_call_usd for attempts that report no cost')
     command = spec.get('council')
@@ -576,8 +563,6 @@ def run(spec_path, out, call_fn=harness.call):
     prompt_name = f'work-{kind}-script.md' if kind == 'doc' and spec.get('scripts') else f'work-{kind}.md'
     writer_prompt = (HERE / 'prompts' / (prompt_name if text_protocol else 'work.md')).read_text(encoding='utf-8')
     report.update(protocol=spec['protocol'], artifact_kind=kind)
-    if spec.get('stop_on_checks'):
-        report['stop'] = {'retain': spec['stop_on_checks']['retain'], 'eligible': False}
     report['writer_prompt_sha256'] = hashlib.sha256(writer_prompt.encode()).hexdigest()
 
     def bridge_timeout():
@@ -944,17 +929,7 @@ def run(spec_path, out, call_fn=harness.call):
                 entry.update(status='revise', assessment_skipped='checks_failed')
                 continue
             if not council:
-                skip = False
-                if reviewed is None and n == 1 and 'stop' in report \
-                        and not (spec_suite and last_spec and last_spec['failing']):
-                    # Eligible: round 1 passed every check. The draw is logged so an audit can weight the runs that
-                    # were kept (Horvitz-Thompson); a kept run goes on exactly as without the option.
-                    draw = random.random()
-                    skip = draw >= report['stop']['retain']
-                    report['stop'].update(eligible=True, draw=round(draw, 6), retained=not skip)
-                    if skip:
-                        entry['review_skipped'] = 'stop_on_checks'
-                if reviewed is None and not skip:
+                if reviewed is None:
                     review_text = review(current, candidate['rationale'], observed)
                     (folder / 'review.md').write_text(review_text + '\n', encoding='utf-8')
                     entry['review_findings'] = review_findings(review_text)
