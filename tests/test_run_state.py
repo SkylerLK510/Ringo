@@ -144,12 +144,21 @@ class WaitTest(unittest.TestCase):
     def test_a_run_that_finishes_just_before_the_liveness_check_is_not_interrupted(self):
         child = subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True)
         harness.write_state(self.folder, {'version': 1, 'status': 'running', 'pid': int(child.stdout)})
-        real_kill = os.kill
-        def finish_then_check(pid, sig):  # the run writes done and exits in the gap between read and check
+        real_check = ringo.check_pid
+        def finish_then_check(pid):  # the run writes done and exits in the gap between read and check
             harness.write_state(self.folder, {'version': 1, 'status': 'done', 'pid': pid})
-            return real_kill(pid, sig)
-        with mock.patch.object(os, 'kill', side_effect=finish_then_check):
+            return real_check(pid)
+        with mock.patch.object(ringo, 'check_pid', side_effect=finish_then_check):
             self.assertEqual(self.wait('--timeout', '5')[0], 0)
+
+    def test_the_pid_check_tells_a_live_process_from_a_gone_one(self):
+        ringo.check_pid(os.getpid())
+        child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE)
+        ringo.check_pid(child.pid)  # alive, and on Windows not terminated by the check
+        self.assertIsNone(child.poll())
+        child.communicate(b'')
+        with self.assertRaises(ProcessLookupError):
+            ringo.check_pid(child.pid)
 
     def test_no_state_yet_is_not_started(self):
         self.assertEqual(self.wait('--timeout', '0'), (3, {'status': 'not_started', 'folder': str(self.folder)}))

@@ -11,6 +11,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import evaluate as ev  # noqa: E402
+from tests.support import echo_cli  # noqa: E402
 
 USAGE = {'input': 1, 'cache_write': 10, 'cache_read': 0, 'output': 5, 'cost_usd': 0.01}
 FAMILIES = {'grader-claude': 'claude', 'grader-codex': 'codex'}  # fake graders standing in for two provider families
@@ -465,15 +466,13 @@ class ReviewFindingsTest(unittest.TestCase):
     def test_only_an_executable_a_person_vouched_for_gets_a_family(self):
         s = Store()
         d = Path(tempfile.mkdtemp())
-        stub = d / 'claude'
-        stub.write_text('#!/bin/sh\necho "9.9 (Claude Code)"\n')
-        stub.chmod(0o755)
-        self.assertEqual(ev.real_identity(str(stub), s.dir)['family'], 'custom')
-        ev.trust(s.dir, str(stub), 'claude')
-        trusted = ev.real_identity(str(stub), s.dir)
+        stub = echo_cli(d / 'claude', '9.9 (Claude Code)')
+        self.assertEqual(ev.real_identity(stub, s.dir)['family'], 'custom')
+        ev.trust(s.dir, stub, 'claude')
+        trusted = ev.real_identity(stub, s.dir)
         self.assertEqual((trusted['family'], trusted['version']), ('claude', '9.9 (Claude Code)'))
-        stub.write_text('#!/bin/sh\necho "9.9 (Claude Code)" # changed\n')  # same name, other content
-        self.assertEqual(ev.real_identity(str(stub), s.dir)['family'], 'custom')
+        echo_cli(d / 'claude', '9.9 (Claude Code)', note='changed')  # same name, other content
+        self.assertEqual(ev.real_identity(stub, s.dir)['family'], 'custom')
 
     def test_an_interrupted_slot_has_an_unknown_cost_and_is_never_rerun(self):
         s = Store(groups=10)
@@ -544,12 +543,10 @@ class ReviewFindingsTest(unittest.TestCase):
 
     def test_an_edited_backend_wrapper_invalidates_the_experiment(self):
         s = Store()
-        wrapper = s.dir / 'my-reviewer'
-        wrapper.write_text('#!/bin/sh\necho one\n')
-        wrapper.chmod(0o755)
-        d = ev.freeze(s.dir, s.spec(arms={'cand': {'plan': None, 'backend': str(wrapper)},
+        wrapper = echo_cli(s.dir / 'my-reviewer', 'one')
+        d = ev.freeze(s.dir, s.spec(arms={'cand': {'plan': None, 'backend': wrapper},
                                            'base': {'plan': None, 'backend': 'base'}}))
-        wrapper.write_text('#!/bin/sh\necho two\n')
+        echo_cli(s.dir / 'my-reviewer', 'two')
         with self.assertRaisesRegex(ev.EvalError, 'changed since freeze'):
             ev.checked(s.dir, d)
 

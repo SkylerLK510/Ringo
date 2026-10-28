@@ -5,11 +5,13 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 import backends
+from tests.support import NO_SYMLINKS, POSIX_MODES, SYMLINKS, python_cli
 
 
 class BackendRuntimeTest(unittest.TestCase):
@@ -47,6 +49,24 @@ class BackendRuntimeTest(unittest.TestCase):
         with self.assertRaises(subprocess.TimeoutExpired) as caught:
             backends.run_isolated([sys.executable, '-c', code], '', 1)
         self.assertIn('event-before-hang', caught.exception.stdout)
+
+    def test_a_timeout_kills_what_the_child_started_too(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d, 'ticks')
+            ticker = f'import time\nfor _ in range(200):\n    open({str(marker)!r}, "a").write("x")\n    time.sleep(0.05)\n'
+            code = (f'import subprocess, sys, time; subprocess.Popen([sys.executable, "-c", {ticker!r}]); '
+                    f'time.sleep(60)')
+            with self.assertRaises(subprocess.TimeoutExpired):
+                backends.run_isolated([sys.executable, '-c', code], '', 2)
+            ticks = marker.stat().st_size
+            time.sleep(0.5)
+            self.assertEqual(marker.stat().st_size, ticks)  # the grandchild died with the call
+
+    def test_a_bare_command_name_is_found_on_path(self):  # on Windows also as the .cmd file npm installs
+        with tempfile.TemporaryDirectory() as d:
+            python_cli(Path(d, 'ringo-fake-cli'), 'import sys; print("found", sys.stdin.read())')
+            with mock.patch.dict(os.environ, {'PATH': f'{d}{os.pathsep}{os.environ["PATH"]}'}):
+                self.assertEqual(backends.run_isolated(['ringo-fake-cli'], 'it', 10).strip(), 'found it')
 
     def test_codex_home_false_keeps_the_callers_home(self):
         code = 'import json, os; print(json.dumps([os.environ.get("HOME"), os.environ.get("CODEX_HOME")]))'
@@ -100,7 +120,8 @@ class CodexHomeTest(unittest.TestCase):
         self.auth.write_text(json.dumps({'tokens': {'refresh_token': 'r1'}}))
         os.chmod(self.auth, 0o600)
         env = {k: v for k, v in os.environ.items() if k != 'CODEX_HOME'}
-        patcher = mock.patch.dict(os.environ, {**env, 'HOME': str(self.home), 'CODEX_API_KEY': 'kept'}, clear=True)
+        patcher = mock.patch.dict(os.environ, {**env, 'HOME': str(self.home), 'USERPROFILE': str(self.home),
+                                               'CODEX_API_KEY': 'kept'}, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(self.tmp)]))
@@ -115,14 +136,18 @@ class CodexHomeTest(unittest.TestCase):
         seen = self.run_child('r2')
         self.assertEqual(seen['codex_files'], ['auth.json'])  # no AGENTS.md, skills or memories
         self.assertEqual((seen['home_files'], seen['cwd']), ([], []))  # no ~/.agents, empty working folder
-        self.assertEqual((seen['auth']['tokens']['refresh_token'], seen['mode']), ('r1', '0o600'))
-        self.assertEqual(seen['dirs'], ['0o700', '0o700'])
+        self.assertEqual(seen['auth']['tokens']['refresh_token'], 'r1')
         self.assertEqual(seen['api_key'], 'kept')  # the plain preset keeps the caller's configured auth
         self.assertEqual(self.token(), 'r2')
-        self.assertEqual(stat.S_IMODE(self.auth.stat().st_mode), 0o600)
         self.assertFalse(self.auth.is_symlink())
         self.assertEqual(sorted(p.name for p in self.owner.iterdir()),
                          ['.ringo-auth.lock', 'AGENTS.md', 'auth.json', 'memories_1.sqlite'])  # no temp file left
+
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_private_login_and_folders_are_owner_only_and_the_refresh_keeps_mode_0600(self):
+        seen = self.run_child('r2')
+        self.assertEqual((seen['mode'], seen['dirs']), ('0o600', ['0o700', '0o700']))
+        self.assertEqual(stat.S_IMODE(self.auth.stat().st_mode), 0o600)
 
     def test_codex_home_variable_names_the_owner(self):
         other = self.tmp / 'other'
@@ -156,6 +181,7 @@ class CodexHomeTest(unittest.TestCase):
         self.assertEqual((seen['codex_files'], seen['auth']), ([], None))
         self.assertFalse(self.auth.exists())
 
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
     def test_symlinked_owner_login_is_never_written_through_or_replaced(self):
         target = self.tmp / 'vault.json'
         target.write_text(self.auth.read_text())
@@ -194,13 +220,9 @@ print(json.dumps({'argv': args, 'files': files, 'stdin': sys.stdin.read()}))
 class LeanCodexTest(unittest.TestCase):
     def run_fake(self, **env):
         with tempfile.TemporaryDirectory() as d:
-            script = Path(d, 'codex.py')
-            script.write_text(FAKE_CODEX, encoding='utf-8')
-            launcher = Path(d, 'codex')
-            launcher.write_text(f'#!/bin/sh\nexec {sys.executable} {script} "$@"\n', encoding='utf-8')
-            launcher.chmod(0o755)
+            launcher = python_cli(Path(d, 'codex'), FAKE_CODEX)
             with mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'owner')), **env}):
-                out = backends.run_isolated([str(launcher), 'exec', '--json', '-'], 'PROMPT', 10,
+                out = backends.run_isolated([launcher, 'exec', '--json', '-'], 'PROMPT', 10,
                                             codex_home=True, lean=True)
         return json.loads(out)
 

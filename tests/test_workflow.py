@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -618,6 +619,18 @@ print(json.dumps(out))
                 kill.assert_called_once()
                 self.assertEqual(proc.wait.call_count, 2)
 
+    def test_a_passing_check_cannot_leave_a_child_running(self):  # process group on POSIX, job object on Windows
+        marker = self.root / 'ticks'
+        ticker = f'import time\nfor _ in range(200):\n    open({str(marker)!r}, "a").write("x")\n    time.sleep(0.05)\n'
+        starter = (f'import os, subprocess, sys, time\nsubprocess.Popen([sys.executable, "-c", {ticker!r}])\n'
+                   f'while not os.path.exists({str(marker)!r}): time.sleep(0.01)\n')
+        spec = {**self.spec, 'checks': [{'name': 'check', 'argv': [sys.executable, '-c', starter], 'timeout_s': 30}]}
+        self.assertEqual(workflow.checks(spec, self.root, self.root, lambda: 60)[0]['status'], 'pass')
+        ticks = marker.stat().st_size
+        time.sleep(0.5)
+        self.assertEqual(marker.stat().st_size, ticks)
+
+    @unittest.skipUnless(os.name == 'posix', 'os.killpg and its macOS EPERM case exist only on POSIX')
     def test_cleanup_of_a_group_that_holds_only_zombies_does_not_fail_the_check(self):
         # macOS killpg raises EPERM, not ESRCH, when the check's group holds only unreaped zombies.
         spec = {**self.spec, 'checks': [{'name': 'check', 'argv': ['check'], 'timeout_s': 1}]}
@@ -630,6 +643,7 @@ print(json.dumps(out))
                 self.assertEqual(workflow.checks(spec, self.root, self.root, lambda: 10)[0]['status'], 'pass')
                 self.assertEqual(proc.wait.call_count, 2)
 
+    @unittest.skipUnless(os.name == 'posix', 'os.killpg exists only on POSIX')
     def test_a_live_check_that_cannot_be_signalled_stops_instead_of_waiting_forever(self):
         spec = {**self.spec, 'checks': [{'name': 'check', 'argv': ['check'], 'timeout_s': 1}]}
         proc = mock.Mock(pid=123)

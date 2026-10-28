@@ -14,8 +14,11 @@ import backends  # noqa: E402
 import context  # noqa: E402
 import harness  # noqa: E402
 
+# core.autocrlf=input: the files this test writes in text mode (CRLF on Windows) are committed with the LF its
+# texts hold, so the repository's objects are the same on every platform.
 ENV = {**os.environ, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_AUTHOR_NAME': 't',
-       'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t'}
+       'GIT_AUTHOR_EMAIL': 't@t', 'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@t',
+       'GIT_CONFIG_COUNT': '1', 'GIT_CONFIG_KEY_0': 'core.autocrlf', 'GIT_CONFIG_VALUE_0': 'input'}
 
 BASE = {
     'a.py': 'LIMIT = 3\n\n\nclass Shape:\n    def area(self, x):\n        return x * LIMIT\n\n\n'

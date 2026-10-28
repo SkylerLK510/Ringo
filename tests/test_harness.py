@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import backends  # noqa: E402
 import harness  # noqa: E402
 import pipelines as pl  # noqa: E402
+from tests.support import POSIX_MODES, python_cli  # noqa: E402
 
 REVIEW = 'What this change does: x.\n\n### 1. Bug one (`a.py:1`)\n- Code: `a`\n- Problem: p1. Side claim here.\n\n' \
          '### 2. Bug two (`a.py:2`)\n- Code: `b`\n- Problem: p2.\n\n### Not checked\n- runtime'
@@ -48,11 +49,7 @@ def scripted(replies):
 
 class CallTest(unittest.TestCase):
     def fake_claude(self, body):
-        d = tempfile.mkdtemp()
-        exe = Path(d, 'claude')
-        exe.write_text(f'#!{sys.executable}\n{body}', encoding='utf-8')
-        exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-        return str(exe)
+        return python_cli(Path(tempfile.mkdtemp(), 'claude'), body)
 
     def test_claude_gets_material_in_a_system_prompt_file_and_reports_usage(self):
         exe = self.fake_claude(
@@ -511,12 +508,10 @@ class RunTest(unittest.TestCase):
             unpriced.reserve()
 
     def test_failed_calls_keep_their_reported_cost_and_bad_prices_count_as_unknown(self):
-        exe = Path(tempfile.mkdtemp(), 'claude')
-        exe.write_text(f'#!{sys.executable}\nimport json, sys\nprint(json.dumps({{"is_error": True, "result": "boom", '
-                       f'"total_cost_usd": 0.02, "usage": {{"input_tokens": 50}}}}))\nsys.exit(1)\n')
-        exe.chmod(0o755)
+        exe = python_cli(Path(tempfile.mkdtemp(), 'claude'), 'import json, sys\nprint(json.dumps({"is_error": True, '
+                         '"result": "boom", "total_cost_usd": 0.02, "usage": {"input_tokens": 50}}))\nsys.exit(1)\n')
         with self.assertRaises(harness.CallError) as cm:
-            harness.call({'name': 'c', 'argv': [str(exe)], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': [exe], 'style': 'claude'}, 's', 'm', 30)
         self.assertEqual((cm.exception.usage['cost_usd'], cm.exception.usage['input']), (0.02, 50))
         for bad in (-0.01, float('nan'), True, '0.01'):
             self.assertIsNone(harness.valid_price(bad))
@@ -567,12 +562,17 @@ class RunTest(unittest.TestCase):
         harness.run_plan(p, 'M', B, harness.Run(max_cost=10.0), call_fn=fn)
         self.assertEqual(peak[0], 1)
 
-    def test_trace_folder_is_private_and_complete(self):
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_trace_folder_is_private(self):
+        d = Path(tempfile.mkdtemp()) / 'trace'
+        harness.Run(d)
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_trace_folder_is_complete(self):
         d = Path(tempfile.mkdtemp()) / 'trace'
         fn, _ = scripted({'Review the change': REVIEW})
         run = harness.Run(d)
         harness.run_plan(pl.load_plan(None, 'review'), 'M', B, run, call_fn=fn)
-        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
         recs = [json.loads(line) for line in (d / 'trace.jsonl').read_text().splitlines()]
         self.assertEqual([r['status'] for r in recs], ['started', 'ok'])  # an interrupted call would stay 'started'
         self.assertEqual(recs[1]['usage']['cache_write'], 100)
