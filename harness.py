@@ -462,7 +462,14 @@ def write_state(folder, state):
     path = Path(folder) / 'state.json'
     tmp = path.with_name(f'.state.{os.getpid()}.{threading.get_ident()}.tmp')
     tmp.write_text(json.dumps(state, separators=(',', ':')) + '\n', encoding='utf-8')
-    os.replace(tmp, path)
+    for attempt in range(100):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: a waiter has state.json open for its read, for a moment
+            if os.name != 'nt' or attempt == 99:
+                raise
+            time.sleep(0.01)
 
 
 class Run:
