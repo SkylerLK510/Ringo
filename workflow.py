@@ -12,7 +12,9 @@ Design Council instead of the review: a passing candidate gets first_judges judg
 samples only if those do not recommend, at most max_rounds x (1 + samples) calls (docs/COUNCIL-WORKFLOW.md says
 why the Council is opt-in).
 Writer and judge calls are not retried and there is no call cap; max_seconds, timeout_s and max_cost bound time
-and money.
+and money. Opt-in spec fields (docs/COUNCIL-WORKFLOW.md) add bounded calls: candidates adds k - 1 writer calls in
+round 1, protocol_repair at most one call per round, spec_tests one call; roles, protocol, no_regression and
+scripts add none.
 
 The writer replies with complete files or with exact search/replace edits. Edits are turned into complete files
 before anything else, so the digest, checks, mutation check and judges always see full text.
