@@ -67,6 +67,19 @@ candidate passing all acceptance tests at a third of the Council's tokens. See
 [the work guide](docs/COUNCIL-WORKFLOW.md) for the measurement, the task format,
 outputs, budgets and trust limits.
 
+Opt-in spec fields tune `work` for cost and safety, and the defaults are unchanged:
+- `roles`: the model and reasoning effort for each call role (writer, revision, escalate, tests, review).
+- `protocol: "text"`: plain `@@@` blocks instead of JSON-escaped files, with exact `REPLACE` edits for revisions.
+- `protocol_repair`: one immediate call, asking for whole files, instead of losing the round to a reply that cannot be
+  applied.
+- `no_regression`: a revision that breaks a check, or a spec test the adopted candidate passed, is set aside. For
+  documents with `scripts`, a revision may not introduce a number that no successful script printed.
+- `scripts`: a document writer computes its numbers with a script that Ringo runs and shows to the writer and the
+  review.
+- `spec_tests` and `candidates`: blind tests written from the brief, and best-of-k first drafts selected by execution.
+
+`candidates` adds k - 1 writer calls in round 1, `protocol_repair` at most one call per round and `spec_tests` one.
+
 `review --findings-json FILE` also writes the findings as
 [ReviewBench](https://github.com/review-bench/ReviewBench) agent-contract JSON,
 one entry per finding and file. With `--repo`, files are checked against head
