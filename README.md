@@ -56,8 +56,8 @@ temporary folders are created atomically with a protected DACL granting full con
 verified before sensitive files are written; new files and folders inherit that access. Existing user-supplied
 folders are tightened and verified, but earlier open handles are not revoked: new folders are the private case.
 A filesystem that cannot set and verify the DACL is refused.
-This does not restrict administrators taking ownership, other processes using your account, or explicit ACLs on
-pre-existing files. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
+This does not restrict administrators taking ownership, other processes using your account, or explicit ACLs that
+files and folders inside a root already have. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
 
 1. Open PowerShell as Administrator, run `wsl --install`, then restart Windows. This installs WSL 2 with Ubuntu.
 2. Open **Ubuntu** from the Start menu and follow the Linux steps above inside it.
@@ -404,7 +404,9 @@ so this is a confirmation, not a clean held-out test.
   with one inheritable full-control ACE for the current user, including traces, stores, release state, temporary
   prompts and private Codex homes. New roots receive it atomically at creation; child files and folders inherit it.
   Pre-existing roots are tightened, but earlier open handles are not revoked. Failure to set or verify the DACL
-  stops writing. Existing files with explicit ACLs and administrators taking ownership are outside this guarantee.
+  stops writing. Ringo checks the private roots, not every folder inside them: a file or folder already inside a
+  root with an explicit ACL of its own keeps it, and so does what is written into it. Administrators taking
+  ownership are outside this guarantee too.
   Explicit `.cmd`/`.bat`
   launches are refused, including trusted backends and checks; call the underlying executable to avoid `cmd.exe`
   argument interpretation. POSIX permissions and process launching are unchanged.
