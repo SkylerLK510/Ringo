@@ -445,6 +445,15 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 - **Verification on demand, and distinguishing inputs**, under the token rule above.
 - **Benchmarks with headroom,** so quality gains can be measured.
 
+## Engineering optimization goals
+
+Optimize the harness for working code, sound design judgment and architectural
+insight, with concrete task outcomes and separate evidence for each. Whole-task
+token efficiency remains an objective while correctness and quality hold. See
+[engineering objectives](docs/ENGINEERING-OBJECTIVES.md) for task families,
+measurement, Council responsibilities and the gaps in today's review-only
+evaluator. This direction does not start an evaluation or improvement campaign.
+
 ## Evaluation and improvement
 
 See [the harness guide](docs/HARNESS.md) and [the agent skill](skills/ringo-harness/SKILL.md).
