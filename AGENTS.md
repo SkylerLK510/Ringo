@@ -27,5 +27,7 @@ entry prose: the numbers are recomputed from the evidence, and an unsupported
 claim fails `tests/test_improvement_log.py`. Measured non-improvements stay out of
 the log and in their own reports.
 
-Keep credentials, private research, comparison results and run traces outside this
-repository; published improvement evidence is the exception above. Preserve human review of proposed artifacts and policy adoption.
+Keep credentials, private research, task contents, hidden tests and run traces outside
+this repository. The exceptions are published improvement evidence (above) and the experiment
+summaries the owner publishes in the README's Experiments section: designs, aggregate results
+and lessons, never task contents. Preserve human review of proposed artifacts and policy adoption.

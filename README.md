@@ -7,8 +7,96 @@ does not train model weights.
 
 This repository owns the harness, its model calls and their budget. The original
 [design council](https://github.com/SkylerLK510/DukChulBOT) owns proposal judging,
-rubric scoring, decision gates and journals. A future GUI will be a separate
-client; no GUI is implemented here.
+rubric scoring, decision gates and journals. A future IDE (a Rust engine; see
+[Roadmap](#roadmap)) will be a separate client; none is implemented here.
+
+## Install
+
+Ringo is one Python program that uses only the standard library. You need:
+- Python 3.11 or newer;
+- git, or a ZIP download;
+- at least one model CLI for model calls. The offline test suite needs none.
+
+### macOS
+
+```sh
+brew install python git                    # Homebrew; or install Python from python.org
+git clone https://github.com/SkylerLK510/Ringo.git
+cd Ringo
+python3 --version                          # must print 3.11 or newer
+python3 -m unittest discover -s tests -q   # offline check: makes no model calls
+python3 ringo.py --help
+```
+
+The `python3` that comes with Apple's command-line tools may be older than 3.11. If `python3 --version` prints an
+older version, use the Homebrew or python.org Python.
+
+### Linux
+
+```sh
+sudo apt update && sudo apt install -y python3 git   # Debian, Ubuntu
+# sudo dnf install -y python3 git                    # Fedora, RHEL
+# sudo pacman -S python git                          # Arch
+git clone https://github.com/SkylerLK510/Ringo.git
+cd Ringo
+python3 --version                          # must print 3.11 or newer
+python3 -m unittest discover -s tests -q
+python3 ringo.py --help
+```
+
+Ubuntu 24.04 and later ship Python 3.12. On an older release, install Python 3.11 or newer before running Ringo.
+
+### Windows
+
+Today Ringo runs on Windows through WSL 2, the Windows Subsystem for Linux. Native Windows support is in progress,
+and the test suite does not pass natively yet.
+
+1. Open PowerShell as Administrator, run `wsl --install`, then restart Windows. This installs WSL 2 with Ubuntu.
+2. Open **Ubuntu** from the Start menu and follow the Linux steps above inside it.
+3. Install the model CLIs inside Ubuntu too, using the Linux commands below, so Ringo can find them.
+
+### Without git
+
+On the repository page, choose **Code**, then **Download ZIP**, or download an archive from
+[Releases](https://github.com/SkylerLK510/Ringo/releases). Unzip it, open a terminal in the folder, and run the
+checks above.
+
+### Model CLIs
+
+Install at least one, from its official instructions ([Codex CLI](https://github.com/openai/codex),
+[Claude Code](https://code.claude.com/docs/en/setup)):
+
+- **Codex CLI** (Ringo backend `codex-chatgpt`):
+  - macOS, Linux, WSL: `curl -fsSL https://chatgpt.com/codex/install.sh | sh`, `brew install --cask codex` or
+    `npm install -g @openai/codex`.
+  - Windows PowerShell: `powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"`.
+  - Sign in: run `codex` and choose **Sign in with ChatGPT**. A Plus, Pro, Business, Edu or Enterprise plan covers
+    the calls.
+- **Claude Code** (Ringo backend `claude`):
+  - macOS, Linux, WSL: `curl -fsSL https://claude.ai/install.sh | bash` or `brew install --cask claude-code`.
+  - Windows: `irm https://claude.ai/install.ps1 | iex` in PowerShell, or `winget install Anthropic.ClaudeCode`.
+  - Sign in: run `claude` and follow the browser prompts. It needs a Pro, Max, Team, Enterprise or Console account.
+- **Ollama** for local models (Ringo backend `ollama:MODEL`): see [ollama.com/download](https://ollama.com/download).
+
+Ringo calls these CLIs with your existing sign-in. It does not need an API key.
+
+### First run
+
+```sh
+python3 ringo.py work --spec examples/v3-codex.json --out ~/ringo-runs/first-run
+# or, with Claude Code:
+python3 ringo.py work --spec examples/v3-claude.json --out ~/ringo-runs/first-run-claude
+```
+
+The example asks for a small `slugify` function with explicit rules. Ringo then:
+1. writes `slug.py`;
+2. runs the example's check against it;
+3. reviews the result;
+4. puts the version ready for your review in `~/ringo-runs/first-run/final/`.
+
+`report.json` lists the rounds, checks and token usage. Our first run of the Codex example took one round, two model
+calls, about 2,800 tokens and 14 seconds. Run folders must be outside the Ringo checkout, which keeps private
+material out of the repository. Ringo creates them with owner-only permissions.
 
 ## Run
 
@@ -80,6 +168,28 @@ Opt-in spec fields tune `work` for cost and safety, and the defaults are unchang
 
 `candidates` adds k - 1 writer calls in round 1, `protocol_repair` at most one call per round and `spec_tests` one.
 
+### V3: the recommended `work` settings
+
+V3 is the configuration our experiments favour (see [Experiments](#experiments-what-we-tried-what-broke-what-we-measured)):
+- one strong model at low effort on every role;
+- the text protocol, protocol repair and the no-regression gate;
+- review material without rewrite diffs;
+- one review, and at most three rounds.
+
+It adds nothing that costs extra tokens. To use it on your own task, add these fields to its spec:
+
+```json
+"protocol": "text", "protocol_repair": true, "no_regression": true, "max_rounds": 3,
+"roles": {"writer": {"effort": "low"}, "revision": {"effort": "low"}, "review": {"effort": "low"}}
+```
+
+With a Claude backend, leave out `roles`, because Claude takes a model, not an effort. `"{python}"` in a check,
+script or spec-test command means the interpreter running Ringo, so one spec runs on every OS. `scripts`
+(writer-computed numbers for documents) is opt-in and not part of V3: it adds 1–2k tokens per document. Use it only
+for a document whose numbers must be computed.
+
+### Backends, findings and usage
+
 `review --findings-json FILE` also writes the findings as
 [ReviewBench](https://github.com/review-bench/ReviewBench) agent-contract JSON,
 one entry per finding and file. With `--repo`, files are checked against head
@@ -117,6 +227,209 @@ identified explicitly. The optimization goal is fewer whole-task tokens than the
 same agent working alone at equal or better quality, including harness/Council
 overhead and retries. No monetary spending cap has been set for this work.
 Dollar estimates are omitted; protected evaluation gates remain unchanged.
+
+## Experiments: what we tried, what broke, what we measured
+
+Every number here comes from our own runs. The task contents, hidden tests and raw traces stay private so the tasks
+can be reused. This section records the designs, the results and every mistake we found.
+
+**The current adoption rule:** a change is adopted only if it uses no more tokens than what it replaces. Cheaper
+credits do not justify more tokens.
+
+### How we measure
+
+- **Tasks:** each is a brief with hidden acceptance tests. Every hidden test traces to a sentence in the brief.
+  Mutants (plausible wrong answers that still pass the public checks) show that the hidden tests catch real
+  mistakes.
+- **Held-out discipline:** held-out tasks are frozen by hash before any model call, and development uses separate
+  tasks.
+- **Arms:**
+  - the Codex CLI agent alone at high effort (AH) and at low effort (AL);
+  - Claude Code alone (CA);
+  - Ringo configurations.
+
+  Every arm gets the same brief, public checks and instructions.
+- **Quality:** the share of hidden tests that the delivered files pass.
+- **Cost:**
+  - Tokens are all input (uncached and cached) plus all output, for every provider.
+  - Codex credits use the published rates for GPT-6.1 Sol (50 per million uncached input tokens, 2.5 cached, 250
+    output) and GPT-6 Luna (2.5, 0.25, 12.5).
+- **Decision rule, written before the runs:** a harness wins outright only if its paired quality interval lies
+  above zero and it costs less.
+- **Statistics:** two runs per arm per task; a 95% paired bootstrap with 10,000 resamples.
+- **Audit:** an agent run that touched the hidden material would be excluded. None did.
+
+### 1. The Design Council (2026-10-27)
+
+The multi-judge Council cost about 7× the tokens of checks alone, with no significant quality gain. One review and
+one revision delivered every candidate passing all acceptance tests, at a third of the Council's tokens. The Council
+became opt-in (#15).
+
+### 2. Where the tokens go: one code task with 26 hidden tests, one run per arm, all 26/26
+
+| Arm | Tokens | Credits |
+|---|---|---|
+| Codex agent alone, high effort | 190,695 | 5.11 |
+| One bare model call, high effort | 9,305 | 1.93 |
+| Ringo, writer plus 6 Council judges | 75,229 | 7.04 |
+| Ringo, check-first Council | 71,941 | 6.61 |
+| Ringo, one review, high effort | 54,275 | 6.61 |
+| Ringo, one review, low effort | 21,754 | 2.05 |
+
+What we learned:
+- **Output tokens are the cost.** They cost 5× uncached input and 100× cached input.
+- **The agent's tokens were mostly re-reads.** 84% were cached re-reads of its own session.
+- **High effort on every call bought nothing.**
+- **No caching across calls.** A fresh `codex exec` call gets no cache hits from an earlier call.
+
+### 3. Current Ringo against the agents (held-out tasks, phase 1)
+
+Six tasks were built for this study:
+- four code tasks: semantic-version ranges, a ledger, cron schedules, patch application;
+- two analysis memos: a vendor decision, an incident postmortem.
+
+Each has 27–40 hidden tests, and each arm ran twice.
+
+| Arm | Hidden tests passed | Credits per task | Tokens per task | Seconds |
+|---|---|---|---|---|
+| Codex agent, high (AH) | 100% | 2.94 | 153k | 115 |
+| Codex agent, low (AL) | 100% | 1.52 | 89k | 46 |
+| Claude Code (CA) | 100% | (Claude: $0.32 API-equivalent) | 150k | 66 |
+| Ringo, every call high (RH) | 100% | 2.38 | 26k | 129 |
+| Ringo, every call low (RL) | 100% | 1.49 | 20k | 45 |
+
+- **No quality win was possible.** Every arm passed every hidden test.
+- **RH:** used 1.57× AL's credits, so it lost to AL. High effort everywhere was the bloat.
+- **RL:** used 0.98× AL's credits and 0.22× its tokens.
+
+### 4. Building v2: trials and errors
+
+We tuned only on development tasks: a 26-test job-queue task, an ISO 8601 duration library (40 hidden tests) and an
+inventory reconciliation memo (35).
+
+| We tried | What happened | What we changed |
+|---|---|---|
+| The text protocol as the default | 28 existing tests built on JSON broke | Made it opt-in (`protocol: "text"`) |
+| The writer's `@@@ FILE` blocks | It closed them with `@@@ END`, so every round was malformed | `END` is accepted after any block |
+| GPT-6 Luna writing spec tests | It quoted the brief in four-quote docstrings, which do not compile, so the suite was lost | Brief sentences go in `# brief:` comments; four-quote docstrings are repaired |
+| Luna's edits | It wrote a bare `@@@` where `@@@ WITH` belonged | A bare marker is read by position |
+| Luna's edit anchors | An anchor matched twice, and the round was lost | `protocol_repair`: one immediate call that asks for whole files |
+| Three Luna drafts (job queue) | 0.24–0.31 credits against 5.11 for the agent, but 25/26 in four of four runs. Every run returned `''` where the brief said `empty`, and Luna's tests shared that blind spot | Luna is not a writer |
+| Sol writer, Luna for everything else (job queue) | 26/26 at 0.81 credits. Half of Luna's tests were wrong, and an unchanged reply ended the run before the review | An unchanged reply stands by the code and goes on to the review |
+| Two Sol drafts (duration library) | Both drafts passed 40/40, but revisions driven by wrong Luna tests delivered 36/40 twice | Dual agreement (a test every draft fails stops gating) and the no-regression gate, after which it passed 40/40 |
+| Luna's rationale-only replies | Counted as malformed | They stand by the code |
+| Three Luna drafts (memo) | Luna sent only scripts, the run ended (a bug), and Sol escalation then wrote the memo at 3.0 credits | Fixed the bug; dropped Luna as a writer |
+
+### 5. v2 on the held-out tasks (phase 2)
+
+| Arm | Hidden tests passed | Credits per task | Tokens per task |
+|---|---|---|---|
+| V2S: Sol writer; Luna tests, revision and review | 99.4% (one memo run lost 2 of 28) | 1.13 | 58k |
+| V2K: V2S with two Sol drafts | 100% | 1.93 | 61k |
+
+- **V2S** had the lowest credits, but nearly 3× RL's tokens and twice its time.
+- **V2K** used more credits than AL.
+
+Current Ringo was outperforming v2, and the data showed why:
+- **The first draft was already right.** In all 36 runs we checked (RH, RL, V2S), Ringo's first draft passed every
+  hidden test, so everything after round 1 was overhead.
+- **The reviews' findings were all false.** Luna reviews raised findings on 12 of 12 V2S runs, all false. Sol
+  reviews raised findings on 3 of 12 RL runs, also false but harmless.
+- **The one loss:** the Sol writer had the right answer (40 customers, SEV2) for three rounds. Then a Luna review
+  claimed the count was wrong, and a Luna revision changed it to 56 and SEV1 with no successful script behind it.
+
+### 6. V3: removing the kinks
+
+**Fixes:**
+- **The number-evidence gate:** with `scripts`, a document revision may not introduce a number that no successful
+  script printed. Replayed on the real loss, the revision's only unbacked number was the wrong 56, so the revision
+  would have been set aside.
+- **Review material:** a rewritten file gets no diff. A stub-to-implementation diff repeated the whole file, which
+  was 2–3k of a code review's 8k input tokens.
+- **Scripts:** a script whose output already matches the document no longer forces a round. Script logs no longer
+  overwrite the round's check logs.
+- **Prompts:** when feedback is wrong, change nothing and say why; resend the script when changing a number.
+
+**Three Ringo code reviews of these changes found seven more bugs, all fixed with tests:**
+- a spec-runner timeout crashed the run;
+- unittest class fixtures were skipped;
+- module fixtures were skipped;
+- teardown errors were dropped;
+- fixture errors were matched to the wrong module;
+- the blind test writer was shown fixtures;
+- the number gate ignored sign changes.
+
+**Dev check (one run each):**
+
+| Task | Current Ringo (RL) | V3 without scripts | V3 with scripts |
+|---|---|---|---|
+| Memo, 35 hidden tests | 34/35, 2.14 credits, 28k tokens | 34/35, 2.08 credits, 25k tokens | 35/35, 2.55 credits, 29k tokens |
+| Duration library, 40 hidden tests | 40/40, 1.47 credits, 18k tokens | 40/40, 0.89 credits, 10k tokens | n/a (code) |
+
+**Phase 3** used fresh repetitions 3 and 4 of the six held-out tasks. V3 was designed after seeing phases 1 and 2,
+so this is a confirmation, not a clean held-out test.
+
+| Arm | Hidden tests passed | Credits per task | Tokens per task | Seconds |
+|---|---|---|---|---|
+| V3 with memo scripts (V3s) | 100% | 1.44 | 17.7k | 46 |
+| Current Ringo (RL) | 100% | 1.52 | 20.3k | 46 |
+| Codex agent, low (AL) | 100% | 1.42 | 88.2k | 45 |
+
+- **Against RL:** at equal quality, V3s used 5% fewer credits and 13% fewer tokens.
+- **Against AL:** about equal credits (1.01×) and 80% fewer tokens.
+- **By task:** on code, V3s used fewer tokens than RL on three of four tasks (14k against 25k, 11k against 14k, 14k
+  against 21k) and the same on the ledger task (15k each), where RL used slightly fewer credits (1.18 against 1.20).
+  On the memos the scripts added tokens: 23k against RL's 17k on the vendor memo. Under the adoption rule, the
+  recommended V3 therefore leaves `scripts` out.
+
+### 7. Portability
+
+- **`ringo.py wait`:** its liveness check used `os.kill(pid, 0)`, which terminates the process on Windows. It is now
+  skipped on Windows.
+- **Spec runner:** it used `SIGALRM`, which Windows lacks. It now runs without it there; the suite's timeout still
+  bounds it.
+- **Release bundles:** these left out `spec_runner.py`. It is now in the bundle.
+- **CI:** it runs on Ubuntu, macOS and Windows. Natively on Windows, 14 of 304 tests failed and 76 errored, mostly on
+  POSIX-only test setups (symlinks, permission bits, process groups) and release locking. Until the native port
+  lands, Windows users run Ringo in WSL 2.
+
+### 8. Ideas we considered and did not adopt
+
+A deep-research pass checked 25 published claims: 19 were confirmed and 6 refuted. Its verdicts are included below.
+
+| Idea | Evidence | Decision |
+|---|---|---|
+| High effort on every call | RH: 2.38 credits against RL's 1.49, same quality | Rejected: bloat |
+| The Council by default | About 7× tokens, no quality gain | Opt-in |
+| Luna as the writer | Cheap, but missed rules and could not write a memo | Rejected |
+| Luna reviews and revisions | False findings on 12 of 12 runs; caused the one loss | Rejected: weak models may advise, never change the result |
+| Spec tests by default | Never improved a result; wrong tests drove regressions | Opt-in, with dual agreement |
+| Two Sol drafts (V2K) | 1.27× AL's credits, with no quality to buy | Opt-in (`candidates`) |
+| Shared-primer session forking: a seed session holds the brief, and later calls fork from it to read it from cache | `codex exec fork --ephemeral` reuses the parent's cache routing (Codex CLI 0.164.0); cached input costs 0.05× (estimated 27–34% fewer credits, not measured). A separate seed adds about 10k tokens per memo run. Using the writer as the seed adds the writer's transcript to the reviewer's context | Not adopted: it adds tokens |
+| A cheap scout plus a router | The published saving came from a cheap fixer, not from the router | Rejected; Luna as writer already failed here |
+| Learned per-step routers | No measurable end-to-end gain; needs a fine-tuned model | Rejected |
+| A strong advisor beside a weak executor | Published gains are confounded and inside noise | Deferred |
+| Single-pass claim verification | Worked only with a fine-tuned small model | At most a pilot |
+| Batching similar checks into one call | About 4× fewer reasoning tokens, in one preprint | At most a pilot |
+
+### 9. What would move it next
+
+- **Tasks with headroom.** Until standalone agents fail some tasks, every improvement reads as "cheaper, no edge".
+- **Verification on demand.** Skip the review when the cheap signals agree. The review was 6–15k tokens and changed
+  nothing in 36 of 36 runs, so this cuts tokens and credits.
+- **Distinguishing inputs.** Find inputs where two independent drafts disagree, and check only those, in place of a
+  prose review.
+- **The IDE.** Two of the largest gains need a person in the loop: asking at the fork (a one-click choice where the
+  spec has two readings) and remembering the user's conventions. Both belong in the IDE (see Roadmap).
+
+## Roadmap
+
+- **IDE:** a Rust engine, with support for Python, Jupyter notebooks, Rust and C/C++. It will carry live context,
+  one-click decisions where a spec is ambiguous, and per-repository preference memory. It will be a separate client
+  of this harness.
+- **Native Windows** without WSL.
+- **Verification on demand, and distinguishing inputs**, under the token rule above.
+- **Benchmarks with headroom,** so quality gains can be measured.
 
 ## Evaluation and improvement
 
