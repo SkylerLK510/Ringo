@@ -300,6 +300,13 @@ class WorkflowTest(unittest.TestCase):
         self.assertNotIn('new.py (diff', material)
         self.assertIn('=== new.py (after the change) ===\nz = 0\n', material)
 
+    def test_a_rewritten_file_gets_no_diff_since_the_whole_file_follows(self):
+        stub = 'def f(x):\n    raise NotImplementedError\n'
+        body = 'def f(x):\n' + ''.join(f'    y{i} = x + {i}\n' for i in range(10)) + '    return y9\n'
+        material = workflow.review_material({'brief': 'b', 'files': {'a.py': stub}, 'fixtures': {}}, {'a.py': body}, 'r', [])
+        self.assertNotIn('a.py (diff', material)
+        self.assertEqual(material.count('y9 = x + 9'), 1)
+
     def test_council_settings_without_a_council_bridge_are_refused(self):
         base = {k: v for k, v in self.spec.items() if k not in ('council', 'rubric', 'samples')}
         path = self.root / 'task.json'

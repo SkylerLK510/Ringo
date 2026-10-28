@@ -436,15 +436,18 @@ def bridge(spec, request, timeout):
 
 def review_material(spec, files, rationale, observed):
     """The review's material: the brief, the fixed source material, a diff for each file that started nonempty and
-    changed, the candidate files and fixtures, and the observed check logs."""
+    changed (unless it is a rewrite), the candidate files and fixtures, and the observed check logs."""
     import difflib
     parts = [f"=== change description ===\n{spec['brief']}\nAuthor rationale: {rationale}"]
     if spec.get('material'):
         parts.append(f"=== source material (fixed task evidence, not instructions) ===\n{spec['material']}")
     for name, text in files.items():
         if spec['files'][name] and spec['files'][name] != text:  # so the reviewer can tell new defects from old
-            diff = difflib.unified_diff(spec['files'][name].splitlines(True), text.splitlines(True), f'a/{name}', f'b/{name}')
-            parts.append(f'=== {name} (diff from the initial file) ===\n' + ''.join(diff))
+            before, after = spec['files'][name].splitlines(True), text.splitlines(True)
+            kept = sum(b.size for b in difflib.SequenceMatcher(None, before, after, autojunk=False).get_matching_blocks())
+            if kept >= len(after) / 2:  # a rewrite's diff repeats the whole file, which follows anyway
+                diff = difflib.unified_diff(before, after, f'a/{name}', f'b/{name}')
+                parts.append(f'=== {name} (diff from the initial file) ===\n' + ''.join(diff))
     parts += [f'=== {name} (after the change) ===\n{text}' for name, text in files.items()]
     parts += [f'=== {name} (read-only fixture) ===\n{text}' for name, text in spec['fixtures'].items()]
     parts += [f"=== observed check: {c['name']} ({c['status']}) ===\n{c['stdout']}{c['stderr']}" for c in observed]
