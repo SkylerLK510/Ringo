@@ -3,10 +3,13 @@
 Extracted from the original design council runtime; no council scoring or CLI dependency.
 """
 import contextlib
+import errno
+import functools
 import json
 import math
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -17,8 +20,9 @@ from pathlib import Path
 
 try:
     import fcntl
-except ImportError:  # not POSIX: Ringo processes are not serialized against each other
+except ImportError:  # Windows: file_lock uses msvcrt instead
     fcntl = None
+    import msvcrt
 
 JUDGE_PRESETS = {
     'claude': ('claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" '
@@ -58,6 +62,126 @@ class JudgeError(Exception):
     def __init__(self, message, fatal=False):
         super().__init__(message)
         self.fatal = fatal
+
+
+@contextlib.contextmanager
+def file_lock(f, blocking=True):
+    """Hold an exclusive lock on the open file f (a descriptor or file object) against every other process and open
+    file that locks the same path. POSIX: flock. Windows: a msvcrt lock on the file's first byte, retried until it is
+    free. With blocking=False a lock that is already held raises BlockingIOError."""
+    fd = f if isinstance(f, int) else f.fileno()
+    if fcntl:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        return
+    while True:
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            break
+        except OSError as exc:
+            if exc.errno != errno.EACCES:
+                raise
+            if not blocking:
+                raise BlockingIOError(errno.EAGAIN, 'the lock is held by another process') from None
+        time.sleep(0.05)  # ceiling: polls every 50 ms; LockFileEx through ctypes would wait without polling
+    try:
+        yield
+    finally:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+
+@functools.cache
+def _win32():
+    """kernel32 and ntdll with the signatures Ringo calls (Windows only)."""
+    import ctypes
+    from ctypes import wintypes
+    k32, nt = ctypes.WinDLL('kernel32', use_last_error=True), ctypes.WinDLL('ntdll')
+    for name, res, args in (
+            ('CreateJobObjectW', wintypes.HANDLE, (wintypes.LPVOID, wintypes.LPCWSTR)),
+            ('OpenProcess', wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)),
+            ('AssignProcessToJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.HANDLE)),
+            ('TerminateJobObject', wintypes.BOOL, (wintypes.HANDLE, wintypes.UINT)),
+            ('QueryInformationJobObject', wintypes.BOOL,
+             (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID)),
+            ('CloseHandle', wintypes.BOOL, (wintypes.HANDLE,))):
+        fn = getattr(k32, name)
+        fn.restype, fn.argtypes = res, args
+    nt.NtResumeProcess.restype, nt.NtResumeProcess.argtypes = ctypes.c_long, (wintypes.HANDLE,)
+    return ctypes, k32, nt
+
+
+def _found(argv, env=None):
+    """argv with argv[0] looked up on env's PATH with PATHEXT on Windows, as a shell finds it (CreateProcess adds only
+    .exe), so a `claude` or `codex` that npm installed as a .cmd file runs. Unchanged elsewhere."""
+    if os.name != 'nt' or not argv:
+        return argv
+    return [shutil.which(argv[0], path=(env or os.environ).get('PATH')) or argv[0], *argv[1:]]
+
+
+def spawn(argv, **kw):
+    """subprocess.Popen(argv, **kw) in a process tree of its own, which kill_tree ends with everything it started.
+    POSIX: a new session. Windows: a new process group inside a job object; the command starts suspended and runs
+    only once it is in the job, so nothing it starts can escape it, and argv[0] is looked up as _found does."""
+    if os.name != 'nt':
+        return subprocess.Popen(argv, start_new_session=True, **kw)
+    ctypes, k32, nt = _win32()
+    argv = _found(argv, kw.get('env'))
+    job = k32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        proc = subprocess.Popen(argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | 0x4, **kw)  # CREATE_SUSPENDED
+    except BaseException:
+        k32.CloseHandle(job)
+        raise
+    proc.ringo_job = job
+    # PROCESS_TERMINATE | PROCESS_SET_QUOTA (to join a job) | PROCESS_SUSPEND_RESUME
+    handle = k32.OpenProcess(0x0001 | 0x0100 | 0x0800, False, proc.pid)
+    try:
+        if not handle or not k32.AssignProcessToJobObject(job, handle):
+            error = ctypes.WinError(ctypes.get_last_error())
+        else:  # NtResumeProcess (also what psutil's resume() calls): Popen keeps no handle to the main thread
+            status = nt.NtResumeProcess(handle)
+            error = OSError(f'cannot resume the command (NTSTATUS {status & 0xFFFFFFFF:#x})') if status else None
+    finally:
+        if handle:
+            k32.CloseHandle(handle)
+    if error:
+        kill_tree(proc)
+        proc.wait()
+        raise error
+    return proc
+
+
+def kill_tree(proc, settle_s=10):
+    """Kill proc and everything it started (see spawn), without reaping proc. POSIX: SIGKILL to its process group,
+    raising as os.killpg does. Windows: terminate its job and wait up to settle_s for the job to empty, so no
+    process it held still has a file open when the caller removes them; a process spawn did not start is killed
+    alone."""
+    if os.name != 'nt':
+        os.killpg(proc.pid, signal.SIGKILL)
+        return
+    job = getattr(proc, 'ringo_job', None)
+    if job is None:
+        proc.kill()
+        return
+    ctypes, k32, _ = _win32()
+    try:
+        if not k32.TerminateJobObject(job, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+        info = (ctypes.c_uint32 * 12)()  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION; ActiveProcesses is info[10]
+        deadline = time.monotonic() + settle_s
+        while k32.QueryInformationJobObject(job, 1, info, ctypes.sizeof(info), None) and info[10] \
+                and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        proc.ringo_job = None
+        k32.CloseHandle(job)
 
 
 def _no_constant(name):
@@ -153,6 +277,8 @@ def _codex_home(root, env):
         with os.fdopen(fd, 'wb') as f:
             f.write(snapshot)
     env.update(HOME=str(home), CODEX_HOME=str(private))
+    if os.name == 'nt':  # Windows programs find the home folder in USERPROFILE, not HOME
+        env['USERPROFILE'] = str(home)
     return owner, snapshot, copy
 
 
@@ -162,10 +288,10 @@ def _lean_codex(argv, private, env, timeout_s=15):
     in the call's private CODEX_HOME. A CLI without `debug models`, or a catalog in another format, keeps only
     the instructions override."""
     instructions = private / 'ringo-instructions.md'
-    instructions.write_text(CODEX_INSTRUCTIONS, encoding='utf-8')
+    instructions.write_text(CODEX_INSTRUCTIONS, encoding='utf-8', newline='')  # LF on Windows too
     extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
     try:
-        listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
+        listed = subprocess.run(_found([argv[0], 'debug', 'models'], env), env=env, cwd=private, stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=timeout_s, check=True).stdout
         catalog = json.loads(listed)
         for model in catalog['models']:
@@ -188,9 +314,8 @@ def _owner_lock(owner):
     close that window."""
     fd = os.open(owner.parent / '.ringo-auth.lock', os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     try:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        with file_lock(fd):
+            yield
     finally:
         os.close(fd)
 
@@ -258,11 +383,26 @@ def _wait(proc, timeout_s, watch, snapshot, started, threads):
             return None
 
 
+def _spool(folder, name):
+    """A file a command writes to (or reads its stdin from) that _peek can read while the command runs. POSIX: an
+    anonymous temporary file. Windows has no os.pread, and the command's handle shares the file position with
+    ours, so the file is named, in folder, for _peek to open a handle of its own."""
+    return tempfile.TemporaryFile() if hasattr(os, 'pread') else open(Path(folder) / name, 'w+b')
+
+
+def _peek(f):
+    """The first RAW_PEEK bytes of a _spool file, without moving the position the command writes at."""
+    if hasattr(os, 'pread'):
+        return os.pread(f.fileno(), RAW_PEEK, 0)
+    with open(f.name, 'rb') as own:
+        return own.read(RAW_PEEK)
+
+
 def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False, watch=None):
     """stdout of one run. The working folder is empty, so no project instructions or files
     load from it; it is not a file-system boundary. The command gets the caller's
-    environment without the TypeSafe key, in a session of its own, so a timeout kills it and
-    everything it started, not only the direct child. codex_home: the command is a Codex CLI, so it
+    environment without the TypeSafe key, in a process tree of its own (see spawn), so a timeout kills
+    it and everything it started, not only the direct child. codex_home: the command is a Codex CLI, so it
     gets a private CODEX_HOME and HOME (see _codex_home); a refreshed login is written back even
     when the call fails or times out. lean (with codex_home): the call is a single tool-free Codex turn, so
     Codex's agent prompt and tool modes are replaced (see _lean_codex). watch: timeout_s becomes a soft limit
@@ -277,8 +417,8 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
     # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.
-    with tempfile.TemporaryDirectory(prefix='council-judge-') as tmp, tempfile.TemporaryFile() as out, \
-            tempfile.TemporaryFile() as err, tempfile.TemporaryFile() as stdin:
+    with tempfile.TemporaryDirectory(prefix='council-judge-') as tmp, _spool(tmp, 'out') as out, \
+            _spool(tmp, 'err') as err, _spool(tmp, 'stdin') as stdin:
         stdin.write(prompt.encode('utf-8'))
         stdin.seek(0)
         cwd = Path(tmp) / 'work'
@@ -286,20 +426,19 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
         started, ended, threads = time.monotonic(), None, []  # the limit counts setup too
         limit = watch.limit_s if watch else timeout_s
         login = _codex_home(Path(tmp), env) if codex_home else None
-        snapshot = lambda: tuple(os.pread(f.fileno(), RAW_PEEK, 0).decode('utf-8', 'replace') for f in (out, err))
+        snapshot = lambda: tuple(_peek(f).decode('utf-8', 'replace') for f in (out, err))
         try:
             if codex_home and lean:
                 argv = _lean_codex(argv, Path(tmp) / 'codex', env, max(0.1, min(15, limit)))
             if time.monotonic() - started >= limit:
                 ended = 'limit'  # setup used the whole window: the model is never launched
             else:
-                proc = subprocess.Popen(argv, stdin=stdin, stdout=out, stderr=err, cwd=cwd, env=env,
-                                        start_new_session=True)
+                proc = spawn(argv, stdin=stdin, stdout=out, stderr=err, cwd=cwd, env=env)
                 try:
                     ended = _wait(proc, timeout_s, watch, snapshot, started, threads)
                 finally:
                     try:
-                        os.killpg(proc.pid, signal.SIGKILL) if hasattr(os, 'killpg') else proc.kill()
+                        kill_tree(proc)
                     except (ProcessLookupError, PermissionError):
                         pass
                     proc.wait()
@@ -313,6 +452,8 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
         out.seek(0)
         err.seek(0)
         stdout, stderr = out.read().decode('utf-8', 'replace'), err.read().decode('utf-8', 'replace')
+    if os.name == 'nt':  # a Windows program's text-mode output ends lines with CRLF: read the LF text it printed
+        stdout = stdout.replace('\r\n', '\n')
     if ended:
         exc = (Stopped if ended == 'stop' else subprocess.TimeoutExpired)(argv, round(time.monotonic() - started, 1))
         exc.limit = ended == 'limit'

@@ -269,7 +269,7 @@ def call(backend, system, message, timeout_s, model=None, watch=None):
         return backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, watch=watch), None
     with tempfile.TemporaryDirectory(prefix='ringo-system-') as d:  # created 0700; removed after the call
         path = Path(d) / 'system.txt'
-        path.write_text(system, encoding='utf-8')
+        path.write_text(system, encoding='utf-8', newline='')  # the exact text: no CRLF on Windows
         try:
             out = backends.run_isolated([*argv, '--system-prompt-file', str(path), '--output-format', 'json'],
                                        message, timeout_s, watch=watch)
@@ -820,7 +820,7 @@ def task(args, kind):
             args.findings_pr = findings_pr(args)
         run = Run(args.trace, args.max_cost, args.unpriced_call_usd)
         if run.trace:
-            (run.trace / 'material.txt').write_text(material, encoding='utf-8')
+            (run.trace / 'material.txt').write_text(material, encoding='utf-8', newline='')  # as sent, on every OS
             (run.trace / 'plan.json').write_text(json.dumps(plan, indent=1), encoding='utf-8')
             (run.trace / 'backends.json').write_text(json.dumps({k: names[k] for k in
                 ('backend', 'checker_backend')}, indent=1), encoding='utf-8')

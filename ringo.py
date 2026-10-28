@@ -6,6 +6,38 @@ import sys
 WAIT_EXIT = {'done': 0, 'ready_for_review': 0, 'needs_revision': 1, 'repeated_candidate': 1, 'budget_exhausted': 1}
 
 
+def check_pid(pid):
+    """Return if a process with this pid exists; raise ProcessLookupError if none does, PermissionError if it exists
+    but may not be asked. POSIX: os.kill(pid, 0). On Windows os.kill(pid, 0) terminates the process, so the process
+    is opened for a zero-timeout wait instead: an exited process whose handle someone still holds counts as gone."""
+    import os
+    if os.name != 'nt':
+        os.kill(pid, 0)
+        return
+    if type(pid) is not int:
+        raise TypeError(f'pid must be an int, not {type(pid).__name__}')
+    if not 0 <= pid <= 0xFFFFFFFF:
+        raise OverflowError('pid out of range')
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    k32.OpenProcess.restype, k32.OpenProcess.argtypes = wintypes.HANDLE, (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.WaitForSingleObject.restype = wintypes.DWORD
+    k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = k32.OpenProcess(0x00100000 | 0x1000, False, pid)  # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no process has this pid
+            raise ProcessLookupError(pid)
+        raise PermissionError(error, ctypes.FormatError(error))
+    try:
+        if k32.WaitForSingleObject(handle, 0) == 0:  # WAIT_OBJECT_0: it has exited
+            raise ProcessLookupError(pid)
+    finally:
+        k32.CloseHandle(handle)
+
+
 def wait(argv):
     """Block until a run's state.json leaves 'running', then print it as one line. A deterministic wait: one
     command instead of an agent re-entering its model to sleep and poll. Needs no runtime bundle."""
@@ -22,10 +54,9 @@ def wait(argv):
             state = json.loads(path.read_text(encoding='utf-8'))
         except (OSError, ValueError):  # not written yet
             state = None
-        # On Windows os.kill(pid, 0) would terminate the process, so only the state file or the timeout ends the wait.
-        if state and state.get('status') == 'running' and os.name != 'nt':
+        if state and state.get('status') == 'running':
             try:
-                os.kill(state['pid'], 0)
+                check_pid(state['pid'])
             except ProcessLookupError:  # it may have finished between the read and the check: read again
                 try:
                     state = json.loads(path.read_text(encoding='utf-8'))

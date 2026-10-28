@@ -504,9 +504,8 @@ def checks(spec, root, logdir, remaining):
             raise harness.BudgetExceeded('workflow wall-clock limit reached')
         # Retain bounded log excerpts; full output is spooled to files, not memory.
         with (logdir / f'check-{i}.out').open('wb') as out, (logdir / f'check-{i}.err').open('wb') as err:
-            proc = subprocess.Popen(check['argv'], cwd=root, stdout=out, stderr=err,
-                                    env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-                                    start_new_session=os.name == 'posix')
+            proc = backends.spawn(check['argv'], cwd=root, stdout=out, stderr=err,
+                                  env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
             try:
                 code = proc.wait(timeout=timeout)
                 status = 'pass' if code == 0 else 'fail'
@@ -517,11 +516,7 @@ def checks(spec, root, logdir, remaining):
             finally:
                 # A successful parent may leave children writing or mutating files.
                 try:
-                    if os.name == 'posix':
-                        import signal
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    else:
-                        proc.kill()
+                    backends.kill_tree(proc)
                 except ProcessLookupError:
                     pass
                 except PermissionError:  # macOS reports EPERM for a group that holds only zombies

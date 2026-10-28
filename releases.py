@@ -95,13 +95,24 @@ def private_root(path=None):
 
 @contextlib.contextmanager
 def locked(root):
-    import fcntl
+    import backends
     lock = root / '.lock'
     if lock.is_symlink():
         raise ValueError('release lock cannot be a symlink')
-    with lock.open('a') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with lock.open('a') as f, backends.file_lock(f):
         yield
+
+
+def fsync_dir(path):
+    """Make a rename inside the folder path durable. Windows cannot open a folder for os.fsync; NTFS records the
+    rename in its metadata journal instead."""
+    if os.name == 'nt':
+        return
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def atomic_json(path, value):
@@ -113,11 +124,7 @@ def atomic_json(path, value):
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_dir(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -251,11 +258,7 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
             path.chmod(0o555 if path.is_dir() else 0o444)
         os.rename(tmp, target)
         target.chmod(0o555)
-        directory = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_dir(target.parent)
         # TemporaryDirectory's cleanup tolerates the moved-away path.
         return rid
 
