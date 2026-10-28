@@ -68,7 +68,9 @@ def main(argv):
     except BaseException:
         results['<import>'] = {'ok': False, 'error': traceback.format_exc(limit=4)[-2000:]}
         suite = unittest.TestSuite()
-    ids = [test_id(t) for t in tests_in(suite)]  # before running: a suite drops its tests as it runs them
+    # Before running (a suite drops its tests as it runs them): each test's module and class, as unittest names them.
+    owners = {test_id(t): (type(t).__module__, f'{type(t).__module__}.{type(t).__qualname__}') for t in tests_in(suite)}
+    ids = list(owners)
     signal.signal(signal.SIGALRM, _alarm)
     record = Record()
     try:
@@ -78,12 +80,14 @@ def main(argv):
     for holder, error in record.errors:
         if isinstance(holder, unittest.TestCase):
             continue
-        # A class or module fixture failed: "setUpClass (spec_tests.Name)" or "tearDownModule (spec_tests)". Its error
-        # fails every test it covers, run or not, as a failed fixture fails the suite in unittest.
+        # A class or module fixture failed: "setUpClass (module.Class)" or "tearDownModule (module)". Its error fails
+        # every test it covers, run or not, as a failed fixture fails the suite in unittest.
         desc = getattr(holder, 'description', '')
-        name = desc.rsplit('.', 1)[-1].rstrip(')') if '.' in desc else None
+        method, _, target = desc.partition(' (')
+        target = target[:-1] if target.endswith(')') else None
+        side = 0 if method in ('setUpModule', 'tearDownModule') else 1
         for tid in ids:
-            if name is None or tid.split('.')[0] == name:
+            if target is None or owners[tid][side] == target:
                 if record.outcomes.get(tid, {}).get('ok', True):
                     record.outcomes[tid] = {'ok': False, 'error': f'{desc or "suite"}: {error}'[-2000:]}
     for tid in ids:

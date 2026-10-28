@@ -249,6 +249,23 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertFalse(tests['BadTeardown.test_passes_first']['ok'])
         self.assertIn('close failed', tests['BadTeardown.test_passes_first']['error'])
 
+    def test_spec_runner_matches_a_module_fixture_error_to_that_module_only(self):
+        import subprocess
+        (self.root / 'helpers').mkdir()
+        (self.root / 'helpers/__init__.py').write_text('')
+        (self.root / 'helpers/fixtures.py').write_text(
+            'import unittest\n\ndef tearDownModule():\n    raise RuntimeError("helper teardown")\n\n'
+            'class Shared(unittest.TestCase):\n    def test_shared(self):\n        pass\n')
+        module = self.root / 'mod_tests.py'
+        module.write_text('import unittest\nfrom helpers.fixtures import Shared\n\nclass Own(unittest.TestCase):\n'
+                          '    def test_own(self):\n        pass\n')
+        out = self.root / 'out3.json'
+        subprocess.run([sys.executable, '-I', '-B', str(Path(workflow.__file__).parent / 'spec_runner.py'),
+                        str(self.root), str(module), '--json', str(out)], capture_output=True, timeout=60)
+        tests = json.loads(out.read_text())['tests']
+        self.assertTrue(tests['Own.test_own']['ok'])
+        self.assertIn('helper teardown', tests['Shared.test_shared']['error'])
+
     def test_a_spec_runner_that_produces_no_result_drops_the_suite(self):
         hang = '```python\nimport time, unittest\ntime.sleep(30)\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n```'
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'], hang,
