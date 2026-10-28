@@ -361,6 +361,29 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertIn('complete FILE block', seen[2][1])  # and is asked for whole files, which cannot mis-anchor
         self.assertEqual(report['usage']['calls'], 4)  # spec tests, writer, repair, review
 
+    def test_python_placeholder_is_the_running_interpreter(self):
+        path = self.root / 'placeholder.json'
+        path.write_text(json.dumps({**self.spec, 'checks': [{'name': 'c', 'argv': ['{python}', '-B', 'check.py']}],
+                                    'spec_tests': {'python': '{python}'}, 'scripts': {'python': '{python}'}}))
+        spec = workflow.load_spec(path)
+        self.assertEqual(spec['checks'][0]['argv'], [sys.executable, '-B', 'check.py'])
+        self.assertEqual((spec['spec_tests']['python'], spec['scripts']['python']), (sys.executable, sys.executable))
+
+    def test_the_example_specs_load_and_their_check_passes_a_correct_solution(self):
+        import subprocess
+        examples = Path(workflow.__file__).parent / 'examples'
+        for name in ('v3-codex.json', 'v3-claude.json'):
+            spec = workflow.load_spec(examples / name)
+            self.assertEqual(spec['checks'][0]['argv'][0], sys.executable)
+        folder = self.root / 'example'
+        folder.mkdir()
+        (folder / 'check.py').write_text(spec['fixtures']['check.py'])
+        (folder / 'slug.py').write_text(
+            'import re\n\ndef slugify(text):\n    if not isinstance(text, str):\n        raise TypeError("text must be a str")\n'
+            '    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40].rstrip("-")\n    return s or "n-a"\n')
+        run = subprocess.run(spec['checks'][0]['argv'], cwd=folder, capture_output=True, text=True, timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+
     def test_script_and_candidate_options_are_validated(self):
         base = {**self.spec, 'spec_tests': None}
         for changes, message in (({'candidates': 5}, 'candidates'), ({'candidates': 0}, 'candidates'),

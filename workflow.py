@@ -431,6 +431,12 @@ def load_spec(path):
                 or not all(isinstance(a, str) and a for a in check['argv']):
             raise ValueError('each check needs name and nonempty argv')
         positive(check.setdefault('timeout_s', 30), 'check timeout_s')
+    # "{python}" in a command is the interpreter running Ringo, so one spec runs on macOS, Linux and Windows alike.
+    for check in checks:
+        check['argv'] = [sys.executable if a == '{python}' else a for a in check['argv']]
+    for key in ('spec_tests', 'scripts'):
+        if spec.get(key) and spec[key].get('python') == '{python}':
+            spec[key]['python'] = sys.executable
     # The caller selects executable bridge/check commands. They are trusted code,
     # not an OS boundary around model-generated artifacts.
     if council:
