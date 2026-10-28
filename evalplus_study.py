@@ -75,7 +75,9 @@ def hidden(out, task_id):
 
 def task_spec(task, template, backend=None):
     spec = json.loads(Path(template).read_text(encoding='utf-8'))
-    check = (f"from solution import {task['entry_point']}\n{task['test']}\n\ncheck({task['entry_point']})\n"
+    # The star import brings helpers the prompt defines and the test calls (HumanEval/38 and /50 call encode_*).
+    check = (f"from solution import *\nfrom solution import {task['entry_point']}\n{task['test']}\n\n"
+             f"check({task['entry_point']})\n"
              "print('base tests pass')\n")
     spec.update(brief=f"Complete `{task['entry_point']}` in solution.py. Its signature and docstring are the "
                       'specification. Keep the signature, use only the standard library, and do not print.\n',

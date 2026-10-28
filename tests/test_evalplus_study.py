@@ -54,6 +54,15 @@ class SeedTest(unittest.TestCase):
 
 
 class SpecTest(unittest.TestCase):
+    def test_the_public_check_sees_helpers_the_prompt_defines(self):
+        task = {**TASK, 'prompt': 'def helper(x):\n    return x\n\n\n' + TASK['prompt'],
+                'test': 'def check(candidate):\n    assert candidate([helper(2)]) == 2\n'}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'task.json'
+            path.write_text(json.dumps(study.task_spec(task, study.HERE / 'examples' / 'v3-codex.json')))
+            spec = workflow.load_spec(path)
+            self.assertTrue(study.base_passes(spec, task['prompt'] + GOOD[len(TASK['prompt']):]))
+
     def test_a_task_is_a_v3_work_spec_in_shadow_mode(self):
         spec = study.task_spec(TASK, study.HERE / 'examples' / 'v3-codex.json')
         self.assertEqual(spec['stop_on_checks'], {'retain': 1})
