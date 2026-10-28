@@ -528,15 +528,24 @@ def draft_one(out, name, writer):
     system = (HERE / 'prompts' / 'work-code.md').read_text(encoding='utf-8')
     role = spec['roles'].get('writer') if writer.startswith('codex') == spec['writer'].startswith('codex') else None
     backend = workflow.role_backend(harness.backend(writer), role)
-    reply, usage = harness.call(backend, system, workflow.text_message(spec, spec['files'], {}), spec['timeout_s'])
-    (dest / 'reply.txt').write_text(reply, encoding='utf-8')
-    result = {'writer': writer, 'usage': usage}
-    try:
-        files = workflow.materialize_text(spec['files'], spec['files'], workflow.parse_text_reply(reply))
+    feedback, result = {}, {'writer': writer, 'usage': []}
+    for attempt in ('draft', 'repair'):  # protocol_repair, as in work: one repair call with the exact error
+        reply, usage = harness.call(backend, system, workflow.text_message(spec, spec['files'], feedback),
+                                    spec['timeout_s'])
+        (dest / f'{attempt}-reply.txt').write_text(reply, encoding='utf-8')
+        result['usage'].append(usage)
+        try:
+            files = workflow.materialize_text(spec['files'], spec['files'], workflow.parse_text_reply(reply))
+        except ValueError as exc:
+            result.update(base_pass=False, error=str(exc)[:300])
+            if not spec.get('protocol_repair'):
+                break
+            feedback = {'protocol_error': str(exc) + workflow.REPAIR}
+            continue
         (dest / 'solution.py').write_text(files['solution.py'], encoding='utf-8')
-        result['base_pass'] = base_passes(spec, files['solution.py'])
-    except ValueError as exc:
-        result.update(base_pass=False, error=str(exc)[:300])
+        result.pop('error', None)
+        result.update(base_pass=base_passes(spec, files['solution.py']), repaired=attempt == 'repair')
+        break
     (dest / 'result.json').write_text(json.dumps(result, indent=1) + '\n', encoding='utf-8')
     return result
 
