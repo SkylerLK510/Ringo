@@ -203,14 +203,23 @@ def private_directory(path, *, create=False, **mkdir):
         if error:  # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
             raise c.WinError(error)
 
-    def verify(folder):
+    def private(folder):
         control, aces = _windows_acl(folder)
-        if not control & 0x1000 or aces != [(0, 3, 0x1F01FF, sid)]:  # SE_DACL_PROTECTED, OI | CI
+        return bool(control & 0x1000) and aces == [(0, 3, 0x1F01FF, sid)]  # SE_DACL_PROTECTED, OI | CI
+
+    def verify(folder):
+        if not private(folder):
             raise OSError(f'{folder}: owner-only protected DACL verification failed')
 
+    def secure_existing(folder):
+        # Setting a folder's DACL re-applies inheritance to everything inside it, so tighten only a folder that is
+        # not private yet: a store reopened for every command would otherwise walk its whole tree each time.
+        if not private(folder):
+            tighten(folder)
+            verify(folder)
+
     if not create:
-        tighten(path)
-        verify(path)
+        secure_existing(path)
         return
 
     class SecurityAttributes(c.Structure):
@@ -240,7 +249,8 @@ def private_directory(path, *, create=False, **mkdir):
                     raise
                 if ancestor:  # an existing ancestor is the caller's folder: like Path.mkdir, leave it as it is
                     return
-                tighten(folder)
+                secure_existing(folder)
+                return
             verify(folder)
 
         make(Path(path), **mkdir)

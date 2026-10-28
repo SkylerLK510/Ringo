@@ -94,20 +94,28 @@ class PrivateDirectoryTest(unittest.TestCase):
             out._obj.value = 123
             return True
 
+        private = set()  # folders created with the descriptor or tightened since: what a readback finds private
+
         def mkdir(path, attributes):
             self.assertEqual(attributes._obj.nLength, ctypes.sizeof(attributes._obj))
             self.assertEqual(attributes._obj.lpSecurityDescriptor, 123)
             self.assertFalse(attributes._obj.bInheritHandle)
             events.append(('create', path))
-            return create(path) if create else True
+            made = create(path) if create else True
+            private.add(str(path))
+            return made
 
         def read(path):
             events.append(('verify', str(path)))
-            return 0x1000, [(0, 3, 0x1F01FF, sid)]
+            return (0x1000, [(0, 3, 0x1F01FF, sid)]) if str(path) in private else (0, [])
+
+        def tighten(path, *args):
+            private.add(str(path))
+            return 0
 
         adv.ConvertSidToStringSidW.side_effect = sid_text
         adv.ConvertStringSecurityDescriptorToSecurityDescriptorW.side_effect = descriptor
-        adv.SetNamedSecurityInfoW.return_value = 0
+        adv.SetNamedSecurityInfoW.side_effect = tighten
         kernel.CreateDirectoryW.side_effect = mkdir
         kernel.LocalFree.side_effect = lambda _: events.append('free')
         with mock.patch.object(backends, 'os', wraps=os) as win, \
@@ -160,6 +168,17 @@ class PrivateDirectoryTest(unittest.TestCase):
             self.assertNotIn(('verify', str(parent)), events)
             self.assertIn(('verify', str(leaf)), events)
 
+    def test_an_existing_folder_that_is_already_private_is_not_set_again(self):
+        # Setting a folder's DACL re-applies inheritance to its whole tree; a reopened store must not pay that.
+        with self.creation_api(lambda path: (_ for _ in ()).throw(FileExistsError())) as (_, adv, events), \
+                tempfile.TemporaryDirectory() as d:
+            adv.SetNamedSecurityInfoW(d)  # it was made private earlier
+            adv.SetNamedSecurityInfoW.reset_mock()
+            backends.private_directory(d, create=True, exist_ok=True)
+            backends.private_directory(d)
+            adv.SetNamedSecurityInfoW.assert_not_called()
+            self.assertEqual(events.count(('verify', d)), 2)
+
     def test_existing_directory_is_tightened_only_with_exist_ok_and_files_are_refused(self):
         def exists(path):
             raise FileExistsError()
@@ -208,10 +227,11 @@ class PrivateDirectoryTest(unittest.TestCase):
                 mock.patch.object(backends, '_windows_acl') as read:
             win.name = 'nt'
             expected = (0x1000, [(0, 3, 0x1F01FF, sid)])
-            read.return_value = expected
+            read.side_effect = [(0, []), expected]  # shared before, private after tightening
             backends.private_directory('private')
             call = adv.SetNamedSecurityInfoW.call_args.args
             self.assertEqual((call[0], call[1], call[2]), ('private', 1, 4 | 0x80000000))
+            read.side_effect = None
             for bad in ((0, expected[1]), (0x1000, []), (0x1000, expected[1] * 2),
                         (0x1000, [(0, 19, 0x1F01FF, sid)]), (0x1000, [(0, 3, 1, sid)]),
                         (0x1000, [(0, 3, 0x1F01FF, b'other')])):
@@ -221,11 +241,12 @@ class PrivateDirectoryTest(unittest.TestCase):
             read.side_effect = OSError('cannot read ACL')
             with self.assertRaises(OSError):
                 backends.private_directory('private')
-            read.reset_mock()
+            read.reset_mock(side_effect=True)
+            read.return_value = (0, [])  # not private yet, so it is tightened, and the tightening fails
             adv.SetNamedSecurityInfoW.return_value = 5
             with self.assertRaises(OSError):
                 backends.private_directory('private')
-            read.assert_not_called()
+            read.assert_called_once()  # the check before tightening; nothing is verified after the failure
             adv.SetNamedSecurityInfoW.reset_mock()
             for fn in (adv.InitializeAcl, adv.AddAccessAllowedAceEx):
                 fn.return_value = False
