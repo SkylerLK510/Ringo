@@ -374,7 +374,11 @@ class NativeWindowsPrivacyTest(unittest.TestCase):
             copy.write_bytes(new)
             backends._sync_codex_auth(owner, old, copy)
             self.assertEqual(owner.read_bytes(), new)
-            self.assert_private(owner, directory=False)
+            # One full-control ACE for the user: inherited from the private folder it was written in, or kept
+            # explicit by the move (Windows 3.11 CI); either way the shared folder's ACL is not inherited.
+            _, aces = backends._windows_acl(owner)
+            self.assertEqual([(t, m, sid) for t, _, m, sid in aces], [(0, 0x1F01FF, backends._windows_user_sid())])
+            self.assertIn(aces[0][1], (0, 16))
 
     def test_setting_acl_failure_stops_before_sensitive_writes(self):
         with tempfile.TemporaryDirectory() as d:
