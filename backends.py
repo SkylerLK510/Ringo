@@ -112,7 +112,11 @@ def _win32():
         fn = getattr(k32, name)
         fn.restype, fn.argtypes = res, args
     nt.NtResumeProcess.restype, nt.NtResumeProcess.argtypes = ctypes.c_long, (wintypes.HANDLE,)
-    return ctypes, k32, nt
+
+    class Accounting(ctypes.Structure):  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION
+        _fields_ = [('times', ctypes.c_int64 * 4), ('page_faults', wintypes.DWORD), ('total', wintypes.DWORD),
+                    ('active', wintypes.DWORD), ('terminated', wintypes.DWORD)]
+    return ctypes, k32, nt, Accounting
 
 
 def _found(argv, env=None):
@@ -126,10 +130,11 @@ def _found(argv, env=None):
 def spawn(argv, **kw):
     """subprocess.Popen(argv, **kw) in a process tree of its own, which kill_tree ends with everything it started.
     POSIX: a new session. Windows: a new process group inside a job object; the command starts suspended and runs
-    only once it is in the job, so nothing it starts can escape it, and argv[0] is looked up as _found does."""
+    only once it is in the job, so every process it starts is in the job too, and argv[0] is looked up as _found
+    does."""
     if os.name != 'nt':
         return subprocess.Popen(argv, start_new_session=True, **kw)
-    ctypes, k32, nt = _win32()
+    ctypes, k32, nt, _ = _win32()
     argv = _found(argv, kw.get('env'))
     job = k32.CreateJobObjectW(None, None)
     if not job:
@@ -152,8 +157,11 @@ def spawn(argv, **kw):
         if handle:
             k32.CloseHandle(handle)
     if error:
-        kill_tree(proc)
-        proc.wait()
+        try:
+            kill_tree(proc)
+        finally:
+            proc.kill()  # it may never have joined the job
+            proc.wait()
         raise error
     return proc
 
@@ -170,14 +178,16 @@ def kill_tree(proc, settle_s=10):
     if job is None:
         proc.kill()
         return
-    ctypes, k32, _ = _win32()
+    ctypes, k32, _, Accounting = _win32()
     try:
         if not k32.TerminateJobObject(job, 1):
             raise ctypes.WinError(ctypes.get_last_error())
-        info = (ctypes.c_uint32 * 12)()  # JOBOBJECT_BASIC_ACCOUNTING_INFORMATION; ActiveProcesses is info[10]
-        deadline = time.monotonic() + settle_s
-        while k32.QueryInformationJobObject(job, 1, info, ctypes.sizeof(info), None) and info[10] \
-                and time.monotonic() < deadline:
+        info, deadline = Accounting(), time.monotonic() + settle_s
+        while True:  # ceiling: polls every 10 ms; a completion port would report the empty job at once
+            if not k32.QueryInformationJobObject(job, 1, ctypes.byref(info), ctypes.sizeof(info), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if not info.active or time.monotonic() >= deadline:
+                break
             time.sleep(0.01)
     finally:
         proc.ringo_job = None
