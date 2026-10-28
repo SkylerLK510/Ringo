@@ -163,16 +163,17 @@ def role_backend(backend, opts):
     return {**backend, 'argv': argv}
 
 
-NUMBER = re.compile(r'(?<![A-Za-z_])\d[\d,]*(?:\.\d+)?')
+NUMBER = re.compile(r'(?:(?<![\w.])[-\u2212])?(?<![A-Za-z_])\d[\d,]*(?:\.\d+)?')
 
 
 def numbers(text):
-    """The numeric values in text, normalized so 2.00 == 2, 09 == 9 and 1,628.62 == 1628.62. Digits glued to a letter,
+    """The signed numeric values in text, normalized so 2.00 == 2, 09 == 9 and 1,628.62 == 1628.62; a minus sign
+    (ASCII or U+2212) counts unless it follows a digit or letter, as in a date or a range. Digits glued to a letter,
     such as a source ID like S4, are names, not values."""
     found = set()
     for token in NUMBER.findall(text):
         try:
-            found.add(decimal.Decimal(token.replace(',', '')).normalize())
+            found.add(decimal.Decimal(token.replace(',', '').replace('\u2212', '-')).normalize())
         except decimal.InvalidOperation:
             pass
     return found
@@ -662,11 +663,11 @@ def run(spec_path, out, call_fn=harness.call):
         observed = checks({'checks': [{'name': 'spec tests', 'argv': argv, 'timeout_s': spec['spec_tests']['timeout_s']}]},
                           root, folder, remaining)[0]
         if not result_path.exists():
-            return {'status': observed['status'], 'passed': 0, 'total': len(spec_suite['ids']), 'failing': [],
+            return {'status': 'broken', 'passed': 0, 'total': len(spec_suite['ids']), 'failing': [], 'failing_ids': [],
                     'broken': f"spec runner produced no result ({observed['status']})"}
         outcome = json.loads(result_path.read_text(encoding='utf-8'))
         if '<import>' in outcome['tests']:  # the module itself failed to load: a broken suite, not a code failure
-            return {'status': 'broken', 'passed': 0, 'total': len(spec_suite['ids']), 'failing': [],
+            return {'status': 'broken', 'passed': 0, 'total': len(spec_suite['ids']), 'failing': [], 'failing_ids': [],
                     'broken': outcome['tests']['<import>']['error'][-800:]}
         failing = [{'id': tid, 'error': r['error'][-1200:], 'source': spec_suite['sources'].get(tid, '')}
                    for tid, r in outcome['tests'].items() if not r['ok'] and tid not in disputed]
@@ -683,7 +684,7 @@ def run(spec_path, out, call_fn=harness.call):
                      'rubric': spec['rubric'], 'samples': spec['samples']})
         if spec.get('spec_tests') and kind == 'code':
             reply = call('spec-tests', spec['writer'], (HERE / 'prompts' / 'spec-tests.md').read_text(encoding='utf-8'),
-                         text_message(spec, current, {}), role='tests')
+                         text_message({'brief': spec['brief'], 'fixtures': {}}, current, {}), role='tests')
             try:
                 source, ids = spec_test_file(reply)
                 (out / 'spec_tests.py').write_text(source, encoding='utf-8')

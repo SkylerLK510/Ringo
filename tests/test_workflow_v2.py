@@ -217,6 +217,41 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual(workflow.numbers('2.00% of 1,628.62 at 09:05 [S4]'),
                          {workflow.decimal.Decimal(v).normalize() for v in ('2', '1628.62', '9', '5')})
 
+    def test_spec_runner_runs_class_fixtures_and_reports_tests_a_fixture_kept_from_running(self):
+        import subprocess
+        module = self.root / 'fixture_tests.py'
+        module.write_text('import unittest\n\nclass Shared(unittest.TestCase):\n    @classmethod\n'
+                          '    def setUpClass(cls):\n        cls.k = 2\n\n    def test_k(self):\n        self.assertEqual(self.k, 2)\n\n'
+                          '    def test_fails(self):\n        self.assertEqual(self.k, 3, "wrong k")\n\n'
+                          'class Broken(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n'
+                          '        raise RuntimeError("fixture down")\n\n    def test_never(self):\n        pass\n')
+        out = self.root / 'out.json'
+        subprocess.run([sys.executable, '-I', '-B', str(Path(workflow.__file__).parent / 'spec_runner.py'),
+                        str(self.root), str(module), '--json', str(out)], capture_output=True, timeout=60)
+        tests = json.loads(out.read_text())['tests']
+        self.assertTrue(tests['Shared.test_k']['ok'])
+        self.assertIn('wrong k', tests['Shared.test_fails']['error'])
+        self.assertFalse(tests['Broken.test_never']['ok'])
+        self.assertIn('fixture down', tests['Broken.test_never']['error'])
+
+    def test_a_spec_runner_that_produces_no_result_drops_the_suite(self):
+        hang = '```python\nimport time, unittest\ntime.sleep(30)\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n```'
+        report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'], hang,
+                                  spec_tests={'python': sys.executable, 'timeout_s': 2})
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertIn('no result', report['spec_tests']['dropped'])
+
+    def test_the_test_writer_sees_the_brief_and_starting_files_but_no_fixture(self):
+        _, seen = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'])
+        tests_message = seen[0][1]
+        self.assertIn('Return twice x.', tests_message)
+        self.assertNotIn('check.py', tests_message)
+
+    def test_a_sign_change_is_a_new_number(self):
+        self.assertNotEqual(workflow.numbers('profit: 6'), workflow.numbers('profit: -6'))
+        self.assertEqual(workflow.numbers('loss −6.22'), {workflow.decimal.Decimal('-6.22')})
+        self.assertEqual(workflow.numbers('2031-09-16 and 10-20'), workflow.numbers('2031 09 16 10 20'))
+
     def test_a_suite_that_cannot_load_is_dropped(self):
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'],
                                   '```python\nfrom value import g\n\nimport unittest\nclass T(unittest.TestCase):\n'
