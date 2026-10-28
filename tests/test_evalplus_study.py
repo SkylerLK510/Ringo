@@ -149,11 +149,88 @@ class ReviewFindingTest(unittest.TestCase):
                 (run / 'grade.json').write_text(json.dumps({'round1_pass': True, 'delivered_pass': True}))
                 (run / 'report.json').write_text(json.dumps({'stop': {'eligible': True}, 'rounds': []}))
                 (out / 'seeded' / run.name).mkdir(parents=True)
+                (out / 'seeded' / run.name / 'solution.py').write_text(GOOD)
                 (out / 'seeded' / run.name / 'result.json').write_text('{}')
             with unittest.mock.patch.object(study, 'dataset', return_value={}), \
                     unittest.mock.patch.object(study.subprocess, 'run') as launched:
                 study.seed_all(out, 2, 1)
             launched.assert_not_called()  # two results exist: nothing new is reviewed
+            with unittest.mock.patch.object(study, 'dataset', return_value={}), \
+                    unittest.mock.patch.object(study.subprocess, 'run') as launched:
+                study.seed_all(out, 2, 1, reviewer='claude')
+            argvs = [c.args[0] for c in launched.call_args_list]
+            # another reviewer reviews the same two seeded drafts and the same drafts before seeding: four calls
+            self.assertEqual(len(argvs), 4)
+            self.assertTrue(all(a[a.index('--reviewer') + 1] == 'claude' for a in argvs))
+            self.assertEqual(sum('--clean' in a for a in argvs), 2)
+
+    def test_the_report_compares_reviewers_on_the_same_drafts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            usage = {'input': 100, 'output': 10}
+            for i, (default, other, clean) in enumerate([(1, 1, 0), (0, 1, 1), (1, 0, 0)]):
+                folder = out / 'seeded' / f'HumanEval-{i}'
+                (folder / 'claude').mkdir(parents=True)
+                (folder / 'result.json').write_text(json.dumps(
+                    {'findings': default, 'mentions_change': bool(default), 'original_findings': 0, 'usage': usage}))
+                (folder / 'claude' / 'result.json').write_text(json.dumps(
+                    {'reviewer': 'claude', 'findings': other, 'mentions_change': False, 'usage': usage}))
+                (folder / 'claude' / 'clean.json').write_text(json.dumps(
+                    {'reviewer': 'claude', 'findings': clean, 'mentions_change': False, 'usage': usage}))
+            with unittest.mock.patch('sys.stdout', new_callable=__import__('io').StringIO) as printed:
+                study.report_all(out, .05)
+            text = printed.getvalue()
+        self.assertIn('seeded reviews (template judge): 2/3 raised a finding', text)
+        self.assertIn('2/3 quoted the changed line; 330 tokens', text)
+        self.assertIn('seeded reviews (claude): 2/3 raised a finding', text)
+        self.assertIn('same drafts before seeding: 0/3 reviews raised a finding', text)
+        self.assertIn('same drafts before seeding: 1/3 reviews raised a finding', text)
+
+    def test_a_reviewer_that_can_read_files_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'tasks' / 'HumanEval-0').mkdir(parents=True)
+            (out / 'tasks' / 'HumanEval-0' / 'task.json').write_text(
+                json.dumps(study.task_spec(TASK, study.HERE / 'examples' / 'v3-codex.json')))
+            run = out / 'runs' / 'HumanEval-0'
+            (run / 'round-1' / 'candidate').mkdir(parents=True)
+            (run / 'round-1' / 'candidate' / 'solution.py').write_text(GOOD)
+            (run / 'round-1' / 'proposal.json').write_text(json.dumps({'rationale': 'r'}))
+            (out / 'seeded' / 'HumanEval-0').mkdir(parents=True)
+            (out / 'seeded' / 'HumanEval-0' / 'solution.py').write_text(GOOD)
+            with self.assertRaisesRegex(ValueError, 'tool-free reviewer'):
+                study.review_one(out, 'HumanEval-0', reviewer='codex')
+
+
+class ProbeTest(unittest.TestCase):
+    def test_probe_inputs_are_repeatable_mutations_of_public_inputs_only(self):
+        inputs = study.probe_inputs(TASK['base_input'])
+        self.assertEqual(inputs, study.probe_inputs(TASK['base_input']))
+        self.assertEqual(len(inputs), study.PROBE_INPUTS)
+        self.assertEqual(len({repr(i) for i in inputs}), len(inputs))
+        self.assertTrue(all(len(i) == 1 and isinstance(i[0], list) for i in inputs))
+
+    def test_a_check_missed_defect_is_told_apart_and_a_rewrite_is_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'good.py').write_text(GOOD)
+            (root / 'bad.py').write_text(GOOD.replace('max(evens)', 'min(evens)'))
+            (root / 'same.py').write_text(TASK['prompt'] + '    return max((x for x in xs if x % 2 == 0), default=None)\n')
+            found = study.probe(root, TASK, root / 'good.py', root / 'bad.py')
+            alike = study.probe(root, TASK, root / 'good.py', root / 'same.py')
+        self.assertGreater(found['differ'], 0)
+        self.assertEqual(alike, {'inputs': study.PROBE_INPUTS, 'differ': 0})
+
+    def test_exceptions_are_outcomes_and_a_hang_is_inconclusive(self):
+        crash = TASK['prompt'] + '    raise ValueError\n'
+        self.assertEqual(study.compare_here('largest', 0, crash, crash, [[[1]]]), [])
+        self.assertEqual(study.compare_here('largest', 0, GOOD, crash, [[[2]]]), [0])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'good.py').write_text(GOOD)
+            (root / 'hang.py').write_text(TASK['prompt'] + '    while True:\n        pass\n')
+            with unittest.mock.patch.object(study, 'PROBE_TIMEOUT_S', 2):
+                self.assertEqual(study.probe(root, TASK, root / 'good.py', root / 'hang.py'), {'inconclusive': 'timeout'})
 
 
 if __name__ == '__main__':

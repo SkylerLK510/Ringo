@@ -7,14 +7,18 @@ graded locally after the run. Runs use the checkout's workflow.py, the code unde
 
   run     prepare and run tasks, J at a time (model calls: at most max_rounds + 1 per task)
   grade   score round 1 and the delivered files against the hidden tests (no model calls)
-  seed    plant a defect the public check misses into correct round-1 drafts and give each one review (one call each)
-  report  shadow-label bounds for the runs, and the seeded reviews' catch rate (no model calls)
+  seed    plant a defect the public check misses into correct round-1 drafts and give each one review (one call each);
+          --reviewer BACKEND has another model review the same seeded drafts, and the drafts before seeding (two
+          calls each), so two reviewers' catch rates and false alarms compare on identical material
+  probe   distinguishing inputs, replayed: run each pair of implementations the study has (round 1 and the delivered
+          files; a correct draft and its seeded defect) on inputs mutated from the public tests (no model calls)
+  report  shadow-label bounds for the runs, the seeded reviews' catch rate and the probe's (no model calls)
 
 Run folders and the dataset cache go under --out, outside this checkout. HumanEval+ is downloaded at a pinned
 version and checksum; EvalPlus is Apache-2.0 (https://github.com/evalplus/evalplus), and the output comparison
 follows its evaluator: exact equality, a float tolerance, and a root check for find_zero.
 
-usage: python3 evalplus_study.py {run,grade,seed,report} --out DIR [--limit N] [--jobs J]
+usage: python3 evalplus_study.py {run,grade,seed,probe,report} --out DIR [--limit N] [--jobs J]
 """
 import argparse
 import concurrent.futures
@@ -26,6 +30,7 @@ import io
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import tempfile
@@ -305,7 +310,7 @@ def grade_all(out):
     print(f'graded {count} runs')
 
 
-def seed_all(out, limit, jobs):
+def seed_all(out, limit, jobs, reviewer=None):
     import workflow
     data, chosen = dataset(out), []
     for run in sorted((out / 'runs').glob('HumanEval-*')):
@@ -317,7 +322,7 @@ def seed_all(out, limit, jobs):
         report = json.loads((run / 'report.json').read_text(encoding='utf-8'))
         if not (report.get('stop') or {}).get('eligible') or not grade_result['round1_pass'] or grade_result.get('suspect'):
             continue  # only correct, eligible drafts: the planted defect is then the only defect
-        if (out / 'seeded' / run.name / 'result.json').is_file():
+        if (out / 'seeded' / run.name / 'solution.py').is_file():  # seeded already: reuse the same draft
             chosen.append(run.name)
             continue
         task_id = run.name.replace('HumanEval-', 'HumanEval/')
@@ -331,15 +336,19 @@ def seed_all(out, limit, jobs):
                 (folder / 'mutation.txt').write_text(where + '\n', encoding='utf-8')
                 chosen.append(run.name)
                 break
-    todo = [name for name in chosen if not (out / 'seeded' / name / 'result.json').is_file()]
-    print(f'{len(chosen)} seeded drafts, {len(todo)} to review: one model call each', flush=True)
+    # The template's judge already reviewed each clean draft during its run; another reviewer reviews it here too.
+    todo = [(name, clean) for name in chosen for clean in ((False, True) if reviewer else (False,))
+            if not (reviewer_folder(out, name, reviewer) / ('clean.json' if clean else 'result.json')).is_file()]
+    print(f'{len(chosen)} seeded drafts, {len(todo)} reviews to run: one model call each', flush=True)
 
-    def one(name):
+    def one(item):
+        name, clean = item
         return subprocess.run([sys.executable, str(Path(__file__).resolve()), '_review', '--out', str(out),
-                               '--name', name], capture_output=True, text=True)
+                               '--name', name] + (['--reviewer', reviewer] if reviewer else [])
+                              + (['--clean'] if clean else []), capture_output=True, text=True)
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
-        for name, proc in zip(todo, pool.map(one, todo)):
-            print(f'{name}: {proc.stdout.strip() or proc.stderr.strip()[-200:]}', flush=True)
+        for (name, clean), proc in zip(todo, pool.map(one, todo)):
+            print(f'{name}{" (clean)" if clean else ""}: {proc.stdout.strip() or proc.stderr.strip()[-200:]}', flush=True)
 
 
 def write_temp(out, text):
@@ -350,34 +359,173 @@ def write_temp(out, text):
     return path
 
 
-def review_one(out, name):
-    """The work loop's own review of a seeded draft: the same material, plan and review role as `work`."""
+def reviewer_folder(out, name, reviewer):
+    """Where a review of a seeded draft goes: the draft's folder for the template's judge, else a subfolder per
+    reviewer backend, so one set of seeded drafts can be reviewed by several models."""
+    folder = out / 'seeded' / name
+    return folder / ''.join(c if c.isalnum() else '-' for c in reviewer) if reviewer else folder
+
+
+def review_one(out, name, reviewer=None, clean=False):
+    """The work loop's own review of a seeded draft: the same material, plan and review role as `work`. With a
+    reviewer backend, that backend reviews instead of the template's judge; clean reviews the draft before seeding,
+    which measures the reviewer's false alarms (the template's judge already reviewed it during the run)."""
     import harness
     import pipelines
     import workflow
     spec = workflow.load_spec(out / 'tasks' / name / 'task.json')
+    name_ = reviewer or spec['judge']
+    if name_ not in TOOL_FREE and not name_.startswith('ollama:'):
+        raise ValueError(f'{name_} may read files; the study needs a tool-free reviewer ({", ".join(TOOL_FREE)})')
     folder, run = out / 'seeded' / name, out / 'runs' / name
-    files = {'solution.py': (folder / 'solution.py').read_text(encoding='utf-8')}
+    dest = reviewer_folder(out, name, reviewer)
+    dest.mkdir(parents=True, exist_ok=True)
+    draft = run / 'round-1/candidate/solution.py' if clean else folder / 'solution.py'
+    files = {'solution.py': draft.read_text(encoding='utf-8')}
     rationale = json.loads((run / 'round-1/proposal.json').read_text(encoding='utf-8'))['rationale']
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
         workflow.write_files(root, {**files, **spec['fixtures']})
         observed = workflow.checks(spec, root, root, lambda: 600)
     material = workflow.review_material(spec, files, rationale, observed)
-    trace = harness.outside_repo(folder / 'trace', 'seeded review')
+    kind = 'clean' if clean else 'seeded'
+    trace = harness.outside_repo(dest / ('trace-clean' if clean else 'trace'), f'{kind} review')
     accounting = harness.Run(trace)
-    backend = workflow.role_backend(harness.backend(spec['judge']), spec['roles'].get('review'))
+    # the template's review role (model, effort) applies to its own kind of backend only
+    role = spec['roles'].get('review') if name_.startswith('codex') == spec['judge'].startswith('codex') else None
+    backend = workflow.role_backend(harness.backend(name_), role)
     text, _ = harness.run_plan(pipelines.load_plan(None, 'review'), material, backend, accounting,
                                timeout_s=spec['timeout_s'])
-    (folder / 'review.md').write_text(text + '\n', encoding='utf-8')
+    (dest / ('clean-review.md' if clean else 'review.md')).write_text(text + '\n', encoding='utf-8')
     report = json.loads((run / 'report.json').read_text(encoding='utf-8'))
-    changed = [line.strip() for line in files['solution.py'].splitlines()
+    changed = [line.strip() for line in (folder / 'solution.py').read_text(encoding='utf-8').splitlines()
                if line.strip() and line not in (run / 'round-1/candidate/solution.py').read_text().splitlines()]
-    result = {'findings': workflow.review_findings(text),
-              'original_findings': report['rounds'][0].get('review_findings'),
-              'mentions_change': any(line in text for line in changed), 'usage': accounting.summary()}
-    (folder / 'result.json').write_text(json.dumps(result, indent=1) + '\n', encoding='utf-8')
+    result = {'reviewer': name_, 'findings': workflow.review_findings(text),
+              'mentions_change': not clean and any(line in text for line in changed), 'usage': accounting.summary()}
+    if not reviewer:
+        result['original_findings'] = report['rounds'][0].get('review_findings')
+    (dest / ('clean.json' if clean else 'result.json')).write_text(json.dumps(result, indent=1) + '\n', encoding='utf-8')
     return result
+
+
+# --- distinguishing inputs, replayed offline (no model calls) ---
+# Two implementations of one function are run on inputs mutated from the PUBLIC test inputs (EvalPlus's base_input,
+# the inputs of the original HumanEval tests), never from the hidden ones; an input where they disagree is a
+# distinguishing input. The replay asks whether such locally generated inputs expose the differences the hidden
+# tests expose, which decides whether a zero-token probe could stand in for part of a review (docs/AGCL.md).
+
+PROBE_INPUTS = 200  # local CPU only: a few seconds per pair
+PROBE_TIMEOUT_S = 60
+
+
+def mutate(x, rng):
+    """One type-aware mutation of a value, in the spirit of EvalPlus's input mutation, kept small enough to run."""
+    if isinstance(x, bool):
+        return not x
+    if isinstance(x, int):
+        return rng.choice([x + 1, x - 1, -x, 0, x * 2 if abs(x) < 1000 else x // 2, rng.randint(-20, 20)])
+    if isinstance(x, float):
+        return rng.choice([x + 1.0, x - 1.0, -x, 0.0, x * 2, x / 2, round(rng.uniform(-20, 20), 3)])
+    if isinstance(x, str):
+        i = rng.randrange(len(x) + 1)
+        pick = rng.choice(x) if x else 'a'
+        return rng.choice([x[:i] + x[i + 1:], x[:i] + pick + x[i:], x[:i] + rng.choice('aZ9 _-.') + x[i:],
+                           x.swapcase(), x + x[:i], ''])[:1000]
+    if isinstance(x, list):
+        if not x:
+            return [rng.choice([0, 1, 'a', 1.0])]
+        i = rng.randrange(len(x))
+        return rng.choice([x[:i] + x[i + 1:], x[:i] + [x[i]] + x[i:], x[:i] + [mutate(x[i], rng)] + x[i + 1:],
+                           x[::-1], []])[:1000]
+    if isinstance(x, tuple):
+        return tuple(mutate(list(x), rng)) if not x else x[:(i := rng.randrange(len(x)))] + (mutate(x[i], rng),) + x[i + 1:]
+    if isinstance(x, dict) and x:
+        key = rng.choice(list(x))
+        return {**x, key: mutate(x[key], rng)} if rng.random() < .7 else {k: v for k, v in x.items() if k != key}
+    return x
+
+
+def probe_inputs(base, n=PROBE_INPUTS, seed=0):
+    """n distinct new argument lists, each one mutation of a public input or of an earlier mutant (seeded, so a
+    replay is repeatable)."""
+    rng, pool, found = random.Random(seed), [list(b) for b in base], []
+    seen = {repr(list(b)) for b in base}  # the public tests already ran these
+    for _ in range(n * 30):
+        if len(found) >= n or not pool:
+            break
+        args = copy.deepcopy(rng.choice(pool))
+        if not args:
+            continue
+        i = rng.randrange(len(args))
+        args[i] = mutate(args[i], rng)
+        key = repr(args)
+        if key not in seen and len(key) < 20000:
+            seen.add(key)
+            found.append(args)
+            pool.append(args)
+    return found
+
+
+def compare_here(entry_point, atol, first, second, inputs):
+    """Indexes of the inputs where the two implementations differ. Runs inside the probing child."""
+    fns = []
+    with open(os.devnull, 'w') as quiet, contextlib.redirect_stdout(quiet):
+        for source in (first, second):
+            namespace = {}
+            exec(source, namespace)
+            fns.append(namespace.get(entry_point))
+        differ = []
+        for i, args in enumerate(inputs):
+            outs = []
+            for fn in fns:
+                try:
+                    outs.append(('ok', fn(*copy.deepcopy(args))))
+                except BaseException as exc:  # an exception is an outcome; its type is compared
+                    outs.append(('raised', type(exc).__name__))
+            (a_kind, a), (b_kind, b) = outs
+            if a_kind != b_kind or (a_kind == 'raised' and a != b) or (a_kind == 'ok' and not same(a, b, atol, entry_point, args)):
+                differ.append(i)
+    return differ
+
+
+def probe(out, task, first, second):
+    """{'inputs': n, 'differ': k} for two source files, or {'inconclusive': reason}. The child gets the generated
+    inputs and the two files, nothing else."""
+    inputs = probe_inputs(task['base_input'])
+    with tempfile.TemporaryDirectory() as tmp:
+        spec = Path(tmp) / 'probe.json'
+        spec.write_text(json.dumps({'entry_point': task['entry_point'], 'atol': float(task.get('atol') or 0),
+                                    'first': str(first), 'second': str(second), 'inputs': inputs}), encoding='utf-8')
+        try:
+            proc = subprocess.run([sys.executable, '-I', '-B', str(Path(__file__).resolve()), '_probe', '--out', str(out),
+                                   '--task', str(spec)], capture_output=True, text=True, timeout=PROBE_TIMEOUT_S, cwd=tmp)
+        except subprocess.TimeoutExpired:
+            return {'inconclusive': 'timeout'}
+    lines = proc.stdout.strip().splitlines()
+    if proc.returncode or not lines or not lines[-1].startswith('DIFFER '):
+        return {'inconclusive': (proc.stderr.strip().splitlines() or ['no result'])[-1][:200]}
+    return {'inputs': len(inputs), 'differ': len(json.loads(lines[-1][7:]))}
+
+
+def probe_all(out):
+    """Replay the probe on every pair of implementations the study already has: a run's round 1 against the files
+    it delivered when they differ, and each seeded draft against its correct original. No model calls."""
+    count = 0
+    for run in sorted((out / 'runs').glob('HumanEval-*')):
+        if '.incomplete-' in run.name or not (run / 'grade.json').is_file():
+            continue
+        task = json.loads(hidden(out, run.name.replace('HumanEval-', 'HumanEval/')).read_text(encoding='utf-8'))
+        first, final = run / 'round-1/candidate/solution.py', (delivered(run) or run / 'missing') / 'solution.py'
+        pairs = {}
+        if first.is_file() and final.is_file() and first.read_bytes() != final.read_bytes():
+            pairs['revision'] = probe(out, task, first, final)
+        seeded = out / 'seeded' / run.name / 'solution.py'
+        if first.is_file() and seeded.is_file():
+            pairs['seeded'] = probe(out, task, first, seeded)
+        if pairs:
+            (run / 'probe.json').write_text(json.dumps(pairs) + '\n', encoding='utf-8')
+            count += 1
+    print(f'probed {count} runs')
 
 
 def report_all(out, alpha):
@@ -385,38 +533,71 @@ def report_all(out, alpha):
     rows = [shadow_labels.row(r) for r in shadow_labels.runs([out / 'runs']) if '.incomplete-' not in str(r)]
     if rows:
         print(shadow_labels.summary(rows, alpha))
-    results = [json.loads(p.read_text()) for p in sorted((out / 'seeded').glob('*/result.json'))] \
-        if (out / 'seeded').is_dir() else []
-    if results:
-        n = len(results)
-        caught = sum(r['findings'] > 0 for r in results)
-        located = sum(r['findings'] > 0 and r['mentions_change'] for r in results)
-        paired = [r for r in results if r['original_findings'] is not None]
-        alarms = sum(r['original_findings'] > 0 for r in paired)
-        print(f'seeded reviews: {caught}/{n} raised a finding on the planted defect '
+    probes = []
+    for run in sorted((out / 'runs').glob('HumanEval-*')):
+        if (run / 'probe.json').is_file() and (run / 'grade.json').is_file():
+            probes.append((json.loads((run / 'probe.json').read_text()), json.loads((run / 'grade.json').read_text())))
+    revisions = [(p['revision'], g) for p, g in probes if 'revision' in p]
+    if revisions:
+        told = [p for p, g in revisions if g['round1_pass'] != g['delivered_pass']]  # the hidden tests tell them apart
+        alike = [p for p, g in revisions if g['round1_pass'] and g['delivered_pass']]
+        hit = lambda ps: f"{sum(p.get('differ', 0) > 0 for p in ps)}/{sum('inconclusive' not in p for p in ps)}"
+        print(f'probe, revised runs: local inputs told round 1 from the delivered files apart on {hit(told)} of the '
+              f'revisions the hidden tests tell apart, and on {hit(alike)} where both pass the hidden tests; '
+              f"{sum('inconclusive' in p for p, _ in revisions)} inconclusive")
+    seeded_probes = [p['seeded'] for p, _ in probes if 'seeded' in p]
+    if seeded_probes:
+        print(f'probe, seeded drafts: local inputs told the planted defect from the correct draft apart on '
+              f"{sum(p.get('differ', 0) > 0 for p in seeded_probes)}/{sum('inconclusive' not in p for p in seeded_probes)} "
+              f"({sum('inconclusive' in p for p in seeded_probes)} inconclusive; no model calls)")
+    seeded = out / 'seeded'
+    folders = sorted({p.parent for p in seeded.glob('**/result.json')}) if seeded.is_dir() else []
+    by_reviewer = {}
+    for folder in folders:
+        result = json.loads((folder / 'result.json').read_text())
+        clean = json.loads((folder / 'clean.json').read_text()) if (folder / 'clean.json').is_file() else None
+        alarm = result.get('original_findings') if clean is None else clean['findings']
+        default = folder.parent == seeded
+        by_reviewer.setdefault('template judge' if default else result['reviewer'], []).append((result, alarm))
+    for reviewer, pairs in by_reviewer.items():
+        n = len(pairs)
+        caught = sum(r['findings'] > 0 for r, _ in pairs)
+        located = sum(r['findings'] > 0 and r['mentions_change'] for r, _ in pairs)
+        paired = [a for _, a in pairs if a is not None]
+        tokens = sum(r['usage'].get(k) or 0 for r, _ in pairs for k in ('input', 'cache_read', 'cache_write', 'output'))
+        print(f'seeded reviews ({reviewer}): {caught}/{n} raised a finding on the planted defect '
               f'(lower bound {1 - shadow_labels.upper_bound(n - caught, n, alpha):.1%}); '
-              f'{located}/{n} quoted the changed line')
-        print(f'same drafts before seeding: {alarms}/{len(paired)} reviews raised a finding (false alarms)')
+              f'{located}/{n} quoted the changed line; {tokens:,} tokens')
+        print(f'  same drafts before seeding: {sum(a > 0 for a in paired)}/{len(paired)} reviews raised a finding '
+              '(false alarms)')
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=('run', 'grade', 'seed', 'report', '_grade', '_review'))
+    parser.add_argument('command', choices=('run', 'grade', 'seed', 'probe', 'report', '_grade', '_review', '_probe'))
     parser.add_argument('--out', type=Path, required=True, help='study folder outside this checkout')
     parser.add_argument('--limit', type=int, help='first N tasks (run) or seeded drafts (seed)')
     parser.add_argument('--jobs', type=int, default=4, help='parallel runs; Codex usage limits bind near 6')
     parser.add_argument('--template', type=Path, default=HERE / 'examples' / 'v3-codex.json')
     parser.add_argument('--backend', help='writer and judge backend instead of the template\'s')
     parser.add_argument('--alpha', type=float, default=0.05)
+    parser.add_argument('--reviewer', help='seed: review the seeded drafts, and the same drafts before seeding, with '
+                        'this tool-free backend instead of the template\'s judge')
     parser.add_argument('--task'), parser.add_argument('--file'), parser.add_argument('--name')
+    parser.add_argument('--clean', action='store_true')
     args = parser.parse_args(argv)
     out = args.out.expanduser().resolve()
     if args.command == '_grade':
         task = json.loads(Path(args.task).read_text(encoding='utf-8'))
         print('PASS' if grade_here(task, Path(args.file).read_text(encoding='utf-8')) else 'FAIL')
         return 0
+    if args.command == '_probe':
+        job = json.loads(Path(args.task).read_text(encoding='utf-8'))
+        first, second = (Path(job[k]).read_text(encoding='utf-8') for k in ('first', 'second'))
+        print('DIFFER ' + json.dumps(compare_here(job['entry_point'], job['atol'], first, second, job['inputs'])))
+        return 0
     if args.command == '_review':
-        result = review_one(out, args.name)
+        result = review_one(out, args.name, args.reviewer, args.clean)
         print(f"findings {result['findings']}, quoted the change: {result['mentions_change']}")
         return 0
     if out == HERE or HERE in out.parents:
@@ -429,7 +610,9 @@ def main(argv=None):
     elif args.command == 'grade':
         grade_all(out)
     elif args.command == 'seed':
-        seed_all(out, args.limit, max(1, args.jobs))
+        seed_all(out, args.limit, max(1, args.jobs), args.reviewer)
+    elif args.command == 'probe':
+        probe_all(out)
     else:
         report_all(out, args.alpha)
     return 0

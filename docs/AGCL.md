@@ -66,6 +66,14 @@ The limit is labels, not model capacity. AGCL is built to collect labels without
   - Runs use this checkout's `workflow.py` in shadow mode, and writer and reviewer must be tool-free backends, so the models themselves cannot read the hidden files.
   - Draft code is different: the checks run it with your permissions, so it could read the hidden files beside the specs. HumanEval solutions never need files or processes, so `grade` flags any draft that names file, process or network access and leaves that run out of the bounds. This is a tripwire, not a sandbox.
   - HumanEval/32 is excluded: its reference fails EvalPlus's own root check on 6 of 888 inputs.
+- **Cross-model review** (`seed --reviewer BACKEND`): another tool-free model reviews the same seeded drafts, and the
+  same drafts before seeding, so two reviewers' catch rates and false alarms compare on identical material. A review
+  by a different model adds no calls to a run, so it is a quality lever under the token rule if it catches more.
+- **Distinguishing inputs, replayed offline** (`probe`, no model calls): each pair of implementations the study
+  already has runs on 200 inputs mutated from the public test inputs, never the hidden ones. The pairs are round 1
+  against the delivered files when a revision changed them, and each correct draft against its seeded defect. The
+  replay measures whether local inputs expose the differences the hidden tests expose. A real run has a second
+  implementation only when it revised or drew `candidates`, so this is a diagnostic first, not a stop signal.
 
 ## Running the studies
 
@@ -75,6 +83,8 @@ Keep the study folder outside the checkout. Each run makes at most `max_rounds +
 python3 evalplus_study.py run    --out ~/ringo-runs/agcl-evalplus --jobs 4   # 163 tasks
 python3 evalplus_study.py grade  --out ~/ringo-runs/agcl-evalplus             # no model calls
 python3 evalplus_study.py seed   --out ~/ringo-runs/agcl-evalplus --limit 40 --jobs 4   # 40 review calls
+python3 evalplus_study.py seed   --out ~/ringo-runs/agcl-evalplus --limit 40 --reviewer claude   # 80 review calls
+python3 evalplus_study.py probe  --out ~/ringo-runs/agcl-evalplus             # no model calls
 python3 evalplus_study.py report --out ~/ringo-runs/agcl-evalplus             # bounds; no model calls
 ```
 
