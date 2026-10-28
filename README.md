@@ -10,6 +10,9 @@ This repository owns the harness, its model calls and their budget. The original
 rubric scoring, decision gates and journals. A future IDE (a Rust engine; see
 [Roadmap](#roadmap)) will be a separate client; none is implemented here.
 
+**About the name:** the harness and the [Ringo IDE](https://github.com/SkylerLK510/Ringo-IDE) are both named after
+Ringo, one of my three beloved cats.
+
 ## Install
 
 Ringo is one Python program that uses only the standard library. You need:
@@ -383,7 +386,40 @@ so this is a confirmation, not a clean held-out test.
   On the memos the scripts added tokens: 23k against RL's 17k on the vendor memo. Under the adoption rule, the
   recommended V3 therefore leaves `scripts` out.
 
-### 7. Portability
+### 7. HumanEval+: the review earns its place on code (2026-10-28)
+
+The first study with hidden-test headroom: 163 HumanEval+ tasks (EvalPlus v0.1.10, Apache-2.0; HumanEval/32 left
+out because its own reference fails the benchmark's root check). The original HumanEval tests are the public check;
+EvalPlus's extra inputs, about 80 times as many, are the hidden tests. Every task ran once on V3 (Codex, Sol low).
+Details and the method are in [AGCL](docs/AGCL.md); task files and traces stay private.
+
+**Against a standalone agent.** The same tasks also ran through the Codex CLI as a plain agent (Sol low, a fresh
+workspace per task), in a fixed random order until an 80-credit ceiling stopped it after 154 tasks. On those 154:
+
+| Arm | Hidden tests passed | Tokens per task | Credits per task |
+|---|---|---|---|
+| Codex agent | 148/154 | 50,325 | 0.513 |
+| Ringo V3 | 147/154 | 3,500 | 0.235 |
+
+Quality is a tie: the two disagree on 3 tasks (the agent alone passes 2, Ringo alone 1; exact McNemar p = 1.0), and 5
+fail for both. Ringo uses 14.4 times fewer tokens and 2.2 times fewer credits. 87% of the agent's tokens are cached
+input, its own context re-sent on each of about five steps. So Ringo does not beat the agent outright here: it
+matches it at a fraction of the cost, and a quality win needs harder tasks.
+
+| Idea | Measured | Decision |
+|---|---|---|
+| Stop after round 1 when the checks pass | Saves 53% of tokens. The review then caught one defect the public tests missed (HumanEval/137), so stopping harms 1 of 162 eligible runs: upper bound 2.9%, over the 2% bar set beforehand | Rejected; `stop_on_checks` removed |
+| Keep the review on code | 24 planted defects that pass the public tests: the review flagged 24/24 and quoted the line on 23, with findings on 3/24 of the same drafts before seeding | Kept |
+| A reviewer from another family (Claude Sonnet 5.5) | Same catch rate (24/24), no false alarms (0/24), but 51% more tokens per review (2,963 against 1,957) | Not adopted: adds tokens |
+| Distinguishing inputs without a model: 200 inputs mutated from the public tests | Told 20 of 23 planted defects apart from the correct draft. Between Claude's and Codex's real drafts it flagged 1 of the 8 tasks Codex fails and 24 of the 150 it passes; it missed the one revision that mattered | Not adopted: misses the corners hidden tests reach |
+| A second draft from another family | Either draft passes on 154 of 158 tasks, against 150 for Codex alone: real headroom, but no zero-token signal picks the right one | Open; nothing built on it |
+
+**Mistakes found in the study itself:** HumanEval/38 and /50 test their function through a helper the prompt
+defines, and the generated public check imported only the function, so it could never pass. Both were rerun with the
+fix. 14 of 163 Claude drafts were replies Ringo could not apply; a `work` round answers that with one repair call, so
+the drafts were redone with it.
+
+### 8. Portability
 
 - **`ringo.py wait`:** its liveness check used `os.kill(pid, 0)`, which terminates the process on Windows. On Windows
   it now opens the process and waits on it with a zero timeout instead.
@@ -397,7 +433,7 @@ so this is a confirmation, not a clean held-out test.
   release state keeps its parent folder's access list. Under your user profile that list admits you, SYSTEM and
   administrators, so keep run folders out of shared folders.
 
-### 8. Ideas we considered and did not adopt
+### 9. Ideas we considered and did not adopt
 
 A deep-research pass checked 25 published claims: 19 were confirmed and 6 refuted. Its verdicts are included below.
 
@@ -415,14 +451,21 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 | A strong advisor beside a weak executor | Published gains are confounded and inside noise | Deferred |
 | Single-pass claim verification | Worked only with a fine-tuned small model | At most a pilot |
 | Batching similar checks into one call | About 4× fewer reasoning tokens, in one preprint | At most a pilot |
+| Stop after round 1 when the checks pass (`stop_on_checks`) | 1 harm in 162 HumanEval+ runs; bound 2.9% over the 2% bar (section 7) | Removed |
+| A reviewer from another model family | Same catches, fewer false alarms, 51% more tokens per review (section 7) | Not adopted |
+| Distinguishing inputs from mutated public inputs | Flagged 1 of 8 real hidden failures, with 24 false flags in 150 (section 7) | Not adopted |
+| Letting a model rewrite an ambiguous brief directly | Below the original brief in 11 of 12 model-benchmark cells (SpecFix, arXiv 2505.07270) | Not tried: published as harmful |
+| Regenerating when the model seems uncertain | Lower pass@1 in 5 of 6 configurations (arXiv 2608.14659; small models) | Not tried: published as harmful |
+| Fixed multi-round repair | Repair with a noisy verifier turned correct answers wrong (arXiv 2607.17641); at a matched budget, more first drafts beat more repairs (Olausson et al., ICLR 2024) | Not tried; `max_rounds` stays bounded by the checks |
 
-### 9. What would move it next
+### 10. What would move it next
 
-- **Tasks with headroom.** Until standalone agents fail some tasks, every improvement reads as "cheaper, no edge".
-- **Verification on demand.** Skip the review when the cheap signals agree. The review was 6–15k tokens and changed
-  nothing in 36 of 36 runs, so this cuts tokens and credits.
-- **Distinguishing inputs.** Find inputs where two independent drafts disagree, and check only those, in place of a
-  prose review.
+- **Tasks with headroom, measured against the agent.** On HumanEval+ the two tie on quality and Ringo costs far less
+  (section 7); harder sets (MBPP+, LiveCodeBench) are next.
+- **Choosing between two drafts.** Two drafts from different families pass more hidden tests than either alone, but
+  the cheap signals tried so far cannot tell which one is right. A published e-process release rule
+  (arXiv 2605.12947) and execution-based selection (DiffCodeGen, arXiv 2605.20473) are the starting points; both
+  spend far more samples than Ringo, so the question is a gate that pays only when drafts disagree.
 - **The IDE.** Two of the largest gains need a person in the loop: asking at the fork (a one-click choice where the
   spec has two readings) and remembering the user's conventions. Both belong in the IDE (see Roadmap).
 
@@ -431,15 +474,14 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 - **IDE:** a Rust engine that runs on macOS, with support for Python, Jupyter notebooks, Rust and C/C++. It will
   carry live context, one-click decisions where a spec is ambiguous, and per-repository preference memory. It will be
   a separate client of this harness.
+  Its local model is meant to do more than complete code: keep Claude, Codex and other agents supplied with current
+  facts about the code, so they spend fewer tokens finding them, and audit a codebase in the background, proposing
+  small fixes that pass the project's checks before the user approves them. None of it is built or measured yet.
 - **Native Windows model calls:** the offline suite passes natively; real Claude and Codex calls still need a run.
 - **Audit-Gated Continual Learning ([AGCL](docs/AGCL.md)):** Ringo learns when it can stop spending tokens, and it
-  changes behavior only through a release with a measured harm bound and human approval. Built so far:
-  - the `stop_on_checks` field;
-  - `shadow_labels.py`;
-  - the HumanEval+ studies in `evalplus_study.py`.
-
-  Next is running the sealed study.
-- **Verification on demand, and distinguishing inputs**, under the token rule above.
+  changes behavior only through a release with a measured harm bound and human approval. Built: `shadow_labels.py`
+  and the HumanEval+ studies in `evalplus_study.py`. The first candidate, stopping when the checks pass, was rejected
+  by its sealed study; a new candidate needs a new study on untouched tasks.
 - **Benchmarks with headroom,** so quality gains can be measured.
 
 ## Engineering optimization goals

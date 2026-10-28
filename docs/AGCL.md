@@ -1,9 +1,8 @@
 # Audit-Gated Continual Learning (AGCL)
 
-AGCL is how Ringo learns when it can stop spending tokens without changing its behavior on its own. The thing it learns is a stopping policy, starting with one rule:
-- stop a `work` run after round 1 when every check passes.
+AGCL is how Ringo learns when it can stop spending tokens without changing its behavior on its own. The thing it learns is a stopping policy. Learning ships only as a release that carries a measured harm bound and a human approval, and every part adds zero model-call tokens.
 
-Learning ships only as a release that carries a measured harm bound and a human approval. Every part adds zero model-call tokens.
+**First candidate, measured and rejected (2026-10-28):** "stop a `work` run after round 1 when every check passes". On 163 HumanEval+ tasks the review caught a defect the public tests missed in 1 of 162 eligible runs, so the harm bound (2.9%) missed the 2% bar. That is the method's "no solution found" outcome: the current behavior stays, and the `stop_on_checks` field that implemented the candidate was removed. See [Results](#results-humaneval-2026-10-28).
 
 ## Why a method, not a model
 
@@ -30,7 +29,7 @@ The limit is labels, not model capacity. AGCL is built to collect labels without
    - byte identity;
    - tokens before and after round 1;
    - harm, when a `grade.json` from an evaluation sits beside the report.
-2. **Retention cohort (zero added tokens).** With `stop_on_checks`, a run that is eligible still runs the full suffix when a random draw falls below `retain` (from 0.05 to 1). The draw is logged in `report.json`, so audits can weight it.
+2. **Retention cohort (zero added tokens).** A stopping policy in real use keeps a logged random share of eligible runs (at least 5%) on the full suffix, so audits can weight them. This needs a candidate policy to exist; the first one was rejected, and its field removed, so no cohort runs today.
    - These are calls the baseline already makes, so exploration costs nothing relative to today.
    - The runs that ran the full suffix give an unbiased **change rate**. Stopping can harm only when the files would have changed, so the change rate bounds real-use harm.
    - Harm itself needs a graded outcome, such as hidden tests in an evaluation.
@@ -54,26 +53,31 @@ The limit is labels, not model capacity. AGCL is built to collect labels without
 
 ## What is implemented
 
-- **`stop_on_checks`** (`work` spec field, opt-in, off by default):
-  - Form: `"stop_on_checks": {"retain": 0.1}`.
-  - A round-1 candidate that passes every check, with no failing spec tests, is ready for review without the review call unless the draw keeps it.
-  - `retain: 1` is shadow mode: it records eligibility and changes nothing.
-  - It only removes calls, and it does not combine with the Council.
-- **`shadow_labels.py RUNS... [--jsonl OUT]`:** rows and per-regime bounds from finished runs. It makes no model calls.
-- **`evalplus_study.py`:** the sealed paired-prefix study and the seeded-review study on HumanEval+ (EvalPlus, Apache-2.0).
+- **`shadow_labels.py RUNS... [--jsonl OUT]`:** rows and per-regime bounds from finished runs: eligibility (round 1 passed every check), byte identity, tokens before and after round 1, and harm when a `grade.json` sits beside the report. It makes no model calls.
+- **`evalplus_study.py`:** the sealed studies on HumanEval+ (EvalPlus, Apache-2.0).
   - It downloads data at a pinned version and checksum.
   - The original HumanEval tests are the public check, and EvalPlus's extra inputs (about 80 times as many) are hidden tests graded locally.
-  - Runs use this checkout's `workflow.py` in shadow mode, and writer and reviewer must be tool-free backends, so the models themselves cannot read the hidden files.
+  - Runs use this checkout's `workflow.py`, and writer and reviewer must be tool-free backends, so the models themselves cannot read the hidden files.
   - Draft code is different: the checks run it with your permissions, so it could read the hidden files beside the specs. HumanEval solutions never need files or processes, so `grade` flags any draft that names file, process or network access and leaves that run out of the bounds. This is a tripwire, not a sandbox.
   - HumanEval/32 is excluded: its reference fails EvalPlus's own root check on 6 of 888 inputs.
-- **Cross-model review** (`seed --reviewer BACKEND`): another tool-free model reviews the same seeded drafts, and the
-  same drafts before seeding, so two reviewers' catch rates and false alarms compare on identical material. A review
-  by a different model adds no calls to a run, so it is a quality lever under the token rule if it catches more.
-- **Distinguishing inputs, replayed offline** (`probe`, no model calls): each pair of implementations the study
-  already has runs on 200 inputs mutated from the public test inputs, never the hidden ones. The pairs are round 1
-  against the delivered files when a revision changed them, and each correct draft against its seeded defect. The
-  replay measures whether local inputs expose the differences the hidden tests expose. A real run has a second
-  implementation only when it revised or drew `candidates`, so this is a diagnostic first, not a stop signal.
+- **Cross-model review** (`seed --reviewer BACKEND`): another tool-free model reviews the same seeded drafts, and the same drafts before seeding, so two reviewers' catch rates and false alarms compare on identical material.
+- **Cross-family drafts** (`draft --writer BACKEND`): one round-1 draft per task by another model, from the same writer prompt and material, with the protocol repair a `work` round gets.
+- **Distinguishing inputs, replayed offline** (`probe`, no model calls): each pair of implementations runs on 200 inputs mutated from the public test inputs, never the hidden ones. The pairs are round 1 against the delivered files, each correct draft against its seeded defect, and round 1 against the other model's draft.
+
+## Results: HumanEval+, 2026-10-28
+
+163 tasks, one V3 run each (Sol low on every role, text protocol, repair, no-regression; Codex on a ChatGPT plan), 368 calls, 3,486 tokens per task. The study code changed once after it ran: HumanEval/38 and /50 call a helper the prompt defines, the public check could not see it, and both were rerun with the fixed check.
+
+| Question | Measured | Verdict |
+|---|---|---|
+| Can `work` stop after round 1 when the checks pass? | 162 of 163 runs eligible. After round 1 the files changed in 13; the hidden tests went from fail to pass in 1 (HumanEval/137: the review found that `Fraction(0.1)` is not one tenth) and from pass to fail in none. Harm 1/162, one-sided 95% upper bound 2.9%, over the 2% bar. Stopping would have saved 53% of tokens | Rejected; `stop_on_checks` removed |
+| Does the review catch what the checks miss? | 24 correct drafts got a single-token defect that passes the public tests and fails the hidden ones (only 24 of 155 drafts had one among their first 80 mutants). The Codex review raised a finding on 24/24 (lower bound 88%) and quoted the changed line on 23; on the same drafts before seeding it raised a finding on 3/24 | The review stays on code |
+| Is a reviewer from another family better? | Claude (Sonnet 5.5) on the same material: 24/24 caught, 22 quoted the line, 0/24 false alarms, but 2,963 tokens per review against Codex's 1,957 (+51%) | Not adopted: it adds tokens |
+| Can local inputs stand in for part of the review? | Against a correct draft, 200 inputs mutated from the public tests told the planted defect apart on 20 of 23. Between two real drafts from different families (Claude's against Codex's round 1), they disagreed on 25 of 158 tasks but flagged only 1 of the 8 tasks where Codex's round 1 fails the hidden tests, and 24 of 150 where it passes; 13 of those 24 differ only in exceptions on inputs outside the function's contract. The revision that mattered (HumanEval/137) was not told apart at all | Not adopted: the inputs miss the corners the hidden tests reach |
+| Does Ringo beat a standalone agent? | The Codex CLI as a plain agent (Sol low), in a fixed random order until an 80-credit ceiling stopped it after 154 tasks. Paired on those 154: agent 148, Ringo 147 hidden passes; 3 disagreements (agent alone 2, Ringo alone 1; exact McNemar p = 1.0). Tokens per task 50,325 against 3,500 (14.4x); credits 0.513 against 0.235 (2.2x) | A tie on quality at a fraction of the cost; a quality win needs harder tasks |
+| Is there headroom in a second draft? | Claude's draft passes the hidden tests on 4 of Codex's 8 failures, so either draft passes on 154 of 158 against round 1's 150 | Real, but no cheap signal picks the right draft |
+
+**What this means for the method:** the free labels worked as designed. The stop-rule labels cost no tokens beyond the baseline runs, the first candidate met its falsifier, and the release process answered "no solution found" instead of shipping a 53% saving that loses quality. A narrower stopping population would need a new candidate and a new sealed study on untouched tasks (MBPP+), not a refit on these.
 
 ## Running the studies
 
@@ -83,7 +87,8 @@ Keep the study folder outside the checkout. Each run makes at most `max_rounds +
 python3 evalplus_study.py run    --out ~/ringo-runs/agcl-evalplus --jobs 4   # 163 tasks
 python3 evalplus_study.py grade  --out ~/ringo-runs/agcl-evalplus             # no model calls
 python3 evalplus_study.py seed   --out ~/ringo-runs/agcl-evalplus --limit 40 --jobs 4   # 40 review calls
-python3 evalplus_study.py seed   --out ~/ringo-runs/agcl-evalplus --limit 40 --reviewer claude   # 80 review calls
+python3 evalplus_study.py seed   --out ~/ringo-runs/agcl-evalplus --limit 40 --reviewer claude   # two calls per seeded draft
+python3 evalplus_study.py draft  --out ~/ringo-runs/agcl-evalplus --writer claude --jobs 2       # 163 calls
 python3 evalplus_study.py probe  --out ~/ringo-runs/agcl-evalplus             # no model calls
 python3 evalplus_study.py report --out ~/ringo-runs/agcl-evalplus             # bounds; no model calls
 ```
@@ -101,7 +106,7 @@ python3 evalplus_study.py report --out ~/ringo-runs/agcl-evalplus             # 
 
 | Output | Meaning |
 |---|---|
-| `graded harm: 0/149` or better among eligible tasks | Under 2% harm at 95% confidence, the bar for a first release of the code stop rule. 59 eligible tasks with zero harms give under 5% |
+| `graded harm: 0/149` or better among eligible tasks | Under 2% harm at 95% confidence, the bar a stopping rule must clear. 59 eligible tasks with zero harms give under 5%; one harm needs 236 |
 | `seeded reviews: k/n raised a finding on the planted defect` | Whether the review catches what the checks miss. Read it against the false-alarm line, which gives the same drafts before seeding |
 
 If fewer than 149 tasks are eligible, because round 1 failed the base tests, add tasks: MBPP+ is the next source. Then make the release decision with the dossier above.
