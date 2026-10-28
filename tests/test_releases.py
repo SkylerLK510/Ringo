@@ -99,6 +99,14 @@ print('No defects found.')
         with self.assertRaises(ValueError):
             rel.stage(self.source, self.state)
 
+    def test_a_bundle_staged_before_a_later_runtime_file_still_verifies(self):
+        older = tuple(name for name in rel.RUNTIME if name not in rel.LATER_RUNTIME)
+        with mock.patch.object(rel, 'RUNTIME', older):
+            rid = rel.stage(self.source, self.state)
+        _, manifest = rel.verify(self.state, rid)
+        self.assertNotIn('spec_runner.py', manifest['files'])
+        self.assertIn('spec_runner.py', self.manifest['files'])  # a new bundle carries it
+
     def test_symlink_source_and_bundle_are_refused(self):
         p = self.source / 'context.py'
         p.unlink()

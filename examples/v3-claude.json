@@ -24,9 +24,6 @@
  "protocol": "text",
  "protocol_repair": true,
  "no_regression": true,
- "scripts": {
-  "python": "{python}"
- },
  "max_rounds": 3,
  "max_seconds": 1200,
  "timeout_s": 300
