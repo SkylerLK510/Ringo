@@ -455,7 +455,7 @@ def digest(files):
 def write_files(root, files):
     for name, text in files.items():
         path = root / name
-        backends.private_directory(path.parent, create=True, parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(text, encoding='utf-8')
 
 
@@ -659,7 +659,7 @@ def run(spec_path, out, call_fn=harness.call):
 
     def run_spec_tests(root, folder):
         folder = folder / 'spec-tests'
-        backends.private_directory(folder, create=True)
+        folder.mkdir()
         result_path = folder / 'result.json'
         argv = [spec['spec_tests']['python'], '-I', '-B', str(HERE / 'spec_runner.py'), str(root), str(spec_suite['path']),
                 '--json', str(result_path)]
@@ -713,7 +713,7 @@ def run(spec_path, out, call_fn=harness.call):
             tests: (observed checks, spec-test result or None)."""
             nonlocal spec_suite
             root = folder / 'candidate'
-            backends.private_directory(root, create=True, parents=True)
+            root.mkdir(parents=True)
             expected = {**files, **spec['fixtures']}
             write_files(root, expected)
             observed = checks(spec, root, folder, remaining)
@@ -736,12 +736,12 @@ def run(spec_path, out, call_fn=harness.call):
             """Run the writer's script in a scratch copy of its files and the fixtures. Its output is feedback for the
             writer and evidence for the review; it never changes a file that is delivered."""
             root = folder / 'script'
-            backends.private_directory(root, create=True)
+            root.mkdir()
             write_files(root, {**files, **spec['fixtures']})
             (root / '_writer_script.py').write_text(script, encoding='utf-8')
             argv = [spec['scripts']['python'], '-I', '-B', '_writer_script.py']
             logs = folder / 'script-log'  # its own folder, so the round's check logs are not overwritten
-            backends.private_directory(logs, create=True)
+            logs.mkdir()
             ran = checks({'checks': [{'name': 'writer script', 'argv': argv, 'timeout_s': spec['scripts']['timeout_s']}]},
                          root, logs, remaining)[0]
             return {**ran, 'source': script}
@@ -768,7 +768,7 @@ def run(spec_path, out, call_fn=harness.call):
 
         for n in range(1, spec['max_rounds'] + 1):
             folder = out / f'round-{n}'
-            backends.private_directory(folder, create=True)
+            folder.mkdir()
             entry = {'round': n}
             report['rounds'].append(entry)
             answering = feedback  # what this round's writer answers; a rejected revision answers it again

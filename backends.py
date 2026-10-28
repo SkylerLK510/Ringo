@@ -10,6 +10,8 @@ import math
 import ntpath
 import os
 import re
+import secrets
+import shutil
 import signal
 import subprocess
 import sys
@@ -107,10 +109,14 @@ def _win_security():
             (kernel, 'GetCurrentProcess', w.HANDLE, ()),
             (kernel, 'CloseHandle', w.BOOL, (w.HANDLE,)),
             (kernel, 'LocalFree', ptr, (ptr,)),
+            (kernel, 'CreateDirectoryW', w.BOOL, (w.LPCWSTR, ptr)),
             (adv, 'OpenProcessToken', w.BOOL, (w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE))),
             (adv, 'GetTokenInformation', w.BOOL,
              (w.HANDLE, ctypes.c_int, ptr, w.DWORD, ctypes.POINTER(w.DWORD))),
             (adv, 'GetLengthSid', w.DWORD, (ptr,)),
+            (adv, 'ConvertSidToStringSidW', w.BOOL, (ptr, ctypes.POINTER(w.LPWSTR))),
+            (adv, 'ConvertStringSecurityDescriptorToSecurityDescriptorW', w.BOOL,
+             (w.LPCWSTR, w.DWORD, ctypes.POINTER(ptr), ctypes.POINTER(w.DWORD))),
             (adv, 'InitializeAcl', w.BOOL, (ptr, w.DWORD, w.DWORD)),
             (adv, 'AddAccessAllowedAceEx', w.BOOL, (ptr, w.DWORD, w.DWORD, w.DWORD, ptr)),
             (adv, 'SetNamedSecurityInfoW', w.DWORD,
@@ -178,34 +184,101 @@ def _windows_acl(path):
 def private_directory(path, *, create=False, **mkdir):
     """Secure a private directory before writing; optionally create it with the caller's existing mkdir options.
 
-    Windows: replace inheritance with one user-only full-control ACE, inheritable by files and directories;
-    fail closed if setting or reading back the protected DACL fails. This is not a boundary against the same
-    account, administrators taking ownership, or pre-existing files with explicit ACLs.
+    Windows: create atomically with a protected user-only DACL, or tighten an existing directory, and verify it.
+    Earlier handles to existing directories are not revoked. This is not a boundary against the same account,
+    administrators taking ownership, or pre-existing files with explicit ACLs.
     """
-    created = []
-    if create:
-        path = Path(path)
-        if os.name == 'nt':
-            parent = path
-            while not parent.exists():
-                created.append(parent)
-                parent = parent.parent
-        path.mkdir(**mkdir)
     if os.name != 'nt':
+        if create:
+            Path(path).mkdir(**mkdir)
         return
-    c, _, _, adv = _win_security()
+    c, w, kernel, adv = _win_security()
     sid = _windows_user_sid()
-    acl = c.create_string_buffer(8 + 8 + len(sid))  # ACL header + ACCESS_ALLOWED_ACE header/mask + SID
-    if not adv.InitializeAcl(acl, len(acl), 2) or not adv.AddAccessAllowedAceEx(acl, 2, 3, 0x1F01FF, sid):
-        raise c.WinError(c.get_last_error())
-    for folder in reversed(created) if created else (path,):
-        # Protect every parent mkdir(parents=True) created too, without changing existing ancestors.
+
+    def tighten(folder):
+        acl = c.create_string_buffer(8 + 8 + len(sid))  # ACL header + ACCESS_ALLOWED_ACE header/mask + SID
+        if not adv.InitializeAcl(acl, len(acl), 2) or not adv.AddAccessAllowedAceEx(acl, 2, 3, 0x1F01FF, sid):
+            raise c.WinError(c.get_last_error())
         error = adv.SetNamedSecurityInfoW(str(folder), 1, 4 | 0x80000000, None, None, acl, None)
         if error:  # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
             raise c.WinError(error)
+
+    def verify(folder):
         control, aces = _windows_acl(folder)
         if not control & 0x1000 or aces != [(0, 3, 0x1F01FF, sid)]:  # SE_DACL_PROTECTED, OI | CI
             raise OSError(f'{folder}: owner-only protected DACL verification failed')
+
+    if not create:
+        tighten(path)
+        verify(path)
+        return
+
+    class SecurityAttributes(c.Structure):
+        _fields_ = [('nLength', w.DWORD), ('lpSecurityDescriptor', w.LPVOID), ('bInheritHandle', w.BOOL)]
+
+    text, descriptor = w.LPWSTR(), w.LPVOID()
+    try:
+        if not adv.ConvertSidToStringSidW(sid, c.byref(text)):
+            raise c.WinError(c.get_last_error())
+        if not adv.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                f'D:P(A;OICI;FA;;;{text.value})', 1, c.byref(descriptor), None):
+            raise c.WinError(c.get_last_error())
+        attributes = SecurityAttributes(c.sizeof(SecurityAttributes), descriptor, False)
+
+        def make(folder, mode=0o777, parents=False, exist_ok=False, ancestor=False):
+            try:
+                if not kernel.CreateDirectoryW(str(folder), c.byref(attributes)):
+                    raise c.WinError(c.get_last_error())
+            except FileNotFoundError:
+                if not parents or folder.parent == folder:
+                    raise
+                make(folder.parent, parents=True, exist_ok=True, ancestor=True)
+                make(folder, exist_ok=exist_ok, ancestor=ancestor)
+                return
+            except OSError:
+                if not exist_ok or not folder.is_dir():
+                    raise
+                if ancestor:  # an existing ancestor is the caller's folder: like Path.mkdir, leave it as it is
+                    return
+                tighten(folder)
+            verify(folder)
+
+        make(Path(path), **mkdir)
+    finally:
+        if descriptor:
+            kernel.LocalFree(descriptor)
+        if text:
+            kernel.LocalFree(text)
+
+
+@contextlib.contextmanager
+def private_tempdir(prefix, dir=None, *, cleanup=True):
+    """Private temporary root; cleanup=False preserves printed incident evidence like mkdtemp."""
+    if os.name != 'nt':
+        if cleanup:
+            with tempfile.TemporaryDirectory(prefix=prefix, dir=dir) as folder:
+                yield folder
+        else:
+            yield tempfile.mkdtemp(prefix=prefix, dir=dir)
+        return
+    for _ in range(tempfile.TMP_MAX):
+        folder = Path(dir if dir is not None else tempfile.gettempdir()) / (prefix + secrets.token_hex(8))
+        try:
+            private_directory(folder, create=True)
+        except FileExistsError:
+            continue
+        break
+    else:
+        raise FileExistsError(errno.EEXIST, 'no usable private temporary directory name')
+    try:
+        yield str(folder)
+    finally:
+        if cleanup:
+            def retry_readonly(fn, path, exc):
+                os.chmod(path, 0o700)
+                fn(path)
+            with contextlib.suppress(FileNotFoundError):  # release staging may have moved the directory
+                shutil.rmtree(folder, onerror=retry_readonly)
 
 
 def _check_windows_program(argv, executable=None):
@@ -391,6 +464,7 @@ def _codex_home(root, env):
     global $CODEX_HOME/AGENTS.md, ~/.codex/skills, its memories or ~/.agents/skills; a fresh home does. Returns
     (owner path, snapshot bytes or None, private copy path) for the write-back after the call."""
     home, private = root / 'home', root / 'codex'
+    # Callers can supply the root; protect both homes before copying credentials.
     private_directory(home, create=True, mode=0o700)
     private_directory(private, create=True, mode=0o700)
     owner = _owner_auth()
@@ -474,8 +548,7 @@ def _sync_codex_auth(owner, snapshot, copy):
             with contextlib.ExitStack() as stack:
                 parent = owner.parent
                 if os.name == 'nt':  # don't inherit a possibly shared owner's folder ACL for refreshed credentials
-                    parent = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='.ringo-auth-', dir=parent)))
-                    private_directory(parent)
+                    parent = Path(stack.enter_context(private_tempdir(prefix='.ringo-auth-', dir=parent)))
                 fd, tmp = tempfile.mkstemp(prefix='.ringo-auth-', dir=parent)  # created 0600 on POSIX
                 try:
                     with os.fdopen(fd, 'wb') as f:
@@ -550,13 +623,12 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
     # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.
-    with tempfile.TemporaryDirectory(prefix='council-judge-') as tmp, contextlib.ExitStack() as files:
-        private_directory(tmp)
+    with private_tempdir(prefix='council-judge-') as tmp, contextlib.ExitStack() as files:
         out, err, stdin = (files.enter_context(_spool(tmp, name)) for name in ('out', 'err', 'stdin'))
         stdin.write(prompt.encode('utf-8'))
         stdin.seek(0)
         cwd = Path(tmp) / 'work'
-        private_directory(cwd, create=True)
+        cwd.mkdir()
         started, ended, threads = time.monotonic(), None, []  # the limit counts setup too
         limit = watch.limit_s if watch else timeout_s
         login = _codex_home(Path(tmp), env) if codex_home else None

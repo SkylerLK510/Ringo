@@ -46,7 +46,6 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -278,8 +277,7 @@ def call(backend, system, message, timeout_s, model=None, watch=None):
         return codex_reply(output, backend['name'], tools)
     if backend['style'] == 'plain':
         return backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, watch=watch), None
-    with tempfile.TemporaryDirectory(prefix='ringo-system-') as d:
-        backends.private_directory(d)
+    with backends.private_tempdir(prefix='ringo-system-') as d:
         path = Path(d) / 'system.txt'
         path.write_text(system, encoding='utf-8', newline='')  # the exact text: no CRLF on Windows
         try:
@@ -497,7 +495,7 @@ class Run:
             if os.name == 'nt':  # protect the root before creating children that inherit its ACL
                 backends.private_directory(self.trace, create=True, parents=True, exist_ok=True)
             # Exclusive steps creation also refuses concurrent trace writers.
-            backends.private_directory(self.trace / 'steps', create=True, parents=True)
+            (self.trace / 'steps').mkdir(parents=True)
             os.chmod(self.trace, 0o700)
         self.started, self.last = time.time(), None
         self.state('running')
@@ -569,10 +567,10 @@ class Run:
             if self.incident_dir is None:
                 if self.trace:
                     folder = self.trace / 'incidents'
-                    backends.private_directory(folder, create=True, mode=0o700, exist_ok=True)
+                    folder.mkdir(mode=0o700, exist_ok=True)
                 else:
-                    folder = Path(tempfile.mkdtemp(prefix='ringo-incidents-'))
-                    backends.private_directory(folder)
+                    with backends.private_tempdir(prefix='ringo-incidents-', cleanup=False) as tmp:
+                        folder = Path(tmp)
                 self.incident_dir = folder  # cache only after protection and verification succeeded
             return self.incident_dir
 

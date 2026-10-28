@@ -184,7 +184,7 @@ def prereg(store, digest):
 @contextlib.contextmanager
 def exclusive(path, what):
     """A non-blocking exclusive lock on path, held across processes; EvalError if someone else holds it."""
-    backends.private_directory(path.parent, create=True, parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'a', encoding='utf-8') as f, contextlib.ExitStack() as held:
         try:
             held.enter_context(backends.file_lock(f, blocking=False))
@@ -537,7 +537,7 @@ def freeze(store, spec_path):
         d = digest(store, spec)
         if any(r['kind'] == 'prereg' and r['digest'] == d for r in rows):
             raise EvalError('this exact experiment is already preregistered')
-        backends.private_directory(store / 'runs' / d, create=True, parents=True, exist_ok=True)
+        (store / 'runs' / d).mkdir(parents=True, exist_ok=True)
         (store / 'runs' / d / 'spec.json').write_text(json.dumps(spec, indent=1), encoding='utf-8')
         record(store, 'prereg', digest=d, split=spec['split'], campaign=spec['campaign'],
                alpha=alpha(store, spec['split']), spec=spec)
@@ -701,7 +701,7 @@ def run(store, d, parallel=3, call_fn=harness.call, stop_on_failure=False):
         if (where / 'trace' / 'trace.jsonl').exists():  # interrupted earlier: paid for, never silently run again
             (where / 'failed.json').write_text(json.dumps({'error': 'interrupted before it finished'}), encoding='utf-8')
             return
-        backends.private_directory(where, create=True, parents=True, exist_ok=True)
+        where.mkdir(parents=True, exist_ok=True)
         left = None
         if budget is not None:
             spent, unknown = cost(store, d, spec, active_slot=f'{cid}/{arm}.{r}')
@@ -744,7 +744,7 @@ def run(store, d, parallel=3, call_fn=harness.call, stop_on_failure=False):
         if previous:
             if previous.get('artifact') == artifact_hash(where) and previous['status'] != 'started':
                 return
-            backends.private_directory(where, create=True, parents=True, exist_ok=True)
+            where.mkdir(parents=True, exist_ok=True)
             (where / 'result.md').unlink(missing_ok=True)
             (where / 'failed.json').write_text(json.dumps({'error': 'earlier outcome removed, changed or interrupted'}))
             if stop_on_failure:
@@ -754,7 +754,7 @@ def run(store, d, parallel=3, call_fn=harness.call, stop_on_failure=False):
             raise EvalError(f'unsealed slot artifacts for {item}; void this experiment instead of adopting them')
         record(store, 'slot', digest=d, item=item, status='started')
         if stopped.is_set():
-            backends.private_directory(where, create=True, parents=True, exist_ok=True)
+            where.mkdir(parents=True, exist_ok=True)
             (where / 'failed.json').write_text(json.dumps({'error': 'not run: an earlier slot failed', 'skipped': True}))
         else:
             execute(slot)
@@ -817,7 +817,7 @@ def _grade(store, d, spec, call_fn, timeout_s):
         raise EvalError(f'the run is not finished ({len(unfinished)} slots have no result); run it first')
     instructions = (HERE / 'prompts' / 'grade.md').read_text(encoding='utf-8').strip()
     keyfile = store / 'keys' / f'{d}.json'
-    backends.private_directory(keyfile.parent, create=True, parents=True, exist_ok=True)
+    keyfile.parent.mkdir(parents=True, exist_ok=True)
     key_seals = [r for r in ledger(store) if r['kind'] == 'blind_key' and r['digest'] == d]
     if (keyfile.exists() and not key_seals) or (key_seals and (
             not keyfile.exists() or key_seals[-1]['artifact'] != file_sha(keyfile))):
@@ -835,7 +835,7 @@ def _grade(store, d, spec, call_fn, timeout_s):
         if mine and sorted(mine.values()) != results:
             for g in spec['graders']:
                 target = store / 'runs' / d / 'grades' / sha(g)[:12] / f'{cid}.failed'
-                backends.private_directory(target.parent, create=True, parents=True, exist_ok=True)
+                target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text('blind key no longer matches the outputs')
             continue
         if not mine:
@@ -856,7 +856,7 @@ def _grade(store, d, spec, call_fn, timeout_s):
         message = f'{instructions}\n\nReview ids: {", ".join(order)}\n\n{reviews}'
         for g in spec['graders']:
             target = store / 'runs' / d / 'grades' / sha(g)[:12] / f'{cid}.json'
-            backends.private_directory(target.parent, create=True, parents=True, exist_ok=True)
+            target.parent.mkdir(parents=True, exist_ok=True)
             item = f'{cid}/{sha(g)}'
             seal = outcomes(store, d, 'grade_outcome').get(item)
             if seal:
@@ -1220,7 +1220,7 @@ def import_reviewbench(store, corpus, clones, max_chars=140_000, languages=None)
         gold = [f"# Ground truth: {t['nwo']}#{t['pr_number']}", f'CANARY {canary}', '']
         gold += [format_gold(i, x) for i, x in enumerate(tps, 1)]
         d = component(store / 'cases', cid)
-        backends.private_directory(d, create=True, parents=True, exist_ok=True)
+        d.mkdir(parents=True, exist_ok=True)
         (d / 'material.txt').write_text(material, encoding='utf-8', newline='')  # the same bytes on every OS
         (d / 'gold.md').write_text('\n'.join(gold) + '\n', encoding='utf-8', newline='')
         created = git(repo, 'show', '-s', '--format=%cI', t['head']).strip()

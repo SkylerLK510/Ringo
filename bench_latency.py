@@ -146,16 +146,7 @@ print(json.dumps({'version':1, **result}))
             # approval by mirroring the verified baseline bundle into private experiment state.
             bundle, _ = releases.verify(releases.state_root(baseline_state), baseline_release)
             base_state = releases.private_root(out / 'baseline-state')
-            destination = base_state / 'bundles' / baseline_release
-            if os.name == 'nt':
-                backends.private_directory(destination, create=True)
-                for directory in bundle.rglob('*'):
-                    if directory.is_dir():
-                        backends.private_directory(destination / directory.relative_to(bundle), create=True,
-                                                   parents=True, exist_ok=True)
-                shutil.copytree(bundle, destination, dirs_exist_ok=True)
-            else:
-                shutil.copytree(bundle, destination)
+            shutil.copytree(bundle, base_state / 'bundles' / baseline_release)
             selection_fixture(base_state, baseline_release, pairs)
     env = {**os.environ, 'RINGO_RELEASE_HOME': str(out / 'no-active')}
     rng, reports = random.Random(42), []

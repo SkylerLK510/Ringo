@@ -52,8 +52,10 @@ The offline test suite passes natively on Windows (CI runs it on `windows-latest
 Ringo runs with a native Python 3.11 or newer. Real model calls have so far been run only on macOS, so they are
 untested natively. Native Windows refuses `.cmd`/`.bat` backend and check programs: call the underlying executable
 directly (for example, `node.exe` with the CLI's JavaScript entrypoint). Private run, store, release-state and
-temporary folders receive a protected DACL granting full control only to the current user, verified before
-sensitive files are written; new files inherit that access. A filesystem that cannot set and verify it is refused.
+temporary folders are created atomically with a protected DACL granting full control only to the current user,
+verified before sensitive files are written; new files and folders inherit that access. Existing user-supplied
+folders are tightened and verified, but earlier open handles are not revoked: new folders are the private case.
+A filesystem that cannot set and verify the DACL is refused.
 This does not restrict administrators taking ownership, other processes using your account, or explicit ACLs on
 pre-existing files. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
 
@@ -400,8 +402,10 @@ so this is a confirmation, not a clean held-out test.
   without treating `\` in Windows paths as an escape. Tests of POSIX-only properties (permission bits, `os.killpg`,
   FIFOs, the Linux ReviewBench image) are skipped there. Windows private folders use a protected, verified DACL
   with one inheritable full-control ACE for the current user, including traces, stores, release state, temporary
-  prompts and private Codex homes. New files inherit it; failure to set or verify it stops writing. Existing files
-  with explicit ACLs and administrators taking ownership are outside this guarantee. Explicit `.cmd`/`.bat`
+  prompts and private Codex homes. New roots receive it atomically at creation; child files and folders inherit it.
+  Pre-existing roots are tightened, but earlier open handles are not revoked. Failure to set or verify the DACL
+  stops writing. Existing files with explicit ACLs and administrators taking ownership are outside this guarantee.
+  Explicit `.cmd`/`.bat`
   launches are refused, including trusted backends and checks; call the underlying executable to avoid `cmd.exe`
   argument interpretation. POSIX permissions and process launching are unchanged.
 
