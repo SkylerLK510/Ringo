@@ -230,6 +230,22 @@ class ProbeTest(unittest.TestCase):
         self.assertGreater(found['differ'], 0)
         self.assertEqual(alike, {'inputs': study.PROBE_INPUTS, 'differ': 0})
 
+    def test_the_report_scores_a_cross_family_draft_as_a_flag_for_hidden_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            cases = [(False, 2, False), (False, 0, True), (True, 1, True), (True, 0, True), (True, 0, False)]
+            for i, (r1, differ, other) in enumerate(cases):
+                run = out / 'runs' / f'HumanEval-{i}'
+                run.mkdir(parents=True)
+                (run / 'grade.json').write_text(json.dumps({'round1_pass': r1, 'delivered_pass': r1}))
+                (run / 'probe.json').write_text(json.dumps(
+                    {'cross-claude': {'inputs': 200, 'differ': differ, 'other_pass': other}}))
+            with unittest.mock.patch('sys.stdout', new_callable=__import__('io').StringIO) as printed:
+                study.report_all(out, .05)
+        self.assertIn('probe, claude draft against round 1: they disagree on local inputs in 2/5 tasks; flagged 1/2 '
+                      'where round 1 fails the hidden tests and 1/3 where it passes; either draft passes the hidden '
+                      'tests on 4/5, round 1 alone on 3/5', printed.getvalue())
+
     def test_exceptions_are_outcomes_and_a_hang_is_inconclusive(self):
         crash = TASK['prompt'] + '    raise ValueError\n'
         self.assertEqual(study.compare_here('largest', 0, crash, crash, [[[1]]]), [])

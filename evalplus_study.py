@@ -10,6 +10,8 @@ graded locally after the run. Runs use the checkout's workflow.py, the code unde
   seed    plant a defect the public check misses into correct round-1 drafts and give each one review (one call each);
           --reviewer BACKEND has another model review the same seeded drafts, and the drafts before seeding (two
           calls each), so two reviewers' catch rates and false alarms compare on identical material
+  draft   one round-1 draft per task by another tool-free writer (--writer BACKEND; one call each), for the
+          probe's cross-family pair
   probe   distinguishing inputs, replayed: run each pair of implementations the study has (round 1 and the delivered
           files; a correct draft and its seeded defect) on inputs mutated from the public tests (no model calls)
   report  shadow-label bounds for the runs, the seeded reviews' catch rate and the probe's (no model calls)
@@ -18,7 +20,7 @@ Run folders and the dataset cache go under --out, outside this checkout. HumanEv
 version and checksum; EvalPlus is Apache-2.0 (https://github.com/evalplus/evalplus), and the output comparison
 follows its evaluator: exact equality, a float tolerance, and a root check for find_zero.
 
-usage: python3 evalplus_study.py {run,grade,seed,probe,report} --out DIR [--limit N] [--jobs J]
+usage: python3 evalplus_study.py {run,grade,seed,draft,probe,report} --out DIR [--limit N] [--jobs J]
 """
 import argparse
 import concurrent.futures
@@ -509,6 +511,50 @@ def probe(out, task, first, second):
     return {'inputs': len(inputs), 'differ': len(json.loads(lines[-1][7:]))}
 
 
+def backend_folder(name):
+    return ''.join(c if c.isalnum() else '-' for c in name)
+
+
+def draft_one(out, name, writer):
+    """One round-1 draft by another writer backend: the same writer prompt and material as the run's round 1, one
+    call, no review. A second implementation from a different model family, for the probe's cross-family pair."""
+    import harness
+    import workflow
+    if writer not in TOOL_FREE and not writer.startswith('ollama:'):
+        raise ValueError(f'{writer} may read files; the study needs a tool-free writer ({", ".join(TOOL_FREE)})')
+    spec = workflow.load_spec(out / 'tasks' / name / 'task.json')
+    dest = out / 'drafts' / backend_folder(writer) / name
+    dest.mkdir(parents=True, exist_ok=True)
+    system = (HERE / 'prompts' / 'work-code.md').read_text(encoding='utf-8')
+    role = spec['roles'].get('writer') if writer.startswith('codex') == spec['writer'].startswith('codex') else None
+    backend = workflow.role_backend(harness.backend(writer), role)
+    reply, usage = harness.call(backend, system, workflow.text_message(spec, spec['files'], {}), spec['timeout_s'])
+    (dest / 'reply.txt').write_text(reply, encoding='utf-8')
+    result = {'writer': writer, 'usage': usage}
+    try:
+        files = workflow.materialize_text(spec['files'], spec['files'], workflow.parse_text_reply(reply))
+        (dest / 'solution.py').write_text(files['solution.py'], encoding='utf-8')
+        result['base_pass'] = base_passes(spec, files['solution.py'])
+    except ValueError as exc:
+        result.update(base_pass=False, error=str(exc)[:300])
+    (dest / 'result.json').write_text(json.dumps(result, indent=1) + '\n', encoding='utf-8')
+    return result
+
+
+def draft_all(out, writer, jobs):
+    names = [r.name for r in sorted((out / 'runs').glob('HumanEval-*'))
+             if '.incomplete-' not in r.name and (r / 'grade.json').is_file()]
+    todo = [n for n in names if not (out / 'drafts' / backend_folder(writer) / n / 'result.json').is_file()]
+    print(f'{len(todo)} drafts to write with {writer}: one model call each', flush=True)
+
+    def one(name):
+        return subprocess.run([sys.executable, str(Path(__file__).resolve()), '_draft', '--out', str(out),
+                               '--name', name, '--writer', writer], capture_output=True, text=True)
+    with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
+        for name, proc in zip(todo, pool.map(one, todo)):
+            print(f'{name}: {proc.stdout.strip() or proc.stderr.strip()[-200:]}', flush=True)
+
+
 def probe_all(out):
     """Replay the probe on every pair of implementations the study already has: a run's round 1 against the files
     it delivered when they differ, and each seeded draft against its correct original. No model calls."""
@@ -524,6 +570,11 @@ def probe_all(out):
         seeded = out / 'seeded' / run.name / 'solution.py'
         if first.is_file() and seeded.is_file():
             pairs['seeded'] = probe(out, task, first, seeded)
+        for other in sorted((out / 'drafts').glob(f'*/{run.name}/solution.py')) if (out / 'drafts').is_dir() else []:
+            if first.is_file():  # a cross-family pair: round 1 against another model's draft of the same task
+                pairs[f'cross-{other.parent.parent.name}'] = {
+                    **probe(out, task, first, other),
+                    'other_pass': grade(out, task['task_id'], other)}
         if pairs:
             (run / 'probe.json').write_text(json.dumps(pairs) + '\n', encoding='utf-8')
             count += 1
@@ -552,6 +603,16 @@ def report_all(out, alpha):
         print(f'probe, seeded drafts: local inputs told the planted defect from the correct draft apart on '
               f"{sum(p.get('differ', 0) > 0 for p in seeded_probes)}/{sum('inconclusive' not in p for p in seeded_probes)} "
               f"({sum('inconclusive' in p for p in seeded_probes)} inconclusive; no model calls)")
+    for key in sorted({k for p, _ in probes for k in p if k.startswith('cross-')}):
+        pairs = [(p[key], g) for p, g in probes if key in p and 'inconclusive' not in p[key]]
+        flagged = lambda ps: sum(p['differ'] > 0 for p, _ in ps)
+        wrong = [(p, g) for p, g in pairs if not g['round1_pass']]
+        right = [(p, g) for p, g in pairs if g['round1_pass']]
+        both = sum(g['round1_pass'] or p['other_pass'] for p, g in pairs)
+        print(f'probe, {key[6:]} draft against round 1: they disagree on local inputs in {flagged(pairs)}/{len(pairs)} '
+              f'tasks; flagged {flagged(wrong)}/{len(wrong)} where round 1 fails the hidden tests and {flagged(right)}/'
+              f'{len(right)} where it passes; either draft passes the hidden tests on {both}/{len(pairs)}, round 1 '
+              f'alone on {len(right)}/{len(pairs)}; {sum("inconclusive" in p[key] for p, _ in probes if key in p)} inconclusive')
     seeded = out / 'seeded'
     folders = sorted({p.parent for p in seeded.glob('**/result.json')}) if seeded.is_dir() else []
     by_reviewer = {}
@@ -576,7 +637,8 @@ def report_all(out, alpha):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('command', choices=('run', 'grade', 'seed', 'probe', 'report', '_grade', '_review', '_probe'))
+    parser.add_argument('command', choices=('run', 'grade', 'seed', 'draft', 'probe', 'report', '_grade', '_review',
+                                            '_probe', '_draft'))
     parser.add_argument('--out', type=Path, required=True, help='study folder outside this checkout')
     parser.add_argument('--limit', type=int, help='first N tasks (run) or seeded drafts (seed)')
     parser.add_argument('--jobs', type=int, default=4, help='parallel runs; Codex usage limits bind near 6')
@@ -585,6 +647,7 @@ def main(argv=None):
     parser.add_argument('--alpha', type=float, default=0.05)
     parser.add_argument('--reviewer', help='seed: review the seeded drafts, and the same drafts before seeding, with '
                         'this tool-free backend instead of the template\'s judge')
+    parser.add_argument('--writer', help='draft: the other writer backend (tool-free), one call per task')
     parser.add_argument('--task'), parser.add_argument('--file'), parser.add_argument('--name')
     parser.add_argument('--clean', action='store_true')
     args = parser.parse_args(argv)
@@ -592,6 +655,10 @@ def main(argv=None):
     if args.command == '_grade':
         task = json.loads(Path(args.task).read_text(encoding='utf-8'))
         print('PASS' if grade_here(task, Path(args.file).read_text(encoding='utf-8')) else 'FAIL')
+        return 0
+    if args.command == '_draft':
+        result = draft_one(out, args.name, args.writer)
+        print(f"base tests pass: {result['base_pass']}{' (' + result['error'] + ')' if 'error' in result else ''}")
         return 0
     if args.command == '_probe':
         job = json.loads(Path(args.task).read_text(encoding='utf-8'))
@@ -613,6 +680,10 @@ def main(argv=None):
         grade_all(out)
     elif args.command == 'seed':
         seed_all(out, args.limit, max(1, args.jobs), args.reviewer)
+    elif args.command == 'draft':
+        if not args.writer:
+            parser.error('draft needs --writer BACKEND')
+        draft_all(out, args.writer, max(1, args.jobs))
     elif args.command == 'probe':
         probe_all(out)
     else:
