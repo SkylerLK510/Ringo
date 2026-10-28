@@ -424,9 +424,9 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 
 ## Roadmap
 
-- **IDE:** a Rust engine, with support for Python, Jupyter notebooks, Rust and C/C++. It will carry live context,
-  one-click decisions where a spec is ambiguous, and per-repository preference memory. It will be a separate client
-  of this harness.
+- **IDE:** a Rust engine that runs on macOS, with support for Python, Jupyter notebooks, Rust and C/C++. It will
+  carry live context, one-click decisions where a spec is ambiguous, and per-repository preference memory. It will be
+  a separate client of this harness.
 - **Native Windows** without WSL.
 - **Verification on demand, and distinguishing inputs**, under the token rule above.
 - **Benchmarks with headroom,** so quality gains can be measured.
@@ -498,8 +498,7 @@ owns their budget.
 Existing evaluation stores must be re-frozen for this source layout; do not reuse
 old digests or copy sealed data into this repository.
 
-A publication license has not yet been selected. No performance or quality gain
-is claimed from this repository extraction.
+No performance or quality gain is claimed from this repository extraction.
 
 ## Use from an agent
 
@@ -520,3 +519,7 @@ Council for structured assessment, with Ringo providing execution and validation
 Basic integration exists: `work` combines generated files, fixed checks and an
 opt-in council assessment. The research workflow those requirements describe is future work, and
 the current harness has not been validated for that workload.
+
+## License
+
+Ringo is licensed under the [Apache License, Version 2.0](LICENSE).
