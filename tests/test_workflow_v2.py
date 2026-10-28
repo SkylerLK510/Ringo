@@ -280,6 +280,8 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual(report['usage']['calls'], 3)  # writer, writer, review; the script is not a model call
         self.assertEqual((self.root / 'run/final/REPORT.md').read_text(), 'total: 6\n')
         self.assertFalse((self.root / 'run/final/_writer_script.py').exists())
+        self.assertEqual((self.root / 'run/round-1/script-log/check-1.out').read_text(), 'total 6\n')
+        self.assertNotIn('total 6', (self.root / 'run/round-1/check-1.out').read_text())  # the check's own log
 
     def test_protocol_repair_spends_one_call_not_the_round(self):
         bad = '@@@ REPLACE value.py\nnot there\n@@@ WITH\nx\n@@@ END\n'

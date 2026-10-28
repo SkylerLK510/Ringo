@@ -736,8 +736,10 @@ def run(spec_path, out, call_fn=harness.call):
             write_files(root, {**files, **spec['fixtures']})
             (root / '_writer_script.py').write_text(script, encoding='utf-8')
             argv = [spec['scripts']['python'], '-I', '-B', '_writer_script.py']
+            logs = folder / 'script-log'  # its own folder, so the round's check logs are not overwritten
+            logs.mkdir()
             ran = checks({'checks': [{'name': 'writer script', 'argv': argv, 'timeout_s': spec['scripts']['timeout_s']}]},
-                         root, folder, remaining)[0]
+                         root, logs, remaining)[0]
             return {**ran, 'source': script}
 
         def writer_message(feedback):
