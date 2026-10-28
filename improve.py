@@ -195,7 +195,7 @@ def candidate_key(incumbent, proposal):
     _, _, plan, texts = candidate_parts(incumbent, proposal)
     with tempfile.TemporaryDirectory(prefix='ringo-screen-') as d:
         for n, t in texts.items():
-            (Path(d) / n).write_text(t)
+            (Path(d) / n).write_text(t, encoding='utf-8')
         normalized, used = bare(pipelines.validate(json.loads(json.dumps(plan)), d))
     return evaluate.sha(json.dumps([normalized, used], sort_keys=True))
 

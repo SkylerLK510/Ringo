@@ -1017,7 +1017,7 @@ def _score(store, d):
     if (keyfile.exists() and not key_seals) or (key_seals and (
             not keyfile.exists() or key_seals[-1]['artifact'] != file_sha(keyfile))):
         integrity.append('blind key is unsealed or changed since grading')
-    if set(key.values()) != {str(p.parent.relative_to(out_dir)) for p in out_dir.glob('*/*/result.md')}:
+    if set(key.values()) != {p.parent.relative_to(out_dir).as_posix() for p in out_dir.glob('*/*/result.md')}:
         integrity.append('blind key does not cover exactly the outputs')
     slot_seals = outcomes(store, d, 'slot')
     for c, arm, r in slots(store, spec):
@@ -1221,8 +1221,8 @@ def import_reviewbench(store, corpus, clones, max_chars=140_000, languages=None)
         gold += [format_gold(i, x) for i, x in enumerate(tps, 1)]
         d = component(store / 'cases', cid)
         d.mkdir(parents=True, exist_ok=True)
-        (d / 'material.txt').write_text(material, encoding='utf-8')
-        (d / 'gold.md').write_text('\n'.join(gold) + '\n', encoding='utf-8')
+        (d / 'material.txt').write_text(material, encoding='utf-8', newline='')  # the same bytes on every OS
+        (d / 'gold.md').write_text('\n'.join(gold) + '\n', encoding='utf-8', newline='')
         created = git(repo, 'show', '-s', '--format=%cI', t['head']).strip()
         pool[cid] = {'group': t['nwo'], 'source': 'reviewbench', 'language': t['language'], 'created': created,
                      'gold': len(tps)}

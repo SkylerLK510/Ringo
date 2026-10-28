@@ -256,7 +256,7 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
         # The bundle is owner-readonly against accidents, not a same-user security boundary.
         for path in tmp.rglob('*'):
             if path.is_file():
-                with path.open('rb') as f:
+                with path.open('r+b' if os.name == 'nt' else 'rb') as f:  # Windows flushes only a writable handle
                     os.fsync(f.fileno())
             path.chmod(0o555 if path.is_dir() else 0o444)
         os.rename(tmp, target)

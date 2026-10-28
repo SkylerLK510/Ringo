@@ -101,6 +101,17 @@ def claude_usage(reply):
             'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
 
 
+def split_command(command):
+    """A command string's argv, split as a POSIX shell splits words without expanding anything. On Windows a
+    backslash is the path separator, not an escape, so C:\\tools\\cli.exe needs no quoting there; quote a word
+    that holds spaces with '...' or "...", as shlex.join does."""
+    if os.name != 'nt':
+        return shlex.split(command)
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split, lexer.commenters, lexer.escape = True, '', ''
+    return list(lexer)
+
+
 def backend(spec):
     """{'name', 'argv', 'style'} for a backend spec. The style says how a call is made, declared by the spec and
     never guessed from the executable's name: 'claude' (system-prompt file, JSON reply with usage), 'codex'
@@ -111,24 +122,24 @@ def backend(spec):
     passes --search, and every other tool item fails the turn."""
     extra = {}
     if spec == 'claude':
-        argv, style = shlex.split(backends.JUDGE_PRESETS['claude']), 'claude'
+        argv, style = split_command(backends.JUDGE_PRESETS['claude']), 'claude'
     elif spec.startswith('claude:'):
-        argv, style = shlex.split(spec[7:]), 'claude'
+        argv, style = split_command(spec[7:]), 'claude'
     elif spec in ('codex', 'codex-chatgpt'):
-        argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'codex'
+        argv, style = split_command(backends.JUDGE_PRESETS[spec]), 'codex'
         extra = {'subscription_auth': spec == 'codex-chatgpt', 'lean': spec == 'codex-chatgpt',
                  'tools': ['command_execution'] if spec == 'codex' else []}
     elif spec.startswith('codex:'):
-        argv, style = shlex.split(spec[6:]), 'codex'
+        argv, style = split_command(spec[6:]), 'codex'
         if argv and '--json' not in argv:
             raise ValueError(f'backend {spec!r}: a codex: command must pass --json so its events can be parsed')
         extra = {'subscription_auth': False, 'tools': ['web_search'] if '--search' in argv else []}
     elif spec in backends.JUDGE_PRESETS:
-        argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'plain'
+        argv, style = split_command(backends.JUDGE_PRESETS[spec]), 'plain'
     elif spec.startswith('ollama:'):
         argv, style = (['ollama', 'run', spec[7:]] if spec[7:] else []), 'plain'
     else:
-        argv, style = shlex.split(spec), 'plain'
+        argv, style = split_command(spec), 'plain'
     if not argv:
         raise ValueError(f'backend {spec!r} has no command')
     return {'name': spec, 'argv': argv, 'style': style, **extra}
