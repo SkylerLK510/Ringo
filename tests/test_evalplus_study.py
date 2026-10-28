@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -78,6 +79,57 @@ class DeliveredTest(unittest.TestCase):
             self.assertEqual(study.delivered(run), run / 'round-1/candidate')
             (run / 'final').mkdir()
             self.assertEqual(study.delivered(run), run / 'final')
+
+
+class ReviewFindingTest(unittest.TestCase):
+    """The Ringo review's four findings: hidden data, stopped runs in the harm bound, resume and the seed limit."""
+
+    def test_a_draft_that_touches_files_or_processes_is_flagged(self):
+        for code in ("import os\n", "from pathlib import Path\n", "x = open('hidden.json').read()\n", "p = __file__\n",
+                     "__import__('subprocess')\n", "def f(:\n"):
+            self.assertTrue(study.touches_files(code), code)
+        self.assertFalse(study.touches_files(GOOD))
+        self.assertFalse(study.touches_files("import math, hashlib\nopen_count = 'open'\n"))
+
+    def test_resume_retries_runs_that_ended_in_an_error_and_keeps_results(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runs = Path(tmp)
+            for name, status in (('HumanEval-1', 'ready_for_review'), ('HumanEval-2', 'error'),
+                                 ('HumanEval-4', 'needs_revision')):
+                (runs / name).mkdir()
+                (runs / name / 'report.json').write_text(json.dumps({'status': status}))
+            (runs / 'HumanEval-3').mkdir()  # interrupted before its report
+            ids = [f'HumanEval/{i}' for i in range(5)]
+            self.assertEqual(study.pending(runs, ids), ['HumanEval/0', 'HumanEval/2', 'HumanEval/3'])
+            self.assertTrue((runs / 'HumanEval-2.incomplete-0').is_dir())
+            self.assertFalse((runs / 'HumanEval-2').exists())
+            self.assertTrue((runs / 'HumanEval-4').is_dir())  # a task outcome, not a failed run
+
+    def test_stopped_and_suspect_runs_stay_out_of_the_harm_bound(self):
+        import shadow_labels
+        base = {'regime': 'r', 'implementation': 'x', 'artifact_kind': 'code', 'eligible': True, 'stopped': False,
+                'identical': False, 'round1_tokens': 1, 'after_tokens': 1, 'avoided': False}
+        rows = [{**base, 'ran_suffix': True, 'harm': True, 'suspect': False},
+                *[{**base, 'ran_suffix': False, 'stopped': True, 'identical': None, 'harm': False}] * 99,
+                {**base, 'ran_suffix': True, 'harm': False, 'suspect': True}]
+        text = shadow_labels.summary(rows, .05)
+        self.assertIn('graded harm: 1/1', text)
+        self.assertIn('1 graded runs left out', text)
+
+    def test_seeding_stops_at_the_limit_when_results_already_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for i in range(3):
+                run = out / 'runs' / f'HumanEval-{i}'
+                run.mkdir(parents=True)
+                (run / 'grade.json').write_text(json.dumps({'round1_pass': True, 'delivered_pass': True}))
+                (run / 'report.json').write_text(json.dumps({'stop': {'eligible': True}, 'rounds': []}))
+                (out / 'seeded' / run.name).mkdir(parents=True)
+                (out / 'seeded' / run.name / 'result.json').write_text('{}')
+            with unittest.mock.patch.object(study, 'dataset', return_value={}), \
+                    unittest.mock.patch.object(study.subprocess, 'run') as launched:
+                study.seed_all(out, 2, 1)
+            launched.assert_not_called()  # two results exist: nothing new is reviewed
 
 
 if __name__ == '__main__':

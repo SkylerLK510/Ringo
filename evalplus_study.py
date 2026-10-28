@@ -151,6 +151,20 @@ def grade(out, task_id, path):
     return proc.stdout.strip().endswith('PASS')
 
 
+# HumanEval solutions never need files or processes. Draft code runs with the user's permissions, so it could read the
+# hidden tests beside the specs; a draft that names any of these is flagged and left out of the bounds.
+FILE_ACCESS = {'open', 'os', 'pathlib', 'glob', 'io', 'subprocess', 'shutil', 'importlib', '__import__', '__file__',
+               'builtins', 'socket', 'urllib'}
+
+
+def touches_files(source):
+    try:
+        return any(t.type == tokenize.NAME and t.string in FILE_ACCESS
+                   for t in tokenize.generate_tokens(io.StringIO(source).readline))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        return True  # unreadable: do not trust it
+
+
 def delivered(run):
     """The files the full baseline delivered: final/, else the last round whose candidate passed every check."""
     if (run / 'final').is_dir():
@@ -227,14 +241,28 @@ def tasks_for(out, limit, template, backend):
     return ids
 
 
+RETRY = (None, 'error', 'interrupted', 'budget_exhausted')  # outcomes of the run, not of the task
+
+
+def pending(runs, ids):
+    """Tasks still to run. A run with no report, or one that ended in an error, an interruption or a spent budget
+    (a usage limit, a lost login), is set aside as .incomplete-N and run again; other outcomes are results."""
+    todo = []
+    for t in ids:
+        folder = runs / slug(t)
+        status = json.loads((folder / 'report.json').read_text(encoding='utf-8')).get('status') \
+            if (folder / 'report.json').is_file() else None
+        if status in RETRY:
+            if folder.exists():
+                folder.rename(runs / f'{slug(t)}.incomplete-{sum(1 for _ in runs.glob(slug(t) + ".incomplete-*"))}')
+            todo.append(t)
+    return todo
+
+
 def run_all(out, ids, jobs):
     runs = out / 'runs'
     runs.mkdir(exist_ok=True)
-    todo = [t for t in ids if not (runs / slug(t) / 'report.json').is_file()]
-    for t in todo:  # a run interrupted before its report cannot be resumed: keep it aside, start fresh
-        folder = runs / slug(t)
-        if folder.exists():
-            folder.rename(runs / f'{slug(t)}.incomplete-{sum(1 for _ in runs.glob(slug(t) + ".incomplete-*"))}')
+    todo = pending(runs, ids)
     print(f'{len(todo)} tasks to run, {jobs} at a time; each makes at most max_rounds + 1 model calls', flush=True)
     failures = 0
 
@@ -253,7 +281,7 @@ def run_all(out, ids, jobs):
                 status = (json.loads(proc.stdout or '{}') if proc.stdout.strip().startswith('{') else {}).get('status')
                 print(f'{task_id}: {status or "failed"} {proc.stderr.strip()[-200:] if not status else ""}', flush=True)
                 # Three runs in a row that end in an error (a usage limit, a lost login) stop new launches.
-                failures = failures + 1 if status in (None, 'error', 'interrupted', 'budget_exhausted') else 0
+                failures = failures + 1 if status in RETRY else 0
                 if queue and failures < 3:
                     pending.add(pool.submit(one, queue.pop(0)))
             if failures >= 3:
@@ -267,8 +295,11 @@ def grade_all(out):
         if not (run / 'report.json').is_file() or '.incomplete-' in run.name:
             continue
         task_id = run.name.replace('HumanEval-', 'HumanEval/')
+        drafts = [p for p in run.glob('round-*/*/solution.py')] + [run / 'final/solution.py']
+        suspect = any(touches_files(p.read_text(encoding='utf-8', errors='replace')) for p in drafts if p.is_file())
         result = {'round1_pass': grade(out, task_id, run / 'round-1/candidate/solution.py'),
-                  'delivered_pass': grade(out, task_id, (delivered(run) or run / 'missing') / 'solution.py')}
+                  'delivered_pass': grade(out, task_id, (delivered(run) or run / 'missing') / 'solution.py'),
+                  'suspect': suspect}
         (run / 'grade.json').write_text(json.dumps(result) + '\n', encoding='utf-8')
         count += 1
     print(f'graded {count} runs')
@@ -278,10 +309,13 @@ def seed_all(out, limit, jobs):
     import workflow
     data, chosen = dataset(out), []
     for run in sorted((out / 'runs').glob('HumanEval-*')):
+        if limit and len(chosen) >= limit:
+            break
         if '.incomplete-' in run.name or not (run / 'grade.json').is_file():
             continue
+        grade_result = json.loads((run / 'grade.json').read_text())
         report = json.loads((run / 'report.json').read_text(encoding='utf-8'))
-        if not (report.get('stop') or {}).get('eligible') or not json.loads((run / 'grade.json').read_text())['round1_pass']:
+        if not (report.get('stop') or {}).get('eligible') or not grade_result['round1_pass'] or grade_result.get('suspect'):
             continue  # only correct, eligible drafts: the planted defect is then the only defect
         if (out / 'seeded' / run.name / 'result.json').is_file():
             chosen.append(run.name)
@@ -297,8 +331,6 @@ def seed_all(out, limit, jobs):
                 (folder / 'mutation.txt').write_text(where + '\n', encoding='utf-8')
                 chosen.append(run.name)
                 break
-        if limit and len(chosen) >= limit:
-            break
     todo = [name for name in chosen if not (out / 'seeded' / name / 'result.json').is_file()]
     print(f'{len(chosen)} seeded drafts, {len(todo)} to review: one model call each', flush=True)
 

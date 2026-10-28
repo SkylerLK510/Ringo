@@ -63,7 +63,8 @@ The limit is labels, not model capacity. AGCL is built to collect labels without
 - **`evalplus_study.py`:** the sealed paired-prefix study and the seeded-review study on HumanEval+ (EvalPlus, Apache-2.0).
   - It downloads data at a pinned version and checksum.
   - The original HumanEval tests are the public check, and EvalPlus's extra inputs (about 80 times as many) are hidden tests graded locally.
-  - Runs use this checkout's `workflow.py` in shadow mode, and writer and reviewer must be tool-free backends, so neither can read the hidden files.
+  - Runs use this checkout's `workflow.py` in shadow mode, and writer and reviewer must be tool-free backends, so the models themselves cannot read the hidden files.
+  - Draft code is different: the checks run it with your permissions, so it could read the hidden files beside the specs. HumanEval solutions never need files or processes, so `grade` flags any draft that names file, process or network access and leaves that run out of the bounds. This is a tripwire, not a sandbox.
   - HumanEval/32 is excluded: its reference fails EvalPlus's own root check on 6 of 888 inputs.
 
 ## Running the studies

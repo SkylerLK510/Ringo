@@ -103,7 +103,7 @@ def row(run):
            'round1_tokens': first_tokens, 'after_tokens': after_tokens}
     if (run / 'grade.json').is_file():
         grade = json.loads((run / 'grade.json').read_text(encoding='utf-8'))
-        out.update(round1_pass=grade['round1_pass'], delivered_pass=grade['delivered_pass'],
+        out.update(round1_pass=grade['round1_pass'], delivered_pass=grade['delivered_pass'], suspect=grade.get('suspect', False),
                    harm=bool(eligible and ran_suffix and not grade['round1_pass'] and grade['delivered_pass']),
                    avoided=bool(eligible and ran_suffix and grade['round1_pass'] and not grade['delivered_pass']))
     return out
@@ -123,7 +123,7 @@ def summary(rows, alpha):
         eligible = [r for r in rs if r['eligible']]
         compared = [r for r in eligible if r['identical'] is not None]
         changed = sum(not r['identical'] for r in compared)
-        graded = [r for r in eligible if 'harm' in r]
+        graded = [r for r in eligible if 'harm' in r and r['ran_suffix'] and not r.get('suspect')]  # a stopped run has no suffix
         harms = sum(r['harm'] for r in graded)
         suffix = [r['after_tokens'] for r in eligible if r['ran_suffix']]
         total = sum(r['round1_tokens'] + r['after_tokens'] for r in rs)
@@ -131,6 +131,9 @@ def summary(rows, alpha):
                      f"{len(eligible)} eligible, {sum(r['stopped'] for r in rs)} stopped")
         lines.append(f'  change rate after round 1: {changed}/{len(compared)}, upper bound '
                      f'{upper_bound(changed, len(compared), alpha):.1%} (bounds the harm of stopping)')
+        suspect = sum(bool(r.get('suspect')) for r in rs)
+        if suspect:
+            lines.append(f'  {suspect} graded runs left out: a draft touched files or processes (see grade.json)')
         if graded:
             lines.append(f'  graded harm: {harms}/{len(graded)}, upper bound {upper_bound(harms, len(graded), alpha):.1%}; '
                          f"stopping would have avoided {sum(r['avoided'] for r in graded)} regressions")
