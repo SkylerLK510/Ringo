@@ -32,11 +32,12 @@ class ShadowLabelTest(unittest.TestCase):
         path = self.root / f'task{self.n}.json'
         path.write_text(json.dumps({**self.spec, **changes}))
         writer = iter(replies)
+        reviews = iter(review if isinstance(review, list) else [review] * 10)
 
         def call(backend, system, message, timeout_s):
             if system.startswith('Implement the brief'):
                 return next(writer), {'input': 100, 'output': 10}
-            return review, {'input': 50, 'output': 5}
+            return next(reviews), {'input': 50, 'output': 5}
         out = self.root / f'run{self.n}'
         workflow.run(path, out, call_fn=call)
         return out
@@ -49,6 +50,10 @@ class ShadowLabelTest(unittest.TestCase):
     def test_a_clean_review_delivers_round_one_unchanged(self):
         row = shadow_labels.row(self.work([GOOD], CLEAN))
         self.assertTrue(row['identical'])
+
+    def test_a_malformed_review_attempt_still_counts_its_tokens(self):
+        row = shadow_labels.row(self.work([GOOD], ['', CLEAN]))
+        self.assertEqual((row['round1_tokens'], row['after_tokens']), (110, 110))  # the harness pays for both attempts
 
     def test_grades_give_harm_and_avoided_regressions(self):
         harmed, avoided = self.work([GOOD, OTHER], FINDING), self.work([GOOD, OTHER], FINDING)

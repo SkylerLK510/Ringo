@@ -25,6 +25,7 @@ import math
 import sys
 from pathlib import Path
 
+import harness
 import workflow
 
 
@@ -54,7 +55,7 @@ def usage_events(trace):
         return
     for line in trace.read_text(encoding='utf-8').splitlines():
         event = json.loads(line)
-        if event.get('status') == 'ok' and event.get('usage'):
+        if event.get('status') in harness.PAID_STATUSES and event.get('usage'):
             usage = event['usage'] if isinstance(event['usage'], dict) else ast.literal_eval(event['usage'])
             yield event['step'], usage
 

@@ -182,6 +182,7 @@ def empty_listing(item):
         return False
     return listed == {key: []}
 TOKEN_KEYS = ('input', 'cache_write', 'cache_read', 'output')
+PAID_STATUSES = ('ok', 'malformed', 'error')  # every attempt is paid for, a failed one too
 
 
 def codex_reply(output, name='codex-chatgpt', tools=()):
@@ -526,7 +527,7 @@ class Run:
             usage = rec.get('usage')
             for k in self.tokens:
                 self.tokens[k] += (usage or {}).get(k) or 0
-            if rec.get('status') in ('ok', 'malformed', 'error'):  # every attempt is paid for, a failed one too
+            if rec.get('status') in PAID_STATUSES:
                 if not isinstance(usage, dict) or not all(k in usage for k in TOKEN_KEYS):
                     self.untokened += 1
                 price = valid_price((usage or {}).get('cost_usd'))
