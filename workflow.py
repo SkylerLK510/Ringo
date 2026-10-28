@@ -20,9 +20,11 @@ before anything else, so the digest, checks, mutation check and judges always se
 import argparse
 import concurrent.futures
 import contextlib
+import decimal
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -161,6 +163,25 @@ def role_backend(backend, opts):
     return {**backend, 'argv': argv}
 
 
+NUMBER = re.compile(r'(?<![A-Za-z_])\d[\d,]*(?:\.\d+)?')
+
+
+def numbers(text):
+    """The numeric values in text, normalized so 2.00 == 2, 09 == 9 and 1,628.62 == 1628.62. Digits glued to a letter,
+    such as a source ID like S4, are names, not values."""
+    found = set()
+    for token in NUMBER.findall(text):
+        try:
+            found.add(decimal.Decimal(token.replace(',', '')).normalize())
+        except decimal.InvalidOperation:
+            pass
+    return found
+
+
+def text_of(files):
+    return '\n'.join(files.values())
+
+
 def text_message(spec, files, feedback):
     """The writer's input as plain sections: code is not JSON-escaped, so it costs fewer tokens and reads as code."""
     parts = [f"=== BRIEF ===\n{spec['brief']}"]
@@ -195,6 +216,9 @@ def render_feedback(feedback):
                 out.append(f"Check {c['name']!r} {c['status']}:\n{(c['stdout'] + c['stderr'])[-4000:]}")
         for t in regression['tests']:
             out.append(f"--- {t['id']}\n{t['source']}\nResult: {t['error']}")
+        if regression.get('unbacked'):
+            out.append('These numbers in your revision were printed by no successful script: '
+                       + ', '.join(regression['unbacked']) + '. Send a SCRIPT that computes them, or keep the earlier values.')
     script = feedback.get('script')
     if script:
         out.append(f"Your script {script['status']} (it ran with the sources and your files in its folder). Output:\n"
@@ -669,6 +693,8 @@ def run(spec_path, out, call_fn=harness.call):
                 report['spec_tests'] = {'error': f'{type(exc).__name__}: {exc}'}
         failed_checks, last_script = False, None
         adopted = None  # the last candidate that passed the checks: {'files', 'failing' spec-test ids}
+        script_numbers = set()  # every number a successful writer script printed in this run
+        given_numbers = numbers(spec['brief']) | numbers(text_of(spec['fixtures'])) | numbers(text_of(spec['files']))
 
         def parse(text):
             """(candidate, files) of a writer reply; ValueError when it cannot be applied."""
@@ -842,22 +868,37 @@ def run(spec_path, out, call_fn=harness.call):
             entry.update(candidate_sha256=key, checks=observed)
             failed_checks = not all(c['status'] == 'pass' for c in observed)
             fresh_script = bool(candidate.get('script') and spec.get('scripts'))
+            consistent = False
             if fresh_script:
                 last_script = run_script(folder, current, candidate['script'])
                 entry['script'] = {key: last_script[key] for key in ('status', 'seconds')}
+                if last_script['status'] == 'pass':
+                    printed = numbers(last_script['stdout'])
+                    script_numbers |= printed
+                    # Every number the document states is given (brief, sources, starting files) or printed: no need
+                    # to spend a round showing the writer an output it already matches.
+                    consistent = not (numbers(text_of(current)) - given_numbers - printed)
+                    entry['script']['consistent'] = consistent
             if spec_result is not None:
                 entry['spec_tests'] = {key: spec_result.get(key) for key in ('status', 'passed', 'total', 'failing_count', 'broken')}
             graded = spec_result is not None and spec_result['status'] != 'broken'
             broke = sorted(set(spec_result['failing_ids']) - adopted['failing']) if adopted and graded and not failed_checks else []
-            if adopted and spec['no_regression'] and (failed_checks or broke):
+            # A document revision may introduce a number only when a successful script printed it: a review's claim
+            # alone does not overturn computed values.
+            unbacked = sorted(numbers(text_of(current)) - numbers(text_of(adopted['files'])) - numbers(spec['brief'])
+                              - script_numbers, key=float) \
+                if adopted and kind == 'doc' and spec.get('scripts') and not failed_checks else []
+            if adopted and spec['no_regression'] and (failed_checks or broke or unbacked):
                 # A revision may not undo what the adopted candidate achieved. It is set aside, and the writer gets the
-                # earlier code back with what the revision broke and the feedback it was answering.
+                # earlier files back with what the revision broke and the feedback it was answering.
                 (folder / 'candidate').rename(folder / 'rejected')
-                entry.update(status='rejected', rejected_for='checks' if failed_checks else broke[:15])
+                entry.update(status='rejected', rejected_for='checks' if failed_checks else broke[:15] if broke
+                             else {'unbacked_numbers': [str(v) for v in unbacked[:15]]})
                 current = adopted['files']
                 feedback = {**{name: v for name, v in answering.items() if name not in ('protocol_error', 'regression')},
                             'regression': {'checks': observed if failed_checks else [],
-                                           'tests': [t for t in spec_result['failing'] if t['id'] in broke] if broke else []}}
+                                           'tests': [t for t in spec_result['failing'] if t['id'] in broke] if broke else [],
+                                           'unbacked': [str(v) for v in unbacked[:15]]}}
                 continue
             if spec_result is not None:
                 last_spec = spec_result
@@ -865,7 +906,8 @@ def run(spec_path, out, call_fn=harness.call):
                 adopted = {'files': current, 'failing': set(spec_result['failing_ids']) if graded else set()}
             # Spec failures and a new script's output drive a revision only while a review and its revision still fit.
             spec_failing = bool(spec_result and spec_result['failing'])
-            if not failed_checks and (spec_failing or fresh_script) and n < spec['max_rounds'] - 1 and reviewed is None:
+            script_news = fresh_script and not consistent
+            if not failed_checks and (spec_failing or script_news) and n < spec['max_rounds'] - 1 and reviewed is None:
                 feedback = {'checks': observed, **({'spec_tests': spec_result} if spec_failing else {}),
                             **({'script': last_script} if fresh_script else {})}
                 entry['status'] = 'revise'

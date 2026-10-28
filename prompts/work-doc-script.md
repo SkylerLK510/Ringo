@@ -26,4 +26,5 @@ its replacement
 
 Use FILE for a new or empty file or a rewrite. Use REPLACE for targeted changes to an existing file, matched
 against the file as shown. Files you do not name stay unchanged. Never add paths. Send your best draft with the
-script; leave the script out once its output matches your document.
+script. A later change to a number stands only if a successful script prints the new value, so send the script
+again whenever you change one. When feedback is wrong, change nothing and say why in the rationale.

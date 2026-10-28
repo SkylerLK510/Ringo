@@ -181,6 +181,42 @@ class SpecTestLoopTest(unittest.TestCase):
                                   reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK))
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
 
+    def doc_spec(self, **changes):
+        return {'files': {'REPORT.md': ''}, 'fixtures': {'data.csv': 'a,b\n1,2\n3,4\n',
+                                                          'check.py': "assert 'total' in open('REPORT.md').read()\n"},
+                'spec_tests': None, 'scripts': {'python': sys.executable}, **changes}
+
+    def test_a_script_that_matches_the_document_does_not_cost_a_round(self):
+        draft = ('@@@ SCRIPT\nimport csv\nprint("total", sum(int(r["b"]) for r in csv.DictReader(open("data.csv"))))\n'
+                 '@@@ FILE REPORT.md\ntotal: 6\n')
+        report, _ = self.run_with([draft], **self.doc_spec())
+        self.assertEqual([r['status'] for r in report['rounds']], ['ready_for_review'])
+        self.assertTrue(report['rounds'][0]['script']['consistent'])
+        self.assertEqual(report['usage']['calls'], 2)  # writer, review
+
+    def test_a_revision_may_not_change_a_computed_number_without_a_script_printing_it(self):
+        draft = '@@@ SCRIPT\nprint("total", 2 + 4)\n@@@ FILE REPORT.md\ntotal: 6\n'
+        wrong_review = '### 1. Total (`REPORT.md:1`)\n- Problem: the total should be 9.\n- Fix: write 9.'
+        guess = '@@@ REPLACE REPORT.md\ntotal: 6\n@@@ WITH\ntotal: 9\n@@@ END\n'
+        report, seen = self.run_with([draft, guess, '@@@ RATIONALE\nThe script shows 6.\n'], reviews=(wrong_review,),
+                                     **self.doc_spec(no_regression=True))
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'rejected', 'ready_for_review'])
+        self.assertEqual(report['rounds'][1]['rejected_for'], {'unbacked_numbers': ['9']})
+        self.assertIn('printed by no successful script: 9', seen[-1][1])
+        self.assertEqual((self.root / 'run/final/REPORT.md').read_text(), 'total: 6\n')
+
+    def test_a_revision_backed_by_a_successful_script_may_change_a_number(self):
+        draft = '@@@ SCRIPT\nprint("total", 2 + 4)\n@@@ FILE REPORT.md\ntotal: 6\n'
+        review = '### 1. Total (`REPORT.md:1`)\n- Problem: rows were missed; the total is 9.\n- Fix: recount.'
+        backed = '@@@ SCRIPT\nprint("total", 2 + 4 + 3)\n@@@ REPLACE REPORT.md\ntotal: 6\n@@@ WITH\ntotal: 9\n@@@ END\n'
+        report, _ = self.run_with([draft, backed], reviews=(review,), **self.doc_spec(no_regression=True))
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
+        self.assertEqual((self.root / 'run/final/REPORT.md').read_text(), 'total: 9\n')
+
+    def test_numbers_are_values_and_source_ids_are_names(self):
+        self.assertEqual(workflow.numbers('2.00% of 1,628.62 at 09:05 [S4]'),
+                         {workflow.decimal.Decimal(v).normalize() for v in ('2', '1628.62', '9', '5')})
+
     def test_a_suite_that_cannot_load_is_dropped(self):
         report, _ = self.run_with(['@@@ FILE value.py\ndef f(x):\n    return 2*x\n'],
                                   '```python\nfrom value import g\n\nimport unittest\nclass T(unittest.TestCase):\n'
