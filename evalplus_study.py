@@ -272,10 +272,10 @@ def run_all(out, ids, jobs):
                               capture_output=True, text=True)
         return task_id, proc
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
-        pending = {pool.submit(one, t) for t in todo[:jobs]}
+        active = {pool.submit(one, t) for t in todo[:jobs]}
         queue = todo[jobs:]
-        while pending:
-            done, pending = concurrent.futures.wait(pending, return_when=concurrent.futures.FIRST_COMPLETED)
+        while active:
+            done, active = concurrent.futures.wait(active, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
                 task_id, proc = future.result()
                 status = (json.loads(proc.stdout or '{}') if proc.stdout.strip().startswith('{') else {}).get('status')
@@ -283,7 +283,7 @@ def run_all(out, ids, jobs):
                 # Three runs in a row that end in an error (a usage limit, a lost login) stop new launches.
                 failures = failures + 1 if status in RETRY else 0
                 if queue and failures < 3:
-                    pending.add(pool.submit(one, queue.pop(0)))
+                    active.add(pool.submit(one, queue.pop(0)))
             if failures >= 3:
                 print('stopping: three runs in a row failed; fix the cause and rerun to continue', flush=True)
                 queue.clear()

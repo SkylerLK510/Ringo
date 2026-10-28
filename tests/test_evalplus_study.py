@@ -116,6 +116,30 @@ class ReviewFindingTest(unittest.TestCase):
         self.assertIn('graded harm: 1/1', text)
         self.assertIn('1 graded runs left out', text)
 
+    def test_run_all_launches_every_pending_task_and_stops_after_three_failed_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            (out / 'runs').mkdir()
+            calls = []
+
+            def fake(argv, **kw):
+                calls.append(argv[argv.index('--out') + 1])
+                status = 'ready_for_review' if len(calls) <= 2 else 'error'
+                return unittest.mock.Mock(stdout=json.dumps({'status': status}), stderr='')
+            ids = [f'HumanEval/{i}' for i in range(8)]
+            with unittest.mock.patch.object(study.subprocess, 'run', side_effect=fake):
+                study.run_all(out, ids, 1)
+            self.assertEqual(len(calls), 5)  # two successes, then three failures in a row stop new launches
+
+    def test_a_flagged_run_counts_toward_neither_bound(self):
+        import shadow_labels
+        base = {'regime': 'r', 'implementation': 'x', 'artifact_kind': 'code', 'eligible': True, 'stopped': False,
+                'ran_suffix': True, 'round1_tokens': 1, 'after_tokens': 1, 'avoided': False, 'harm': False}
+        rows = [{**base, 'identical': False, 'suspect': False}, *[{**base, 'identical': True, 'suspect': True}] * 50]
+        text = shadow_labels.summary(rows, .05)
+        self.assertIn('change rate after round 1: 1/1', text)
+        self.assertIn('graded harm: 0/1', text)
+
     def test_seeding_stops_at_the_limit_when_results_already_exist(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)

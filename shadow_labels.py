@@ -120,10 +120,10 @@ def summary(rows, alpha):
     lines = []
     for key in sorted({r['regime'] for r in rows}):
         rs = [r for r in rows if r['regime'] == key]
-        eligible = [r for r in rs if r['eligible']]
+        eligible = [r for r in rs if r['eligible'] and not r.get('suspect')]  # a flagged run counts toward no bound
         compared = [r for r in eligible if r['identical'] is not None]
         changed = sum(not r['identical'] for r in compared)
-        graded = [r for r in eligible if 'harm' in r and r['ran_suffix'] and not r.get('suspect')]  # a stopped run has no suffix
+        graded = [r for r in eligible if 'harm' in r and r['ran_suffix']]  # a stopped run has no suffix
         harms = sum(r['harm'] for r in graded)
         suffix = [r['after_tokens'] for r in eligible if r['ran_suffix']]
         total = sum(r['round1_tokens'] + r['after_tokens'] for r in rs)
