@@ -194,6 +194,7 @@ def candidate_parts(incumbent, proposal):
 def candidate_key(incumbent, proposal):
     _, _, plan, texts = candidate_parts(incumbent, proposal)
     with tempfile.TemporaryDirectory(prefix='ringo-screen-') as d:
+        backends.private_directory(d)
         for n, t in texts.items():
             (Path(d) / n).write_text(t, encoding='utf-8')
         normalized, used = bare(pipelines.validate(json.loads(json.dumps(plan)), d))
@@ -211,6 +212,7 @@ def screen(store, proposal, incumbent, dev_ids, camp):
         if raw.get('kind') != 'review':
             return ['the improver may only propose a review plan']
         with tempfile.TemporaryDirectory(prefix='ringo-screen-') as d:
+            backends.private_directory(d)
             for n, t in new_texts.items():
                 (Path(d) / n).write_text(t, encoding='utf-8')
             new_plan, normalized = bare(pipelines.validate(json.loads(json.dumps(raw)), d))
@@ -290,7 +292,7 @@ def contamination_reasons(store, text, dev_ids):
 def build_candidate(ws, n, incumbent, proposal):
     _, _, plan, texts = candidate_parts(incumbent, proposal)
     d = Path(ws) / 'candidates' / str(n)
-    (d / 'prompts').mkdir(parents=True, exist_ok=True)
+    backends.private_directory(d / 'prompts', create=True, parents=True, exist_ok=True)
     for name, text in texts.items():
         (d / 'prompts' / name).write_text(text + '\n', encoding='utf-8')
     (d / 'plan.json').write_text(json.dumps({**proposal.get('plan', plan), 'prompts_dir': 'prompts'}, indent=1),
@@ -308,7 +310,7 @@ def experiment(store, ws, name, arms, split, camp, comparators=(), runs=1, sampl
             'comparators': list(comparators), 'graders': camp['graders'], 'runs': runs, 'min_groups': camp['min_groups'],
             'margins': camp['margins'], 'bootstrap': camp['bootstrap'], 'seed': camp['seed'], 'sample': sample}
     path = Path(ws) / 'specs' / f'{name}.json'
-    path.parent.mkdir(parents=True, exist_ok=True)
+    backends.private_directory(path.parent, create=True, parents=True, exist_ok=True)
     path.write_text(json.dumps(spec, indent=1), encoding='utf-8')
     d = evaluate.freeze(store, path)
     if digests is not None:
@@ -354,7 +356,7 @@ def campaign(store, campaign_path, ws, call_fn=harness.call):
         ids = evaluate.split_cases(store, part, selection)
         if len({pool[c]['group'] for c in ids}) < camp['min_groups']:
             raise ValueError(f'{part} needs at least {camp["min_groups"]} repository groups before a campaign can spend')
-    ws.mkdir(parents=True, exist_ok=True)
+    backends.private_directory(ws, create=True, parents=True, exist_ok=True)
     with evaluate.exclusive(ws / '.campaign.lock', 'campaign'):
         with evaluate.locked(store):
             if any(r['kind'] in ('campaign_start', 'campaign') and r['name'] == camp['name']

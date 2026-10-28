@@ -278,7 +278,8 @@ def call(backend, system, message, timeout_s, model=None, watch=None):
         return codex_reply(output, backend['name'], tools)
     if backend['style'] == 'plain':
         return backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, watch=watch), None
-    with tempfile.TemporaryDirectory(prefix='ringo-system-') as d:  # created 0700; removed after the call
+    with tempfile.TemporaryDirectory(prefix='ringo-system-') as d:
+        backends.private_directory(d)
         path = Path(d) / 'system.txt'
         path.write_text(system, encoding='utf-8', newline='')  # the exact text: no CRLF on Windows
         try:
@@ -493,8 +494,11 @@ class Run:
         if self.trace:
             if self.trace.exists() and any(self.trace.iterdir()):
                 raise ValueError('the trace folder must be new or empty')
-            (self.trace / 'steps').mkdir(parents=True)  # exclusive creation also refuses concurrent trace writers
-            os.chmod(self.trace, 0o700)  # it holds the material; Windows ignores the mode, the parent's ACL applies
+            if os.name == 'nt':  # protect the root before creating children that inherit its ACL
+                backends.private_directory(self.trace, create=True, parents=True, exist_ok=True)
+            # Exclusive steps creation also refuses concurrent trace writers.
+            backends.private_directory(self.trace / 'steps', create=True, parents=True)
+            os.chmod(self.trace, 0o700)
         self.started, self.last = time.time(), None
         self.state('running')
 
@@ -564,10 +568,12 @@ class Run:
         with self.lock:
             if self.incident_dir is None:
                 if self.trace:
-                    self.incident_dir = self.trace / 'incidents'
-                    self.incident_dir.mkdir(mode=0o700, exist_ok=True)
+                    folder = self.trace / 'incidents'
+                    backends.private_directory(folder, create=True, mode=0o700, exist_ok=True)
                 else:
-                    self.incident_dir = Path(tempfile.mkdtemp(prefix='ringo-incidents-'))
+                    folder = Path(tempfile.mkdtemp(prefix='ringo-incidents-'))
+                    backends.private_directory(folder)
+                self.incident_dir = folder  # cache only after protection and verification succeeded
             return self.incident_dir
 
     def state(self, status, **extra):

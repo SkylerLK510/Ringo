@@ -1,6 +1,7 @@
 """Offline checks of evaluate.py: a fake case pool, fake reviewers and fake graders; no model calls."""
 import json
 import math
+import os
 import re
 import shutil
 import sys
@@ -469,8 +470,13 @@ class ReviewFindingsTest(unittest.TestCase):
         stub = echo_cli(d / 'claude', '9.9 (Claude Code)')
         self.assertEqual(ev.real_identity(stub, s.dir)['family'], 'custom')
         ev.trust(s.dir, stub, 'claude')
-        trusted = ev.real_identity(stub, s.dir)
-        self.assertEqual((trusted['family'], trusted['version']), ('claude', '9.9 (Claude Code)'))
+        if os.name == 'nt':
+            # Trust does not exempt a batch wrapper from the native launch guard.
+            with self.assertRaisesRegex(ValueError, 'call the underlying executable'):
+                ev.real_identity(stub, s.dir)
+        else:
+            trusted = ev.real_identity(stub, s.dir)
+            self.assertEqual((trusted['family'], trusted['version']), ('claude', '9.9 (Claude Code)'))
         echo_cli(d / 'claude', '9.9 (Claude Code)', note='changed')  # same name, other content
         self.assertEqual(ev.real_identity(stub, s.dir)['family'], 'custom')
 

@@ -85,15 +85,15 @@ def state_root(path=None):
 
 
 def private_root(path=None):
+    import backends
     root = state_root(path)
-    # Windows ignores the mode bits: the state keeps its parent folder's access list (the user's own by default).
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backends.private_directory(root, create=True, mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     for name in ('bundles', 'approvals'):
         target = root / name
         if target.is_symlink():
             raise ValueError('release state directories cannot be symlinks')
-        target.mkdir(mode=0o700, exist_ok=True)
+        backends.private_directory(target, create=True, mode=0o700, exist_ok=True)
     return root
 
 
@@ -179,7 +179,9 @@ def quality(store, digest, plan, runtime_root=None, *, verify_bytecode=False):
         import importlib.util
         import py_compile
         import tempfile
+        import backends
         with tempfile.TemporaryDirectory(prefix='ringo-proof-') as folder:
+            backends.private_directory(folder)
             for name in evaluate.CODE:
                 if not name.endswith('.py'):
                     continue
@@ -199,6 +201,7 @@ def quality(store, digest, plan, runtime_root=None, *, verify_bytecode=False):
 
 
 def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None):
+    import backends
     import pipelines
     import py_compile
     import tempfile
@@ -211,18 +214,19 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
     plan = pipelines.load_plan(candidate_plan, 'review') if candidate_plan else default_plan(source)
     evidence = quality(evaluation_store, digest, plan, source) if candidate_plan else {'kind': 'deployment', 'claim': None}
     with locked(root), tempfile.TemporaryDirectory(prefix='.stage-', dir=root) as folder:
+        backends.private_directory(folder)
         tmp = Path(folder)
         for name, expected in files.items():
             data = (source / name).read_bytes()
             if hashlib.sha256(data).hexdigest() != expected:
                 raise ValueError('source changed while staging')
             target = tmp / name
-            target.parent.mkdir(parents=True, exist_ok=True)
+            backends.private_directory(target.parent, create=True, parents=True, exist_ok=True)
             target.write_bytes(data)
         if candidate_plan:
             for p in plan['passes']:
                 target = tmp / 'candidate-prompts' / p['prompt']
-                target.parent.mkdir(exist_ok=True)
+                backends.private_directory(target.parent, create=True, exist_ok=True)
                 target.write_text(p['text'] + '\n', encoding='utf-8')
                 files[target.relative_to(tmp).as_posix()] = file_hash(target)
             raw = {k: v for k, v in plan.items() if k != 'prompts_dir'}
@@ -241,6 +245,8 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
             pipelines.validate(raw, base)
         # Precompile at staging time. Readonly releases must not reparse every module
         # on every invocation. Hash-checked bytecode is also covered by the inventory.
+        if os.name == 'nt':
+            backends.private_directory(tmp / '__pycache__', create=True, exist_ok=True)
         for name in RUNTIME:
             cached = Path(py_compile.compile(str(tmp / name), dfile='ringo-release/' + name,
                 doraise=True, invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH))

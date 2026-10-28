@@ -8,18 +8,15 @@ POSIX_MODES = 'Windows has no POSIX permission bits'
 
 
 def python_cli(path, source):
-    """Make path a command that runs the Python source with this interpreter, and return its argv[0]. POSIX: path
-    itself, executable with a #! line. Windows cannot run a #! script, so path.cmd runs the source saved as path.py."""
+    """Return argv for a Python fixture. Windows uses the interpreter directly, never a batch wrapper."""
     path = Path(path)
     if os.name != 'nt':
         path.write_text(f'#!{sys.executable}\n{source}', encoding='utf-8')
         path.chmod(0o755)
-        return str(path)
+        return [str(path)]
     script = path.with_name(path.name + '.py')
     script.write_text(source, encoding='utf-8')
-    launcher = path.with_name(path.name + '.cmd')
-    launcher.write_text(f'@"{sys.executable}" "{script}" %*\n', encoding='utf-8')
-    return str(launcher)
+    return [sys.executable, str(script)]
 
 
 def echo_cli(path, text, note=''):

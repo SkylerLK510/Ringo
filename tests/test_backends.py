@@ -215,8 +215,13 @@ class LeanCodexTest(unittest.TestCase):
     def run_fake(self, **env):
         with tempfile.TemporaryDirectory() as d:
             launcher = python_cli(Path(d, 'codex'), FAKE_CODEX)
-            with mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'owner')), **env}):
-                out = backends.run_isolated([launcher, 'exec', '--json', '-'], 'PROMPT', 10,
+            run = subprocess.run
+            # The Windows fixture is Python + a script, rather than a real single-file Codex executable.
+            # Route its executable-only `debug models` probe through that script too.
+            with mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'owner')), **env}), \
+                    mock.patch.object(backends.subprocess, 'run',
+                                      side_effect=lambda argv, **kw: run([*launcher, *argv[1:]], **kw)):
+                out = backends.run_isolated([*launcher, 'exec', '--json', '-'], 'PROMPT', 10,
                                             codex_home=True, lean=True)
         return json.loads(out)
 

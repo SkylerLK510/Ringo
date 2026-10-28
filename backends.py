@@ -7,6 +7,7 @@ import errno
 import functools
 import json
 import math
+import ntpath
 import os
 import re
 import signal
@@ -95,6 +96,131 @@ def file_lock(f, blocking=True):
 
 
 @functools.cache
+def _win_security():
+    """Typed Win32 security APIs; loaded only on native Windows."""
+    import ctypes
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    adv = ctypes.WinDLL('advapi32', use_last_error=True)
+    ptr = w.LPVOID
+    for dll, name, result, args in (
+            (kernel, 'GetCurrentProcess', w.HANDLE, ()),
+            (kernel, 'CloseHandle', w.BOOL, (w.HANDLE,)),
+            (kernel, 'LocalFree', ptr, (ptr,)),
+            (adv, 'OpenProcessToken', w.BOOL, (w.HANDLE, w.DWORD, ctypes.POINTER(w.HANDLE))),
+            (adv, 'GetTokenInformation', w.BOOL,
+             (w.HANDLE, ctypes.c_int, ptr, w.DWORD, ctypes.POINTER(w.DWORD))),
+            (adv, 'GetLengthSid', w.DWORD, (ptr,)),
+            (adv, 'InitializeAcl', w.BOOL, (ptr, w.DWORD, w.DWORD)),
+            (adv, 'AddAccessAllowedAceEx', w.BOOL, (ptr, w.DWORD, w.DWORD, w.DWORD, ptr)),
+            (adv, 'SetNamedSecurityInfoW', w.DWORD,
+             (w.LPWSTR, ctypes.c_int, w.DWORD, ptr, ptr, ptr, ptr)),
+            (adv, 'GetNamedSecurityInfoW', w.DWORD,
+             (w.LPWSTR, ctypes.c_int, w.DWORD, ptr, ptr, ctypes.POINTER(ptr), ptr, ctypes.POINTER(ptr))),
+            (adv, 'GetSecurityDescriptorControl', w.BOOL,
+             (ptr, ctypes.POINTER(w.WORD), ctypes.POINTER(w.DWORD))),
+            (adv, 'GetAclInformation', w.BOOL, (ptr, ptr, w.DWORD, ctypes.c_int)),
+            (adv, 'GetAce', w.BOOL, (ptr, w.DWORD, ctypes.POINTER(ptr)))):
+        fn = getattr(dll, name)
+        fn.restype, fn.argtypes = result, args
+    return ctypes, w, kernel, adv
+
+
+def _windows_user_sid():
+    c, w, kernel, adv = _win_security()
+    token, size = w.HANDLE(), w.DWORD()
+    if not adv.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, c.byref(token)):  # TOKEN_QUERY
+        raise c.WinError(c.get_last_error())
+    try:
+        adv.GetTokenInformation(token, 1, None, 0, c.byref(size))  # TokenUser
+        if c.get_last_error() != 122:  # ERROR_INSUFFICIENT_BUFFER
+            raise c.WinError(c.get_last_error())
+        user = c.create_string_buffer(size.value)
+        if not adv.GetTokenInformation(token, 1, user, size, c.byref(size)):
+            raise c.WinError(c.get_last_error())
+        sid = c.cast(user, c.POINTER(w.LPVOID))[0]  # TOKEN_USER starts with SID_AND_ATTRIBUTES.Sid
+        return c.string_at(sid, adv.GetLengthSid(sid))
+    finally:
+        kernel.CloseHandle(token)
+
+
+def _windows_acl(path):
+    """Read back (descriptor control, [(ACE type, flags, mask, SID bytes)]), never a cached assertion."""
+    import struct
+    c, w, kernel, adv = _win_security()
+    acl, descriptor = w.LPVOID(), w.LPVOID()
+    error = adv.GetNamedSecurityInfoW(str(path), 1, 4, None, None, c.byref(acl), None, c.byref(descriptor))
+    if error:
+        raise c.WinError(error)
+    try:
+        control, revision = w.WORD(), w.DWORD()
+        if not adv.GetSecurityDescriptorControl(descriptor, c.byref(control), c.byref(revision)):
+            raise c.WinError(c.get_last_error())
+        if not acl:
+            raise OSError(f'{path}: missing private DACL')
+        info = (w.DWORD * 3)()  # ACL_SIZE_INFORMATION: AceCount, AclBytesInUse, AclBytesFree
+        if not adv.GetAclInformation(acl, info, c.sizeof(info), 2):  # AclSizeInformation
+            raise c.WinError(c.get_last_error())
+        aces = []
+        for i in range(info[0]):
+            ace = w.LPVOID()
+            if not adv.GetAce(acl, i, c.byref(ace)):
+                raise c.WinError(c.get_last_error())
+            kind, flags, size, mask = struct.unpack('<BBHI', c.string_at(ace, 8))
+            # Only ACCESS_ALLOWED_ACE has the layout we accept. Don't interpret another ACE's data as a SID.
+            sid = c.string_at(ace.value + 8, size - 8) if kind == 0 and size >= 8 else None
+            aces.append((kind, flags, mask, sid))
+        return control.value, aces
+    finally:
+        kernel.LocalFree(descriptor)
+
+
+def private_directory(path, *, create=False, **mkdir):
+    """Secure a private directory before writing; optionally create it with the caller's existing mkdir options.
+
+    Windows: replace inheritance with one user-only full-control ACE, inheritable by files and directories;
+    fail closed if setting or reading back the protected DACL fails. This is not a boundary against the same
+    account, administrators taking ownership, or pre-existing files with explicit ACLs.
+    """
+    created = []
+    if create:
+        path = Path(path)
+        if os.name == 'nt':
+            parent = path
+            while not parent.exists():
+                created.append(parent)
+                parent = parent.parent
+        path.mkdir(**mkdir)
+    if os.name != 'nt':
+        return
+    c, _, _, adv = _win_security()
+    sid = _windows_user_sid()
+    acl = c.create_string_buffer(8 + 8 + len(sid))  # ACL header + ACCESS_ALLOWED_ACE header/mask + SID
+    if not adv.InitializeAcl(acl, len(acl), 2) or not adv.AddAccessAllowedAceEx(acl, 2, 3, 0x1F01FF, sid):
+        raise c.WinError(c.get_last_error())
+    for folder in reversed(created) if created else (path,):
+        # Protect every parent mkdir(parents=True) created too, without changing existing ancestors.
+        error = adv.SetNamedSecurityInfoW(str(folder), 1, 4 | 0x80000000, None, None, acl, None)
+        if error:  # SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+            raise c.WinError(error)
+        control, aces = _windows_acl(folder)
+        if not control & 0x1000 or aces != [(0, 3, 0x1F01FF, sid)]:  # SE_DACL_PROTECTED, OI | CI
+            raise OSError(f'{folder}: owner-only protected DACL verification failed')
+
+
+def _check_windows_program(argv, executable=None):
+    """Refuse batch programs altogether: CRT argument quoting cannot safely feed cmd.exe."""
+    if os.name != 'nt':
+        return
+    if isinstance(argv, (str, bytes)):
+        raise ValueError('Windows commands must use an argument list; call the underlying executable')
+    program = os.fsdecode(executable if executable is not None else argv[0])
+    if ntpath.splitext(program.rstrip(' ."'))[1].lower() in ('.cmd', '.bat'):
+        raise ValueError(f'Windows batch program argument {program!r} is refused (arguments {list(argv[1:])!r}); '
+                         'call the underlying executable instead')
+
+
+@functools.cache
 def _win32():
     """kernel32 and ntdll with the signatures Ringo calls (Windows only)."""
     import ctypes
@@ -122,9 +248,10 @@ def spawn(argv, **kw):
     """subprocess.Popen(argv, **kw) in a process tree of its own, which kill_tree ends with everything it started.
     POSIX: a new session. Windows: a new process group inside a job object; the command starts suspended and runs
     only once it is in the job, so every process it starts is in the job too. A bare name is not looked up with
-    PATHEXT: a .cmd or .bat file would get its arguments through cmd.exe, which Popen does not quote for."""
+    PATHEXT. Explicit .cmd/.bat programs are refused before Popen because it cannot quote their arguments safely."""
     if os.name != 'nt':
         return subprocess.Popen(argv, start_new_session=True, **kw)
+    _check_windows_program(argv, kw.get('executable'))
     ctypes, k32, nt, _ = _win32()
     job = k32.CreateJobObjectW(None, None)
     if not job:
@@ -264,9 +391,8 @@ def _codex_home(root, env):
     global $CODEX_HOME/AGENTS.md, ~/.codex/skills, its memories or ~/.agents/skills; a fresh home does. Returns
     (owner path, snapshot bytes or None, private copy path) for the write-back after the call."""
     home, private = root / 'home', root / 'codex'
-    # Windows ignores these modes; the folders keep the access list of %TEMP%, which is the user's own.
-    home.mkdir(mode=0o700)
-    private.mkdir(mode=0o700)
+    private_directory(home, create=True, mode=0o700)
+    private_directory(private, create=True, mode=0o700)
     owner = _owner_auth()
     try:
         snapshot = owner.read_bytes()
@@ -291,6 +417,7 @@ def _lean_codex(argv, private, env, timeout_s=15):
     instructions = private / 'ringo-instructions.md'
     instructions.write_text(CODEX_INSTRUCTIONS, encoding='utf-8', newline='')  # LF on Windows too
     extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
+    _check_windows_program(argv)  # this direct subprocess must obey the same rule as spawn
     try:
         listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=timeout_s, check=True).stdout
@@ -344,17 +471,22 @@ def _sync_codex_auth(owner, snapshot, copy):
                 raise OSError(f'{owner} is a symlink')
             if owner.read_bytes() != snapshot:
                 return
-            fd, tmp = tempfile.mkstemp(prefix='.ringo-auth-', dir=owner.parent)  # created 0600
-            try:
-                with os.fdopen(fd, 'wb') as f:
-                    f.write(new)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.replace(tmp, owner)
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp)
-                raise
+            with contextlib.ExitStack() as stack:
+                parent = owner.parent
+                if os.name == 'nt':  # don't inherit a possibly shared owner's folder ACL for refreshed credentials
+                    parent = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='.ringo-auth-', dir=parent)))
+                    private_directory(parent)
+                fd, tmp = tempfile.mkstemp(prefix='.ringo-auth-', dir=parent)  # created 0600 on POSIX
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(new)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, owner)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    raise
     except OSError as exc:
         print(f'ringo: Codex refreshed its login but it could not be saved to {owner} ({exc}); '
               'run `codex login` if later calls are refused', file=sys.stderr)
@@ -418,12 +550,13 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
     # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.
-    with tempfile.TemporaryDirectory(prefix='council-judge-') as tmp, _spool(tmp, 'out') as out, \
-            _spool(tmp, 'err') as err, _spool(tmp, 'stdin') as stdin:
+    with tempfile.TemporaryDirectory(prefix='council-judge-') as tmp, contextlib.ExitStack() as files:
+        private_directory(tmp)
+        out, err, stdin = (files.enter_context(_spool(tmp, name)) for name in ('out', 'err', 'stdin'))
         stdin.write(prompt.encode('utf-8'))
         stdin.seek(0)
         cwd = Path(tmp) / 'work'
-        cwd.mkdir()
+        private_directory(cwd, create=True)
         started, ended, threads = time.monotonic(), None, []  # the limit counts setup too
         limit = watch.limit_s if watch else timeout_s
         login = _codex_home(Path(tmp), env) if codex_home else None

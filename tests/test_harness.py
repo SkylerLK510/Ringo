@@ -57,20 +57,20 @@ class CallTest(unittest.TestCase):
             'assert a[a.index("--output-format") + 1] == "json"\n'
             'print(json.dumps({"result": open(f).read() + "|" + sys.stdin.read(), "total_cost_usd": 0.02,\n'
             '  "usage": {"input_tokens": 3, "cache_creation_input_tokens": 7, "cache_read_input_tokens": 90, "output_tokens": 4}}))\n')
-        text, usage = harness.call({'name': 'c', 'argv': [exe, '-p'], 'style': 'claude'}, 'SYSTEM+MATERIAL', 'INSTRUCTION', 30)
+        text, usage = harness.call({'name': 'c', 'argv': [*exe, '-p'], 'style': 'claude'}, 'SYSTEM+MATERIAL', 'INSTRUCTION', 30)
         self.assertEqual(text, 'SYSTEM+MATERIAL|INSTRUCTION')
         self.assertEqual(usage, {'input': 3, 'cache_write': 7, 'cache_read': 90, 'output': 4, 'cost_usd': 0.02, 'models': []})
 
     def test_claude_errors_and_non_json_raise(self):
         bad = self.fake_claude('import json\nprint(json.dumps({"is_error": True, "result": "limit reached"}))\n')
         with self.assertRaisesRegex(backends.JudgeError, 'limit reached'):
-            harness.call({'name': 'c', 'argv': [bad], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': bad, 'style': 'claude'}, 's', 'm', 30)
         junk = self.fake_claude('print("not json")\n')
         with self.assertRaisesRegex(backends.JudgeError, 'did not return JSON') as caught:
-            harness.call({'name': 'c', 'argv': [junk], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': junk, 'style': 'claude'}, 's', 'm', 30)
         self.assertEqual(caught.exception.raw.strip(), 'not json')  # kept for the trace
         with self.assertRaises(harness.CallError) as caught:
-            harness.call({'name': 'c', 'argv': [bad], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': bad, 'style': 'claude'}, 's', 'm', 30)
         self.assertIn('limit reached', caught.exception.raw)
 
     def test_other_backends_get_system_then_message_on_stdin(self):
@@ -521,7 +521,7 @@ class RunTest(unittest.TestCase):
         exe = python_cli(Path(tempfile.mkdtemp(), 'claude'), 'import json, sys\nprint(json.dumps({"is_error": True, '
                          '"result": "boom", "total_cost_usd": 0.02, "usage": {"input_tokens": 50}}))\nsys.exit(1)\n')
         with self.assertRaises(harness.CallError) as cm:
-            harness.call({'name': 'c', 'argv': [exe], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': exe, 'style': 'claude'}, 's', 'm', 30)
         self.assertEqual((cm.exception.usage['cost_usd'], cm.exception.usage['input']), (0.02, 50))
         for bad in (-0.01, float('nan'), True, '0.01'):
             self.assertIsNone(harness.valid_price(bad))

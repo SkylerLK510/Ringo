@@ -18,6 +18,7 @@ import sys
 import time
 
 import latency
+import backends
 import releases
 
 
@@ -91,7 +92,7 @@ def run(baseline, out, pairs=100, warmups=5, absolute_ms=5, relative=.05, worklo
     known = releases.LATENCY_WORKLOADS | {'review-delay', 'review-override', 'review-failure'}
     if len(set(workloads)) != len(workloads) or set(workloads) - known:
         raise ValueError('select unique known workloads')
-    out.mkdir(mode=0o700, parents=True, exist_ok=False)
+    backends.private_directory(out, create=True, mode=0o700, parents=True, exist_ok=False)
     fake = out / 'backend.py'
     fake.write_text('''import json, os, sys, time
 text = sys.stdin.read()
@@ -145,7 +146,16 @@ print(json.dumps({'version':1, **result}))
             # approval by mirroring the verified baseline bundle into private experiment state.
             bundle, _ = releases.verify(releases.state_root(baseline_state), baseline_release)
             base_state = releases.private_root(out / 'baseline-state')
-            shutil.copytree(bundle, base_state / 'bundles' / baseline_release)
+            destination = base_state / 'bundles' / baseline_release
+            if os.name == 'nt':
+                backends.private_directory(destination, create=True)
+                for directory in bundle.rglob('*'):
+                    if directory.is_dir():
+                        backends.private_directory(destination / directory.relative_to(bundle), create=True,
+                                                   parents=True, exist_ok=True)
+                shutil.copytree(bundle, destination, dirs_exist_ok=True)
+            else:
+                shutil.copytree(bundle, destination)
             selection_fixture(base_state, baseline_release, pairs)
     env = {**os.environ, 'RINGO_RELEASE_HOME': str(out / 'no-active')}
     rng, reports = random.Random(42), []

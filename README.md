@@ -50,7 +50,12 @@ Ubuntu 24.04 and later ship Python 3.12. On an older release, install Python 3.1
 
 The offline test suite passes natively on Windows (CI runs it on `windows-latest` with Python 3.11 and 3.14), so
 Ringo runs with a native Python 3.11 or newer. Real model calls have so far been run only on macOS, so they are
-untested natively. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
+untested natively. Native Windows refuses `.cmd`/`.bat` backend and check programs: call the underlying executable
+directly (for example, `node.exe` with the CLI's JavaScript entrypoint). Private run, store, release-state and
+temporary folders receive a protected DACL granting full control only to the current user, verified before
+sensitive files are written; new files inherit that access. A filesystem that cannot set and verify it is refused.
+This does not restrict administrators taking ownership, other processes using your account, or explicit ACLs on
+pre-existing files. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
 
 1. Open PowerShell as Administrator, run `wsl --install`, then restart Windows. This installs WSL 2 with Ubuntu.
 2. Open **Ubuntu** from the Start menu and follow the Linux steps above inside it.
@@ -393,9 +398,12 @@ so this is a confirmation, not a clean held-out test.
 - **CI:** it runs on Ubuntu, macOS and Windows, and the whole offline suite passes natively on Windows. The native
   port locks with `msvcrt`, ends a call's or check's process tree through a job object, and splits backend commands
   without treating `\` in Windows paths as an escape. Tests of POSIX-only properties (permission bits, `os.killpg`,
-  FIFOs, the Linux ReviewBench image) are skipped there. Mode 0700 does not apply on Windows: a trace, store or
-  release state keeps its parent folder's access list. Under your user profile that list admits you, SYSTEM and
-  administrators, so keep run folders out of shared folders.
+  FIFOs, the Linux ReviewBench image) are skipped there. Windows private folders use a protected, verified DACL
+  with one inheritable full-control ACE for the current user, including traces, stores, release state, temporary
+  prompts and private Codex homes. New files inherit it; failure to set or verify it stops writing. Existing files
+  with explicit ACLs and administrators taking ownership are outside this guarantee. Explicit `.cmd`/`.bat`
+  launches are refused, including trusted backends and checks; call the underlying executable to avoid `cmd.exe`
+  argument interpretation. POSIX permissions and process launching are unchanged.
 
 ### 8. Ideas we considered and did not adopt
 
