@@ -343,8 +343,9 @@ Model and bridge calls run from empty temporary folders without the TypeSafe key
 those folders are not filesystem boundaries. Full check logs are spooled to disk
 without a quota. Timeouts bound waiting and admission, not CPU, GPU, memory or
 disk use. After each check, on success, timeout or interruption, Ringo kills the
-check's process group on POSIX. Processes that left the group are not stopped. On
-Windows only the direct process is killed.
+check's process group on POSIX; processes that left the group are not stopped. On
+Windows the check starts suspended inside a job object, and Ringo terminates the job,
+so every process the check started is stopped.
 
 ## Task repair is not workflow improvement
 
