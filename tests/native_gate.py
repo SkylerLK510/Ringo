@@ -285,10 +285,11 @@ def run_task(task, arm, source, binary, fakes, gate_repo, work):
     for stream, data in (('<stdout>', proc.stdout), ('<stderr>', proc.stderr)):
         text = data.decode('utf-8', 'replace').replace(str(root), '<RUN>')
         lines = []
-        for line in text.splitlines():  # the harness summary line carries timings and the runtime identity
-            if line.startswith('harness: {'):
+        for line in text.splitlines():  # summary lines (harness: {...}, work's outcome) carry timings and identity
+            prefix = 'harness: ' if line.startswith('harness: {') else '' if line.startswith('{') else None
+            if prefix is not None:
                 try:
-                    line = 'harness: ' + json.dumps(normalise(json.loads(line[9:]), root), ensure_ascii=False)
+                    line = prefix + json.dumps(normalise(json.loads(line[len(prefix):]), root), ensure_ascii=False)
                 except ValueError:
                     pass
             lines.append(line)
