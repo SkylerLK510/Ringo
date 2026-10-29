@@ -216,6 +216,10 @@ fn state_inside_the_repository_is_refused() {
     let link = root().join("inside-link");
     let _ = std::os::unix::fs::symlink(r.join("state"), &link);
     assert!(Session::with_state(&r, &link).err().unwrap().contains("symlink"));
+    let outside = root().join("outside-state");
+    fs::create_dir_all(&outside).unwrap();
+    let _ = std::os::unix::fs::symlink(&r, outside.join("shell")); // the shell folder itself points into the repo
+    assert!(Session::with_state(&r, &outside).err().unwrap().contains("inside the repository"));
     fs::remove_dir_all(&r).unwrap();
 }
 

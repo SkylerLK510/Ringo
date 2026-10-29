@@ -252,7 +252,7 @@ impl Session {
         if root.is_symlink() {
             return Err(format!("the state folder {} cannot be a symlink", root.display()));
         }
-        let parent = resolved(root).join("shell");
+        let parent = resolved(&root.join("shell")); // a symlinked shell folder resolves too
         if parent.starts_with(&repo) {
             return Err(format!("the state folder {} is inside the repository", parent.display()));
         }
