@@ -371,34 +371,53 @@ impl App {
         }
     }
 
+    /// What the panel shows for one job: its mark, who runs it, what it is doing, any same-files warning, and its
+    /// time, tokens and Ringo model calls.
+    fn job_parts(&self, job: &ringo_cli::Job) -> JobParts {
+        let t = &self.theme;
+        let (mark, mark_style) = match &job.status {
+            Status::Running => (self.spinner(), t.running),
+            Status::Done => ("✓", t.ok),
+            Status::Failed(_) => ("✗", t.fail),
+            Status::Cancelled => ("■", t.cancelled),
+        };
+        let (who, who_style) = match &job.kind {
+            Kind::Agent { agent, write } => (format!("{}{}", agent.name(), if *write { "!" } else { "" }), self.agent_style(*agent)),
+            Kind::Ringo { command } => (format!("ringo {command}"), t.ringo),
+        };
+        let mut detail = job.activity.clone();
+        if job.worktree.is_some() && job.status == Status::Done {
+            detail = format!("{} {detail}", if job.applied { "[applied]" } else { "[change ready]" });
+        }
+        let overlaps: Vec<String> = self.s.overlaps(job.id).into_iter()
+            .map(|(other, files)| format!("#{other} {}", files.join(", "))).collect();
+        let warning = if overlaps.is_empty() { String::new() } else { format!("⚠ same files as {}", overlaps.join("; ")) };
+        let calls = if job.calls > 0 { format!(" {}c", job.calls) } else { String::new() };
+        let stats = format!("{} {}{calls}", fmt_age(job.age()), fmt_tokens(job.tokens.total()));
+        JobParts { mark, mark_style, who, who_style, detail, warning, stats }
+    }
+
+    fn sub_mark(&self, ended: Option<bool>) -> (&'static str, Style) {
+        match ended {
+            None => (self.spinner(), self.theme.running),
+            Some(true) => ("✓", self.theme.ok),
+            Some(false) => ("✗", self.theme.fail),
+        }
+    }
+
+    /// The stacked panel: one row per job across the full width, for terminals too narrow for the side column.
     fn panel_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let t = &self.theme;
         let mut lines = Vec::new();
         for job in &self.s.jobs {
-            let t = &self.theme;
-            let (mark, mark_style) = match &job.status {
-                Status::Running => (self.spinner(), t.running),
-                Status::Done => ("✓", t.ok),
-                Status::Failed(_) => ("✗", t.fail),
-                Status::Cancelled => ("■", t.cancelled),
-            };
-            let (who, who_style) = match &job.kind {
-                Kind::Agent { agent, write } => (format!("{}{}", agent.name(), if *write { "!" } else { "" }), self.agent_style(*agent)),
-                Kind::Ringo { command } => (format!("ringo {command}"), t.ringo),
-            };
-            let mut detail = job.activity.clone();
-            if job.worktree.is_some() && job.status == Status::Done {
-                detail = format!("{} {detail}", if job.applied { "[applied]" } else { "[change ready]" });
-            }
-            let overlaps: Vec<String> = self.s.overlaps(job.id).into_iter()
-                .map(|(other, files)| format!("#{other} {}", files.join(", "))).collect();
-            let warning = if overlaps.is_empty() { String::new() } else { format!("⚠ same files as {}", overlaps.join("; ")) };
+            let JobParts { mark, mark_style, who, who_style, mut detail, warning, stats } = self.job_parts(job);
             if !warning.is_empty() {
                 detail = format!(" · {detail}");
             }
-            let calls = if job.calls > 0 { format!(" {}c", job.calls) } else { String::new() };
             let id = format!("#{:<3}", job.id);
             let who = format!("{who:<13}");
-            let stats = format!(" {:>6} {:>7}{calls}  ", fmt_age(job.age()), fmt_tokens(job.tokens.total()));
+            let (age_tokens, calls) = stats.split_once(' ').map_or((stats.as_str(), ""), |(a, rest)| (a, rest));
+            let stats = format!(" {:>6} {:>10}  ", age_tokens, calls);
             let room = width.saturating_sub(id.chars().count() + who.chars().count() + stats.chars().count() + 2);
             let warn_room = warning.chars().count().min(room);
             let row = if self.selected == job.id { t.selected } else { Style::new() };
@@ -412,11 +431,7 @@ impl App {
             ]).style(row));
             for (i, sub) in job.subs.iter().enumerate() {
                 let branch = if i + 1 == job.subs.len() { "└" } else { "├" };
-                let (mark, mark_style) = match sub.ended {
-                    None => (self.spinner(), t.running),
-                    Some(true) => ("✓", t.ok),
-                    Some(false) => ("✗", t.fail),
-                };
+                let (mark, mark_style) = self.sub_mark(sub.ended);
                 let label = format!("     {branch} {:<34} ", ringo_cli::parse::short(&sub.label, 34));
                 let room = width.saturating_sub(label.chars().count() + 4);
                 lines.push(Line::from(vec![
@@ -427,20 +442,58 @@ impl App {
             }
         }
         if lines.is_empty() {
-            lines.push(Line::styled("no jobs yet: /help", self.theme.dim));
+            lines.push(Line::styled("no jobs yet: /help", t.dim));
+        }
+        lines
+    }
+
+    /// The side column: each job as a short card (who, mark, time and tokens; then what it is doing, any
+    /// same-files warning, and one line per subagent), so it reads in a narrow column.
+    fn side_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let short = |text: &str, room: usize| ringo_cli::parse::short(text, room);
+        let mut lines = Vec::new();
+        for job in &self.s.jobs {
+            let JobParts { mark, mark_style, who, who_style, detail, warning, stats } = self.job_parts(job);
+            let row = if self.selected == job.id { t.selected } else { Style::new() };
+            let id = format!("#{} ", job.id);
+            let room = width.saturating_sub(id.chars().count() + stats.chars().count() + 3);
+            let who = format!("{:<room$}", short(&who, room));
+            lines.push(Line::from(vec![
+                Span::styled(id, t.dim.patch(row)),
+                Span::styled(who, who_style.patch(row)),
+                Span::styled(format!(" {mark} "), mark_style.patch(row)),
+                Span::styled(stats, t.dim.patch(row)),
+            ]).style(row));
+            let inner = width.saturating_sub(3);
+            if !detail.is_empty() {
+                lines.push(Line::from(Span::raw(format!("   {}", short(&detail, inner)))).style(row));
+            }
+            if !warning.is_empty() {
+                lines.push(Line::from(Span::styled(format!("   {}", short(&warning, inner)), t.warn)));
+            }
+            for (i, sub) in job.subs.iter().enumerate() {
+                let branch = if i + 1 == job.subs.len() { "└" } else { "├" };
+                let (mark, mark_style) = self.sub_mark(sub.ended);
+                let room = width.saturating_sub(7);
+                let text = if sub.activity.is_empty() { sub.label.clone() } else { format!("{}: {}", sub.label, sub.activity) };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("   {branch} "), t.dim),
+                    Span::styled(format!("{mark} "), mark_style),
+                    Span::styled(short(&text, room), t.dim),
+                ]));
+            }
+        }
+        if lines.is_empty() {
+            lines.push(Line::styled("no jobs yet: /help", t.dim));
         }
         lines
     }
 
     fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
-        let width = area.width.saturating_sub(2) as usize;
-        let panel = self.panel_lines(width);
-        let panel_h = (panel.len() as u16 + 2).clamp(3, (area.height / 2).max(3));
-        let [top, jobs, log, input] = Layout::vertical([Constraint::Length(1), Constraint::Length(panel_h),
-            Constraint::Min(3), Constraint::Length(3)]).areas(area);
-
         let t = self.theme;
+        let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(area);
         let header = Line::from(vec![
             Span::styled(" ringo ", t.brand),
             Span::styled(format!(" {}  ·  {} running  ·  {} tokens this session  ·  pipelines: {}", self.label,
@@ -450,9 +503,26 @@ impl App {
         let block = |title: String, focused: bool| Block::bordered().border_type(BorderType::Rounded)
             .border_style(if focused { t.focus } else { t.border }).title(Span::styled(title, t.title));
 
-        let skip = panel.len().saturating_sub(panel_h as usize - 2); // newest jobs stay visible
-        f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(block(" agents ".into(), false)), jobs);
+        // Wide terminals: the agents in a column on the left, the chat beside it. Narrow ones: stacked.
+        let (log, input) = if area.width >= SIDE_MIN_WIDTH {
+            let side_w = (area.width * 32 / 100).clamp(34, 52);
+            let [side, main] = Layout::horizontal([Constraint::Length(side_w), Constraint::Min(40)]).areas(body);
+            let panel = self.side_lines(side.width.saturating_sub(2) as usize);
+            let skip = panel.len().saturating_sub(side.height.saturating_sub(2) as usize); // newest jobs stay visible
+            f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(block(" agents ".into(), false)), side);
+            let [log, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(main);
+            (log, input)
+        } else {
+            let panel = self.panel_lines(area.width.saturating_sub(2) as usize);
+            let panel_h = (panel.len() as u16 + 2).clamp(3, (body.height / 2).max(3));
+            let [jobs, log, input] = Layout::vertical([Constraint::Length(panel_h), Constraint::Min(3),
+                Constraint::Length(3)]).areas(body);
+            let skip = panel.len().saturating_sub(panel_h as usize - 2);
+            f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(block(" agents ".into(), false)), jobs);
+            (log, input)
+        };
 
+        let width = log.width.saturating_sub(2) as usize;
         let (title, source): (String, Vec<&String>) = match self.s.job(self.selected) {
             Ok(job) if self.selected > 0 => (format!(" #{} {} ", job.id, job.title), job.log.iter().collect()),
             _ => (" console ".into(), self.console.iter().collect()),
@@ -470,16 +540,30 @@ impl App {
         }
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
         let visible: Vec<Line> = rows.iter().skip(self.scroll).take(height).rev().map(|r| Line::raw(r.clone())).collect();
+        let title = if title.chars().count() > width { ringo_cli::parse::short(&title, width.saturating_sub(2)) } else { title };
         f.render_widget(Paragraph::new(visible).block(block(title, self.selected > 0)), log);
 
         let hint = format!(" {} · Enter sends · Tab jobs · /help ", if self.default == Agent::Codex { "@codex" } else { self.default.name() });
-        let room = width.max(1);
+        let room = input.width.saturating_sub(2).max(1) as usize;
         let start = self.cursor.saturating_sub(room - 1);
         let shown: String = self.input.iter().skip(start).take(room).collect();
         f.render_widget(Paragraph::new(shown).block(block(hint, true)), input);
         f.set_cursor_position((input.x + 1 + (self.cursor - start) as u16, input.y + 1));
     }
 }
+
+struct JobParts {
+    mark: &'static str,
+    mark_style: Style,
+    who: String,
+    who_style: Style,
+    detail: String,
+    warning: String,
+    stats: String,
+}
+
+/// From this width the agents panel is a column beside the chat; below it, a strip above the chat.
+const SIDE_MIN_WIDTH: u16 = 90;
 
 pub fn run() -> ExitCode {
     let agents = match ringo_cli::configured_agents() {

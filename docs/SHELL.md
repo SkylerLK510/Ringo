@@ -60,19 +60,20 @@ shell, or `ringo setup`, adds another agent later.
 
 ```
  ringo  my-repo (main)  ·  2 running  ·  48.1k tokens this session  ·  pipelines: codex-chatgpt
-┌ agents ───────────────────────────────────────────────────────────────────────────────────┐
-│#1  codex!       ✓   0:41   34.8k  [change ready] Created the retry wrapper and its test.  │
-│#2  claude       ●   0:12   13.3k  Grep fn retry                                           │
-│     └ Explore: find callers           ● Read client.rs                                    │
-│#3  ringo review ●   0:05       0 1c  review: calling codex-chatgpt                        │
-└───────────────────────────────────────────────────────────────────────────────────────────┘
-┌ #2 where else do we retry HTTP calls? ────────────────────────────────────────────────────┐
-│ ...the selected job's live log...                                                         │
-└───────────────────────────────────────────────────────────────────────────────────────────┘
-┌ @codex · Enter sends · Tab jobs · /help ──────────────────────────────────────────────────┐
-│ /review #1                                                                                │
-└───────────────────────────────────────────────────────────────────────────────────────────┘
+╭ agents ─────────────────────────────╮╭ #2 where else do we retry HTTP calls? ─────────────────╮
+│#1 codex!              ✓ 0:41 34.8k  ││ ...the selected job's live log, or the console...       │
+│   [change ready] Created the retry… ││                                                         │
+│#2 claude              ⠼ 0:12 13.3k  ││                                                         │
+│   Grep fn retry                     ││                                                         │
+│   └ ⠼ Explore: find callers: Read … ││                                                         │
+│#3 ringo review        ⠼ 0:05 0 1c   │╰─────────────────────────────────────────────────────────╯
+│   review: calling codex-chatgpt     │╭ @codex · Enter sends · Tab jobs · /help ────────────────╮
+│                                     ││ /review #1                                              │
+╰─────────────────────────────────────╯╰─────────────────────────────────────────────────────────╯
 ```
+
+From 90 columns wide, the agents sit in a column on the left and the chat beside them. On a narrower terminal the
+panel moves above the chat, one row per job.
 
 | You type | What happens |
 |---|---|
