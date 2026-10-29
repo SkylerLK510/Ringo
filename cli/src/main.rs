@@ -2,6 +2,7 @@
 //! unchanged, so release pinning and the measured pipelines stay exactly as they are.
 
 mod setup;
+mod theme;
 mod tui;
 
 use std::ffi::OsString;

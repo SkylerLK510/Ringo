@@ -3,9 +3,10 @@
 
 use ratatui::crossterm::event::{self, Event as Term, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Color, Modifier, Style};
+use crate::theme::Theme;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
 use ringo_cli::{Agent, Kind, Session, Status};
 use std::collections::VecDeque;
@@ -27,6 +28,7 @@ Agents (full agent turns: far more tokens per task; the panel shows each one's c
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
   /use NAME            default agent for lines without @ (now: {default})
   /setup               add another agent and sign in to it
+  /theme [NAME]        colours: siamese, siamese-light, midnight or mono (now: {theme})
 Jobs: /show N  /diff N  /apply N  /drop N (remove its worktree)  /kill N  /quit
 Keys: Tab / Shift-Tab select a job, PgUp / PgDn scroll, Up / Down history, Esc clear, Ctrl-C twice quits.";
 
@@ -46,6 +48,7 @@ pub enum Cmd {
     Work(String),
     Help,
     Setup,
+    Theme(Option<String>),
     Quit,
 }
 
@@ -64,6 +67,7 @@ pub fn parse(line: &str, default: Agent, all: &[Agent]) -> Result<Cmd, String> {
             "help" | "?" => Ok(Cmd::Help),
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "setup" => Ok(Cmd::Setup),
+            "theme" => Ok(Cmd::Theme(words.next().map(str::to_string))),
             "use" => tail.parse::<String>().ok().and_then(|n| Agent::from_name(&n)).map(Cmd::Use)
                 .ok_or("/use codex, claude or grok".into()),
             "backend" if !tail.is_empty() => Ok(Cmd::Backend(tail.into())),
@@ -142,7 +146,13 @@ struct App {
     setup: bool,
     label: String,
     agents: Vec<Agent>,
+    theme: Theme,
+    started: Instant,
 }
+
+/// The running mark: a braille spinner, one frame per SPIN_MS while anything runs (the only redraws then).
+const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPIN_MS: u128 = 120;
 
 impl App {
     fn say(&mut self, text: impl AsRef<str>) {
@@ -154,9 +164,25 @@ impl App {
         }
     }
 
+    fn help_text(&self) -> String {
+        HELP.replace("{backend}", &self.s.backend).replace("{default}", self.default.name()).replace("{theme}", self.theme.name)
+    }
+
     fn help(&mut self) {
-        let text = HELP.replace("{backend}", &self.s.backend).replace("{default}", self.default.name());
+        let text = self.help_text();
         self.say(text);
+    }
+
+    fn agent_style(&self, agent: Agent) -> Style {
+        match agent {
+            Agent::Codex => self.theme.codex,
+            Agent::Claude => self.theme.claude,
+            Agent::Grok => self.theme.grok,
+        }
+    }
+
+    fn spinner(&self) -> &'static str {
+        SPIN[(self.started.elapsed().as_millis() / SPIN_MS) as usize % SPIN.len()]
     }
 
     fn submit(&mut self) {
@@ -190,7 +216,22 @@ impl App {
             None
         };
         Ok(match cmd {
-            Cmd::Help => Some(HELP.replace("{backend}", &self.s.backend).replace("{default}", self.default.name())),
+            Cmd::Help => Some(self.help_text()),
+            Cmd::Theme(None) => Some(format!("  theme: {} (also: {})", self.theme.name,
+                crate::theme::NAMES.iter().filter(|n| **n != self.theme.name).copied().collect::<Vec<_>>().join(", "))),
+            Cmd::Theme(Some(name)) => {
+                let depth = crate::theme::depth(|k| std::env::var(k).ok());
+                match Theme::named(&name, depth) {
+                    Some(theme) => {
+                        self.theme = theme;
+                        match crate::theme::save(theme.name) {
+                            Ok(()) => Some(format!("  theme: {} (saved for next time)", theme.name)),
+                            Err(e) => Some(format!("  theme: {} (not saved: {e})", theme.name)),
+                        }
+                    }
+                    None => Some(format!("  no theme {name}: {}", crate::theme::NAMES.join(", "))),
+                }
+            }
             Cmd::Quit => {
                 self.quit = true;
                 None
@@ -333,15 +374,16 @@ impl App {
     fn panel_lines(&self, width: usize) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for job in &self.s.jobs {
-            let (mark, color) = match &job.status {
-                Status::Running => ("●", Color::Yellow),
-                Status::Done => ("✓", Color::Green),
-                Status::Failed(_) => ("✗", Color::Red),
-                Status::Cancelled => ("■", Color::DarkGray),
+            let t = &self.theme;
+            let (mark, mark_style) = match &job.status {
+                Status::Running => (self.spinner(), t.running),
+                Status::Done => ("✓", t.ok),
+                Status::Failed(_) => ("✗", t.fail),
+                Status::Cancelled => ("■", t.cancelled),
             };
-            let who = match &job.kind {
-                Kind::Agent { agent, write } => format!("{}{}", agent.name(), if *write { "!" } else { "" }),
-                Kind::Ringo { command } => format!("ringo {command}"),
+            let (who, who_style) = match &job.kind {
+                Kind::Agent { agent, write } => (format!("{}{}", agent.name(), if *write { "!" } else { "" }), self.agent_style(*agent)),
+                Kind::Ringo { command } => (format!("ringo {command}"), t.ringo),
             };
             let mut detail = job.activity.clone();
             if job.worktree.is_some() && job.status == Status::Done {
@@ -349,38 +391,43 @@ impl App {
             }
             let overlaps: Vec<String> = self.s.overlaps(job.id).into_iter()
                 .map(|(other, files)| format!("#{other} {}", files.join(", "))).collect();
-            if !overlaps.is_empty() {
-                detail = format!("⚠ same files as {} · {detail}", overlaps.join("; "));
+            let warning = if overlaps.is_empty() { String::new() } else { format!("⚠ same files as {}", overlaps.join("; ")) };
+            if !warning.is_empty() {
+                detail = format!(" · {detail}");
             }
             let calls = if job.calls > 0 { format!(" {}c", job.calls) } else { String::new() };
-            let head = format!("#{:<3}{:<13}", job.id, who);
+            let id = format!("#{:<3}", job.id);
+            let who = format!("{who:<13}");
             let stats = format!(" {:>6} {:>7}{calls}  ", fmt_age(job.age()), fmt_tokens(job.tokens.total()));
-            let room = width.saturating_sub(head.chars().count() + stats.chars().count() + 2);
-            let style = if self.selected == job.id { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            let room = width.saturating_sub(id.chars().count() + who.chars().count() + stats.chars().count() + 2);
+            let warn_room = warning.chars().count().min(room);
+            let row = if self.selected == job.id { t.selected } else { Style::new() };
             lines.push(Line::from(vec![
-                Span::styled(head, style),
-                Span::styled(mark.to_string(), Style::new().fg(color)),
-                Span::styled(stats, style),
-                Span::raw(ringo_cli::parse::short(&detail, room)),
-            ]));
+                Span::styled(id, t.dim.patch(row)),
+                Span::styled(who, who_style.patch(row)),
+                Span::styled(mark.to_string(), mark_style.patch(row)),
+                Span::styled(stats, t.dim.patch(row)),
+                Span::styled(ringo_cli::parse::short(&warning, warn_room), t.warn),
+                Span::raw(ringo_cli::parse::short(&detail, room - warn_room)),
+            ]).style(row));
             for (i, sub) in job.subs.iter().enumerate() {
                 let branch = if i + 1 == job.subs.len() { "└" } else { "├" };
-                let (mark, color) = match sub.ended {
-                    None => ("●", Color::Yellow),
-                    Some(true) => ("✓", Color::Green),
-                    Some(false) => ("✗", Color::Red),
+                let (mark, mark_style) = match sub.ended {
+                    None => (self.spinner(), t.running),
+                    Some(true) => ("✓", t.ok),
+                    Some(false) => ("✗", t.fail),
                 };
                 let label = format!("     {branch} {:<34} ", ringo_cli::parse::short(&sub.label, 34));
                 let room = width.saturating_sub(label.chars().count() + 4);
                 lines.push(Line::from(vec![
-                    Span::styled(label, Style::new().fg(Color::Gray)),
-                    Span::styled(mark.to_string(), Style::new().fg(color)),
+                    Span::styled(label, t.dim),
+                    Span::styled(mark.to_string(), mark_style),
                     Span::raw(format!(" {}", ringo_cli::parse::short(&sub.activity, room))),
                 ]));
             }
         }
         if lines.is_empty() {
-            lines.push(Line::styled("no jobs yet: /help", Style::new().fg(Color::DarkGray)));
+            lines.push(Line::styled("no jobs yet: /help", self.theme.dim));
         }
         lines
     }
@@ -393,12 +440,18 @@ impl App {
         let [top, jobs, log, input] = Layout::vertical([Constraint::Length(1), Constraint::Length(panel_h),
             Constraint::Min(3), Constraint::Length(3)]).areas(area);
 
-        let header = format!(" ringo  {}  ·  {} running  ·  {} tokens this session  ·  pipelines: {}",
-                             self.label, self.s.running(), fmt_tokens(self.s.tokens()), self.s.backend);
-        f.render_widget(Paragraph::new(header).style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)), top);
+        let t = self.theme;
+        let header = Line::from(vec![
+            Span::styled(" ringo ", t.brand),
+            Span::styled(format!(" {}  ·  {} running  ·  {} tokens this session  ·  pipelines: {}", self.label,
+                                 self.s.running(), fmt_tokens(self.s.tokens()), self.s.backend), t.header),
+        ]);
+        f.render_widget(Paragraph::new(header).style(t.header), top);
+        let block = |title: String, focused: bool| Block::bordered().border_type(BorderType::Rounded)
+            .border_style(if focused { t.focus } else { t.border }).title(Span::styled(title, t.title));
 
         let skip = panel.len().saturating_sub(panel_h as usize - 2); // newest jobs stay visible
-        f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(Block::bordered().title(" agents ")), jobs);
+        f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(block(" agents ".into(), false)), jobs);
 
         let (title, source): (String, Vec<&String>) = match self.s.job(self.selected) {
             Ok(job) if self.selected > 0 => (format!(" #{} {} ", job.id, job.title), job.log.iter().collect()),
@@ -417,13 +470,13 @@ impl App {
         }
         self.scroll = self.scroll.min(rows.len().saturating_sub(height));
         let visible: Vec<Line> = rows.iter().skip(self.scroll).take(height).rev().map(|r| Line::raw(r.clone())).collect();
-        f.render_widget(Paragraph::new(visible).block(Block::bordered().title(title)), log);
+        f.render_widget(Paragraph::new(visible).block(block(title, self.selected > 0)), log);
 
         let hint = format!(" {} · Enter sends · Tab jobs · /help ", if self.default == Agent::Codex { "@codex" } else { self.default.name() });
         let room = width.max(1);
         let start = self.cursor.saturating_sub(room - 1);
         let shown: String = self.input.iter().skip(start).take(room).collect();
-        f.render_widget(Paragraph::new(shown).block(Block::bordered().title(hint)), input);
+        f.render_widget(Paragraph::new(shown).block(block(hint, true)), input);
         f.set_cursor_position((input.x + 1 + (self.cursor - start) as u16, input.y + 1));
     }
 }
@@ -452,7 +505,7 @@ pub fn run() -> ExitCode {
     let label = match branch { Some(b) => format!("{name} ({b})"), None => name };
     let mut app = App { s: session, input: Vec::new(), cursor: 0, history: Vec::new(), hist: 0, selected: 0, scroll: 0,
                         log_height: 0, default: agents[0], console: VecDeque::new(), quit_armed: false, quit: false,
-                        setup: false, label, agents };
+                        setup: false, label, agents, theme: Theme::load(), started: Instant::now() };
     let found: Vec<&str> = app.agents.iter().map(|a| a.name()).collect();
     app.say(format!("Ringo shell in {}. Agents: {} (/setup adds another).", app.s.repo.display(), found.join(", ")));
     app.say(format!("Private state: {}", app.s.dir.display()));
@@ -467,7 +520,8 @@ pub fn run() -> ExitCode {
             }
             dirty = false;
         }
-        if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+        let wait = if app.s.running() > 0 { SPIN_MS as u64 } else { 250 };
+        if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             match event::read() {
                 Ok(Term::Key(k)) if k.kind == KeyEventKind::Press => {
                     app.key(k);
@@ -487,8 +541,8 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
-        if app.s.running() > 0 && tick.elapsed() >= Duration::from_secs(1) {
-            dirty = true; // the running clocks
+        if app.s.running() > 0 && tick.elapsed() >= Duration::from_millis(SPIN_MS as u64) {
+            dirty = true; // the spinner and the running clocks
             tick = Instant::now();
         }
     }

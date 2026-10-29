@@ -93,6 +93,26 @@ subagent: Claude Code's Task subagents and Codex's spawned agents. When two unap
 file, both rows say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs no tokens: it
 compares the agents' own edit events as they arrive.
 
+## Colours
+
+The default theme, `siamese`, takes its palette from a seal-point Siamese: cream and fawn for text and frames, seal
+brown for the header bar, and sapphire, the eye colour, for whatever is running and for the line you type in. Each
+agent keeps one colour (Codex mint, Claude clay, Grok silver), finished jobs are sage, failures rose, and the
+same-files warning amber.
+
+| Theme | For |
+|---|---|
+| `siamese` | dark terminals (default) |
+| `siamese-light` | light terminals |
+| `midnight` | dark terminals, navy and violet |
+| `mono` | no colour: bold, dim and reverse only |
+
+`/theme NAME` switches and remembers the choice; `RINGO_THEME=NAME` overrides it for one start. Ringo uses 24-bit
+colour when the terminal says it supports it (`COLORTERM=truecolor`, iTerm2, WezTerm, Ghostty, kitty, Alacritty,
+Windows Terminal, VS Code) and the nearest of the 256 standard colours otherwise. `NO_COLOR` (https://no-color.org) or
+`TERM=dumb` turns colour off. The theme is fitted once at start; running jobs show a spinner, redrawn about eight
+times a second only while something runs (measured under 0.1% CPU with two jobs running; the shell idles at 2.5 MB).
+
 ## What it costs, and why the defaults are what they are
 
 Ringo's measured advantage is that it sends models less: on HumanEval+ the pipeline passed 147 of 154 tasks at 3,500
@@ -115,9 +135,9 @@ turn re-sends the conversation, so a follow-up costs about twice a first turn; s
 unrelated task instead of continuing a long read conversation. Nothing is shared between agents unless you write
 `{#N}`. (`--bare` would cut more, but it signs in with an API key only, so the shell does not use it.)
 
-The program itself: a 0.9 MB binary that starts in 2.4 ms and idles at 3 MB of memory with no CPU use, against
-35.5 ms and 24 MB for `python3 ringo.py --help` (macOS, Apple silicon). It redraws only on an event, a key, or once
-a second while a job runs.
+The program itself: a 1.0 MB binary that starts in 2.4 ms and idles at 2.5 MB of memory with no measurable CPU,
+against 35.5 ms and 24 MB for `python3 ringo.py --help` (macOS, Apple silicon). It redraws only on an event, a key,
+or for the spinner while a job runs.
 
 ## Safety model
 
