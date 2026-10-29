@@ -336,8 +336,9 @@ class ArmTest(unittest.TestCase):
                 dest = Path(argv[argv.index('--out') + 1])
                 launched.append((Path(argv[1]).parent.name, dest.parent.name, dest.name))
                 dest.mkdir(parents=True)
-                (dest / 'report.json').write_text(json.dumps(
-                    {'status': 'ready_for_review', 'usage': {'input': 10_000, 'output': 2_000}}))  # 1.0 credit
+                usage = {'input': 10_000, 'output': 2_000}  # 1.0 credit
+                (dest / 'trace.jsonl').write_text(json.dumps({'step': 'writer-1', 'status': 'ok', 'usage': usage}) + '\n')
+                (dest / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'usage': usage}))
                 return unittest.mock.Mock(stdout=json.dumps({'status': 'ready_for_review'}), stderr='')
             ids = [f'Mbpp/{i}' for i in range(10)]
             arms = {'a': out / 'impl-a', 'b': out / 'impl-b'}
@@ -349,6 +350,10 @@ class ArmTest(unittest.TestCase):
             self.assertEqual(len(launched) % 2, 0)
             self.assertLessEqual(sum(study.spent(out / f'runs-{n}') for n in arms), 6.5)
             self.assertEqual(len(launched), 6)  # three pairs at 1.0 credit a run fit under 6.5
+            failed = out / 'runs-a' / 'Mbpp-99'
+            failed.mkdir()  # a run that paid for a call and wrote no report still counts
+            (failed / 'trace.jsonl').write_text(json.dumps({'step': 'writer-1', 'status': 'error', 'usage': {'output': 4_000}}) + '\n')
+            self.assertEqual(study.spent(out / 'runs-a'), 4.0)
 
     def test_compare_pairs_graded_tasks_and_counts_gains_harms_and_stands(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -383,3 +388,10 @@ class ArmTest(unittest.TestCase):
             self.assertEqual(result['b_detail']['stands'], {'Mbpp/3': [2]})  # a dispute stop is a stand
             self.assertEqual(set(result['b_detail']['noted']), {'Mbpp/2'})
             self.assertTrue((out / 'compare-a-b.json').is_file())
+            grade = out / 'runs-b' / 'Mbpp-1' / 'grade.json'
+            grade.write_text(json.dumps({'round1_pass': True, 'delivered_pass': True, 'suspect': True}))
+            with unittest.mock.patch('sys.stdout'):
+                result = study.compare_all(out, ['a', 'b'], .05)
+            self.assertEqual(result['suspect'], ['Mbpp/1'])
+            self.assertEqual(result['pass']['harms'], ['Mbpp/1', 'Mbpp/2'])  # the suspect draft is a failure
+            self.assertEqual(result['pass_without_suspect'], {'a': 1, 'b': 1, 'paired': 2})

@@ -478,16 +478,22 @@ def credits(usage):
     return sum((usage.get(k) or 0) * rate for k, rate in RATES.items()) / 1e6
 
 
+def run_credits(run):
+    """Credits of every paid call in a run's trace, a call that failed or a run that wrote no report included."""
+    import shadow_labels
+    return sum(credits(usage) for _, usage in shadow_labels.usage_events(run / 'trace.jsonl'))
+
+
 def spent(runs):
-    """Credits of every run with a report in an arm's folder, set-aside runs included: all of them were paid for."""
-    return sum(credits(json.loads(r.read_text(encoding='utf-8')).get('usage') or {}) for r in runs.glob('*/report.json'))
+    """Credits of every run in an arm's folder, set-aside runs included: all of them were paid for."""
+    return sum(run_credits(r) for r in runs.glob('*') if r.is_dir())
 
 
 def run_all(out, ids, jobs, arms=None, max_credits=None):
     """Run each task once per arm (name -> implementation checkout; default: this checkout into runs/). The arms of
     one task are queued together, so arms run side by side in the same task order. With max_credits, a task's first
-    arm is launched only while the spend so far, the runs in flight and this task's arms, each at the mean cost of a
-    finished run, stay under the ceiling; a task's other arms are always launched, so the ceiling never splits a pair.
+    arm is launched only while the spend so far, the runs in flight and this task's arms, each reserved at the cost of
+    the costliest finished run (1 credit before any finishes), stay under the ceiling; a task's other arms are always launched, so the ceiling never splits a pair.
     Three failed runs in a row stop all launches, a started pair's other arms too; a rerun runs what is missing."""
     arms = arms or {'': HERE}
     folders = {name: out / (f'runs-{name}' if name else 'runs') for name in arms}
@@ -509,8 +515,8 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
         if max_credits is None or queue[0][1] != next(iter(arms)):
             return True  # no ceiling, or the rest of a pair already started
         total = sum(spent(f) for f in folders.values())
-        mean = sum(finished) / len(finished) if finished else 0.5  # a cautious first guess: 0.5 credits per run
-        return total + mean * (len(active) + len(arms)) <= max_credits
+        reserve = max(finished) if finished else 1.0  # the V3 HumanEval+ runs averaged 0.23 credits
+        return total + reserve * (len(active) + len(arms)) <= max_credits
 
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
         active = set()
@@ -521,9 +527,7 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
             for future in done:
                 task_id, name, proc = future.result()
                 status = (json.loads(proc.stdout or '{}') if proc.stdout.strip().startswith('{') else {}).get('status')
-                report = folders[name] / slug(task_id) / 'report.json'
-                if report.is_file():
-                    finished.append(credits(json.loads(report.read_text(encoding='utf-8')).get('usage') or {}))
+                finished.append(run_credits(folders[name] / slug(task_id)))
                 print(f'{task_id}{" [" + name + "]" if name else ""}: {status or "failed"} '
                       f'{proc.stderr.strip()[-200:] if not status else ""}', flush=True)
                 # Three runs in a row that end in an error (a usage limit, a lost login) stop new launches.
@@ -915,15 +919,20 @@ def arm_row(run):
     if report.get('dispute'):  # the dispute rule stopped on a stand, before the round recorded its digest
         stands.append(report['dispute']['round'])
     import workflow
-    notes = [r['round'] for r in rounds if (run / f"round-{r['round']}" / 'proposal.json').is_file()
-             and workflow.special_cases(json.loads((run / f"round-{r['round']}" / 'proposal.json')
-                                                   .read_text(encoding='utf-8'))['files'])]
+    # notes shown: recorded by a run that has the static note; for one without it, the rounds whose candidate it would
+    # flag and whose candidate then went to the review or, failing a check, to another writer round
+    shown = [r['round'] for r in rounds if r.get('static_shown') or r.get('static_reviewed')]
+    flagged = [r['round'] for r in rounds if (run / f"round-{r['round']}" / 'proposal.json').is_file()
+               and workflow.special_cases(json.loads((run / f"round-{r['round']}" / 'proposal.json')
+                                                     .read_text(encoding='utf-8'))['files'])]
+    would = [n for n in flagged if rounds[n - 1].get('review_findings') is not None
+             or (n < len(rounds) and any(c['status'] != 'pass' for c in rounds[n - 1].get('checks') or []))]
     return {'pass': grade_result['delivered_pass'], 'round1_pass': grade_result['round1_pass'],
             'suspect': grade_result.get('suspect', False), 'status': report['status'],
             'tokens': sum(usage.get(k) or 0 for k in ('input', 'cache_read', 'cache_write', 'output')),
             'credits': credits(usage), 'calls': usage.get('calls') or 0, 'rounds': len(rounds),
             'round1_checks_pass': checks_pass, 'round1_findings': first.get('review_findings'),
-            'stands': stands, 'noted_rounds': notes}
+            'stands': stands, 'noted_rounds': shown or would, 'notes_recorded': bool(shown)}
 
 
 def compare_all(out, arms, alpha):
@@ -933,9 +942,12 @@ def compare_all(out, arms, alpha):
     for name in arms:
         rows[name] = {task_of(r.name): arm_row(r) for r in run_folders(out / f'runs-{name}')
                       if (r / 'grade.json').is_file()}
-    both = sorted(set(rows[a]) & set(rows[b]))
-    suspect = [t for t in both if rows[a][t]['suspect'] or rows[b][t]['suspect']]
-    paired = [t for t in both if t not in suspect]
+    paired = sorted(set(rows[a]) & set(rows[b]))
+    suspect = [t for t in paired if rows[a][t]['suspect'] or rows[b][t]['suspect']]
+    for arm in arms:  # a draft that trips the file-access tripwire counts as a failure of its arm
+        for t in paired:
+            if rows[arm][t]['suspect']:
+                rows[arm][t].update({'pass': False, 'round1_pass': False})
     A, B = [rows[a][t] for t in paired], [rows[b][t] for t in paired]
     n = len(paired)
     if not n:
@@ -943,6 +955,9 @@ def compare_all(out, arms, alpha):
         return {}
     result = {'arms': [a, b], 'paired': n, 'suspect': suspect,
               'unpaired': sorted(set(rows[a]) ^ set(rows[b]))}
+    clean = [(x, y) for t, x, y in zip(paired, A, B) if t not in suspect]  # sensitivity: suspect pairs left out
+    result['pass_without_suspect'] = {a: sum(x['pass'] for x, _ in clean), b: sum(y['pass'] for _, y in clean),
+                                      'paired': len(clean)}
     for key in ('pass', 'round1_pass'):
         gains = [t for t, x, y in zip(paired, A, B) if y[key] and not x[key]]
         harms = [t for t, x, y in zip(paired, A, B) if x[key] and not y[key]]
@@ -966,9 +981,12 @@ def compare_all(out, arms, alpha):
             'review_catch': [sum(bool(r['round1_findings']) for r in reviewed if not r['round1_pass']),
                              sum(not r['round1_pass'] for r in reviewed)],
             'review_alarm': [sum(bool(r['round1_findings']) for r in reviewed if r['round1_pass']),
-                             sum(bool(r['round1_pass']) for r in reviewed)]}
+                             sum(bool(r['round1_pass']) for r in reviewed)],
+            # review-stage harms: round 1 passes the hidden tests, the delivered files fail them
+            'review_stage_harms': [t for t, r in zip(paired, rs) if r['round1_pass'] and not r['pass']]}
     p, r1 = result['pass'], result['round1_pass']
-    print(f"paired tasks {n} ({len(suspect)} suspect left out, {len(result['unpaired'])} unpaired)")
+    print(f"paired tasks {n} ({len(suspect)} with a suspect draft, counted as failures; {len(result['unpaired'])} "
+          'unpaired)')
     print(f"hidden pass, delivered: {a} {p[a]}/{n}, {b} {p[b]}/{n}; gains {len(p['gains'])}, harms "
           f"{len(p['harms'])}, exact McNemar p = {p['mcnemar_p']:.3g}; difference 95% CI "
           f"[{p['diff_ci'][0]:+.3f}, {p['diff_ci'][1]:+.3f}]")
@@ -981,6 +999,7 @@ def compare_all(out, arms, alpha):
     for name in arms:
         d = result[f'{name}_detail']
         print(f"{name}: statuses {d['statuses']}; stands {len(d['stands'])}; static notes {len(d['noted'])}; "
+              f"review-stage harms {len(d['review_stage_harms'])}; "
               f"round-1 review caught {d['review_catch'][0]}/{d['review_catch'][1]} hidden failures, "
               f"alarmed on {d['review_alarm'][0]}/{d['review_alarm'][1]} hidden passes")
     print('gains:', ', '.join(p['gains']) or 'none', '| harms:', ', '.join(p['harms']) or 'none')
