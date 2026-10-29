@@ -4,12 +4,16 @@
 //! Normalised fields (everything else is compared exactly):
 //! - state.json `pid`, `started`, `updated` (the process and the wall clock; their types are checked);
 //! - an incident's `decided_after_s` (wall clock), in watch.incident and in the incident file;
-//! - the eight random characters of a `ringo-incidents-XXXXXXXX` folder (tempfile.mkdtemp).
+//! - the eight random characters of a `ringo-incidents-XXXXXXXX` or `ringo-system-XXXXXXXX` folder (mkdtemp);
+//! - for run_plan, trace records' `started` and `seconds`, an incident's `elapsed_s` and probe `seconds` and its
+//!   comparable_seconds (as a count), a stopped call's "timed out after <t> seconds", and, for parallel waves,
+//!   the order of trace lines and calls and state.json's `last`.
 //!
 //! Python and Rust run one after the other in the same scratch folder, so paths in messages compare as they are.
 #![cfg(unix)]
 
-use ringo_cli::rt::harness::{self as h, Backend, CallWatch, Event, Leash, Num, ProbeFn, Run, Watch};
+use ringo_cli::rt::backends::{Snapshot, Watch as CallWatch};
+use ringo_cli::rt::harness::{self as h, Backend, Event, Leash, Num, ProbeFn, Run, Watch};
 use ringo_cli::rt::{pyjson, Error, Exc};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -213,6 +217,123 @@ def re_letter(letter):
     import re
     return re.compile(re.escape(letter), re.I)
 
+def make_exc(o):
+    k = o['raise']
+    if k == 'CallError':
+        return harness.CallError(o['msg'], o.get('usage'), o.get('raw'))
+    if k == 'JudgeError':
+        e = backends.JudgeError(o['msg'])
+        if 'stdout' in o:
+            e.stdout = o['stdout']
+        return e
+    if k in ('TimeoutExpired', 'Stopped'):
+        e = (subprocess.TimeoutExpired if k == 'TimeoutExpired' else backends.Stopped)(['x'], 1.0)
+        e.limit = o.get('limit', False)
+        for attr in ('usage', 'raw', 'stdout'):
+            if attr in o:
+                setattr(e, attr, o[attr])
+        return e
+    if k == 'OSError':
+        return OSError(2, 'No such file or directory', 'cmd')
+    if k == 'AdmissionRefused':
+        return harness.AdmissionRefused(o['msg'])
+    if k == 'BudgetExceeded':
+        return harness.BudgetExceeded(o['msg'])
+    if k == 'TypeError':
+        return TypeError(o['msg'])
+    if k == 'KeyboardInterrupt':
+        return KeyboardInterrupt()
+    return ValueError(o['msg'])
+
+def trace_lines(run, parallel):
+    if run is None or not run.trace or not (run.trace / 'trace.jsonl').exists():
+        return None
+    rows = []
+    for line in (run.trace / 'trace.jsonl').read_text().splitlines():
+        rec = json.loads(line)
+        for k in ('started', 'seconds'):
+            rec.pop(k, None)
+        rows.append(json.dumps(rec))
+    return sorted(rows) if parallel else rows
+
+def plan_case(case):
+    import pipelines
+    base = case['base']
+    os.makedirs(base, exist_ok=True)
+    if case.get('plan') is None:
+        plan = pipelines.load_plan(None, case['kind'])
+    else:
+        d = os.path.join(base, 'prompts')
+        os.makedirs(d, exist_ok=True)
+        for p in case['plan']['passes']:
+            Path(d, p['prompt']).write_text(f"INSTRUCTION {p['id']}", encoding='utf-8')
+        plan = pipelines.validate(json.loads(json.dumps(case['plan'])), d)
+    rules = [[r['match'], list(r['replies'])] for r in case['script']]
+    lock, seen = threading.Lock(), []
+    def outcome(message):
+        with lock:
+            for rule in rules:
+                if rule[0] in message:
+                    return rule[1].pop(0) if rule[1] else {'text': 'No defects found.'}
+        return {'text': 'No defects found.'}
+    def body(backend, system, message, timeout_s, model=None, watch=None):
+        with lock:
+            seen.append(json.dumps([backend['name'], harness.sha(system), message, timeout_s, model, watch is not None]))
+        o = outcome(message)
+        if 'text' in o:
+            return o['text'], o.get('usage')
+        raise make_exc(o)
+    if case.get('real'):
+        fn = harness.call
+    elif case['accepts_watch']:
+        fn = body
+    else:
+        def fn(backend, system, message, timeout_s, model=None):
+            return body(backend, system, message, timeout_s, model)
+    run = None
+    captured, old = io.StringIO(), sys.stderr
+    sys.stderr = captured
+    if case.get('decide'):
+        def decide():
+            path = Path(base, 't', 'incidents', 'review.1.json')
+            for _ in range(400):
+                try:
+                    incident = json.loads(path.read_text())
+                except (OSError, ValueError):
+                    incident = {}
+                if incident.get('recommendation'):
+                    Path(incident['decision_file']).write_text(case['decide'])
+                    return
+                time.sleep(0.02)
+        threading.Thread(target=decide, daemon=True).start()
+    try:
+        run = harness.Run(os.path.join(base, 't') if case['trace'] else None, case.get('max_cost'), case.get('unpriced'))
+        text, stats = harness.run_plan(plan, case['material'], case['backend'], run, call_fn=fn, timeout_s=case['timeout'],
+                                       scope=case.get('scope'), checker_spec=case.get('checker'))
+        res = {'ok': [text, stats]}
+    except BaseException as e:
+        res = {'err': [type(e).__name__, str(e)]}
+    finally:
+        sys.stderr = old
+    steps = None
+    if run is not None and run.trace:
+        steps = {p.name: p.read_text() for p in sorted((run.trace / 'steps').iterdir())}
+    return {'result': res, 'calls': sorted(seen) if case['parallel'] else seen, 'trace': trace_lines(run, case['parallel']),
+            'steps': steps, 'state': state_text(run), 'summary': run.summary() if run else None, 'stderr': captured.getvalue(),
+            'incidents': incidents(run)}
+
+def incidents(run):
+    if run is None or not run.trace or not (run.trace / 'incidents').is_dir():
+        return None
+    return {p.name: p.read_text() for p in sorted((run.trace / 'incidents').iterdir())}
+
+def call_case(case):
+    try:
+        text, usage = harness.call(case['backend'], case['system'], case['message'], case['timeout'], case.get('model'))
+        return {'ok': [text, usage]}
+    except Exception as e:
+        return {'err': [type(e).__name__, str(e), getattr(e, 'usage', None), getattr(e, 'raw', None), getattr(e, 'limit', None)]}
+
 cases = json.loads(sys.stdin.read())
 for case in cases:
     if mode == 'codex_reply':
@@ -228,6 +349,10 @@ for case in cases:
         out(script(case))
     elif mode == 'watch':
         out(watch(case))
+    elif mode == 'plan':
+        out(plan_case(case))
+    elif mode == 'call':
+        out(call_case(case))
     elif mode == 'pure':
         try:
             out({'ok': pure(case[0], case[1])})
@@ -428,10 +553,15 @@ fn normalise_files(files: &mut Value) {
 
 /// Replace the eight random characters after each `ringo-incidents-`.
 fn normalise_mkdtemp(s: &str) -> String {
+    normalise_temp(s, "ringo-incidents-")
+}
+
+/// Replace the eight random characters of a tempfile.mkdtemp folder named prefix + XXXXXXXX.
+fn normalise_temp(s: &str, prefix: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
-    while let Some(i) = rest.find("ringo-incidents-") {
-        let end = i + "ringo-incidents-".len();
+    while let Some(i) = rest.find(prefix) {
+        let end = i + prefix.len();
         out.push_str(&rest[..end]);
         out.push_str("XXXXXXXX");
         rest = &rest[(end + 8).min(rest.len())..];
@@ -1076,7 +1206,7 @@ fn rust_watch(case: &Value, sink: &Arc<Mutex<String>>) -> String {
     let base = PathBuf::from(case["base"].as_str().unwrap());
     fs::create_dir_all(&base).unwrap();
     let trace = case["trace"].as_bool().unwrap().then(|| base.join("t"));
-    let run = Run::new(trace.as_deref(), None, None).unwrap();
+    let run = Arc::new(Run::new(trace.as_deref(), None, None).unwrap());
     for (f, text) in case.get("files").and_then(Value::as_object).into_iter().flatten() {
         let p = base.join(f);
         fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -1114,7 +1244,9 @@ fn rust_watch(case: &Value, sink: &Arc<Mutex<String>>) -> String {
     sink.lock().unwrap().clear();
     let (stdout, stderr) = (case["stdout"].as_str().unwrap().to_string(), case["stderr"].as_str().unwrap().to_string());
     std::thread::scope(|s| {
-        let soft = s.spawn(|| watch.soft(case["elapsed"].as_f64().unwrap(), &|| (stdout.clone(), stderr.clone())));
+        let (out, err) = (stdout.clone(), stderr.clone());
+        let snapshot: Snapshot = Arc::new(move || Ok((out.clone(), err.clone())));
+        let soft = s.spawn(|| watch.soft(case["elapsed"].as_f64().unwrap(), snapshot));
         let started = Instant::now();
         match case["wait"].as_f64() {
             None => {
@@ -1194,7 +1326,7 @@ fn leash_and_watch_serve_the_call_watch_interface() {
     assert!(!as_watch.stop_is_set());
     call_done.set(); // the watched call ended: its probe stops
     assert!(as_watch.stop_is_set());
-    as_watch.soft(1.0, &|| (String::new(), String::new()));
+    as_watch.soft(1.0, Arc::new(|| Ok((String::new(), String::new()))));
     as_watch.set_done();
     assert!(leash.done.is_set());
     let stopped = Error::new(Exc::Stopped, "stopped");
@@ -1206,12 +1338,12 @@ fn leash_and_watch_serve_the_call_watch_interface() {
     // a Watch driven the way backends._wait drives it: soft() in a thread, then done when the command ends
     let _serial = STDERR.lock().unwrap_or_else(|e| e.into_inner());
     h::set_stderr(Some(Box::new(|_: &str| {})));
-    let run = Run::new(None, None, None).unwrap();
+    let run = Arc::new(Run::new(None, None, None).unwrap());
     let backend = Backend { name: "b".into(), argv: vec![], style: "plain".into(), subscription_auth: None, lean: None, tools: None };
     let watch = Watch::new(&run, "review", 1, &backend, Num::Int(1), Num::Int(900), "review", None);
     let w: &dyn CallWatch = &watch;
     std::thread::scope(|s| {
-        let soft = s.spawn(|| w.soft(2.0, &|| ("{\"type\":\"turn.started\"}\n".into(), String::new())));
+        let soft = s.spawn(|| w.soft(2.0, Arc::new(|| Ok(("{\"type\":\"turn.started\"}\n".into(), String::new())))));
         while !watch.incident().is_some_and(|i| i.contains_key("recommendation")) {
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1532,4 +1664,696 @@ fn sha_and_fence_match_python_on_repository_and_stdlib_files() {
 fn sha_and_fence_match_python_on_the_whole_stdlib() {
     let cases: Vec<Value> = corpus_files(1).iter().map(|p| json!(["sha_file", [p.to_string_lossy()]])).collect();
     run_pure("sha/fence (repository + whole stdlib)", cases);
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// run_plan with scripted call functions
+//
+// Normalised: each trace record's `started` and `seconds` (the wall clock) are dropped, and state.json is
+// normalised as above. Where a wave or a batched checker runs in parallel, trace lines and calls are compared as
+// sorted lists and state.json's `last` (the record written last) is dropped: their order is the threads' timing,
+// in Python as here.
+
+fn backend_of(v: &Value) -> Backend {
+    let strs = |k: &str| v.get(k).and_then(Value::as_array).map(|a| a.iter().map(|x| x.as_str().unwrap().to_string()).collect());
+    Backend {
+        name: v["name"].as_str().unwrap().into(),
+        argv: strs("argv").unwrap_or_default(),
+        style: v["style"].as_str().unwrap().into(),
+        subscription_auth: v.get("subscription_auth").and_then(Value::as_bool),
+        lean: v.get("lean").and_then(Value::as_bool),
+        tools: strs("tools"),
+    }
+}
+
+fn make_exc(o: &Value) -> Error {
+    use ringo_cli::rt::backends;
+    let msg = o.get("msg").and_then(Value::as_str).unwrap_or("").to_string();
+    let attrs = |e: Error, keys: &[&str]| -> Error {
+        let mut data = e.data.clone().and_then(|d| d.as_object().cloned()).unwrap_or_default();
+        for k in keys {
+            if let Some(v) = o.get(*k) {
+                data.insert((*k).into(), v.clone());
+            }
+        }
+        Error { data: Some(Value::Object(data)), ..e }
+    };
+    match o["raise"].as_str().unwrap() {
+        "CallError" => h::call_error(msg, o.get("usage").filter(|u| !u.is_null()).cloned(), o.get("raw").and_then(Value::as_str).map(String::from)),
+        "JudgeError" => attrs(backends::judge_error(msg, false), &["stdout"]),
+        "TimeoutExpired" | "Stopped" => {
+            let cmd = ["x".to_string()];
+            let e = if o["raise"] == "Stopped" { backends::stopped(&cmd, 1.0) } else { backends::timeout_expired(&cmd, 1.0) };
+            let e = attrs(e, &["usage", "raw", "stdout"]);
+            let limit = o.get("limit").cloned().unwrap_or(Value::Bool(false));
+            let mut data = e.data.clone().unwrap().as_object().unwrap().clone();
+            data.insert("limit".into(), limit);
+            Error { data: Some(Value::Object(data)), ..e }
+        }
+        "OSError" => Error::os("[Errno 2] No such file or directory: 'cmd'"),
+        "AdmissionRefused" => h::admission_refused(msg),
+        "BudgetExceeded" => h::budget_exceeded(msg),
+        "TypeError" => Error::new(Exc::Type, msg),
+        "KeyboardInterrupt" => backends::keyboard_interrupt(),
+        _ => Error::value(msg),
+    }
+}
+
+fn trace_lines(run: Option<&Run>, parallel: bool) -> Value {
+    let Some(text) = run.and_then(|r| r.trace.as_ref()).and_then(|t| fs::read_to_string(t.join("trace.jsonl")).ok()) else {
+        return Value::Null;
+    };
+    let mut rows: Vec<String> = text
+        .lines()
+        .map(|l| {
+            let mut rec = parse_line(l);
+            let m = rec.as_object_mut().unwrap();
+            m.shift_remove("started");
+            m.shift_remove("seconds");
+            pyjson::dumps(&rec)
+        })
+        .collect();
+    if parallel {
+        rows.sort();
+    }
+    json!(rows)
+}
+
+fn rust_plan(case: &Value, sink: &Arc<Mutex<String>>) -> String {
+    use ringo_cli::rt::pipelines;
+    let base = PathBuf::from(case["base"].as_str().unwrap());
+    fs::create_dir_all(&base).unwrap();
+    let plan = match case.get("plan").filter(|p| !p.is_null()) {
+        None => pipelines::load_plan(&root(), None, case["kind"].as_str().unwrap()).unwrap(),
+        Some(plan) => {
+            let d = base.join("prompts");
+            fs::create_dir_all(&d).unwrap();
+            for p in plan["passes"].as_array().unwrap() {
+                fs::write(d.join(p["prompt"].as_str().unwrap()), format!("INSTRUCTION {}", p["id"].as_str().unwrap())).unwrap();
+            }
+            pipelines::validate(plan.clone(), &d).unwrap()
+        }
+    };
+    type Rules = Vec<(String, std::collections::VecDeque<Value>)>;
+    let rules: Arc<Mutex<Rules>> = Arc::new(Mutex::new(
+        case["script"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["match"].as_str().unwrap().to_string(), r["replies"].as_array().unwrap().iter().cloned().collect()))
+            .collect(),
+    ));
+    let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (rules2, seen2) = (Arc::clone(&rules), Arc::clone(&seen));
+    let scripted = h::CallFn::new(case["accepts_watch"].as_bool().unwrap(), move |b, system, message, timeout_s, model, watch| {
+        seen2.lock().unwrap().push(pyjson::dumps(&json!([b.name, h::sha(system), message, timeout_s.to_value(), model, watch.is_some()])));
+        let o = {
+            let mut rules = rules2.lock().unwrap();
+            rules
+                .iter_mut()
+                .find(|(m, _)| message.contains(m.as_str()))
+                .map(|(_, replies)| replies.pop_front().unwrap_or(json!({"text": "No defects found."})))
+                .unwrap_or(json!({"text": "No defects found."}))
+        };
+        match o.get("text") {
+            Some(t) => Ok((t.as_str().unwrap().to_string(), o.get("usage").filter(|u| !u.is_null()).cloned())),
+            None => Err(make_exc(&o)),
+        }
+    });
+    let call_fn = if case.get("real").is_some() { h::CallFn::real() } else { scripted };
+    let parallel = case["parallel"].as_bool().unwrap();
+    sink.lock().unwrap().clear();
+    if let Some(answer) = case.get("decide").and_then(Value::as_str).map(String::from) {
+        let path = base.join("t/incidents/review.1.json");
+        std::thread::spawn(move || {
+            for _ in 0..400 {
+                let incident: Value = fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
+                if incident.get("recommendation").is_some_and(|r| !r.is_null()) {
+                    fs::write(incident["decision_file"].as_str().unwrap(), &answer).unwrap();
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+    }
+    let mut run = None;
+    let result = (|| -> Result<Value, Error> {
+        let trace = case["trace"].as_bool().unwrap().then(|| base.join("t"));
+        let r = Arc::new(Run::new(trace.as_deref(), case.get("max_cost"), case.get("unpriced"))?);
+        run = Some(Arc::clone(&r));
+        let checker = case.get("checker").filter(|c| !c.is_null()).map(backend_of);
+        let (text, stats) = h::run_plan(&plan, case["material"].as_str().unwrap(), &backend_of(&case["backend"]), &r, &call_fn,
+                                        num(&case["timeout"]), case.get("scope").and_then(Value::as_str), checker.as_ref())?;
+        Ok(json!([text, stats]))
+    })();
+    let res = ok_or_err(result);
+    let run = run.as_deref();
+    let steps = run.and_then(|r| r.trace.as_ref()).map(|t| {
+        let mut names: Vec<PathBuf> = fs::read_dir(t.join("steps")).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        Value::Object(names.iter().map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), json!(fs::read_to_string(p).unwrap()))).collect())
+    });
+    let mut calls = seen.lock().unwrap().clone();
+    if parallel {
+        calls.sort();
+    }
+    let state = run.and_then(|r| r.trace.as_ref()).and_then(|t| fs::read_to_string(t.join("state.json")).ok());
+    let incidents = run.and_then(|r| r.trace.as_ref()).map(|t| t.join("incidents")).filter(|d| d.is_dir()).map(|d| {
+        let mut names: Vec<PathBuf> = fs::read_dir(&d).unwrap().map(|e| e.unwrap().path()).collect();
+        names.sort();
+        Value::Object(names.iter().map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), json!(fs::read_to_string(p).unwrap()))).collect())
+    });
+    let stderr = sink.lock().unwrap().clone();
+    pyjson::dumps(&json!({"result": res, "calls": calls, "trace": trace_lines(run, parallel), "steps": steps,
+                          "state": state, "summary": run.map(|r| Value::Object(r.summary())), "stderr": stderr, "incidents": incidents}))
+}
+
+/// "timed out after 1.3 seconds" -> "timed out after <t> seconds" (the elapsed time of a stopped call).
+fn normalise_timeouts(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find("timed out after ") {
+        let start = i + "timed out after ".len();
+        out.push_str(&rest[..start]);
+        out.push_str("<t>");
+        let tail = &rest[start..];
+        rest = &tail[tail.find(" seconds").unwrap_or(0)..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn normalise_plan(line: &str, parallel: bool) -> String {
+    let mut v = parse_line(line);
+    if let Some(m) = v["incidents"].as_object_mut() {
+        for (name, text) in m.iter_mut() {
+            if !name.ends_with(".json") {
+                continue;
+            }
+            let mut incident = parse_line(text.as_str().unwrap());
+            let i = incident.as_object_mut().unwrap();
+            for k in ["elapsed_s", "decided_after_s"] {
+                i.shift_remove(k);
+            }
+            let n = i["checks"]["comparable_seconds"].as_array().map_or(0, Vec::len);
+            i["checks"]["comparable_seconds"] = json!(n);
+            if let Some(probe) = i.get_mut("probe").and_then(Value::as_object_mut) {
+                probe.shift_remove("seconds");
+            }
+            *text = json!(pyjson::dumps(&incident));
+        }
+    }
+    if let Some(text) = v["state"].as_str() {
+        let mut state = parse_line(&normalise_state(text));
+        if parallel {
+            state["last"] = json!("<parallel>");
+        }
+        v["state"] = state;
+    }
+    normalise_timeouts(&pyjson::dumps(&v))
+}
+
+/// Run f with harness's stderr captured (one test at a time holds the process-wide sink).
+fn with_stderr<T>(f: impl FnOnce(&Arc<Mutex<String>>) -> T) -> T {
+    let _serial = STDERR.lock().unwrap_or_else(|e| e.into_inner());
+    let sink = Arc::new(Mutex::new(String::new()));
+    let writer = sink.clone();
+    h::set_stderr(Some(Box::new(move |text: &str| writer.lock().unwrap().push_str(text))));
+    let out = f(&sink);
+    h::set_stderr(None);
+    out
+}
+
+const READER: &str = "### 1. Bug one (`a.py:1`)\n- Problem: p1.\n\n### 2. Bug two (`a.py:2`)\n- Problem: p2.\n\n### Not checked\n- runtime";
+
+fn plan_cases(base: &Path) -> Vec<Value> {
+    let plain = json!({"name": "x", "argv": ["x"], "style": "plain"});
+    let claude = json!({"name": "c", "argv": ["c", "-p"], "style": "claude"});
+    let checker = json!({"name": "checker", "argv": ["k"], "style": "claude"});
+    let usage = json!({"input": 2, "cache_write": 100, "cache_read": 0, "output": 10, "cost_usd": 0.01});
+    let txt = |t: &str| json!({"text": t, "usage": usage});
+    let three = json!({"version": 1, "kind": "review", "role": "ROLE", "passes": [
+        {"id": "r1", "prompt": "r1.md", "reply": "findings"}, {"id": "r2", "prompt": "r2.md", "reply": "findings"},
+        {"id": "r3", "prompt": "r3.md", "reply": "findings"}, {"id": "v", "prompt": "v.md", "reply": "verdicts", "inputs": ["r1", "r2", "r3"]}]});
+    let batched = json!({"version": 1, "kind": "review", "role": "ROLE", "passes": [
+        {"id": "r1", "prompt": "r1.md", "reply": "findings"}, {"id": "v", "prompt": "v.md", "reply": "verdicts", "inputs": ["r1"], "batch": 1}]});
+    let modelled = json!({"version": 1, "kind": "review", "role": "ROLE", "passes": [
+        {"id": "r1", "prompt": "r1.md", "reply": "findings", "model": "haiku"}, {"id": "v", "prompt": "v.md", "reply": "verdicts", "inputs": ["r1"], "model": "opus"}]});
+    let design = json!({"version": 1, "kind": "design", "role": "ROLE", "passes": [
+        {"id": "draft", "prompt": "draft.md", "reply": "proposal"}, {"id": "audit", "prompt": "audit.md", "reply": "issues", "inputs": ["draft"]},
+        {"id": "revise", "prompt": "revise.md", "reply": "proposal", "inputs": ["draft", "audit"], "when": "audit"}]});
+    let mut cases: Vec<Value> = vec![];
+    let mut add = |extra: Value| {
+        let mut case = json!({"kind": "review", "plan": null, "material": "M\u{e9} material", "backend": plain, "checker": null,
+                              "script": [], "accepts_watch": false, "trace": true, "timeout": 900, "parallel": false});
+        for (k, v) in extra.as_object().unwrap() {
+            case[k] = v.clone();
+        }
+        case["base"] = json!(base.join(format!("p{}", cases.len())).to_string_lossy());
+        cases.push(case);
+    };
+    // the built-in one-call plans
+    add(json!({"script": [{"match": "", "replies": [txt(READER)]}]}));
+    add(json!({"script": [{"match": "", "replies": [txt("No defects found.")]}], "accepts_watch": true, "timeout": 30.5}));
+    add(json!({"kind": "design", "script": [{"match": "", "replies": [txt("  Decision\n\nDo it.\n")]}], "scope": "the cache"}));
+    // retries: a failed call or a wrong shape is asked once more
+    for first in [
+        json!({"raise": "CallError", "msg": "codex turn rejected: x", "usage": usage, "raw": "events"}),
+        json!({"raise": "JudgeError", "msg": "x exited with 1: boom", "stdout": "partial"}),
+        json!({"raise": "ValueError", "msg": "bad"}),
+        json!({"raise": "TimeoutExpired", "usage": {"cost_usd": null, "items": {}, "warnings": []}, "raw": "", "stdout": "so far"}),
+        json!({"raise": "Stopped", "stdout": "x"}),
+        json!({"raise": "TimeoutExpired", "limit": true}),
+        json!({"raise": "OSError"}),
+        json!({"raise": "AdmissionRefused", "msg": "not started"}),
+        json!({"raise": "BudgetExceeded", "msg": "over"}),
+        json!({"raise": "TypeError", "msg": "odd"}),
+        json!({"raise": "KeyboardInterrupt"}),
+        json!({"text": ""}),
+    ] {
+        for (second, watch) in [(txt(READER), false), (txt(READER), true), (json!({"raise": "CallError", "msg": "again"}), true), (json!({"raise": "AdmissionRefused", "msg": "no"}), false)] {
+            add(json!({"script": [{"match": "", "replies": [first, second]}], "accepts_watch": watch}));
+        }
+    }
+    // a checker plan: reader replies in the wrong shape, verdicts, a missing verdict repaired, DUP/CUT, a checker backend
+    let verdicts = "r1.1 KEEP fine\nr1.2 REFUTED no";
+    add(json!({"plan": batched, "script": [{"match": "INSTRUCTION r1", "replies": [txt("prose without headings"), txt(READER)]},
+                                           {"match": "in this batch: r1.1.", "replies": [txt("r1.1 KEEP fine")]},
+                                           {"match": "in this batch: r1.2.", "replies": [txt("r1.2 KEEP ok")]}], "parallel": true}));
+    add(json!({"plan": batched, "script": [{"match": "INSTRUCTION r1", "replies": [txt(READER)]},
+                                           {"match": "in this batch: r1.1.", "replies": [txt("r1.1 KEEP")]},
+                                           {"match": "in this batch: r1.2.", "replies": [txt("nothing"), txt("still nothing")]}], "parallel": true}));
+    add(json!({"plan": batched, "checker": checker, "script": [{"match": "INSTRUCTION r1", "replies": [txt(READER)]},
+                                                               {"match": "in this batch: r1.1.", "replies": [txt("r1.1 KEEP")]},
+                                                               {"match": "in this batch: r1.2.", "replies": [txt("r1.2 DUP r1.1")]}], "parallel": true}));
+    add(json!({"plan": batched, "script": [{"match": "INSTRUCTION r1", "replies": [txt("No defects found.")]}]}));
+    for (v1, repair) in [(verdicts, "r1.1 KEEP"), ("r1.1 KEEP fine", "r1.2 OPEN unsure"), ("r1.1 KEEP fine", "nothing"), ("r1.1 CUT \"Side\"\nr1.1 KEEP", "r1.2 KEEP")] {
+        let plan = json!({"version": 1, "kind": "review", "role": "ROLE", "passes": [
+            {"id": "r1", "prompt": "r1.md", "reply": "findings"}, {"id": "v", "prompt": "v.md", "reply": "verdicts", "inputs": ["r1"]}]});
+        add(json!({"plan": plan, "script": [{"match": "INSTRUCTION r1", "replies": [txt(READER)]},
+                                            {"match": "still need a verdict", "replies": [txt(repair)]},
+                                            {"match": "INSTRUCTION v", "replies": [txt(v1)]}]}));
+    }
+    // three readers: the second and third in parallel, then the checker
+    add(json!({"plan": three, "parallel": true, "script": [{"match": "INSTRUCTION r1", "replies": [txt(READER)]},
+        {"match": "INSTRUCTION r2", "replies": [txt("No defects found.")]}, {"match": "INSTRUCTION r3", "replies": [txt(READER)]},
+        {"match": "INSTRUCTION v", "replies": [txt("r1.1 KEEP\nr1.2 KEEP\nr3.1 DUP r1.1\nr3.2 REFUTED")]}]}));
+    // (a failure in one branch of a parallel wave is left out: whether the other branch's call starts before it sees
+    // the stop is the threads' timing, in Python as here)
+    add(json!({"plan": three, "max_cost": 0.025, "unpriced": 0.01, "script": [{"match": "", "replies": [txt(READER), txt(READER), txt(READER)]}]}));
+    add(json!({"plan": three, "max_cost": 1, "script": [{"match": "INSTRUCTION r1", "replies": [{"text": READER}]}]}));
+    // per-pass models need a claude-style backend; with one they reach the call
+    add(json!({"plan": modelled, "script": []}));
+    add(json!({"plan": modelled, "backend": claude, "script": [{"match": "INSTRUCTION r1", "replies": [txt(READER)]}, {"match": "INSTRUCTION v", "replies": [txt(verdicts)]}]}));
+    add(json!({"plan": modelled, "backend": claude, "checker": plain, "script": []}));
+    // design: the revision runs only when the audit finds issues
+    for audit in ["NONE", "1. The cache never expires.", ""] {
+        add(json!({"kind": "design", "plan": design, "script": [{"match": "INSTRUCTION draft", "replies": [txt("Draft")]},
+            {"match": "INSTRUCTION audit", "replies": [txt(audit), txt("NONE")]}, {"match": "INSTRUCTION revise", "replies": [txt("Revised")]}]}));
+    }
+    // validation before any call, and no trace
+    add(json!({"timeout": 0, "script": []}));
+    add(json!({"timeout": -1.5, "script": []}));
+    add(json!({"checker": checker, "script": []}));
+    add(json!({"trace": false, "script": [{"match": "", "replies": [txt(READER)]}]}));
+    add(json!({"max_cost": 0.005, "unpriced": 0.5, "script": [{"match": "", "replies": [{"raise": "CallError", "msg": "x", "usage": {"cost_usd": 0.01}}, txt(READER)]}]}));
+    cases
+}
+
+#[test]
+fn run_plan_matches_python_on_scripted_call_sequences() {
+    let base = scratch("plan");
+    let cases = plan_cases(&base);
+    let py = python("plan", &cases);
+    reset(&base);
+    let rs = with_stderr(|sink| cases.iter().map(|c| rust_plan(c, sink)).collect::<Vec<_>>());
+    let parallel = |i: usize| cases[i]["parallel"].as_bool().unwrap();
+    let py: Vec<String> = py.iter().enumerate().map(|(i, l)| normalise_plan(l, parallel(i))).collect();
+    let rs: Vec<String> = rs.iter().enumerate().map(|(i, l)| normalise_plan(l, parallel(i))).collect();
+    compare("run_plan", &cases, &py, &rs);
+    let errors = py.iter().filter(|l| l.contains(r#""result": {"err""#)).count();
+    eprintln!("run_plan: {} cases raised", errors);
+    for needle in ["KeyboardInterrupt", "retry not started after attempt 1 failed", "admission_refused", r#"\"stopped\": \"limit\""#,
+                   r#"\"stopped\": \"person\""#, r#"\"status\": \"fatal\""#, r#"\"status\": \"malformed\""#, "v.repair",
+                   r#"\"status\": \"skipped\""#, "v.batch-2", "cost cap reached", "a per-pass model needs a claude-style backend",
+                   "timeout_s must be finite and positive", "soft_s"] {
+        assert!(py.iter().any(|l| l.contains(needle)), "no case covers {needle}");
+    }
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// The Python interpreter's own path, so both runtimes start the same stand-in programs.
+fn python_exe() -> String {
+    let out = Command::new("python3").args(["-c", "import sys; print(sys.executable)"]).output().unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// A plain stand-in backend (as test_soft_limit.py's): the probe gets OK at once (or, with probe_sleep, late); a
+/// review call sleeps `delay`, or with hang_first its first invocation hangs. Its settings are in argv[1].
+const CHILD: &str = r#"
+import json, os, sys, time
+cfg = json.load(open(sys.argv[1]))
+prompt = sys.stdin.read()
+if 'Reply with the single word OK.' in prompt:
+    time.sleep(cfg.get('probe_sleep', 0))
+    print('OK')
+    sys.exit(0)
+path = cfg['counter']
+n = int(open(path).read() or 0) + 1 if os.path.exists(path) else 1
+open(path, 'w').write(str(n))
+time.sleep(60 if cfg.get('hang_first') and n == 1 else cfg.get('delay', 0))
+sys.stdout.write(cfg['reply'])
+"#;
+
+#[test]
+fn soft_limits_probe_and_decisions_match_python() {
+    let base = scratch("soft");
+    let exe = python_exe();
+    let mut cases = vec![];
+    for (k, (cfg, decide)) in [
+        (json!({"delay": 1.2}), None),
+        (json!({"hang_first": true}), Some("stop\n")),
+        (json!({"delay": 0.9, "probe_sleep": 60}), None),
+        (json!({"hang_first": true}), Some("maybe")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let dir = base.join(format!("s{k}"));
+        let mut cfg = cfg;
+        cfg["counter"] = json!(dir.join("count").to_string_lossy());
+        cfg["reply"] = json!(READER);
+        let cfg_path = base.join(format!("cfg{k}.json"));
+        fs::write(&cfg_path, cfg.to_string()).unwrap();
+        let mut case = json!({"kind": "review", "plan": null, "material": "M", "checker": null, "script": [], "accepts_watch": true,
+                              "trace": true, "timeout": 0.3, "parallel": false, "real": true, "base": dir.to_string_lossy(),
+                              "backend": {"name": "stand-in", "argv": [exe, "-c", CHILD, cfg_path.to_string_lossy()], "style": "plain"}});
+        if let Some(d) = decide {
+            case["decide"] = json!(d);
+            if d != "stop\n" {
+                case["backend"]["argv"][3] = json!(cfg_path.to_string_lossy());
+                case["timeout"] = json!(0.3);
+                cfg["hang_first"] = json!(false);
+                cfg["delay"] = json!(2.0);
+                fs::write(&cfg_path, cfg.to_string()).unwrap();
+            }
+        }
+        cases.push(case);
+    }
+    let py = python("plan", &cases);
+    for k in 0..cases.len() {
+        let _ = fs::remove_dir_all(base.join(format!("s{k}")));
+    }
+    let rs = with_stderr(|sink| cases.iter().map(|c| rust_plan(c, sink)).collect::<Vec<_>>());
+    let py: Vec<String> = py.iter().map(|l| normalise_plan(l, false)).collect();
+    let rs: Vec<String> = rs.iter().map(|l| normalise_plan(l, false)).collect();
+    compare("soft limits through call", &cases, &py, &rs);
+    for needle in ["review.1.probe", r#"\"stopped\": \"person\""#, "soft limit and is still running", r#"\"decision\": \"stop\""#] {
+        assert!(py.iter().any(|l| l.contains(needle)), "no case covers {needle}");
+    }
+    fs::remove_dir_all(&base).unwrap();
+}
+
+/// A fake `claude` or plain command: argv[1] names its behaviour: what to print and exit with, or, with echo, the
+/// system prompt file and stdin it received.
+const FAKE: &str = r#"
+import json, sys, time
+cfg = json.load(open(sys.argv[1]))
+args = sys.argv[2:]
+stdin = sys.stdin.read()
+time.sleep(cfg.get('sleep', 0))
+if cfg.get('echo') == 'claude':
+    system = open(args[args.index('--system-prompt-file') + 1]).read()
+    print(json.dumps({'result': system + '|' + stdin + '|' + ' '.join(args[:-4]), 'total_cost_usd': 0.02,
+                      'usage': {'input_tokens': 3, 'cache_creation_input_tokens': 7, 'cache_read_input_tokens': 90, 'output_tokens': 4},
+                      'modelUsage': {'m2': {}, 'm1': {}}}))
+elif cfg.get('echo') == 'plain':
+    sys.stdout.write(stdin)
+else:
+    sys.stdout.write(cfg.get('stdout', ''))
+    sys.stderr.write(cfg.get('stderr', ''))
+    sys.stdout.flush()
+    sys.exit(cfg.get('exit', 0))
+"#;
+
+#[test]
+fn call_matches_python_for_claude_and_plain_backends() {
+    let base = scratch("call");
+    let fake = base.join("fake");
+    fs::write(&fake, format!("#!{}\n{FAKE}", python_exe())).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let behaviours = [
+        json!({"echo": "claude"}),
+        json!({"echo": "plain"}),
+        json!({"stdout": "{\"is_error\": true, \"result\": \"limit reached\", \"total_cost_usd\": 0.5}"}),
+        json!({"stdout": "not json"}),
+        json!({"stdout": "[1, 2]"}),
+        json!({"stdout": "\"text\""}),
+        json!({"stdout": "{\"result\": 5}"}),
+        json!({"stdout": "{\"result\": null, \"usage\": {\"input_tokens\": 1}}"}),
+        json!({"stdout": "{\"result\": \"ok\", \"total_cost_usd\": Infinity, \"usage\": \"bad\"}"}),
+        json!({"stdout": "{\"result\": \"ok\", \"modelUsage\": {\"b\": 1, \"a\": 2}}  \n"}),
+        json!({"stdout": "{\"result\": \"x\"} trailing"}),
+        json!({"stdout": "{\"is_error\": true, \"result\": \"overloaded\", \"total_cost_usd\": 0.5}", "exit": 1, "stderr": "boom\n  second   line"}),
+        json!({"stdout": "", "exit": 3, "stderr": "fatal: nope"}),
+        json!({"stdout": "partial", "exit": 2}),
+        json!({"stdout": "[]", "exit": 1}),
+        json!({"stdout": "{\"result\": \"slow\"}", "sleep": 5}),
+        json!({"stdout": "{\"result\": \"é\\u2028\", \"total_cost_usd\": 1}"}),
+    ];
+    let mut cases = vec![];
+    for (k, b) in behaviours.iter().enumerate() {
+        let cfg = base.join(format!("b{k}.json"));
+        fs::write(&cfg, b.to_string()).unwrap();
+        for style in ["claude", "plain"] {
+            let backend = json!({"name": format!("fake-{style}"), "argv": [fake.to_string_lossy(), cfg.to_string_lossy(), "--model", "sonnet"], "style": style});
+            for model in [Value::Null, json!("haiku")] {
+                let timeout = if b.get("sleep").is_some() { json!(1) } else { json!(30.0) };
+                cases.push(json!({"backend": backend, "system": "SYSTEM é\nmaterial", "message": "MESSAGE\r\nline", "timeout": timeout, "model": model}));
+            }
+        }
+    }
+    let py = python("call", &cases);
+    let rs: Vec<String> = cases
+        .iter()
+        .map(|c| {
+            let r = h::call(&backend_of(&c["backend"]), c["system"].as_str().unwrap(), c["message"].as_str().unwrap(), num(&c["timeout"]),
+                            c["model"].as_str(), None);
+            pyjson::dumps(&match r {
+                Ok((text, usage)) => json!({"ok": [text, usage]}),
+                Err(e) => json!({"err": [h::type_name(&e), e.msg, h::attr(&e, "usage").cloned(), h::attr(&e, "raw").cloned(), h::attr(&e, "limit").cloned()]}),
+            })
+        })
+        .collect();
+    // normalised: a stopped call's elapsed time and the random name of its ringo-system- folder
+    let norm = |l: &String| normalise_temp(&normalise_timeouts(&pyjson::dumps(&parse_line(l))), "ringo-system-");
+    let (py, rs): (Vec<String>, Vec<String>) = (py.iter().map(norm).collect(), rs.iter().map(norm).collect());
+    compare("call (claude and plain)", &cases, &py, &rs);
+    for needle in ["claude did not return JSON", "claude returned list, not an object", "claude reported an error: limit reached",
+                   "fake exited with 3: fatal: nope", "a per-pass model needs a claude-style backend, not fake-plain", "TimeoutExpired"] {
+        assert!(py.iter().any(|l| l.contains(needle)), "no case covers {needle}");
+    }
+    fs::remove_dir_all(&base).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The command line: the native `ringo review|design` against `python3 ringo.py review|design`
+//
+// Normalised: in a `harness: {...}` summary line, the implementation identity's values and its native-only keys
+// (runtime, binary_sha256), and elapsed_s.
+
+fn cli_env(cmd: &mut Command, home: &Path, columns: &str) {
+    cmd.env_remove("RINGO_CHILD")
+        .env_remove("RINGO_PINNED")
+        .env_remove("CODEX_HOME")
+        .env("HOME", home.join("home"))
+        .env("RINGO_RELEASE_HOME", home.join("release-state"))
+        .env("RINGO_HOME", root())
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("COLUMNS", columns)
+        .env("LINES", "40");
+}
+
+fn normalise_cli(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
+        .map(|line| match line.strip_prefix("harness: {") {
+            Some(_) => {
+                let mut summary = parse_line(&line["harness: ".len()..]);
+                if let Some(m) = summary.as_object_mut() {
+                    m.shift_remove("elapsed_s");
+                    if let Some(id) = m.get_mut("implementation").and_then(Value::as_object_mut) {
+                        id.shift_remove("runtime");
+                        id.shift_remove("binary_sha256");
+                        for k in ["mode", "id", "root"] {
+                            id.insert(k.into(), json!("<identity>"));
+                        }
+                    }
+                }
+                format!("harness: {}", pyjson::dumps(&summary))
+            }
+            None => line.to_string(),
+        })
+        .collect();
+    lines.join("\n")
+}
+
+#[test]
+fn cli_help_errors_and_refusals_match_ringo_py() {
+    let base = scratch("cli");
+    fs::create_dir_all(base.join("home")).unwrap();
+    fs::create_dir_all(base.join("release-state")).unwrap();
+    let work = base.join("work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join("m.txt"), "M\r\nmaterial\n").unwrap();
+    fs::write(work.join("bad.txt"), b"ok\xff\xfe").unwrap();
+    fs::write(work.join("bad-plan.json"), "{\"version\": 2}").unwrap();
+    fs::write(work.join("not-json.json"), "{").unwrap();
+    fs::write(work.join("list.json"), "[1]").unwrap();
+    fs::create_dir_all(work.join("full")).unwrap();
+    fs::write(work.join("full/x"), "x").unwrap();
+    let m = work.join("m.txt").to_string_lossy().to_string();
+    let inside = root().join("cli/target/ringo-gate-trace").to_string_lossy().to_string();
+    let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+    let mut argvs: Vec<Vec<String>> = vec![
+        args(&["review", "-h"]), args(&["design", "--help"]), args(&["review", "--he"]), args(&["review", "--h"]), args(&["review", "-hx"]),
+        args(&["review", "--help=x"]), args(&["review", "-h-"]), args(&["review"]), args(&["design"]), args(&["review", "--input"]),
+        args(&["review", "--input", "a", "--repo", "b"]), args(&["review", "--input", "a", "--bogus", "v"]), args(&["review", "--inp", "a", "--c", "x"]),
+        args(&["review", "--input", "a", "--max-cost", "x"]), args(&["review", "--input", "a", "--context-budget", "3"]),
+        args(&["review", "--input", "a", "--max-calls", "3"]), args(&["design", "--input", "a", "--repo", "r"]), args(&["review", "--repo", "r"]),
+        args(&["review", "--repo", "r", "--base", "b", "--head", "h", "--context-budget", "0"]), args(&["review", "--input", "a", "--rb-pr-json", "x"]),
+        args(&["review", "--input", "a", "--timeout", "abc"]), args(&["review", "--input", "a", "--", "x"]), args(&["review", "--input", "-x"]),
+        args(&["review", "--context-budget", "1.5"]), args(&["review", "--input=", "--trace", "-1"]),
+    ];
+    for extra in [
+        vec!["--input", "/nonexistent/m.txt"], vec!["--input", ""], vec!["--input", "full"], vec!["--input", "bad.txt"],
+        vec!["--input", &m, "--backend", "codex:fake exec"], vec!["--input", &m, "--backend", "'unclosed"], vec!["--input", &m, "--backend", "ollama:"],
+        vec!["--input", &m, "--max-cost", "1"], vec!["--input", &m, "--max-cost", "nan", "--unpriced-call-usd", "0"],
+        vec!["--input", &m, "--max-cost", "-1", "--unpriced-call-usd", "0"], vec!["--input", &m, "--trace", &inside],
+        vec!["--input", &m, "--trace", "full"], vec!["--input", &m, "--pipeline", "/nonexistent.json"], vec!["--input", &m, "--pipeline", "bad-plan.json"],
+        vec!["--input", &m, "--pipeline", "not-json.json"], vec!["--input", &m, "--checker-backend", "claude"], vec!["--input", &m, "--out", "full"],
+        vec!["--input", &m, "--findings-json", "f.json", "--rb-pr-json", "not-json.json"], vec!["--input", &m, "--findings-json", "f.json", "--rb-pr-json", "list.json"],
+        vec!["--input", &m, "--timeout", "0", "--backend", "cat"], vec!["--input", &m, "--timeout", "inf", "--backend", "cat"],
+        vec!["--repo", "full", "--base", "a", "--head", "b"], vec!["--repo", "/nonexistent", "--base", "a", "--head", "b"],
+    ] {
+        let mut a = vec!["review".to_string()];
+        a.extend(extra.iter().map(|s| s.to_string()));
+        argvs.push(a);
+    }
+    let mut cases = vec![];
+    for argv in &argvs {
+        for columns in ["80", "120", "40"] {
+            if columns != "80" && !argv.iter().any(|a| a.starts_with("-h") || a.starts_with("--h")) && argv.len() > 2 {
+                continue;
+            }
+            cases.push((argv.clone(), columns));
+        }
+    }
+    let run = |python: bool, argv: &[String], columns: &str| -> String {
+        let _ = fs::remove_file(work.join("f.json"));
+        let mut cmd = if python {
+            let mut c = Command::new("python3");
+            c.arg(root().join("ringo.py"));
+            c
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_ringo"))
+        };
+        cmd.args(argv).current_dir(&work).stdin(Stdio::null());
+        cli_env(&mut cmd, &base, columns);
+        let out = cmd.output().unwrap();
+        pyjson::dumps(&json!({"exit": out.status.code(), "stdout": String::from_utf8_lossy(&out.stdout),
+                              "stderr": normalise_cli(&String::from_utf8_lossy(&out.stderr))}))
+    };
+    let mut bad = vec![];
+    for (argv, columns) in &cases {
+        let (py, rs) = (run(true, argv, columns), run(false, argv, columns));
+        if py != rs {
+            bad.push(format!("{argv:?} COLUMNS={columns}\n{}", diff(&py, &rs)));
+        }
+    }
+    assert!(bad.is_empty(), "{} of {} command lines differ\n{}", bad.len(), cases.len(), bad.iter().take(4).cloned().collect::<Vec<_>>().join("\n"));
+    eprintln!("command line: {} cases identical", cases.len());
+    let _ = fs::remove_dir_all(root().join("cli/target/ringo-gate-trace"));
+    fs::remove_dir_all(&base).unwrap();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Ctrl-C: SIGINT during a call kills the call's process tree, records the attempt, marks the run interrupted
+
+/// A stand-in that starts a grandchild, writes both pids, and hangs.
+const HANG: &str = r#"
+import os, subprocess, sys, time
+sys.stdin.read()
+child = subprocess.Popen(['sleep', '60'])
+open(sys.argv[1], 'w').write(f'{os.getpid()} {child.pid}')
+time.sleep(60)
+"#;
+
+fn interrupted_run(python: bool, base: &Path) -> (Option<i32>, Value) {
+    let dir = base.join(if python { "py" } else { "rs" });
+    fs::create_dir_all(dir.join("home")).unwrap();
+    fs::create_dir_all(dir.join("release-state")).unwrap();
+    fs::write(dir.join("m.txt"), "M").unwrap();
+    let pids = dir.join("pids");
+    let backend = format!("{} -c {} {}", python_exe(), shell_quote(HANG), shell_quote(&pids.to_string_lossy()));
+    let mut cmd = if python {
+        let mut c = Command::new("python3");
+        c.arg(root().join("ringo.py"));
+        c
+    } else {
+        Command::new(env!("CARGO_BIN_EXE_ringo"))
+    };
+    cmd.args(["review", "--input", "m.txt", "--backend", &backend, "--trace", "t", "--timeout", "30"]).current_dir(&dir);
+    cli_env(&mut cmd, &dir, "80");
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let started = Instant::now();
+    while !pids.exists() || fs::read_to_string(&pids).unwrap().split(' ').count() < 2 {
+        assert!(started.elapsed() < Duration::from_secs(20), "the stand-in never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) };
+    let status = child.wait().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(20), "the run outlived its interrupt");
+    let ids: Vec<i32> = fs::read_to_string(&pids).unwrap().split(' ').map(|p| p.parse().unwrap()).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    for pid in ids {
+        // the call's whole process tree is gone (a zombie of the stand-in's own child is reaped by init)
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive || is_zombie(pid), "process {pid} outlived the interrupt");
+    }
+    let trace: Vec<Value> = fs::read_to_string(dir.join("t/trace.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut rec = parse_line(l);
+            let m = rec.as_object_mut().unwrap();
+            m.shift_remove("started");
+            m.shift_remove("seconds");
+            rec
+        })
+        .collect();
+    let state = parse_line(&normalise_state(&fs::read_to_string(dir.join("t/state.json")).unwrap()));
+    (status.code(), json!({"trace": trace, "state": state}))
+}
+
+fn is_zombie(pid: i32) -> bool {
+    let out = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().starts_with('Z')
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
+}
+
+#[test]
+fn sigint_kills_the_call_and_marks_the_run_interrupted_as_python_does() {
+    let base = scratch("sigint");
+    let (py_code, py) = interrupted_run(true, &base);
+    let (rs_code, rs) = interrupted_run(false, &base);
+    assert_eq!(rs_code, Some(130), "the native runtime exits 130 after Ctrl-C");
+    assert_eq!(py_code, None, "Python ends by SIGINT itself");
+    let (py, rs) = (pyjson::dumps(&py), pyjson::dumps(&rs));
+    assert_eq!(py.replace(&base.join("py").to_string_lossy().to_string(), "<dir>"), rs.replace(&base.join("rs").to_string_lossy().to_string(), "<dir>"));
+    assert!(rs.contains("KeyboardInterrupt: ") && rs.contains("\"status\": \"interrupted\""), "{rs}");
+    fs::remove_dir_all(&base).unwrap();
 }
