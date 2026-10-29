@@ -1,5 +1,6 @@
-//! `ringo`: with no arguments on a terminal, the shell; `review` and `design` run in this binary's native runtime
-//! unless a release decides otherwise (then, and for the other commands, Ringo's Python harness `ringo.py` runs).
+//! `ringo`: with no arguments on a terminal, the shell; `review`, `design` and `work` run in this binary's native
+//! runtime unless a release decides otherwise (then, and for the other commands, Ringo's Python harness `ringo.py`
+//! runs).
 
 mod setup;
 mod theme;
@@ -48,18 +49,24 @@ fn main() -> ExitCode {
             let rest: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
             ExitCode::from(ringo_cli::rt::wait::main(&rest) as u8)
         }
-        Some("review" | "design") => pipeline(args),
+        Some("review" | "design" | "work") => pipeline(args),
         _ => harness(args),
     }
 }
 
-/// `ringo review|design ...`: the native runtime when the release gate selects it, else ringo.py.
+/// `ringo review|design|work ...`: the native runtime when the release gate selects it, else ringo.py.
 fn pipeline(args: Vec<OsString>) -> ExitCode {
     use ringo_cli::rt::Selection;
     match ringo_cli::rt::select(&ringo_cli::ringo_home()) {
         Ok(Selection::Native(identity)) => {
             let argv: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-            ExitCode::from(ringo_cli::rt::harness::main(&argv, identity).clamp(0, 255) as u8)
+            let code = if argv[0] == "work" {
+                // ringo.py work runs workflow.main(argv[1:])
+                ringo_cli::rt::workflow::main(&argv[1..], &identity)
+            } else {
+                ringo_cli::rt::harness::main(&argv, identity)
+            };
+            ExitCode::from(code.clamp(0, 255) as u8)
         }
         Ok(Selection::Python) => harness(args),
         Err(e) => {
