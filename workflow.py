@@ -20,7 +20,6 @@ The writer replies with complete files or with exact search/replace edits. Edits
 before anything else, so the digest, checks, mutation check and judges always see full text.
 """
 import argparse
-import ast
 import concurrent.futures
 import contextlib
 import decimal
@@ -205,8 +204,6 @@ def render_feedback(feedback):
     for c in feedback.get('checks', []):
         if c['status'] != 'pass':
             out.append(f"Check {c['name']!r} {c['status']}:\n{(c['stdout'] + c['stderr'])[-6000:]}")
-    if feedback.get('static'):
-        out.append('Static notes (not check results):\n' + '\n'.join(feedback['static']))
     spec_tests = feedback.get('spec_tests')
     if spec_tests and spec_tests.get('failing'):
         out.append(f"Spec tests written from the brief alone: {spec_tests['passed']}/{spec_tests['total']} pass. "
@@ -470,42 +467,6 @@ def bridge(spec, request, timeout):
     return result
 
 
-def special_cases(files):
-    """Static notes, no model call: Python lines that return a literal when a value equals a literal container of two
-    or more items, the shape of code fitted to one example. A note is a question for the writer or the review, not a
-    failure: a contract can name a literal case."""
-    notes = []
-    for name, text in files.items():
-        if not name.endswith('.py'):
-            continue
-        try:
-            tree = ast.parse(text)
-        except (SyntaxError, ValueError):
-            continue
-        for node in ast.walk(tree):
-            test = getattr(node, 'test', None)
-            if not isinstance(node, ast.If) or not isinstance(test, ast.Compare) or len(test.ops) != 1 \
-                    or not isinstance(test.ops[0], ast.Eq) or not node.body or not isinstance(node.body[0], ast.Return):
-                continue
-            sides = [test.left, test.comparators[0]]
-            if any(_literal_items(side) >= 2 for side in sides) and _literal_items(node.body[0].value) >= 0:
-                notes.append(f'{name}:{node.lineno} returns a literal for one literal input: '
-                             f'`{ast.get_source_segment(text, test) or "?"}`. Confirm the general rule gives it; '
-                             'a case that only matches an example or a check is a defect.')
-    return notes[:3]
-
-
-def _literal_items(node):
-    """Items in a literal list, tuple or set (-1 when node is not a literal; 0 for a plain constant)."""
-    if isinstance(node, ast.Constant):
-        return 0
-    if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and all(_literal_items(e) >= 0 for e in node.elts):
-        return len(node.elts)
-    if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant):
-        return 0
-    return -1
-
-
 def review_material(spec, files, rationale, observed):
     """The review's material: the brief, the fixed source material, a diff for each file that started nonempty and
     changed (unless it is a rewrite), the candidate files and fixtures, and the observed check logs."""
@@ -523,9 +484,6 @@ def review_material(spec, files, rationale, observed):
     parts += [f'=== {name} (after the change) ===\n{text}' for name, text in files.items()]
     parts += [f'=== {name} (read-only fixture) ===\n{text}' for name, text in spec['fixtures'].items()]
     parts += [f"=== observed check: {c['name']} ({c['status']}) ===\n{c['stdout']}{c['stderr']}" for c in observed]
-    notes = special_cases(files)
-    if notes:
-        parts.append('=== static notes (not check results) ===\n' + '\n'.join(notes))
     return '\n\n'.join(parts)
 
 
@@ -815,8 +773,6 @@ def run(spec_path, out, call_fn=harness.call):
             report['rounds'].append(entry)
             answering = feedback  # what this round's writer answers; a rejected revision answers it again
             message = writer_message(feedback)
-            if feedback.get('static'):
-                entry['static_shown'] = len(feedback['static'])  # the writer sees the notes this round
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
             k = spec['candidates'] if n == 1 else 1
@@ -898,13 +854,6 @@ def run(spec_path, out, call_fn=harness.call):
                 # A reply with only a rationale also stands by the code it was shown (it disagrees with the feedback).
                 noop = not any(candidate.get(part) for part in ('files', 'edits', 'disputes', 'script'))
                 stands = text_protocol and files == current and (spec_feedback or noop)
-                # Unchanged code that fails a declared check stands against that check: another round would get the
-                # same feedback, so the run stops and hands the writer's reason to a person.
-                failing = [c['name'] for c in answering.get('checks', []) if c['status'] != 'pass']
-                if files == current and failing and 'regression' not in answering:
-                    report['dispute'] = {'round': n, 'checks': failing, 'rationale': candidate['rationale']}
-                    entry['status'] = report['status'] = 'disputed'
-                    break
                 if stands and spec_feedback:
                     for tid in feedback['spec_tests']['failing_ids']:
                         disputed.setdefault(tid, 'the writer left the code unchanged')
@@ -973,9 +922,6 @@ def run(spec_path, out, call_fn=harness.call):
                 # A known failing candidate cannot be ready for review. Spend the
                 # next allowed round on correction, not on assessing that failure.
                 feedback = {'checks': observed, **({'script': last_script} if fresh_script else {})}
-                notes = special_cases(current) if kind == 'code' else []
-                if notes:
-                    feedback['static'] = notes
                 if last_council is not None:
                     feedback['previous_council'] = last_council
                 if reviewed is not None:
@@ -984,9 +930,6 @@ def run(spec_path, out, call_fn=harness.call):
                 continue
             if not council:
                 if reviewed is None:
-                    noted = special_cases(current)
-                    if noted:
-                        entry['static_reviewed'] = len(noted)  # the review material carries the notes
                     review_text = review(current, candidate['rationale'], observed)
                     (folder / 'review.md').write_text(review_text + '\n', encoding='utf-8')
                     entry['review_findings'] = review_findings(review_text)
@@ -1072,7 +1015,7 @@ def outcome(report, out):
             'rounds': len(report['rounds']), 'error': report.get('error'),
             'usage': {k: report['usage'].get(k) for k in ('calls', 'untokened_calls', 'input', 'cache_read',
                                                          'cache_write', 'output')},
-            'elapsed_s': round(report['elapsed_s'], 1), **({'dispute': report['dispute']} if report.get('dispute') else {})}
+            'elapsed_s': round(report['elapsed_s'], 1)}
 
 
 def main(argv=None):

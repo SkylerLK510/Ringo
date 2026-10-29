@@ -118,4 +118,15 @@ Clipped changes are recorded in the README's experiments log and removed from th
 
 ## Deviations
 
-None yet.
+- The official EvalPlus evaluator ran with `EVALPLUS_MAX_MEMORY_BYTES=-1` (its own switch for no memory limit),
+  because macOS refuses its address-space limit and every task otherwise read as a timeout. Both graders then
+  agreed on all 150 reference solutions and all 150 null functions of the sample before the arms were graded.
+- Not a deviation: two arm-A runs (Mbpp/555, Mbpp/77) ended with the provider error "Selected model is at capacity"
+  at no token cost, and were rerun as the plan says.
+
+## Outcome (added 2026-10-29, after grading)
+
+The bundle fails both conditions: 6 delivered harms and no gains (V3 132/150, B 126/150; exact McNemar p = 0.031,
+in favour of V3), and +35 tokens per task (95% interval -43 to +118). Nothing is adopted and all four changes are
+removed. The official evaluator agrees with the study's grader on all 300 graded files. Spend: 51.88 credits. The
+per-change readings and the mechanism are in the README's experiments log, section 8.

@@ -371,10 +371,8 @@ class ArmTest(unittest.TestCase):
                     (run / 'round-1' / 'proposal.json').write_text(json.dumps(
                         {'files': {'solution.py': 'def f(v):\n    if v == [1, 2]:\n        return 3\n'
                                    if task_id == 'Mbpp/2' else 'def f(v):\n    return v\n'}}))
-                    dispute = {'dispute': {'round': 2}} if task_id == 'Mbpp/3' and arm == 'b' else {}
                     (run / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'rounds': rounds,
-                                                                 'usage': {'input': tokens, 'output': 0, 'calls': 2},
-                                                                 **dispute}))
+                                                                 'usage': {'input': tokens, 'output': 0, 'calls': 2}}))
                     (run / 'grade.json').write_text(json.dumps({'round1_pass': passed, 'delivered_pass': passed,
                                                                 'suspect': False}))
             with unittest.mock.patch('sys.stdout'):
@@ -385,8 +383,6 @@ class ArmTest(unittest.TestCase):
             self.assertEqual(result['pass']['mcnemar_p'], 1.0)
             self.assertAlmostEqual(result['tokens']['diff'], (-10 - 20 - 100) / 3)
             self.assertEqual(result['a_detail']['stands'], {'Mbpp/3': [2]})
-            self.assertEqual(result['b_detail']['stands'], {'Mbpp/3': [2]})  # a dispute stop is a stand
-            self.assertEqual(set(result['b_detail']['noted']), {'Mbpp/2'})
             self.assertTrue((out / 'compare-a-b.json').is_file())
             grade = out / 'runs-b' / 'Mbpp-1' / 'grade.json'
             grade.write_text(json.dumps({'round1_pass': True, 'delivered_pass': True, 'suspect': True}))

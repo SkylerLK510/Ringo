@@ -912,27 +912,16 @@ def arm_row(run):
     rounds = report.get('rounds') or []
     first = rounds[0] if rounds else {}
     checks_pass = bool(first.get('checks')) and all(c['status'] == 'pass' for c in first['checks'])
-    # stands: a revision that left code failing a declared check unchanged (what the dispute rule stops on)
+    # stands: a revision that left code failing a declared check unchanged (the writer stood by it)
     stands = [r['round'] for prev, r in zip(rounds, rounds[1:]) if prev.get('checks') and r.get('candidate_sha256')
               and r.get('candidate_sha256') == prev.get('candidate_sha256')
               and any(c['status'] != 'pass' for c in prev['checks'])]
-    if report.get('dispute'):  # the dispute rule stopped on a stand, before the round recorded its digest
-        stands.append(report['dispute']['round'])
-    import workflow
-    # notes shown: recorded by a run that has the static note; for one without it, the rounds whose candidate it would
-    # flag and whose candidate then went to the review or, failing a check, to another writer round
-    shown = [r['round'] for r in rounds if r.get('static_shown') or r.get('static_reviewed')]
-    flagged = [r['round'] for r in rounds if (run / f"round-{r['round']}" / 'proposal.json').is_file()
-               and workflow.special_cases(json.loads((run / f"round-{r['round']}" / 'proposal.json')
-                                                     .read_text(encoding='utf-8'))['files'])]
-    would = [n for n in flagged if rounds[n - 1].get('review_findings') is not None
-             or (n < len(rounds) and any(c['status'] != 'pass' for c in rounds[n - 1].get('checks') or []))]
     return {'pass': grade_result['delivered_pass'], 'round1_pass': grade_result['round1_pass'],
             'suspect': grade_result.get('suspect', False), 'status': report['status'],
             'tokens': sum(usage.get(k) or 0 for k in ('input', 'cache_read', 'cache_write', 'output')),
             'credits': credits(usage), 'calls': usage.get('calls') or 0, 'rounds': len(rounds),
             'round1_checks_pass': checks_pass, 'round1_findings': first.get('review_findings'),
-            'stands': stands, 'noted_rounds': shown or would, 'notes_recorded': bool(shown)}
+            'stands': stands}
 
 
 def compare_all(out, arms, alpha):
@@ -976,7 +965,6 @@ def compare_all(out, arms, alpha):
         result[f'{name}_detail'] = {
             'statuses': statuses,
             'stands': {t: r['stands'] for t, r in zip(paired, rs) if r['stands']},
-            'noted': {t: r['noted_rounds'] for t, r in zip(paired, rs) if r['noted_rounds']},
             # round-1 review: findings on drafts that fail the hidden tests (catches) and that pass them (alarms)
             'review_catch': [sum(bool(r['round1_findings']) for r in reviewed if not r['round1_pass']),
                              sum(not r['round1_pass'] for r in reviewed)],
@@ -998,7 +986,7 @@ def compare_all(out, arms, alpha):
               f"(95% CI [{x['diff_ci'][0]:+,.3f}, {x['diff_ci'][1]:+,.3f}])")
     for name in arms:
         d = result[f'{name}_detail']
-        print(f"{name}: statuses {d['statuses']}; stands {len(d['stands'])}; static notes {len(d['noted'])}; "
+        print(f"{name}: statuses {d['statuses']}; stands {len(d['stands'])}; "
               f"review-stage harms {len(d['review_stage_harms'])}; "
               f"round-1 review caught {d['review_catch'][0]}/{d['review_catch'][1]} hidden failures, "
               f"alarmed on {d['review_alarm'][0]}/{d['review_alarm'][1]} hidden passes")

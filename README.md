@@ -419,7 +419,42 @@ defines, and the generated public check imported only the function, so it could 
 fix. 14 of 163 Claude drafts were replies Ringo could not apply; a `work` round answers that with one repair call, so
 the drafts were redone with it.
 
-### 8. Portability
+### 8. MBPP+: four refinements from HumanEval+ failures, rejected (2026-10-29)
+
+Four changes came from reading two of V3's HumanEval+ failures. HumanEval/47 hardcoded its docstring's wrong
+example, and /34 sorted before deduplicating. Each change was written to add no tokens:
+
+- a writer rule: follow the behaviour the brief names over its examples, and never special-case an input;
+- a static note on code fitted to one literal example;
+- a stop when a revision leaves code that fails a check unchanged, handing the dispute to a person;
+- review wording that names edge values.
+
+HumanEval+ cannot test changes built from its own failures. So the changes ran on 150 MBPP+ tasks (v0.2.0, a
+seeded random sample; the other 228 stay sealed), paired with V3 on the same model, under a plan registered before
+the first call ([preregistration](docs/prereg/2026-10-29-v3-refine-mbpp.md)).
+
+| Arm | Hidden tests passed | Tokens per task | Credits per task |
+|---|---|---|---|
+| V3 | 132/150 | 2,631 | 0.171 |
+| V3 + the four changes | 126/150 | 2,666 | 0.175 |
+
+Six tasks went from pass to fail and none the other way (exact McNemar p = 0.031), so the changes made Ringo worse.
+They also used 35 more tokens per task (95% interval -43 to +118). The official EvalPlus evaluator agrees with the study's grader on all 300 graded files.
+The study cost 51.9 credits.
+
+**Why.** MBPP's prose is short, and its examples define the behaviour.
+- The writer rule told the writer to follow the named behaviour over the examples. On 4 tasks it overrode correct
+  examples.
+- The stop rule then ended 5 runs as disputes. On 4 of those tasks, V3 delivered a correct answer by fixing its code
+  in round 2.
+- The edge-value wording led the review to flag float precision on huge integers (Mbpp/14). The revision broke the
+  expected result. Overall, false alarms nearly doubled: 13 of 127 passing drafts against 7 of 131.
+- The static note never fired.
+
+All four were removed. A rule fitted to one benchmark's quirk, here a wrong docstring example, does harm where the
+examples are the specification. On these tasks, deferring to the check worked better than trusting the prose.
+
+### 9. Portability
 
 - **`ringo.py wait`:** its liveness check used `os.kill(pid, 0)`, which terminates the process on Windows. On Windows
   it now opens the process and waits on it with a zero timeout instead.
@@ -433,7 +468,7 @@ the drafts were redone with it.
   release state keeps its parent folder's access list. Under your user profile that list admits you, SYSTEM and
   administrators, so keep run folders out of shared folders.
 
-### 9. Ideas we considered and did not adopt
+### 10. Ideas we considered and did not adopt
 
 A deep-research pass checked 25 published claims: 19 were confirmed and 6 refuted. Its verdicts are included below.
 
@@ -457,11 +492,18 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 | Letting a model rewrite an ambiguous brief directly | Below the original brief in 11 of 12 model-benchmark cells (SpecFix, arXiv 2505.07270) | Not tried: published as harmful |
 | Regenerating when the model seems uncertain | Lower pass@1 in 5 of 6 configurations (arXiv 2608.14659; small models) | Not tried: published as harmful |
 | Fixed multi-round repair | Repair with a noisy verifier turned correct answers wrong (arXiv 2607.17641); at a matched budget, more first drafts beat more repairs (Olausson et al., ICLR 2024) | Not tried; `max_rounds` stays bounded by the checks |
+| Follow the named behaviour over the examples (writer rule) | 4 round-1 losses and no gains on MBPP+ (section 8) | Removed |
+| Stop when unchanged code fails a check, and hand the dispute to a person | Ended 5 MBPP+ runs; V3 delivered 4 of those tasks correctly (section 8) | Removed |
+| A static note on code fitted to one literal example | Fired on 1 of 645 earlier drafts and on none of 300 MBPP+ runs | Removed: inert |
+| Edge values named in the review prompt | False alarms 13/127 against 7/131; one revision broke a passing draft (section 8) | Removed |
 
-### 10. What would move it next
+### 11. What would move it next
 
 - **Tasks with headroom, measured against the agent.** On HumanEval+ the two tie on quality and Ringo costs far less
-  (section 7); harder sets (MBPP+, LiveCodeBench) are next.
+  (section 7). V3 passes 132 of 150 MBPP+ tasks at 2,631 tokens each (section 8). The agent on those same tasks, and
+  harder sets such as LiveCodeBench, come next.
+- **Refinements need unseen tasks.** All four changes built from HumanEval+ failures did harm on MBPP+ (section 8). A
+  candidate is now built on one set and judged on a sealed one.
 - **Choosing between two drafts.** Two drafts from different families pass more hidden tests than either alone, but
   the cheap signals tried so far cannot tell which one is right. A published e-process release rule
   (arXiv 2605.12947) and execution-based selection (DiffCodeGen, arXiv 2605.20473) are the starting points; both

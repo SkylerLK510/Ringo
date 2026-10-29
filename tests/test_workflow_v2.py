@@ -181,46 +181,6 @@ class SpecTestLoopTest(unittest.TestCase):
                                   reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK))
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
 
-    def test_a_rationale_only_reply_to_a_failing_check_is_a_dispute_for_a_person(self):
-        bad = '@@@ FILE value.py\ndef f(x):\n    return x\n'
-        stand = '@@@ RATIONALE\nThe check contradicts the brief.\n'
-        report, seen = self.run_with([bad, stand, stand], spec_tests=None)
-        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'disputed'])
-        self.assertEqual(report['dispute'], {'round': 2, 'checks': ['reference'],
-                                             'rationale': 'The check contradicts the brief.'})
-        self.assertEqual(len(seen), 2)  # no third writer call on the same feedback
-        self.assertIsNone(report['final'])
-
-    def test_an_unchanged_reply_after_a_rejected_revision_is_not_a_dispute(self):
-        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
-        report, _ = self.run_with([good, '@@@ FILE value.py\ndef f(x):\n    return x\n', '@@@ RATIONALE\nKeep it.\n'],
-                                  reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK),
-                                  no_regression=True, spec_tests=None)
-        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'rejected', 'ready_for_review'])
-        self.assertNotIn('dispute', report)
-
-    def test_code_fitted_to_one_example_gets_a_static_note_in_feedback_and_review(self):
-        fitted = '@@@ FILE value.py\ndef f(x):\n    if x == [1, 2]:\n        return 9\n    return x\n'
-        report, seen = self.run_with([fitted, fitted.replace('return x\n', 'return 2*x if x != [1, 2] else 9\n')],
-                                     spec_tests=None)
-        self.assertIn('Static notes (not check results):\nvalue.py:2 returns a literal for one literal input: '
-                      '`x == [1, 2]`', seen[1][1])
-        self.assertIn('=== static notes (not check results) ===\nvalue.py:2', seen[2][0])  # the review's material
-        self.assertEqual(report['status'], 'ready_for_review')
-        self.assertEqual([r.get('static_shown') for r in report['rounds']], [None, 1])
-        self.assertEqual([r.get('static_reviewed') for r in report['rounds']], [None, 1])
-
-    def test_static_notes_flag_only_a_literal_container_input_that_returns_a_literal(self):
-        flagged = workflow.special_cases({'a.py': 'def f(v):\n    if sorted(v) == [-10, 4, 6]:\n        return 15.0\n'
-                                                  '    elif (v, 2) == (3, 4):\n        return (1, -2)\n    return v\n'})
-        self.assertEqual([n.split(' ')[0] for n in flagged], ['a.py:2', 'a.py:4'])
-        quiet = {'b.py': 'def f(v):\n    if v == []:\n        return 0\n    if v == [1]:\n        return 1\n'
-                         '    if v == 2:\n        return 3\n    if v == [1, 2]:\n        return v\n    if v != [1, 2]:\n'
-                         '        return 0\n', 'c.md': 'if v == [1, 2]: return 3', 'd.py': 'def broken(:\n'}
-        self.assertEqual(workflow.special_cases(quiet), [])
-        many = 'def f(v):\n' + ''.join(f'    if v == [{i}, {i}]:\n        return {i}\n' for i in range(5))
-        self.assertEqual(len(workflow.special_cases({'e.py': many})), 3)
-
     def doc_spec(self, **changes):
         return {'files': {'REPORT.md': ''}, 'fixtures': {'data.csv': 'a,b\n1,2\n3,4\n',
                                                           'check.py': "assert 'total' in open('REPORT.md').read()\n"},

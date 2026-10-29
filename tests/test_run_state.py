@@ -111,7 +111,7 @@ class WaitTest(unittest.TestCase):
         return code, json.loads(out.getvalue())
 
     def test_exit_codes_follow_the_final_status(self):
-        for status, code in (('done', 0), ('ready_for_review', 0), ('needs_revision', 1), ('repeated_candidate', 1), ('disputed', 1),
+        for status, code in (('done', 0), ('ready_for_review', 0), ('needs_revision', 1), ('repeated_candidate', 1),
                              ('budget_exhausted', 1),
                              ('failed', 2), ('error', 2), ('interrupted', 2)):
             with self.subTest(status=status):
