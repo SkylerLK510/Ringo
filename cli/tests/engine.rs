@@ -13,7 +13,7 @@ const CODEX_OK: &str = r#"#!/bin/sh
 echo "$@" >> "$0.args"
 env > "$0.env"
 cat > "$0.stdin"
-case "$*" in *workspace-write*) echo made > made.txt
+case "$*" in *workspace-write*) echo made > made.txt; printf 'y\nx\n\n' > b.txt
   echo "{\"type\":\"item.started\",\"item\":{\"type\":\"file_change\",\"changes\":[{\"path\":\"$PWD/made.txt\",\"kind\":\"add\"}]}}" ;; esac
 echo '{"type":"thread.started","thread_id":"t-1"}'
 echo '{"type":"item.started","item":{"type":"command_execution","command":"ls"}}'
@@ -118,6 +118,9 @@ fn agents_get_no_api_keys_and_cannot_start_ringo() {
 #[test]
 fn write_jobs_stay_in_their_worktree_until_applied() {
     let r = repo("write");
+    fs::write(r.join("b.txt"), "x\n\n").unwrap(); // ends in a blank line: patch context that trimming would break
+    git(&r, &["add", "."]);
+    git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b"]);
     let codex = fake(&root(), "codex-write", CODEX_OK);
     let mut s = session(&r, Agent::Codex, &codex);
     let (one, two) = (s.launch_agent(Agent::Codex, true, "make it").unwrap(),
@@ -132,6 +135,7 @@ fn write_jobs_stay_in_their_worktree_until_applied() {
     git(&r, &["checkout", "--", "a.txt"]);
     s.apply(one).unwrap();
     assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "made\n");
+    assert_eq!(fs::read_to_string(r.join("b.txt")).unwrap(), "y\nx\n\n");
     let wt = s.job(one).unwrap().worktree.clone().unwrap();
     s.drop_worktree(one).unwrap();
     assert!(!wt.exists());
@@ -198,4 +202,46 @@ fn arguments_pass_through_to_ringo_py() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("not_started"));
     let help = Command::new(env!("CARGO_BIN_EXE_ringo")).stdin(std::process::Stdio::null()).output().unwrap();
     assert_eq!(help.status.code(), Some(2), "no arguments and no terminal: usage, not the shell");
+}
+
+#[test]
+fn state_inside_the_repository_is_refused() {
+    // a repository under the crate folder (the tests' working folder), so a relative state root can point into it
+    let r = Path::new(env!("CARGO_MANIFEST_DIR")).join("target").join(format!("inside-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&r);
+    fs::create_dir_all(&r).unwrap();
+    git(&r, &["init", "-q"]);
+    let relative = Path::new("target").join(r.file_name().unwrap()).join("private-state");
+    assert!(Session::with_state(&r, &relative).err().unwrap().contains("inside the repository"));
+    let link = root().join("inside-link");
+    let _ = std::os::unix::fs::symlink(r.join("state"), &link);
+    assert!(Session::with_state(&r, &link).err().unwrap().contains("symlink"));
+    fs::remove_dir_all(&r).unwrap();
+}
+
+#[test]
+fn killing_a_pipeline_stops_its_model_calls_too() {
+    // Ringo's model calls run in sessions of their own; the interrupt lets Python's cleanup end them.
+    let r = repo("pipeline");
+    let home = root().join("fake-ringo-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("ringo.py"), "import subprocess, sys, time\n\
+        p = subprocess.Popen(['sleep', '30'], start_new_session=True)\n\
+        open(sys.argv[0] + '.child', 'w').write(str(p.pid))\n\
+        try:\n    time.sleep(30)\nfinally:\n    p.kill()\n").unwrap();
+    let mut s = Session::new(&r).unwrap();
+    s.ringo_home = home.clone();
+    let id = s.launch_ringo("fake review", vec!["review".into()], root().join("no-trace")).unwrap();
+    let child_file = home.join("ringo.py.child");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !child_file.exists() || fs::read_to_string(&child_file).unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.kill(id).unwrap();
+    assert_eq!(wait(&mut s, id), Status::Cancelled);
+    let child: i32 = fs::read_to_string(&child_file).unwrap().trim().parse().unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    // SAFETY: signal 0 only checks that the process exists.
+    assert_eq!(unsafe { libc::kill(child, 0) }, -1, "the model call in its own session is gone");
 }

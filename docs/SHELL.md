@@ -121,15 +121,20 @@ a second while a job runs.
 
 ## Safety model
 
-- **Read turns:** Codex runs with its `read-only` sandbox; Claude runs with `--permission-prompts none`, so any
-  tool that needs permission (edits, shell commands) is refused. Grok has no read-only mode Ringo has verified, so it
-  only runs write jobs.
-- **Write turns** run in a worktree under Ringo's private state folder: Codex with `workspace-write`, Claude with
-  `acceptEdits` (edits allowed, shell commands refused), Grok with `--always-approve` (every tool call approved, so
+- **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with `--permission-prompts none` and deny
+  rules for `Bash`, `Edit`, `Write` and `NotebookEdit`, which win over any allow rules in your own settings. Grok has
+  no read-only mode Ringo has verified, so it only runs write jobs. Checked live: asked in a read turn to create a
+  file, both refused and no file appeared, but trying cost Claude 98k tokens and Codex 40k. Use `@agent!` when you
+  want edits.
+- **Write turns** run in a worktree under Ringo's private state folder: Codex with `workspace-write` (its sandbox allows commands in
+  the worktree), Claude with `acceptEdits` and a deny rule for `Bash` (edits allowed, shell commands refused: Claude
+  has no sandbox here), Grok with `--always-approve` (every tool call approved, so
   it is not contained; its flags come from xAI's documentation and are untested here). A worktree keeps parallel
   edits apart; it is not a security boundary.
 - **Applying:** `/apply` needs a finished job and a clean tree, checks the patch first, and applies it with
   `git apply --3way` without committing. A conflict leaves your tree and the job untouched.
+- **Stopping:** `/kill` stops the job's whole process group. A Ringo pipeline is interrupted first, so Python's own
+  cleanup ends its model calls, which run in sessions of their own.
 - **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.

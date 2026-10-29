@@ -165,12 +165,37 @@ fn private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+/// git's stdout exactly as written (a patch must stay byte-for-byte intact).
+fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let out = Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(out.stdout)
+}
+
+/// git's stdout as a trimmed value (an id, a path, a status).
+fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
+    Ok(String::from_utf8_lossy(&git_raw(dir, args)?).trim_end().to_string())
+}
+
+/// An absolute path with symlinks resolved, for a path whose tail may not exist yet.
+fn resolved(path: &Path) -> PathBuf {
+    let path = std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf());
+    let mut tail = Vec::new();
+    let mut head = path.as_path();
+    loop {
+        if let Ok(real) = head.canonicalize() {
+            return tail.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (head.parent(), head.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                head = parent;
+            }
+            _ => return path,
+        }
+    }
 }
 
 /// The agent child's environment: no API keys or endpoint overrides (subscription logins only), and RINGO_CHILD
@@ -187,29 +212,47 @@ fn agent_env(cmd: &mut Command) {
     cmd.env("RINGO_CHILD", "1");
 }
 
-/// Stops a job's whole process group: TERM, then KILL after a grace period.
-fn stop_group(pid: u32, grace: Duration) {
+/// Stops a job's whole process group: TERM, then KILL after a grace period. A Ringo pipeline gets INT first: its
+/// model calls run in sessions of their own, out of the group's reach, and Python's interrupt handling ends them.
+fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     #[cfg(unix)]
     {
-        // SAFETY: killpg only sends a signal; a group that is already gone returns ESRCH.
-        unsafe { libc::killpg(pid as libc::pid_t, libc::SIGTERM) };
+        let signal = move |sig| unsafe { libc::killpg(pid as libc::pid_t, sig) }; // SAFETY: only sends a signal
+        if pipeline {
+            signal(libc::SIGINT);
+        } else {
+            signal(libc::SIGTERM);
+        }
         thread::spawn(move || {
             thread::sleep(grace);
-            unsafe { libc::killpg(pid as libc::pid_t, libc::SIGKILL) };
+            if pipeline {
+                signal(libc::SIGTERM);
+                thread::sleep(grace);
+            }
+            signal(libc::SIGKILL);
         });
     }
     #[cfg(not(unix))]
     {
-        let _ = grace;
+        let _ = (grace, pipeline);
         let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
     }
 }
 
 impl Session {
     pub fn new(cwd: &Path) -> Result<Session, String> {
+        Session::with_state(cwd, &state_root())
+    }
+
+    /// A session whose private state lives under `root` (a relative root is taken from the current folder).
+    pub fn with_state(cwd: &Path, root: &Path) -> Result<Session, String> {
         let repo = git(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from).unwrap_or_else(|_| cwd.to_path_buf());
+        let repo = resolved(&repo);
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let parent = state_root().join("shell");
+        if root.is_symlink() {
+            return Err(format!("the state folder {} cannot be a symlink", root.display()));
+        }
+        let parent = resolved(root).join("shell");
         if parent.starts_with(&repo) {
             return Err(format!("the state folder {} is inside the repository", parent.display()));
         }
@@ -309,6 +352,9 @@ impl Session {
                 // The repository's own instructions are appended instead.
                 cmd.args(["-p", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-prompts",
                           "none", "--permission-mode", if write { "acceptEdits" } else { "default" }]);
+                // Safe mode keeps the owner's permission rules; deny rules win over them. Read turns cannot edit or
+                // run commands, write turns cannot run commands (they have no sandbox).
+                cmd.arg("--disallowed-tools").args(if write { &["Bash"][..] } else { &["Bash", "Edit", "Write", "NotebookEdit"][..] });
                 if let Some(session) = &resume {
                     cmd.args(["--resume", session]);
                 }
@@ -442,7 +488,7 @@ impl Session {
                 }
                 for note in parser.line(line) {
                     if matches!(note, Note::Fail(_)) && style != Style::Trace {
-                        stop_group(pid, Duration::from_secs(3)); // fail closed: stop the turn now
+                        stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
                     }
                     let _ = tx.send(Event::Note(id, note));
                 }
@@ -598,7 +644,7 @@ impl Session {
         let job = self.job(id)?;
         let pid = job.pid.filter(|_| job.running()).ok_or(format!("#{id} is not running"))?;
         job.cancel.store(true, Ordering::SeqCst);
-        stop_group(pid, Duration::from_secs(3));
+        stop_group(pid, Duration::from_secs(3), matches!(job.kind, Kind::Ringo { .. }));
         Ok(())
     }
 
@@ -610,9 +656,9 @@ impl Session {
             return Err(format!("#{id} is not a write job with a worktree"));
         };
         git(wt, &["add", "-A"])?;
-        let patch = git(wt, &["diff", "--cached", "--binary", base])?;
-        fs::write(job.dir.join("change.patch"), format!("{patch}\n")).map_err(|e| e.to_string())?;
-        Ok(patch)
+        let patch = git_raw(wt, &["diff", "--cached", "--binary", base])?;
+        fs::write(job.dir.join("change.patch"), &patch).map_err(|e| e.to_string())?;
+        Ok(String::from_utf8_lossy(&patch).into_owned())
     }
 
     /// Applies a finished write job's change to the owner's tree, which must be clean. Nothing is committed; a
@@ -677,11 +723,11 @@ impl Session {
         for job in self.jobs.iter().filter(|j| j.running()) {
             if let Some(pid) = job.pid {
                 job.cancel.store(true, Ordering::SeqCst);
-                stop_group(pid, Duration::from_millis(1500));
+                stop_group(pid, Duration::from_millis(1500), matches!(job.kind, Kind::Ringo { .. }));
             }
         }
         if self.running() > 0 {
-            thread::sleep(Duration::from_millis(1600)); // let the KILL land before the process exits
+            thread::sleep(Duration::from_millis(3100)); // let the last signal land before the process exits
         }
     }
 }
