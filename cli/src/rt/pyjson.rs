@@ -150,7 +150,11 @@ pub fn float(f: f64) -> String {
     if f == 0.0 {
         return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
-    let sci = format!("{f:e}"); // shortest round-trip digits, as Python's repr
+    // Python's repr: the fewest digits that round-trip, correctly rounded (ties to even). Rust's shortest form has
+    // the right number of digits but may round an exact tie up, so the digits are re-made with exact formatting.
+    let shortest = format!("{f:e}");
+    let count = shortest.split_once('e').unwrap().0.chars().filter(char::is_ascii_digit).count();
+    let sci = format!("{f:.*e}", count - 1);
     let (mantissa, exp) = sci.split_once('e').expect("LowerExp has an exponent");
     let exp: i32 = exp.parse().expect("an integer exponent");
     let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |m| ("-", m));
@@ -207,6 +211,9 @@ mod tests {
             (-0.0, "-0.0"),
             (1.5e300, "1.5e+300"),
             (12345678901234567.0, "1.2345678901234568e+16"),
+            (1566004145404016.25, "1566004145404016.2"),
+            (0.5, "0.5"),
+            (2.5e-5, "2.5e-05"),
         ] {
             assert_eq!(float(f), want, "{f}");
         }
