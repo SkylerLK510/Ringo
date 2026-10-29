@@ -113,6 +113,8 @@ pub enum Event {
 
 pub struct Session {
     pub repo: PathBuf,
+    /// Whether `repo` is a git project; outside one, agents can read and answer but not edit in a worktree.
+    pub git: bool,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -249,24 +251,40 @@ impl Session {
 
     /// A session whose private state lives under `root` (a relative root is taken from the current folder).
     pub fn with_state(cwd: &Path, root: &Path) -> Result<Session, String> {
-        let repo = git(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from).unwrap_or_else(|_| cwd.to_path_buf());
-        let repo = resolved(&repo);
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
+        Session::with_state_home(cwd, root, &home)
+    }
+
+    /// `with_state` with the owner's home folder given. A repository whose root is the home folder or above it
+    /// holds the home folder (a dotfiles repository), not a project: there, as outside git, the session works in the
+    /// current folder, as claude and codex do, and only `@agent!` and `/review` (which need a project) are refused.
+    pub fn with_state_home(cwd: &Path, root: &Path, home: &Path) -> Result<Session, String> {
+        let home = resolved(home);
+        let top = git(cwd, &["rev-parse", "--show-toplevel"]).ok().map(|t| resolved(Path::new(&t)));
+        let project = top.filter(|t| home.as_os_str().is_empty() || !home.starts_with(t));
+        let repo = project.clone().unwrap_or_else(|| resolved(cwd));
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if root.is_symlink() {
             return Err(format!("the state folder {} cannot be a symlink", root.display()));
         }
         let parent = resolved(&root.join("shell")); // a symlinked shell folder resolves too
-        if parent.starts_with(&repo) {
+        if project.as_ref().is_some_and(|p| parent.starts_with(p)) {
             return Err(format!("the state folder {} is inside the repository", parent.display()));
         }
         private_dir(&parent)?;
+        // An enclosing repository (a dotfiles repository holding the home folder) must never pick up the private
+        // state, even with `git add -A`.
+        let ignore = resolved(root).join(".gitignore");
+        if !ignore.exists() {
+            fs::write(&ignore, "# Ringo's private state: never commit it\n*\n").map_err(|e| format!("{}: {e}", ignore.display()))?;
+        }
         // create_dir claims a name atomically, so two sessions never share a folder
         let dir = (0..100).map(|n| parent.join(format!("{stamp}-{}-{n}", std::process::id())))
             .find(|d| fs::create_dir(d).is_ok()).ok_or(format!("cannot create a session folder in {}", parent.display()))?;
         private_dir(&dir)?;
         let (tx, rx) = channel();
         let programs = Agent::ALL.iter().map(|a| (*a, PathBuf::from(a.name()))).collect();
-        Ok(Session { repo, dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
+        Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, threads: HashMap::new(), tx, rx })
     }
 
@@ -311,6 +329,10 @@ impl Session {
         }
         if !write && let Some(busy) = self.jobs.iter().find(|j| j.running() && j.kind == (Kind::Agent { agent, write: false })) {
             return Err(format!("{} is busy with #{}; its conversation takes one turn at a time", agent.name(), busy.id));
+        }
+        if write && !self.git {
+            return Err(format!("@{}! edits in a private git worktree, so it needs a git project: start ringo inside one \
+                                (or run git init here). @{} without ! works in any folder", agent.name(), agent.name()));
         }
         let base = if write { Some(git(&self.repo, &["rev-parse", "HEAD"])?) } else { None };
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
@@ -424,6 +446,9 @@ impl Session {
 
     /// `/review BASE [HEAD]` of the owner's repository.
     pub fn review_repo(&mut self, base: &str, head: &str) -> Result<usize, String> {
+        if !self.git {
+            return Err("/review BASE [HEAD] reviews a git project's commits: start ringo inside one".into());
+        }
         let dir = self.next_dir()?;
         let args = self.review_args(&self.repo, base, head, &dir, None);
         self.launch_ringo(&format!("review {base}..{head}"), args, dir.join("trace"))

@@ -88,6 +88,11 @@ panel moves above the chat, one row per job.
 | `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
 | `/show N`, `/kill N`, `/use NAME`, `/backend SPEC`, `/setup`, `/quit` | select a job, stop it with everything it started, set the default agent or pipeline backend, add an agent, quit |
 
+Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
+(`@agent!`, in a worktree) and `/review BASE` reviews its commits; in any other folder, a repository that holds your
+home folder (a dotfiles repository) included, they read and answer, and Ringo says why an edit needs a project.
+Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
+
 A line without `/` or `@` goes to the default agent (the first one you set up). Tab and Shift-Tab select a job,
 PgUp and PgDn scroll its log, Up and Down recall earlier lines, and Ctrl-C twice quits, stopping running jobs.
 

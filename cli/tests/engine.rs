@@ -224,6 +224,29 @@ fn state_inside_the_repository_is_refused() {
 }
 
 #[test]
+fn a_repository_holding_the_home_folder_is_not_a_project() {
+    // A dotfiles repository at the home folder: the session works in the current folder, keeps its private state
+    // under the home folder (git-ignored there), answers questions, and refuses worktree edits with a clear reason.
+    let home = repo("dotfiles-home");
+    let docs = home.join("Documents");
+    fs::create_dir_all(&docs).unwrap();
+    let state = home.join(".local/share/ringo");
+    let mut s = Session::with_state_home(&docs, &state, &home).unwrap();
+    assert_eq!((s.repo.clone(), s.git), (docs.canonicalize().unwrap(), false));
+    assert!(fs::read_to_string(state.join(".gitignore")).unwrap().contains('*'));
+    let status = Command::new("git").arg("-C").arg(&home).args(["status", "--porcelain", "--untracked-files=all"])
+        .output().unwrap();
+    assert!(!String::from_utf8_lossy(&status.stdout).contains(".local"), "the home repository sees the private state");
+    let refused = s.launch_agent(Agent::Codex, true, "edit it").unwrap_err();
+    assert!(refused.contains("needs a git project"), "{refused}");
+    assert!(s.review_repo("HEAD~1", "HEAD").unwrap_err().contains("git project"));
+    // a project inside the home folder is still a project, and its own state rule still holds
+    let project = repo("project-under-home");
+    let s = Session::with_state_home(&project, &state, &home).unwrap();
+    assert!(s.git);
+}
+
+#[test]
 fn killing_a_pipeline_stops_its_model_calls_too() {
     // Ringo's model calls run in sessions of their own; the interrupt lets Python's cleanup end them.
     let r = repo("pipeline");
