@@ -3,7 +3,8 @@ import argparse
 import sys
 
 # wait's exit codes: ready or done 0, finished without a ready result 1, failed or gone 2, still running 3
-WAIT_EXIT = {'done': 0, 'ready_for_review': 0, 'needs_revision': 1, 'repeated_candidate': 1, 'budget_exhausted': 1}
+WAIT_EXIT = {'done': 0, 'ready_for_review': 0, 'needs_revision': 1, 'repeated_candidate': 1, 'disputed': 1,
+             'budget_exhausted': 1}
 
 
 def check_pid(pid):

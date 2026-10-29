@@ -854,6 +854,13 @@ def run(spec_path, out, call_fn=harness.call):
                 # A reply with only a rationale also stands by the code it was shown (it disagrees with the feedback).
                 noop = not any(candidate.get(part) for part in ('files', 'edits', 'disputes', 'script'))
                 stands = text_protocol and files == current and (spec_feedback or noop)
+                # Unchanged code that fails a declared check stands against that check: another round would get the
+                # same feedback, so the run stops and hands the writer's reason to a person.
+                failing = [c['name'] for c in answering.get('checks', []) if c['status'] != 'pass']
+                if files == current and failing and 'regression' not in answering:
+                    report['dispute'] = {'round': n, 'checks': failing, 'rationale': candidate['rationale']}
+                    entry['status'] = report['status'] = 'disputed'
+                    break
                 if stands and spec_feedback:
                     for tid in feedback['spec_tests']['failing_ids']:
                         disputed.setdefault(tid, 'the writer left the code unchanged')
@@ -1015,7 +1022,7 @@ def outcome(report, out):
             'rounds': len(report['rounds']), 'error': report.get('error'),
             'usage': {k: report['usage'].get(k) for k in ('calls', 'untokened_calls', 'input', 'cache_read',
                                                          'cache_write', 'output')},
-            'elapsed_s': round(report['elapsed_s'], 1)}
+            'elapsed_s': round(report['elapsed_s'], 1), **({'dispute': report['dispute']} if report.get('dispute') else {})}
 
 
 def main(argv=None):

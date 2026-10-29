@@ -181,6 +181,24 @@ class SpecTestLoopTest(unittest.TestCase):
                                   reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK))
         self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'ready_for_review'])
 
+    def test_a_rationale_only_reply_to_a_failing_check_is_a_dispute_for_a_person(self):
+        bad = '@@@ FILE value.py\ndef f(x):\n    return x\n'
+        stand = '@@@ RATIONALE\nThe check contradicts the brief.\n'
+        report, seen = self.run_with([bad, stand, stand], spec_tests=None)
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'disputed'])
+        self.assertEqual(report['dispute'], {'round': 2, 'checks': ['reference'],
+                                             'rationale': 'The check contradicts the brief.'})
+        self.assertEqual(len(seen), 2)  # no third writer call on the same feedback
+        self.assertIsNone(report['final'])
+
+    def test_an_unchanged_reply_after_a_rejected_revision_is_not_a_dispute(self):
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        report, _ = self.run_with([good, '@@@ FILE value.py\ndef f(x):\n    return x\n', '@@@ RATIONALE\nKeep it.\n'],
+                                  reviews=('### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.', REVIEW_OK),
+                                  no_regression=True, spec_tests=None)
+        self.assertEqual([r['status'] for r in report['rounds']], ['revise', 'rejected', 'ready_for_review'])
+        self.assertNotIn('dispute', report)
+
     def doc_spec(self, **changes):
         return {'files': {'REPORT.md': ''}, 'fixtures': {'data.csv': 'a,b\n1,2\n3,4\n',
                                                           'check.py': "assert 'total' in open('REPORT.md').read()\n"},

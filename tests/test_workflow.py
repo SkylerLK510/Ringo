@@ -335,7 +335,8 @@ class WorkflowTest(unittest.TestCase):
     def test_repeated_failed_candidate_stops_without_more_judging(self):
         bad = self.proposal('def f(x): return x')
         report, _ = self.execute([bad, bad])
-        self.assertEqual(report['status'], 'repeated_candidate')
+        self.assertEqual(report['status'], 'disputed')  # unchanged code that fails a check stands against it
+        self.assertEqual(report['dispute'], {'round': 2, 'checks': ['reference'], 'rationale': bad['rationale']})
         self.assertEqual(report['usage']['calls'], 2)
         self.assertIsNone(report['final'])
 
