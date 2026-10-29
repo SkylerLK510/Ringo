@@ -4,6 +4,7 @@
 #![cfg(unix)]
 
 use ringo_cli::rt::workflow::{self as wf, difflib};
+use ringo_cli::rt::harness::Backend;
 use ringo_cli::rt::{pyjson, Error};
 use serde_json::{json, Map, Value};
 use std::io::Write;
@@ -90,7 +91,82 @@ def write_json(path, value):
     return Path(path).read_text(encoding='utf-8')
 
 
+def checks_case(spec, root, logdir, remaining):
+    rows = workflow.checks(spec, Path(root), Path(logdir), lambda: remaining)
+    for r in rows:
+        r['seconds'] = type(r['seconds']).__name__
+    return rows
+
+
+ENV_KEYS = ('COLUMNS', 'LINES', 'NO_COLOR', 'FORCE_COLOR', 'PYTHON_COLORS', 'TERM')
+
+
+def main_case(argv, env):
+    import contextlib, io, os
+    saved = {k: os.environ.get(k) for k in ENV_KEYS}
+    for k in ENV_KEYS:
+        os.environ.pop(k, None)
+    os.environ.update(env)
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = workflow.main(argv)
+            except SystemExit as e:
+                code = e.code
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return [code, out.getvalue(), err.getvalue()]
+
+
+def make_error(kind, msg, data):
+    import subprocess, backends
+    if kind == 'AdmissionRefused':
+        return harness.AdmissionRefused(msg)
+    if kind == 'BudgetExceeded':
+        return harness.BudgetExceeded(msg)
+    if kind == 'CallError':
+        return harness.CallError(msg, data.get('usage'), data.get('raw'))
+    if kind == 'JudgeError':
+        return backends.JudgeError(msg)
+    if kind == 'Stopped':
+        return backends.Stopped(['x'], 1.0)
+    if kind == 'TimeoutExpired':
+        return subprocess.TimeoutExpired(['x'], 1.0)
+    if kind == 'KeyError':
+        return KeyError(msg)
+    return ValueError(msg)
+
+
+def run_case(spec_path, out, replies):
+    seq, seen = iter(replies), []
+
+    def call(backend, system, message, timeout_s):
+        seen.append([backend, harness.sha(system), message])
+        item = next(seq)
+        if 'raise' in item:
+            raise make_error(*item['raise'])
+        return item['reply'], item.get('usage', {})
+    try:
+        result = {'report': workflow.run(spec_path, out, call_fn=call)}
+    except BaseException as e:
+        result = {'raised': [type(e).__name__, str(e)]}
+    result['seen'] = seen
+    return result
+
+
+def identity():
+    import releases
+    return releases.identity(workflow.HERE)
+
+
 H = {
+    'checks': checks_case, 'bridge': workflow.bridge, 'outcome': workflow.outcome, 'main': main_case,
+    'run': run_case, 'identity': identity, 'review_findings': workflow.review_findings,
     'strict_json': strict_json, 'strict_kind': strict_kind, 'json_boundary': json_boundary, 'file_map': workflow.file_map,
     'near_miss': workflow.near_miss, 'materialize': workflow.materialize, 'json_protocol': json_protocol,
     'parse_text_reply': workflow.parse_text_reply, 'text_pipeline': text_pipeline,
@@ -125,9 +201,15 @@ fn root() -> PathBuf {
 
 /// The Python results for a batch of argument lists, each as json.dumps({'ok': result} or {'err': [type, str]}).
 fn python(function: &str, cases: &[Value]) -> Vec<String> {
+    python_with(function, cases, &["-I", "-B"])
+}
+
+/// python() with these interpreter flags (main's colour checks need the environment, which -I ignores).
+fn python_with(function: &str, cases: &[Value], flags: &[&str]) -> Vec<String> {
     let request = pyjson::dumps(&json!({ "fn": function, "cases": cases }));
     let mut child = Command::new(ringo_cli::python())
-        .args(["-I", "-B", "-c", DRIVER])
+        .args(flags)
+        .args(["-c", DRIVER])
         .arg(root())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -962,7 +1044,10 @@ impl Temp {
 
 impl Drop for Temp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if std::env::var_os("GATE_KEEP").is_none() {
+            // GATE_KEEP=1 keeps the folders for a look at what each side wrote
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 
@@ -1103,6 +1188,19 @@ fn load_spec_matches_python() {
     gate("load_spec", &cases, |c| enc(wf::load_spec(Path::new(s(&c[0])))));
 }
 
+/// harness.backend's dict as the Backend the Rust port takes.
+fn backend_of(v: &Value) -> Backend {
+    let strings = |x: &Value| x.as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect::<Vec<_>>();
+    Backend {
+        name: s(&v["name"]).into(),
+        argv: strings(&v["argv"]),
+        style: s(&v["style"]).into(),
+        subscription_auth: v.get("subscription_auth").and_then(Value::as_bool),
+        lean: v.get("lean").and_then(Value::as_bool),
+        tools: v.get("tools").map(strings),
+    }
+}
+
 #[test]
 fn role_backend_matches_python() {
     let mut cases = Vec::new();
@@ -1116,8 +1214,8 @@ fn role_backend_matches_python() {
     let backends = python("role_backend", &cases.iter().map(|c| json!([c[0], null])).collect::<Vec<_>>());
     gate("role_backend", &cases, |c| {
         let i = cases.iter().position(|x| x == c).unwrap();
-        let backend: Value = serde_json::from_str::<Value>(&backends[i]).unwrap()["ok"].clone();
-        enc(wf::role_backend(&backend, if c[1].is_null() { None } else { Some(&c[1]) }))
+        let backend = backend_of(&serde_json::from_str::<Value>(&backends[i]).unwrap()["ok"]);
+        enc(wf::role_backend(&backend, if c[1].is_null() { None } else { Some(&c[1]) }).map(|b| b.to_value()))
     });
 }
 
@@ -1346,3 +1444,521 @@ fn sweep_strict_json_over_corpus_json_and_mutations() {
     eprintln!("json sweep: {} documents, {total} cases identical", texts.len());
 }
 
+
+// ------------------------------------------------------------------------------------------------------------
+// Phase 2a: checks, bridge, review_findings, outcome, main and run with a fake call function
+
+fn py3() -> String {
+    String::from_utf8(
+        Command::new(ringo_cli::python()).args(["-I", "-c", "import sys; sys.stdout.write(sys.executable)"]).output().unwrap().stdout,
+    )
+    .unwrap()
+}
+
+fn py_check(name: &str, code: &str, timeout: Value) -> Value {
+    json!({"name": name, "argv": [py3(), "-I", "-B", "-c", code], "timeout_s": timeout})
+}
+
+/// Runs the same check batches in a py and an rs folder and compares the results, with the folders' paths
+/// written alike and seconds as their type.
+#[test]
+fn checks_match_python() {
+    let temp = Temp::new("checks");
+    let cases: Vec<(Value, f64)> = vec![
+        (json!({"checks": [py_check("ok", "print('hi'); import sys; print('err', file=sys.stderr)", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("fail", "import sys; sys.exit(3)", json!(30)), py_check("second", "print(2)", json!(5.5))]}), 30.0),
+        (json!({"checks": [py_check("signal", "import os; os.kill(os.getpid(), 9)", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("exact", "import sys; sys.stdout.write('x' * 16000)", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("over", "import sys; sys.stdout.write('x' * 16001); sys.stderr.write('y' * 40000)", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("cut", "import sys; sys.stdout.buffer.write(b'x' * 15999 + 'é'.encode() + b'z')", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("bytes", "import sys; sys.stdout.buffer.write(b'a\\xff\\xe2\\x82b\\xf0\\x9f\\x98\\xed\\xa0\\x80c\\xc0\\x80')", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("timeout", "import time; print('slow', flush=True); time.sleep(20)", json!(0.5))]}), 30.0),
+        (json!({"checks": [py_check("budget", "import time; time.sleep(20)", json!(30))]}), 0.6),
+        (json!({"checks": [py_check("env", "import os; print(os.environ.get('PYTHONDONTWRITEBYTECODE'), os.path.basename(os.getcwd()))", json!(30))]}), 30.0),
+        (json!({"checks": [py_check("tree", "import subprocess, sys; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.5); open(\"late.txt\", \"w\").write(\"x\")']); print('started')", json!(30))]}), 30.0),
+        (json!({"checks": [{"name": "missing", "argv": ["ringo-no-such-command"], "timeout_s": 30}]}), 30.0),
+        (json!({"checks": [py_check("never", "print(1)", json!(30))]}), 0.0),
+        (json!({"checks": [py_check("never", "print(1)", json!(30))]}), -1.0),
+    ];
+    let mut py_cases = Vec::new();
+    for (i, (spec, remaining)) in cases.iter().enumerate() {
+        for side in ["py", "rs"] {
+            std::fs::create_dir_all(temp.0.join(format!("{side}-{i}/root"))).unwrap();
+            std::fs::create_dir_all(temp.0.join(format!("{side}-{i}/logs"))).unwrap();
+        }
+        let d = temp.0.join(format!("py-{i}"));
+        py_cases.push(json!([spec, d.join("root").to_string_lossy(), d.join("logs").to_string_lossy(), remaining]));
+    }
+    let want = python("checks", &py_cases);
+    for (i, ((spec, remaining), want)) in cases.iter().zip(&want).enumerate() {
+        let d = temp.0.join(format!("rs-{i}"));
+        let got = wf::checks(spec, &d.join("root"), &d.join("logs"), &|| *remaining).map(|rows| {
+            Value::Array(
+                rows.into_iter()
+                    .map(|mut r| {
+                        r["seconds"] = json!(if r["seconds"].as_f64().is_some() { "float" } else { "other" });
+                        r
+                    })
+                    .collect(),
+            )
+        });
+        let got = enc(got).replace(&format!("rs-{i}"), &format!("py-{i}"));
+        assert_eq!(&got, want, "checks case {i}: {}", short(&pyjson::dumps(spec)));
+    }
+    // A check's children are killed with it: neither side's late writer survived to write its file.
+    std::thread::sleep(std::time::Duration::from_millis(2000));
+    for side in ["py", "rs"] {
+        assert!(!temp.0.join(format!("{side}-10/root/late.txt")).exists(), "{side}: a check's child outlived it");
+    }
+    // the logs are the same bytes
+    for i in 0..cases.len() {
+        for name in ["check-1.out", "check-1.err", "check-2.out"] {
+            let (a, b) = (std::fs::read(temp.0.join(format!("py-{i}/logs/{name}"))), std::fs::read(temp.0.join(format!("rs-{i}/logs/{name}"))));
+            assert_eq!(a.ok(), b.ok(), "log {name} of case {i}");
+        }
+    }
+    eprintln!("checks: {} cases identical", cases.len());
+}
+
+#[test]
+fn bridge_matches_python() {
+    let echo = |reply: &str| json!({"council": [py3(), "-I", "-c", reply]});
+    let mut cases = Vec::new();
+    for program in [
+        "import json, sys; print(json.dumps({'version': 1, 'got': sys.stdin.read()}))",
+        "print('{\"version\": 1.0, \"x\": \"\\\\u00e9\"}')",
+        "print('{\"version\": true}')",
+        "print('{\"version\": 2}')",
+        "print('[1]')",
+        "print('not json')",
+        "print('{\"version\": 1, \"version\": 1}')",
+        "print('{\"version\": 1, \"x\": NaN}')",
+        "import sys; print('partial'); sys.stderr.write('  bad   news \\n' * 50); sys.exit(3)",
+        "import sys; sys.exit(1)",
+        "",
+    ] {
+        cases.push(json!([echo(program), {"operation": "prepare", "brief": "é", "samples": 2}, 30]));
+    }
+    cases.push(json!([{"council": ["ringo-no-such-bridge"]}, {}, 30]));
+    gate("bridge", &cases, |c| enc(wf::bridge(&c[0], &c[1], c[2].as_f64().unwrap())));
+}
+
+#[test]
+fn review_findings_match_python() {
+    let cases: Vec<Value> = [
+        "What this change does: adds f.\n\nNo defects found.",
+        "### 1. Name (`value.py:2`)\n- Problem: rename.\n- Fix: rename.",
+        "### 1. A\nx\n### 2. B\ny\n## Open questions\nnone",
+        "Looks fine to me.",
+        "```\nNo defects found.\n```",
+        "Intro\n```\n### 1. inside a fence\n```\nno defects found.",
+        "",
+        "- no defects found",
+        "NO DEFECTS FOUND here",
+    ]
+    .iter()
+    .map(|t| json!([t]))
+    .collect();
+    gate("review_findings", &cases, |c| enc(Ok(Value::from(wf::review_findings(s(&c[0]))))));
+}
+
+#[test]
+fn outcome_matches_python() {
+    let temp = Temp::new("outcome");
+    let out = temp.0.join("run");
+    std::fs::create_dir_all(&out).unwrap();
+    let usage = json!({"calls": 3, "cost_usd": 0.0, "input": 10, "cache_read": 0, "cache_write": 0, "output": 5, "untokened_calls": 1});
+    let cases = vec![
+        json!([{"status": "ready_for_review", "final": "/x/final", "rounds": [{}, {}], "usage": usage, "elapsed_s": 12.345678}, out.to_string_lossy()]),
+        json!([{"status": "error", "final": null, "rounds": [], "error": "ValueError: x", "usage": {}, "elapsed_s": 0.05}, format!("{}/./", out.display())]),
+        json!([{"status": "needs_revision", "final": null, "rounds": [1], "usage": {"calls": 1}, "elapsed_s": 2.25}, temp.0.join("missing/../run").to_string_lossy()]),
+        json!([{"status": "x", "final": null, "rounds": [], "usage": {}, "elapsed_s": 3}, "relative-dir"]),
+        json!([{"status": "x", "final": null, "usage": {}, "elapsed_s": 1.0}, "r"]),
+    ];
+    gate("outcome", &cases, |c| enc(wf::outcome(&c[0], Path::new(s(&c[1])))));
+}
+
+#[test]
+fn main_arguments_and_help_match_python() {
+    let temp = Temp::new("main");
+    let missing = temp.0.join("missing.json").to_string_lossy().into_owned();
+    let inside = root().join("run-inside").to_string_lossy().into_owned();
+    let spec = temp.0.join("spec.json");
+    std::fs::write(&spec, pyjson::dumps(&base_spec(false))).unwrap();
+    let spec = spec.to_string_lossy().into_owned();
+    let argvs: Vec<Vec<String>> = [
+        vec![],
+        vec!["-h"],
+        vec!["--help"],
+        vec!["--he"],
+        vec!["-hx"],
+        vec!["-h=x"],
+        vec!["--help=x"],
+        vec!["--spec"],
+        vec!["--spec", "a"],
+        vec!["--out", "o"],
+        vec!["--spec", "--out", "o"],
+        vec!["--spec", "a", "--out"],
+        vec!["--spec", "a", "--out", "o", "extra"],
+        vec!["x", "--spec", "a", "--out", "o", "y"],
+        vec!["--sp", "a", "--o", "o", "--bogus"],
+        vec!["--spec=", "--out=o", "-x"],
+        vec!["--=x"],
+        vec!["--s=a", "--out", "-1"],
+        vec!["--spec", "-a b", "--out", "-.5", "--", "z"],
+        vec!["-spec", "a"],
+        vec!["--spec", "a", "-h", "--out"],
+        vec!["--bogus", "-h"],
+        vec!["---"],
+        vec!["-"],
+        vec!["--spec", &missing, "--out", "o"],
+        vec!["--spec", &spec, "--out", &inside],
+    ]
+    .iter()
+    .map(|a| a.iter().map(|x| x.to_string()).collect())
+    .collect();
+    let envs = [
+        json!({}),
+        json!({"COLUMNS": "40"}),
+        json!({"COLUMNS": "120"}),
+        json!({"COLUMNS": "1"}),
+        json!({"COLUMNS": "25"}),
+        json!({"COLUMNS": " 6_0 "}),
+        json!({"COLUMNS": "x"}),
+        json!({"FORCE_COLOR": "1"}),
+        json!({"FORCE_COLOR": "1", "COLUMNS": "30"}),
+        json!({"FORCE_COLOR": "1", "NO_COLOR": "1"}),
+        json!({"PYTHON_COLORS": "1", "TERM": "dumb"}),
+        json!({"PYTHON_COLORS": "0", "FORCE_COLOR": "1"}),
+        json!({"FORCE_COLOR": "1", "TERM": "dumb"}),
+    ];
+    let mut cases = Vec::new();
+    for argv in &argvs {
+        for env in &envs {
+            if argv.len() > 2 && env.as_object().unwrap().len() > 1 {
+                continue; // argument errors print the usage only: fewer environments are enough
+            }
+            cases.push(json!([argv, env]));
+        }
+    }
+    for columns in 1..=130 {
+        cases.push(json!([["--help"], {"COLUMNS": columns.to_string()}]));
+        cases.push(json!([["--spec"], {"COLUMNS": columns.to_string(), "FORCE_COLOR": "1"}]));
+    }
+    let want = python_with("main", &cases, &["-B"]);
+    let identity = json!({"mode": "checkout", "id": "x", "root": "/r", "quality_claim": null});
+    let mut bad = Vec::new();
+    for (c, want) in cases.iter().zip(&want) {
+        let argv: Vec<String> = c[0].as_array().unwrap().iter().map(|a| s(a).to_string()).collect();
+        let env_map = c[1].as_object().unwrap().clone();
+        let env = move |k: &str| env_map.get(k).and_then(Value::as_str).map(String::from);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = wf::main_with(&argv, wf::Console { out: &mut out, err: &mut err, stdout_tty: false, terminal_columns: None, env: &env }, None, &identity);
+        let got = enc(Ok(json!([code, String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap()])));
+        if &got != want {
+            bad.push(format!("{}\n  python: {}\n  rust:   {}", pyjson::dumps(c), short(want), short(&got)));
+        }
+    }
+    assert!(bad.is_empty(), "main: {} of {} differ:\n{}", bad.len(), cases.len(), bad[..bad.len().min(4)].join("\n"));
+    eprintln!("main: {} cases identical", cases.len());
+}
+
+const FAKE_BRIDGE: &str = "import json, sys
+r = json.load(sys.stdin)
+if r['operation'] == 'prepare':
+    out = {'version': 1, 'fingerprint': 'fixed', 'policy_sha256': 'a'*64,
+           'requests': ['JUDGE '+str(n)+' '+json.dumps(json.loads(r['proposal'])['files']) for n in range(r['samples'])]}
+else:
+    assert len(r['replies']) == r['samples']
+    ok = all(json.loads(x)['accept'] for x in r['replies'])
+    out = {'version': 1, 'report': {'complete': True, 'scored': [len(r['replies'])],
+           'decision': {'action': 'recommend' if ok else 'escalate', 'reasons': []}}}
+print(json.dumps(out))
+";
+
+const CHECK_PY: &str = "from pathlib import Path\nn={}\nexec(Path('value.py').read_text(), n)\nassert n['f'](5)==10\nassert n['f'](-2)==-4\n";
+
+fn reply(text: &str) -> Value {
+    json!({"reply": text, "usage": {"input": 7, "output": 3, "cache_read": 0, "cache_write": 0, "cost_usd": 0.01}})
+}
+
+fn proposal(code: &str) -> Value {
+    reply(&pyjson::dumps(&json!({"files": {"value.py": code}, "rationale": "Implement it."})))
+}
+
+fn accept(yes: bool) -> Value {
+    reply(&pyjson::dumps(&json!({"accept": yes})))
+}
+
+fn raise(kind: &str, msg: &str, data: Value) -> Value {
+    json!({"raise": [kind, msg, data]})
+}
+
+/// The error a fake call function raises, as the driver's make_error builds it.
+fn make_error(kind: &str, msg: &str, data: &Value) -> Error {
+    use ringo_cli::rt::{backends, harness, Exc};
+    match kind {
+        "AdmissionRefused" => harness::admission_refused(msg),
+        "BudgetExceeded" => harness::budget_exceeded(msg),
+        "CallError" => harness::call_error(msg, data.get("usage").cloned(), data.get("raw").and_then(Value::as_str).map(String::from)),
+        "JudgeError" => backends::judge_error(msg, false),
+        "Stopped" => backends::stopped(&["x".to_string()], 1.0),
+        "TimeoutExpired" => backends::timeout_expired(&["x".to_string()], 1.0),
+        "KeyError" => Error::new(Exc::Key, wf::repr(msg)),
+        _ => Error::value(msg),
+    }
+}
+
+/// Timing values (seconds, elapsed, state times, pid) as a marker, and the rs folder's paths as the py folder's.
+fn normalize(v: &mut Value, from: &str, to: &str) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m.iter_mut() {
+                if ["seconds", "elapsed_s", "started", "updated", "pid"].contains(&k.as_str()) && x.is_number() {
+                    *x = json!("<n>");
+                } else if k == "message_sha256" {
+                    *x = json!("<sha of a message the calls already compare, timing included>");
+                } else {
+                    normalize(x, from, to);
+                }
+            }
+        }
+        Value::Array(a) => a.iter_mut().for_each(|x| normalize(x, from, to)),
+        Value::String(t) => {
+            // a JSON-protocol writer message carries the check results, timing included
+            static SECONDS: std::sync::LazyLock<regex::Regex> =
+                std::sync::LazyLock::new(|| regex::Regex::new(r#""(seconds|elapsed_s)": [0-9.e+-]+"#).unwrap());
+            *t = SECONDS.replace_all(&t.replace(from, to), "\"$1\": \"<n>\"").into_owned();
+        }
+        _ => {}
+    }
+}
+
+/// Every file under dir: relative path and content, JSON files normalized.
+fn tree(dir: &Path, from: &str, to: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                out.push((rel, "/".into()));
+                stack.push(p);
+                continue;
+            }
+            let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
+            let text = if rel.ends_with(".json") || rel.ends_with(".jsonl") {
+                text.lines()
+                    .map(|line| match serde_json::from_str::<Value>(line).or_else(|_| serde_json::from_str::<Value>(&text)) {
+                        Ok(mut v) => {
+                            normalize(&mut v, from, to);
+                            pyjson::dumps(&v)
+                        }
+                        Err(_) => line.replace(from, to),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                text.replace(from, to)
+            };
+            out.push((rel, text));
+        }
+    }
+    out.sort();
+    out
+}
+
+struct RunCase {
+    name: &'static str,
+    spec: Value,
+    replies: Vec<Value>,
+}
+
+fn council_spec(dir: &Path) -> Value {
+    std::fs::write(dir.join("bridge.py"), FAKE_BRIDGE).unwrap();
+    json!({"version": 1, "brief": "Implement f(x)=2*x.\n\nHard constraints:\n- Return twice x.\n", "files": {"value.py": ""},
+           "fixtures": {"check.py": CHECK_PY}, "checks": [{"name": "reference", "argv": ["{python}", "-I", "-B", "check.py"]}],
+           "writer": "fake", "judge": "fake", "allow_tool_backends": true, "allow_execution": true,
+           "council": [py3(), dir.join("bridge.py").to_string_lossy()], "rubric": "unused.json",
+           "max_rounds": 3, "max_seconds": 60, "samples": 2})
+}
+
+fn with(spec: &Value, changes: Value) -> Value {
+    let mut s = spec.clone();
+    for (k, v) in changes.as_object().unwrap() {
+        if v.is_null() {
+            s.as_object_mut().unwrap().remove(k);
+        } else {
+            s[k.as_str()] = v.clone();
+        }
+    }
+    s
+}
+
+const SPEC_TESTS_REPLY: &str = "```python\nimport unittest\nfrom value import f\n\n\nclass Brief(unittest.TestCase):\n    def test_doubles_integers(self):\n        self.assertEqual(f(5), 10)\n\n    def test_keeps_floats(self):\n        self.assertEqual(f(0.5), 1.0)\n        self.assertIsInstance(f(0.5), float)\n```";
+
+const THREE_SPEC_TESTS: &str = "```python\nimport unittest\nfrom value import f\n\n\nclass Brief(unittest.TestCase):\n    def test_ints(self):\n        self.assertEqual(f(5), 10)\n\n    def test_floats(self):\n        self.assertIsInstance(f(0.5), float)\n\n    def test_negative(self):\n        self.assertEqual(f(-2), -4)\n```";
+
+fn run_cases(dir: &Path) -> Vec<RunCase> {
+    let base = council_spec(dir);
+    let text = with(&base, json!({"protocol": "text"}));
+    let good = "def f(x): return 2*x\n";
+    let plain = json!({"version": 1, "brief": "Implement f(x).\n\nReturn twice x.\n", "files": {"value.py": ""},
+        "fixtures": {"check.py": "from value import f\nassert f(5) == 10\n"}, "checks": [{"name": "reference", "argv": ["{python}", "-B", "check.py"]}],
+        "writer": "fake", "judge": "fake", "allow_tool_backends": true, "allow_execution": true, "max_rounds": 3, "max_seconds": 60,
+        "protocol": "text", "spec_tests": {"python": "{python}"}});
+    vec![
+        RunCase { name: "ready", spec: base.clone(), replies: vec![proposal(good), accept(true), accept(true)] },
+        RunCase { name: "revise", spec: base.clone(), replies: vec![proposal("def f(x): return x\n"), proposal(good), accept(true), accept(true)] },
+        RunCase { name: "malformed", spec: base.clone(), replies: vec![reply("not json"), proposal("# keep\ndef f(x): return x\n"),
+            reply(&pyjson::dumps(&json!({"edits": [{"path": "value.py", "old": "return 2*x", "new": "return x+x"}], "rationale": "r"}))),
+            reply(&pyjson::dumps(&json!({"edits": [{"path": "value.py", "old": "return x", "new": "return 2*x"}], "rationale": "r"})))] },
+        RunCase { name: "escalate", spec: with(&base, json!({"samples": 4, "first_judges": 2})), replies: vec![proposal(good), accept(true), accept(false), accept(true), accept(true),
+            proposal("def f(x): return x + x\n"), accept(true), accept(true)] },
+        RunCase { name: "exhausted", spec: base.clone(), replies: vec![proposal(good), accept(true)] },
+        RunCase { name: "repeated", spec: base.clone(), replies: vec![proposal("")] },
+        RunCase { name: "deep", spec: base.clone(), replies: vec![reply(&format!("{}0{}", "[".repeat(200_000), "]".repeat(200_000))), proposal(good), accept(true), accept(true)] },
+        RunCase { name: "admission", spec: base.clone(), replies: vec![raise("AdmissionRefused", "no room", json!({}))] },
+        RunCase { name: "call-error", spec: base.clone(), replies: vec![raise("CallError", "bad reply", json!({"usage": {"input": 4, "output": 0, "cache_read": 0, "cache_write": 0}, "raw": "events"}))] },
+        RunCase { name: "stopped-retry", spec: base.clone(), replies: vec![raise("Stopped", "", json!({})), proposal(good), accept(true), accept(true)] },
+        RunCase { name: "stopped-twice", spec: base.clone(), replies: vec![raise("Stopped", "", json!({})), raise("Stopped", "", json!({}))] },
+        RunCase { name: "judge-error", spec: base.clone(), replies: vec![proposal(good), raise("JudgeError", "the judge failed", json!({}))] },
+        RunCase { name: "key-error", spec: base.clone(), replies: vec![raise("KeyError", "k", json!({}))] },
+        RunCase { name: "mutation", spec: base.clone(), replies: vec![proposal("from pathlib import Path\nPath('check.py').write_text('pass')\ndef f(x): return 2*x\n")] },
+        RunCase { name: "crlf", spec: base.clone(), replies: vec![proposal("def f(x):\r\n    return 2*x\r\n")] },
+        RunCase { name: "timeout", spec: with(&base, json!({"checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(5)"], "timeout_s": 0.3}], "max_rounds": 1})),
+            replies: vec![proposal(good)] },
+        RunCase { name: "all-fail", spec: with(&base, json!({"max_rounds": 2})), replies: vec![proposal("def f(x): return x\n"), proposal("def f(x): return 3*x\n")] },
+        RunCase { name: "budget", spec: with(&base, json!({"max_seconds": 0.5, "checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(3)"], "timeout_s": 10}]})),
+            replies: vec![proposal(good)] },
+        RunCase { name: "repair", spec: with(&text, json!({"protocol_repair": true})), replies: vec![reply("@@@ REPLACE value.py\nnot there\n@@@ WITH\nx\n@@@ END\n"),
+            reply("@@@ FILE value.py\ndef f(x):\n    return 2*x\n"), accept(true), accept(true)] },
+        RunCase { name: "text", spec: text.clone(), replies: vec![reply("@@@ RATIONALE\nwhy\n@@@ FILE value.py\ndef f(x):\n    return x\n"),
+            reply("@@@ REPLACE value.py\n    return x\n@@@ WITH\n    return 2*x\n@@@ END\n"), accept(false), accept(true),
+            reply("@@@ RATIONALE\nThe judges are wrong.\n"), accept(true), accept(true)] },
+        RunCase { name: "no-regression", spec: with(&text, json!({"no_regression": true})), replies: vec![reply("@@@ FILE value.py\ndef f(x):\n    return 2*x\n"), accept(false), accept(false),
+            reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("@@@ FILE value.py\ndef f(x):\n    return x*2\n"), accept(true), accept(true)] },
+        RunCase { name: "unpriced", spec: with(&base, json!({"max_cost": 0.015, "unpriced_call_usd": 0.004})), replies: vec![proposal(good), accept(true), accept(true), proposal("x"), accept(true)] },
+        RunCase { name: "doc-script", spec: with(&text, json!({"files": {"REPORT.md": ""}, "fixtures": {"data.csv": "a,b\n1,2\n3,4\n", "check.py": "assert 'total' in open('REPORT.md').read()\n"},
+            "checks": [{"name": "c", "argv": ["{python}", "-B", "check.py"]}], "scripts": {"python": "{python}"}, "no_regression": true})),
+            replies: vec![reply("@@@ SCRIPT\nimport csv\nprint('total', sum(int(r['b']) for r in csv.DictReader(open('data.csv'))))\n@@@ FILE REPORT.md\ntotal: 6\n"), accept(false), accept(true),
+                reply("@@@ REPLACE REPORT.md\ntotal: 6\n@@@ WITH\ntotal: 9\n@@@ END\n"), reply("@@@ RATIONALE\nThe script shows 6.\n"), accept(true), accept(true)] },
+        RunCase { name: "spec-tests", spec: plain.clone(), replies: vec![reply(SPEC_TESTS_REPLY), reply("@@@ FILE value.py\ndef f(x):\n    return int(2*x)\n"),
+            reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("@@@ DISPUTE Brief.test_keeps_floats\n\"Return twice x.\"\n@@@ FILE value.py\ndef f(x):\n    return 3*x\n")] },
+        RunCase { name: "candidates", spec: with(&plain, json!({"candidates": 2, "max_cost": 10, "unpriced_call_usd": 0.0})),
+            replies: vec![reply(THREE_SPEC_TESTS), reply("@@@ FILE value.py\ndef f(x):\n    return int(2*x)\n"), reply("@@@ FILE value.py\ndef f(x):\n    return abs(2*x)\n"),
+                reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("@@@ FILE value.py\ndef f(x):\n    return -x\n")] },
+        RunCase { name: "candidates-fail", spec: with(&plain, json!({"candidates": 3, "max_cost": 10, "unpriced_call_usd": 0.0, "max_rounds": 2, "spec_tests": null})),
+            replies: vec![reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("not blocks"), reply("@@@ FILE value.py\ndef f(x):\n    return x\n"),
+                reply("@@@ FILE value.py\ndef f(x):\n    return 3*x\n")] },
+        RunCase { name: "script-only", spec: with(&plain, json!({"files": {"REPORT.md": ""}, "fixtures": {"check.py": "assert 'total' in open('REPORT.md').read()\n"},
+            "spec_tests": null, "scripts": {"python": "{python}"}, "candidates": 2, "max_cost": 10, "unpriced_call_usd": 0.0})),
+            replies: vec![reply("@@@ SCRIPT\nprint('total', 6)\n"), reply("@@@ SCRIPT\nprint('total', 7)\n"), reply("@@@ FILE REPORT.md\nno word\n"), reply("@@@ FILE REPORT.md\nstill none\n")] },
+        RunCase { name: "spec-tests-none", spec: with(&plain, json!({"max_rounds": 2})), replies: vec![reply("no tests here"), reply("@@@ FILE value.py\ndef f(x):\n    return x\n"),
+            reply("@@@ FILE value.py\ndef f(x):\n    return x + 1\n")] },
+    ]
+}
+
+/// run() against workflow.run with the same scripted call function: the report, the calls it made (backend,
+/// system prompt hash, message) and every file it wrote must match, timing aside.
+#[test]
+fn run_matches_python_with_a_fake_call_function() {
+    let temp = Temp::new("run");
+    let identity = serde_json::from_str::<Value>(&python("identity", &[json!([])])[0]).unwrap()["ok"].clone();
+    let cases = run_cases(&temp.0);
+    let mut py_cases = Vec::new();
+    for c in &cases {
+        let path = temp.0.join(format!("{}.json", c.name));
+        std::fs::write(&path, pyjson::dumps(&c.spec)).unwrap();
+        py_cases.push(json!([path.to_string_lossy(), temp.0.join(format!("py-{}", c.name)).to_string_lossy(), c.replies]));
+    }
+    let want = python("run", &py_cases);
+    for (c, want) in cases.iter().zip(&want) {
+        let (py_out, rs_out) = (temp.0.join(format!("py-{}", c.name)), temp.0.join(format!("rs-{}", c.name)));
+        let seen = std::sync::Mutex::new(Vec::new());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let call = |backend: &Backend, system: &str, message: &str, _timeout: f64| -> Result<(String, Value), Error> {
+            seen.lock().unwrap().push(json!([backend.to_value(), ringo_cli::rt::harness::sha(system), message]));
+            let Some(item) = c.replies.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else {
+                // Python's next() on the exhausted replies: StopIteration, which run() does not catch
+                return Err(Error::new(ringo_cli::rt::Exc::NeedVerdicts, "").with_data(json!({"python_type": "StopIteration"})));
+            };
+            if let Some(r) = item.get("raise") {
+                return Err(make_error(s(&r[0]), s(&r[1]), &r[2]));
+            }
+            Ok((s(&item["reply"]).to_string(), item.get("usage").cloned().unwrap_or(json!({}))))
+        };
+        let spec_path = temp.0.join(format!("{}.json", c.name));
+        let result = match wf::run(&spec_path, &rs_out, Some(&call), &identity) {
+            Ok(report) => json!({"report": report}),
+            Err(e) => json!({"raised": [wf::exc_name(&e), e.msg]}),
+        };
+        let mut result = result;
+        result["seen"] = Value::Array(seen.into_inner().unwrap());
+        let (from, to) = (rs_out.to_string_lossy().into_owned(), py_out.to_string_lossy().into_owned());
+        let (from_real, to_real) = (
+            ringo_cli::rt::harness::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
+            ringo_cli::rt::harness::realpath(&py_out).unwrap().to_string_lossy().into_owned(),
+        );
+        normalize(&mut result, &from_real, &to_real);
+        normalize(&mut result, &from, &to);
+        let mut want: Value = serde_json::from_str(want).unwrap();
+        normalize(&mut want, "\u{0}", "\u{0}");
+        let (got, wanted) = (pyjson::dumps(&result), pyjson::dumps(&want["ok"]));
+        if got != wanted {
+            let at = got.chars().zip(wanted.chars()).take_while(|(a, b)| a == b).count();
+            let around = |t: &str| t.chars().skip(at.saturating_sub(200)).take(500).collect::<String>();
+            panic!("run case {}: differs at {at}\n  python: {}\n  rust:   {}", c.name, around(&wanted), around(&got));
+        }
+        let status = want["ok"].get("report").map_or_else(|| want["ok"]["raised"].clone(), |r| r["status"].clone());
+        eprintln!("run case {}: {} ({} calls)", c.name, status, want["ok"]["seen"].as_array().map_or(0, Vec::len));
+        let (a, b) = (tree(&py_out, "\u{0}", "\u{0}"), tree(&rs_out, &from_real, &to_real));
+        let names = |t: &[(String, String)]| t.iter().map(|x| x.0.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&a), names(&b), "run case {}: files", c.name);
+        for (x, y) in a.iter().zip(&b) {
+            assert_eq!(x.1, y.1, "run case {}: {}", c.name, x.0);
+        }
+    }
+    eprintln!("run: {} cases identical (report, calls and files)", cases.len());
+}
+
+/// What run() cannot do yet: its default call function (harness.call) and the review (harness.run_plan) are the
+/// marked gaps; a run that needs them ends as an error report naming the gap.
+#[test]
+fn run_reports_the_harness_gaps() {
+    let temp = Temp::new("gaps");
+    let identity = json!({"mode": "checkout", "id": "x", "root": "/r", "quality_claim": null});
+    let spec = temp.0.join("council.json");
+    std::fs::write(&spec, pyjson::dumps(&council_spec(&temp.0))).unwrap();
+    let report = wf::run(&spec, &temp.0.join("default-call"), None, &identity).unwrap();
+    assert_eq!(report["status"], "error");
+    assert!(s(&report["error"]).contains("harness.call"), "{}", report["error"]);
+    let plain = with(&council_spec(&temp.0), json!({"council": null, "rubric": null, "samples": null}));
+    let spec = temp.0.join("plain.json");
+    std::fs::write(&spec, pyjson::dumps(&plain)).unwrap();
+    let call = |_: &Backend, _: &str, _: &str, _: f64| -> Result<(String, Value), Error> {
+        Ok((pyjson::dumps(&json!({"files": {"value.py": "def f(x): return 2*x\n"}, "rationale": "r"})), json!({})))
+    };
+    let report = wf::run(&spec, &temp.0.join("review"), Some(&call), &identity).unwrap();
+    assert_eq!(report["status"], "error");
+    assert!(s(&report["error"]).contains("harness.run_plan"), "{}", report["error"]);
+    assert_eq!(report["rounds"][0]["checks"][0]["status"], "pass");
+    // A spec-test suite that cannot load is dropped (spec_runner.py ran it) before the review's gap.
+    let mut plain = with(&plain, json!({"protocol": "text", "spec_tests": {"python": "{python}"}}));
+    plain["fixtures"] = json!({"check.py": "from value import f\nassert f(5) == 10\n"});
+    plain["checks"] = json!([{"name": "reference", "argv": ["{python}", "-B", "check.py"]}]);
+    let spec = temp.0.join("broken.json");
+    std::fs::write(&spec, pyjson::dumps(&plain)).unwrap();
+    let replies = ["```python\nfrom value import g\nimport unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n```",
+        "@@@ FILE value.py\ndef f(x):\n    return 2*x\n"];
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let call = |_: &Backend, _: &str, _: &str, _: f64| -> Result<(String, Value), Error> {
+        Ok((replies[next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)].to_string(), json!({})))
+    };
+    let report = wf::run(&spec, &temp.0.join("broken"), Some(&call), &identity).unwrap();
+    assert!(s(&report["spec_tests"]["dropped"]).contains("ImportError"), "{}", report["spec_tests"]);
+    assert_eq!(report["rounds"][0]["spec_tests"]["status"], "broken");
+    assert!(s(&report["error"]).contains("harness.run_plan"), "{}", report["error"]);
+}
