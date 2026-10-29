@@ -277,6 +277,16 @@ def _codex_home(root, env):
         fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
         with os.fdopen(fd, 'wb') as f:
             f.write(snapshot)
+    # The owner's model catalog cache: without it every call's `codex debug models` (see _lean_codex) fetches the
+    # same catalog over the network, about 0.5-1 s; with it, about 15 ms. It holds no instructions. Not copied back.
+    try:
+        catalog = (owner.parent / 'models_cache.json').read_bytes()
+    except OSError:
+        catalog = None
+    if catalog is not None:
+        fd = os.open(private / 'models_cache.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(catalog)
     env.update(HOME=str(home), CODEX_HOME=str(private))
     if os.name == 'nt':  # Windows programs find the home folder in USERPROFILE, not HOME
         env['USERPROFILE'] = str(home)

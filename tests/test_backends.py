@@ -137,6 +137,12 @@ class CodexHomeTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.owner.iterdir()),
                          ['.ringo-auth.lock', 'AGENTS.md', 'auth.json', 'memories_1.sqlite'])  # no temp file left
 
+    def test_the_owners_model_catalog_cache_is_copied_and_nothing_else(self):
+        (self.owner / 'models_cache.json').write_text('{"models": []}')
+        seen = self.run_child('r2')
+        self.assertEqual(seen['codex_files'], ['auth.json', 'models_cache.json'])  # still no AGENTS.md or memories
+        self.assertEqual((self.owner / 'models_cache.json').read_text(), '{"models": []}')
+
     @unittest.skipIf(os.name == 'nt', POSIX_MODES)
     def test_private_login_and_folders_are_owner_only_and_the_refresh_keeps_mode_0600(self):
         seen = self.run_child('r2')
