@@ -127,11 +127,7 @@ pub fn select(home: &std::path::Path) -> Result<Selection> {
     let binary_sha256 = sha256_hex(&std::fs::read(&exe)?);
     if let Some(pinned) = std::env::var_os("RINGO_PINNED") {
         let mut meta = pyjson::loads(&pinned.to_string_lossy())?;
-        let root = meta.get("root").and_then(|r| r.as_str()).ok_or_else(|| Error::value("RINGO_PINNED has no release root"))?;
-        let want = std::path::Path::new(root).join("bin/ringo").canonicalize().ok();
-        if want.as_deref() != Some(exe.as_path()) {
-            return Err(Error::value("RINGO_PINNED names a release whose binary is not this program"));
-        }
+        verify_pinned(&meta, &exe, &binary_sha256)?;
         let map = meta.as_object_mut().ok_or_else(|| Error::value("RINGO_PINNED is not an object"))?;
         map.insert("binary_sha256".into(), binary_sha256.into());
         return Ok(Selection::Native(meta));
@@ -171,6 +167,62 @@ pub fn select(home: &std::path::Path) -> Result<Selection> {
         "runtime": "native",
         "binary_sha256": binary_sha256,
     })))
+}
+
+/// RINGO_PINNED is honoured only for a release releases.py could have run: the release state's own bundle for that
+/// id (no symlinked stand-in), whose release.json hashes to the id and names this exact binary, and, for an active
+/// release, the active pointer and its approval record. An environment variable alone authorises nothing.
+fn verify_pinned(meta: &serde_json::Value, exe: &std::path::Path, binary_sha256: &str) -> Result<()> {
+    let refuse = |why: &str| Error::value(format!("RINGO_PINNED refused: {why}"));
+    let text = |k: &str| meta.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let hex64 = |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let id = text("id");
+    if !hex64(id) {
+        return Err(refuse("no release id"));
+    }
+    let state = resolve(&crate::state_root());
+    let bundle = state.join("bundles").join(id);
+    let real = bundle.canonicalize().map_err(|_| refuse("its release is not staged here"))?;
+    // releases.py passes the bundle's resolved path itself; anything else, a symlink to it included, is refused
+    if real != bundle || std::path::Path::new(text("root")) != bundle {
+        return Err(refuse("its root is not this release state's bundle"));
+    }
+    if bundle.join("bin/ringo").canonicalize().ok().as_deref() != Some(exe) {
+        return Err(refuse("this program is not the release's bundled binary"));
+    }
+    // A record written by releases.atomic_json is canonical JSON and a newline: its id is the hash of those bytes.
+    let record = |path: std::path::PathBuf, want: &str| -> Result<serde_json::Value> {
+        let bytes = std::fs::read(&path).map_err(|_| refuse("a release record is missing"))?;
+        if path.is_symlink() || sha256_hex(bytes.strip_suffix(b"\n").unwrap_or(&bytes)) != want {
+            return Err(refuse("a release record does not match its id"));
+        }
+        pyjson::loads(&String::from_utf8_lossy(&bytes))
+    };
+    let manifest = record(bundle.join("release.json"), id)?;
+    let native = serde_json::json!({"binary": "bin/ringo", "gate": "native-gate.json"});
+    if manifest.get("native") != Some(&native)
+        || manifest.pointer("/files/bin~1ringo").and_then(|v| v.as_str()) != Some(binary_sha256)
+    {
+        return Err(refuse("the release does not pin this binary"));
+    }
+    match text("mode") {
+        "preview" => Ok(()), // `release preview`: an explicit test of a staged bundle, never active
+        "release" => {
+            let approval = text("approval");
+            let pointer = pyjson::loads(&std::fs::read_to_string(state.join("active.json")).unwrap_or_default())
+                .map_err(|_| refuse("no active release"))?;
+            let active = pointer.get("active").cloned().unwrap_or_default();
+            if !hex64(approval) || active != serde_json::json!({"release": id, "approval": approval}) {
+                return Err(refuse("it is not the active release"));
+            }
+            let approved = record(state.join("approvals").join(format!("{approval}.json")), approval)?;
+            if approved.get("release").and_then(|v| v.as_str()) != Some(id) {
+                return Err(refuse("its approval is for another release"));
+            }
+            Ok(())
+        }
+        _ => Err(refuse("unknown mode")),
+    }
 }
 
 /// latency.canonical(): sorted keys, no spaces, ASCII only.

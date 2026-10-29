@@ -302,8 +302,22 @@ def _lean_codex(argv, private, env, timeout_s=15):
     instructions.write_text(CODEX_INSTRUCTIONS, encoding='utf-8', newline='')  # LF on Windows too
     extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
     try:
-        listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=timeout_s, check=True).stdout
+        # In a process tree of its own (see spawn), killed whole on timeout or Ctrl-C, like the call itself.
+        with tempfile.TemporaryFile() as out:
+            proc = spawn([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL, stdout=out,
+                         stderr=subprocess.DEVNULL)
+            try:
+                proc.wait(timeout=timeout_s)
+            finally:
+                try:
+                    kill_tree(proc)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                proc.wait()
+            if proc.returncode:
+                raise subprocess.CalledProcessError(proc.returncode, proc.args)
+            out.seek(0)
+            listed = out.read()
         catalog = json.loads(listed)
         for model in catalog['models']:
             for field in CATALOG_TOOL_FIELDS:

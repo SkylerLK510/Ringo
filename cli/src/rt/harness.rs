@@ -1320,8 +1320,10 @@ impl Run {
                     return Err(Error::value("the trace folder must be new or empty"));
                 }
             }
-            mkdir(&join(t, "steps"), 0o777, true, false)?;
+            // Private from creation (umask can only narrow 0700), not tightened afterwards: it holds the material.
+            mkdir(t, 0o700, true, true)?;
             chmod(t, 0o700)?;
+            mkdir(&join(t, "steps"), 0o700, false, false)?; // exclusive creation also refuses concurrent trace writers
         }
         let run = Run {
             trace,

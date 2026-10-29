@@ -1115,16 +1115,17 @@ fn catalog_without_tools(listed: &[u8]) -> Result<Option<String>> {
     Ok(Some(pyjson::dumps(&Value::Object(catalog))))
 }
 
-/// `subprocess.run(argv, env=env, cwd=cwd, stdin=DEVNULL, capture_output=True, timeout=timeout_s,
-/// check=True).stdout`, None where that raises OSError or a SubprocessError. Not a session of its own: on timeout
-/// only the direct child is killed, as Python does.
+/// `debug models` as `_lean_codex` runs it: stdout, or None on failure, timeout or Ctrl-C. In a process group of its
+/// own, killed whole when it does not finish, as Python's spawn/kill_tree do for it.
 #[cfg(unix)]
 fn run_checked(argv: &[String], env: &Env, cwd: &Path, timeout_s: f64) -> Option<Vec<u8>> {
     use std::io::Read;
     use std::os::fd::AsRawFd;
     let deadline = Instant::now().checked_add(seconds(timeout_s));
+    use std::os::unix::process::CommandExt;
     let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
+        .process_group(0)
         .env_clear()
         .envs(env.iter().map(|(k, v)| (k, v)))
         .current_dir(cwd)
@@ -1138,11 +1139,12 @@ fn run_checked(argv: &[String], env: &Env, cwd: &Path, timeout_s: f64) -> Option
     let mut timed_out = false;
     while open[0] || open[1] {
         let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        if remaining.is_some_and(|r| r.is_zero()) {
+        if remaining.is_some_and(|r| r.is_zero()) || interrupted() {
             timed_out = true;
             break;
         }
-        let ms = remaining.map_or(-1, |r| r.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32);
+        // at most 250 ms per wait, so Ctrl-C is noticed as quickly as during the call itself
+        let ms = remaining.map_or(250, |r| r.as_micros().div_ceil(1000).min(250) as i32);
         let fd = |i: usize, raw: i32| libc::pollfd { fd: if open[i] { raw } else { -1 }, events: libc::POLLIN, revents: 0 };
         let mut fds = [fd(0, out.as_raw_fd()), fd(1, err.as_raw_fd())];
         // SAFETY: fds is a valid array of two pollfd for the call's duration.
@@ -1179,17 +1181,20 @@ fn run_checked(argv: &[String], env: &Env, cwd: &Path, timeout_s: f64) -> Option
                 Err(_) => break,
             }
             let remaining = deadline.map_or(f64::INFINITY, |d| d.saturating_duration_since(Instant::now()).as_secs_f64());
-            if remaining <= 0.0 {
+            if remaining <= 0.0 || interrupted() {
                 break;
             }
             delay = f64::min(delay * 2.0, remaining).min(0.05);
             std::thread::sleep(Duration::from_secs_f64(delay));
         }
     }
+    // SAFETY: the group is this child's own (process_group(0)); killing it ends anything it started.
+    unsafe {
+        libc::killpg(child.id() as i32, libc::SIGKILL);
+    }
     match status {
-        Some(s) => s.success().then_some(stdout),
-        None => {
-            let _ = child.kill();
+        Some(s) if !interrupted() => s.success().then_some(stdout),
+        _ => {
             let _ = child.wait();
             None
         }
@@ -1819,6 +1824,9 @@ fn isolated_call(tmp: &Path, argv: &[String], prompt: &str, timeout_s: f64, kw: 
             // max(0.1, min(15, limit)): Python's min keeps 15 when limit is NaN, where clamp would give NaN
             let within = if limit.is_nan() { 15.0 } else { limit.clamp(0.1, 15.0) };
             argv = lean_codex(&argv, &tmp.join("codex"), &env, within)?;
+            if interrupted() {
+                return Err(keyboard_interrupt()); // Ctrl-C during setup: the model is never launched
+            }
         }
         if started.elapsed().as_secs_f64() >= limit {
             ended = Some(Ended::Limit); // setup used the whole window: the model is never launched
