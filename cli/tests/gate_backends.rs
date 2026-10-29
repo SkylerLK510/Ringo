@@ -577,7 +577,10 @@ refresh = E('FAKE_REFRESH')
 if refresh:
     c = E('CODEX_HOME')
     a = os.path.join(c, 'auth.json')
-    if refresh.startswith('symlink:'):
+    if refresh == 'fifo':
+        os.unlink(a)
+        os.mkfifo(a)
+    elif refresh.startswith('symlink:'):
         os.unlink(a)
         os.symlink(refresh[len('symlink:'):], a)
     else:
@@ -1155,7 +1158,7 @@ fn run_isolated_timeouts_kill_the_whole_session() {
     assert!(seen.result["stdout"].as_str().unwrap().contains("thread.started"));
     let seen = same(
         Case::new("timeout-grandchild-term-ignored", &["{bin}/codex"])
-            .timeout(1.5)
+            .timeout(5.0) // room for the grandchild to start under load before the timeout ends the call
             .env("FAKE_SLEEP", "30")
             .env("FAKE_TERM_IGNORE", "1")
             .env("FAKE_TICKS", "{ticks}"),
@@ -1219,6 +1222,9 @@ fn private_codex_home_and_login_write_back() {
     assert_eq!(seen.owner["other/auth.json"]["data"], json!("{\"tokens\": {\"refresh_token\": \"o2\"}}"));
     let seen = same(codex_case("copy-symlinked-by-child").owner(json_target_owner).env("FAKE_REFRESH", "symlink:{home}/other.json"));
     // a symlink the child put in place of its copy is not followed: the owner keeps their login
+    assert_eq!(seen.owner[".codex/auth.json"]["data"], json!("{\"tokens\": {\"refresh_token\": \"r1\"}}"));
+    // a FIFO the child leaves in place of its copy is not read, so it cannot hang the write-back
+    let seen = same(codex_case("copy-replaced-by-fifo").env("FAKE_REFRESH", "fifo"));
     assert_eq!(seen.owner[".codex/auth.json"]["data"], json!("{\"tokens\": {\"refresh_token\": \"r1\"}}"));
     same(codex_case("child-locks-its-homes").env("FAKE_LOCKDOWN", "1").env("FAKE_REFRESH", "r2"));
     same(codex_case("plain-preset-keeps-keys").kw(json!({"codex_home": true, "subscription_auth": false})));

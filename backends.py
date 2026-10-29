@@ -10,6 +10,7 @@ import math
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -352,9 +353,13 @@ def _sync_codex_auth(owner, snapshot, copy):
     file in the same folder, then os.replace), mode 0600, and never goes through a symlink."""
     if snapshot is None:
         return
-    try:  # never through a symlink the child put in its copy's place: that would hand the owner another file
-        fd = os.open(copy, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+    # Only a regular file the child left in its copy's place: never through a symlink (that would hand the owner
+    # another file), and never a FIFO or device (opened non-blocking, so one cannot hang the write-back).
+    try:
+        fd = os.open(copy, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
         with os.fdopen(fd, 'rb') as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return
             new = f.read()
     except OSError:
         return

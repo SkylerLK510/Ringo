@@ -80,6 +80,42 @@ fn only_the_staged_releases_own_binary_runs_pinned() {
             "no active release");
     refused(&run(&pinned_binary, &["design", "--help"], &state, Some(&meta("checkout", &rid, &bundle))),
             "unknown mode");
+
+    // an active release: releases.py's records (canonical JSON and a newline, named by their hash) and pointer
+    let activate = |release: &str| -> String {
+        let script = format!(
+            "import sys; sys.path.insert(0, {home:?}); import latency\n\
+             from pathlib import Path\n\
+             state = Path({state:?}).resolve()\n\
+             record = {{'version': 1, 'release': {release:?}, 'approved_by': 'gate test', 'latency': {{}},\n\
+               'uncertain_reason': None, 'previous': None, 'quality': {{'kind': 'deployment', 'claim': None}}}}\n\
+             aid = latency.sha(record)\n\
+             (state / 'approvals' / (aid + '.json')).write_bytes(latency.canonical(record) + b'\\n')\n\
+             (state / 'active.json').write_bytes(latency.canonical({{'version': 1,\n\
+               'active': {{'release': {rid:?}, 'approval': aid}}, 'previous': None}}) + b'\\n')\n\
+             print(aid)",
+            home = home().to_str().unwrap(), state = state.to_str().unwrap(), release = release, rid = rid);
+        let out = Command::new("python3").arg("-c").arg(&script).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    let approval = activate(&rid);
+    let mut active = meta("release", &rid, &bundle);
+    active["approval"] = json!(approval);
+    let ok = run(&pinned_binary, &["design", "--help"], &state, Some(&active));
+    assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
+    // the real chain for an active release: ringo.py checks its approval, then runs the bundled binary
+    let out = Command::new("python3").arg(home().join("ringo.py")).args(["design", "--help"])
+        .env("RINGO_RELEASE_HOME", &state).env_remove("RINGO_CHILD").env_remove("RINGO_PINNED").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("usage: ringo.py design"));
+    let mut other = active.clone();
+    other["approval"] = json!("1".repeat(64));
+    refused(&run(&pinned_binary, &["design", "--help"], &state, Some(&other)), "it is not the active release");
+    let wrong = activate(&"0".repeat(64)); // an approval record for another release, under this release's pointer
+    let mut forged = active.clone();
+    forged["approval"] = json!(wrong);
+    refused(&run(&pinned_binary, &["design", "--help"], &state, Some(&forged)), "its approval is for another release");
     let _ = Command::new("chmod").args(["-R", "u+w"]).arg(&tmp).status();
     std::fs::remove_dir_all(&tmp).unwrap();
 }

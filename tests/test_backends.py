@@ -204,6 +204,15 @@ class CodexHomeTest(unittest.TestCase):
         backends.run_isolated([sys.executable, '-c', child], '', 10, codex_home=True)
         self.assertEqual(self.token(), 'r1')
 
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_a_fifo_the_child_puts_in_place_of_its_copy_cannot_hang_the_write_back(self):
+        child = ('import os, pathlib\np = pathlib.Path(os.environ["CODEX_HOME"]) / "auth.json"\n'
+                 'p.unlink()\nos.mkfifo(p)\nprint("{}")\n')
+        started = time.monotonic()
+        backends.run_isolated([sys.executable, '-c', child], '', 10, codex_home=True)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(self.token(), 'r1')
+
 
 # A stand-in Codex CLI: `debug models` prints a two-model catalog (or fails with FAKE_CATALOG=fail);
 # any other command prints the argv it received and the instructions file it was pointed at.

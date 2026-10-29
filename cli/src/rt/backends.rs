@@ -1243,7 +1243,8 @@ fn sync_codex_auth(login: &Login) -> Result<()> {
     let Some(snapshot) = &login.snapshot else {
         return Ok(());
     };
-    // never through a symlink the child put in its copy's place: that would hand the owner another file
+    // Only a regular file the child left in its copy's place: never through a symlink (that would hand the owner
+    // another file), and never a FIFO or device (opened non-blocking, so one cannot hang the write-back).
     let Ok(new) = read_no_follow(&login.copy) else {
         return Ok(());
     };
@@ -1275,10 +1276,14 @@ fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
     }
     let mut data = Vec::new();
-    options.open(path)?.read_to_end(&mut data)?;
+    file.read_to_end(&mut data)?;
     Ok(data)
 }
 
