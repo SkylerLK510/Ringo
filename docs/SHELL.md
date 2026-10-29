@@ -4,13 +4,15 @@ Type `ringo` in a terminal and Ringo opens its own session, the way `claude` ope
 terminal you route work to the coding agents you already use (OpenAI Codex CLI, Claude Code, xAI Grok Build), run
 Ringo's own pipelines with them, and watch every job and subagent in a live panel.
 
-The shell is a small Rust program (`cli/`). Ringo's pipelines (`review`, `design`, `work`) stay in Python and run
-unchanged, so the measured results in the [README](../README.md#experiments-what-we-tried-what-broke-what-we-measured)
-still describe what they do.
+The shell is a small Rust program (`cli/`). Its `/review`, `/design` and `/work` start the same binary, which runs
+Ringo's pipelines natively, sending the same requests as the Python runtime (see the
+[README](../README.md#the-native-runtime-and-why-it-moved-to-rust)), or hands them to `ringo.py` when your release
+state says so.
 
 ## Install
 
-You need Rust (once), git, Python 3.11+ for the pipelines, and at least one agent CLI.
+You need Rust (once), git, at least one agent CLI, and Python 3.11+ for `work` checks on Python tasks and for
+reviews of Python changes.
 
 ```sh
 # macOS:    brew install rust git python          (or: curl https://sh.rustup.rs -sSf | sh)
@@ -136,8 +138,9 @@ turn re-sends the conversation, so a follow-up costs about twice a first turn; s
 unrelated task instead of continuing a long read conversation. Nothing is shared between agents unless you write
 `{#N}`. (`--bare` would cut more, but it signs in with an API key only, so the shell does not use it.)
 
-The program itself: a 1.0 MB binary that starts in 2.4 ms and idles at 2.5 MB of memory with no measurable CPU,
-against 35.5 ms and 24 MB for `python3 ringo.py --help` (macOS, Apple silicon). It redraws only on an event, a key,
+The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
+memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
+(macOS, Apple silicon). It redraws only on an event, a key,
 or for the spinner while a job runs.
 
 ## Safety model
