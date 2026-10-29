@@ -195,6 +195,16 @@ class CodexHomeTest(unittest.TestCase):
         self.assertIn('could not be saved', ''.join(c.args[0] for c in err.write.call_args_list))
 
 
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
+    def test_a_symlink_the_child_puts_in_place_of_its_copy_is_not_followed(self):
+        other = self.tmp / 'other.json'
+        other.write_text('{"not": "a login"}')
+        child = ('import os, pathlib\np = pathlib.Path(os.environ["CODEX_HOME"]) / "auth.json"\n'
+                 f'p.unlink()\np.symlink_to({str(other)!r})\nprint("{{}}")\n')
+        backends.run_isolated([sys.executable, '-c', child], '', 10, codex_home=True)
+        self.assertEqual(self.token(), 'r1')
+
+
 # A stand-in Codex CLI: `debug models` prints a two-model catalog (or fails with FAKE_CATALOG=fail);
 # any other command prints the argv it received and the instructions file it was pointed at.
 FAKE_CODEX = r"""

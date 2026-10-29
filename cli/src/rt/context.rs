@@ -397,12 +397,10 @@ impl Objects {
             }
             let fields: Vec<&[u8]> = header[..header.len() - 1].split(|c| *c == b' ').collect();
             let last = fields.last().copied().unwrap_or(b"");
-            if last == b"missing" || last == b"ambiguous" {
-                // a gitlink's commit is not in this repository either
+            if last == b"missing" || last == b"ambiguous" || last == b"submodule" {
+                // a gitlink's commit is not in this repository either; newer git answers 'submodule'
                 return self.not_a_blob(rev, path);
             }
-            // Python's `fields[1].decode(), int(fields[2])`: git 2.54 answers '<id> submodule' for a gitlink whose
-            // commit is missing, two fields, so Python raises IndexError here (ported as it is).
             let (Some(kind), Some(size)) = (fields.get(1), fields.get(2)) else {
                 return Err(Error::new(Exc::Type, "list index out of range").with_data(serde_json::json!({"exception": "IndexError"})));
             };

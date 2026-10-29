@@ -1119,10 +1119,10 @@ fn run_isolated_environment_stdin_and_working_folder() {
     let keys = env_keys(&seen);
     for gone in ["TYPESAFE_API_KEY", "OPENAI_API_KEY", "CODEX_API_KEY", "MY_API_KEY", "XAPI_KEY", "OPENAI_BASE_URL",
                  "OPENAI_API_BASE", "OPENAI_ACCESS_TOKEN", "ANTHROPIC_AUTH_TOKEN", "OPENAI_IDENTITY_TOKEN_FILE",
-                 "OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID"] {
+                 "OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID", "ANTHROPIC_BASE_URL"] {
         assert!(!keys.contains(&gone.to_string()), "{gone} reached the child");
     }
-    for kept in ["API_KEY_PREFIXED", "ANTHROPIC_BASE_URL", "KEEP_ME", "HOME", "PATH"] {
+    for kept in ["API_KEY_PREFIXED", "KEEP_ME", "HOME", "PATH"] {
         assert!(keys.contains(&kept.to_string()), "{kept} was removed");
     }
 
@@ -1218,7 +1218,8 @@ fn private_codex_home_and_login_write_back() {
     let seen = same(codex_case("codex-home-variable").owner(other_owner).env("CODEX_HOME", "{home}/other/").env("FAKE_REFRESH", "o2"));
     assert_eq!(seen.owner["other/auth.json"]["data"], json!("{\"tokens\": {\"refresh_token\": \"o2\"}}"));
     let seen = same(codex_case("copy-symlinked-by-child").owner(json_target_owner).env("FAKE_REFRESH", "symlink:{home}/other.json"));
-    assert_eq!(seen.owner[".codex/auth.json"]["data"], json!("{\"not\": \"a login\"}")); // Python follows it too
+    // a symlink the child put in place of its copy is not followed: the owner keeps their login
+    assert_eq!(seen.owner[".codex/auth.json"]["data"], json!("{\"tokens\": {\"refresh_token\": \"r1\"}}"));
     same(codex_case("child-locks-its-homes").env("FAKE_LOCKDOWN", "1").env("FAKE_REFRESH", "r2"));
     same(codex_case("plain-preset-keeps-keys").kw(json!({"codex_home": true, "subscription_auth": false})));
     let mut missing = codex_case("codex-missing-program");

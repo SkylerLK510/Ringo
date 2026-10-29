@@ -1238,7 +1238,8 @@ fn sync_codex_auth(login: &Login) -> Result<()> {
     let Some(snapshot) = &login.snapshot else {
         return Ok(());
     };
-    let Ok(new) = std::fs::read(&login.copy) else {
+    // never through a symlink the child put in its copy's place: that would hand the owner another file
+    let Ok(new) = read_no_follow(&login.copy) else {
         return Ok(());
     };
     if &new == snapshot {
@@ -1260,6 +1261,20 @@ fn sync_codex_auth(login: &Login) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut data = Vec::new();
+    options.open(path)?.read_to_end(&mut data)?;
+    Ok(data)
 }
 
 #[cfg(unix)]
@@ -1703,6 +1718,10 @@ fn scrubbed(key: &std::ffi::OsStr) -> bool {
             "ANTHROPIC_AUTH_TOKEN",
             "OPENAI_IDENTITY_TOKEN_FILE",
             "OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID",
+            // Claude's endpoint override and its cloud-provider switches would also move a call off the login
+            "ANTHROPIC_BASE_URL",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
         ]
         .iter()
         .any(|n| k == n.as_bytes())

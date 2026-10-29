@@ -121,8 +121,9 @@ def backend(spec):
     contain: the `codex` preset keeps its shell, a `codex:` command may search the web only when its own argv
     passes --search, and every other tool item fails the turn."""
     extra = {}
-    if spec == 'claude':
+    if spec == 'claude':  # the preset uses the subscription login: API keys and endpoint overrides are removed
         argv, style = split_command(backends.JUDGE_PRESETS['claude']), 'claude'
+        extra = {'subscription_auth': True}
     elif spec.startswith('claude:'):
         argv, style = split_command(spec[7:]), 'claude'
     elif spec in ('codex', 'codex-chatgpt'):
@@ -284,7 +285,8 @@ def call(backend, system, message, timeout_s, model=None, watch=None):
         path.write_text(system, encoding='utf-8', newline='')  # the exact text: no CRLF on Windows
         try:
             out = backends.run_isolated([*argv, '--system-prompt-file', str(path), '--output-format', 'json'],
-                                       message, timeout_s, watch=watch)
+                                       message, timeout_s, subscription_auth=backend.get('subscription_auth', False),
+                                       watch=watch)
         except backends.JudgeError as exc:  # a failed call may still have reported its cost
             try:
                 reply = json.loads(getattr(exc, 'stdout', '') or 'null')

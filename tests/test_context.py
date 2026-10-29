@@ -184,6 +184,15 @@ class ContextTest(unittest.TestCase):
         self.assertNotIn('=== README', m)
         self.assertIn('callers.py', blocks(m))  # the rest of the change still gets its context
 
+    def test_a_submodule_bump_to_a_commit_this_repository_lacks_does_not_stop_the_build(self):
+        # Newer git answers '<id> submodule' to cat-file --batch for such a gitlink; it used to fail the build.
+        with tempfile.TemporaryDirectory() as d:
+            repo, base, _ = make_repo(d, {})
+            git(repo, 'update-index', '--add', '--cacheinfo', f'160000,{"1" * 40},sub')
+            git(repo, '-c', 'commit.gpgsign=false', 'commit', '-qm', 'bump sub')
+            m = context.build(repo, base, git(repo, 'rev-parse', 'HEAD').strip())
+        self.assertIn(f'Changed submodules, shown only as their commit:\n- sub at {"1" * 40}\n', m)
+
     def test_revisions_must_be_commits_and_cannot_become_options(self):
         for base in ('--output=/tmp/x', '', 'nope', '0' * 40):
             with self.subTest(base=base), self.assertRaises(context.ContextError):

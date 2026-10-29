@@ -1768,6 +1768,7 @@ pub fn backend(spec: &str) -> Result<Backend> {
     let preset = |name: &str| split_command(backends::judge_preset(name).expect("a preset"));
     let (mut subscription_auth, mut lean, mut tools) = (None, None, None);
     let (argv, style) = if spec == "claude" {
+        subscription_auth = Some(true); // the preset uses the subscription login: API keys and overrides are removed
         (preset("claude")?, "claude")
     } else if let Some(rest) = spec.strip_prefix("claude:") {
         (split_command(rest)?, "claude")
@@ -1905,7 +1906,8 @@ pub fn call(backend: &Backend, system: &str, message: &str, timeout_s: Num, mode
     let ran = write_file(&path, system.as_bytes()).and_then(|()| {
         let mut full = argv.clone();
         full.extend(["--system-prompt-file".to_string(), pstr(&path), "--output-format".into(), "json".into()]);
-        backends::run_isolated(&full, message, timeout, Isolated { watch, ..Isolated::default() })
+        let subscription_auth = backend.subscription_auth.unwrap_or(false);
+        backends::run_isolated(&full, message, timeout, Isolated { subscription_auth, watch, ..Isolated::default() })
     });
     let _ = fs::remove_dir_all(&folder);
     let out = match ran {

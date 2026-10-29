@@ -338,8 +338,10 @@ def _sync_codex_auth(owner, snapshot, copy):
     file in the same folder, then os.replace), mode 0600, and never goes through a symlink."""
     if snapshot is None:
         return
-    try:
-        new = copy.read_bytes()
+    try:  # never through a symlink the child put in its copy's place: that would hand the owner another file
+        fd = os.open(copy, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'rb') as f:
+            new = f.read()
     except OSError:
         return
     if new == snapshot:
@@ -424,7 +426,9 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
     if subscription_auth:
         env = {k: v for k, v in env.items() if not k.endswith('API_KEY') and k not in {
             'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ACCESS_TOKEN', 'ANTHROPIC_AUTH_TOKEN',
-            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID'}}
+            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID',
+            # Claude's endpoint override and its cloud-provider switches would also move a call off the login
+            'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'}}
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
     # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.
