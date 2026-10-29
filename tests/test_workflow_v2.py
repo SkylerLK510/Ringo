@@ -207,6 +207,8 @@ class SpecTestLoopTest(unittest.TestCase):
                       '`x == [1, 2]`', seen[1][1])
         self.assertIn('=== static notes (not check results) ===\nvalue.py:2', seen[2][0])  # the review's material
         self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual([r.get('static_shown') for r in report['rounds']], [None, 1])
+        self.assertEqual([r.get('static_reviewed') for r in report['rounds']], [None, 1])
 
     def test_static_notes_flag_only_a_literal_container_input_that_returns_a_literal(self):
         flagged = workflow.special_cases({'a.py': 'def f(v):\n    if sorted(v) == [-10, 4, 6]:\n        return 15.0\n'

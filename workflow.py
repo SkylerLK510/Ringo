@@ -815,6 +815,8 @@ def run(spec_path, out, call_fn=harness.call):
             report['rounds'].append(entry)
             answering = feedback  # what this round's writer answers; a rejected revision answers it again
             message = writer_message(feedback)
+            if feedback.get('static'):
+                entry['static_shown'] = len(feedback['static'])  # the writer sees the notes this round
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
             k = spec['candidates'] if n == 1 else 1
@@ -982,6 +984,9 @@ def run(spec_path, out, call_fn=harness.call):
                 continue
             if not council:
                 if reviewed is None:
+                    noted = special_cases(current)
+                    if noted:
+                        entry['static_reviewed'] = len(noted)  # the review material carries the notes
                     review_text = review(current, candidate['rationale'], observed)
                     (folder / 'review.md').write_text(review_text + '\n', encoding='utf-8')
                     entry['review_findings'] = review_findings(review_text)
