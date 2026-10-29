@@ -1488,6 +1488,53 @@ fn reset_perms(p: &Path) {
 
 // ---------- the wait ----------
 
+/// SIGINT during a native pipeline run (Python's KeyboardInterrupt): set by the handler `install_interrupt`
+/// installs, polled by `wait`, which then kills the running call and fails with `keyboard_interrupt()`.
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install the SIGINT handler for a native pipeline run (only then does `wait` poll for it). A second SIGINT
+/// restores the default action and ends the process at once, as an impatient second Ctrl-C does.
+pub fn install_interrupt() {
+    #[cfg(unix)]
+    {
+        extern "C" fn on_sigint(_: libc::c_int) {
+            if INTERRUPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                // SAFETY: signal and raise are async-signal-safe.
+                unsafe {
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::raise(libc::SIGINT);
+                }
+            }
+        }
+        // SAFETY: the handler only touches an atomic and async-signal-safe calls; SA_RESTART keeps blocking
+        // calls in other threads from failing with EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_sigint as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        }
+        INSTALLED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// True once SIGINT arrived during a native pipeline run.
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// `KeyboardInterrupt()`: `str()` is empty; `Error.data["type"]` names the class, which no `Exc` stands for
+/// (it is not an Exception, so only a BaseException handler sees it).
+pub fn keyboard_interrupt() -> Error {
+    Error::new(Exc::Type, "").with_data(serde_json::json!({"type": "KeyboardInterrupt"}))
+}
+
+pub fn is_keyboard_interrupt(e: &Error) -> bool {
+    e.data.as_ref().and_then(|d| d.get("type")).is_some_and(|t| t == "KeyboardInterrupt")
+}
+
 /// `snapshot()`: the first RAW_PEEK bytes of the running command's stdout and stderr, decoded with 'replace'.
 pub type Snapshot = Arc<dyn Fn() -> Result<(String, String)> + Send + Sync>;
 
@@ -1566,7 +1613,11 @@ pub fn wait(
             }
             let _ = tx.send(());
         })?;
+        let polled = INSTALLED.load(std::sync::atomic::Ordering::SeqCst);
         loop {
+            if polled && interrupted() {
+                return Err(keyboard_interrupt());
+            }
             let elapsed = started.elapsed().as_secs_f64();
             if elapsed >= limit {
                 return Ok(Some(Ended::Limit));
@@ -1581,7 +1632,7 @@ pub fn wait(
                     threads.push(std::thread::Builder::new().spawn(move || w.soft(elapsed, snapshot))?);
                 }
             }
-            let slice = if watch.is_none() { limit - elapsed } else { f64::min(0.25, limit - elapsed) };
+            let slice = if watch.is_none() && !polled { limit - elapsed } else { f64::min(0.25, limit - elapsed) };
             match exited.recv_timeout(seconds(slice)) {
                 Err(RecvTimeoutError::Timeout) => {}
                 _ => return Ok(None),

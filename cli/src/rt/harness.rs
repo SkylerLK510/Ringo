@@ -1,8 +1,7 @@
-//! Ported from `harness.py`. Phase 1: the run accounting (`Run`: trace folder, trace.jsonl, state.json, cost and
-//! token totals, the summary), the soft time limit (`Watch` and `Leash`, which backends' `_wait` drives through
-//! `CallWatch`), Codex and Claude reply parsing, and the helpers other modules use. `call`, `probe`,
-//! `accepts_watch`, `check_backends`, `backend`, `run_plan`, `repo_material`, `findings_pr`, `write_findings`,
-//! `task` and `main` need backends, context and pipelines and follow in phase 2.
+//! Ported from `harness.py`: a pipeline of isolated, single-turn model calls (`run_plan`), the run accounting
+//! (`Run`: trace folder, trace.jsonl, state.json, cost and token totals, the summary), the soft time limit (`Watch`
+//! and `Leash`, which backends' `_wait` drives as `backends::Watch`), Codex and Claude reply parsing, the review and
+//! design tasks (`task`) and their command line (`main`).
 //!
 //! Python values keep their Python type where it reaches a record or a message: a number is a `Num` (an int or a
 //! float: `soft_s: 900` and `900.0` differ in a record, `$1` and `$1.0` in a message), records and usage are
@@ -10,14 +9,16 @@
 //! `stdout`, `limit`) live in `Error.data` under the same names (see `attr`). Python ints are unbounded; here they
 //! are 128-bit, and a sum past that is an error.
 
+use super::backends::{self, Decoder, Isolated, JsonFail, Snapshot};
 use super::{py, pyjson, Error, Exc, Result};
 use serde_json::{Map, Number, Value};
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use super::pipelines;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const TIMEOUT_S: Num = Num::Int(900);
@@ -277,37 +278,32 @@ fn py_repr(v: &Value) -> String {
     }
 }
 
-/// `json.loads(text)` as harness.py calls it: pyjson's parse plus Python's limit that serde_json lacks (an int
-/// literal over 4300 digits fails). `finite`: as with backends' parse_constant/parse_float hooks, a float literal
-/// that overflows to infinity fails too. (NaN and Infinity, lone surrogates and nesting past 127 levels never
-/// parse here; Python's default json.loads accepts the first two and nests far deeper.)
-fn loads(text: &str, finite: bool) -> Result<Value> {
-    let value = pyjson::loads(text)?;
-    check_numbers(&value, finite)?;
-    Ok(value)
+/// `json.loads(text)` with Python's default hooks: NaN and the infinities parse (NaN, which serde_json cannot
+/// hold, as null); nesting past backends::MAX_DEPTH is a RecursionError, as Python's is past its stack limit.
+fn loads_default(text: &str) -> std::result::Result<Value, JsonFail> {
+    fn constant(name: &str) -> Result<Value> {
+        Ok(float_value(match name {
+            "NaN" => f64::NAN,
+            "-Infinity" => f64::NEG_INFINITY,
+            _ => f64::INFINITY,
+        }))
+    }
+    fn float(text: &str) -> Result<Value> {
+        text.parse::<f64>().map(float_value).map_err(|_| Error::value(format!("could not convert string to float: {}", py::repr(text))))
+    }
+    Decoder { parse_constant: &constant, parse_float: &float, object_pairs_hook: &backends::dict, max_depth: backends::MAX_DEPTH }
+        .loads(text)
 }
 
-fn check_numbers(v: &Value, finite: bool) -> Result<()> {
-    match v {
-        Value::Number(n) => {
-            let s = n.as_str();
-            if is_float_text(s) {
-                if finite && !s.parse::<f64>().is_ok_and(f64::is_finite) {
-                    return Err(Error::value(format!("{s} is not a finite number")));
-                }
-            } else {
-                let digits = s.trim_start_matches('-').len();
-                if digits > 4300 {
-                    return Err(Error::value(format!(
-                        "Exceeds the limit (4300 digits) for integer string conversion: value has {digits} digits; \
-                         use sys.set_int_max_str_digits() to increase the limit")));
-                }
-            }
-            Ok(())
+/// A json.loads failure as the exception Python raises: a ValueError, or a RecursionError (which only
+/// `except Exception` catches).
+fn json_failure(fail: JsonFail, text: &str) -> Error {
+    match fail {
+        JsonFail::Recursion { .. } => {
+            let e = fail.into_error(text);
+            Error::new(Exc::Type, e.msg).with_data(type_data("RecursionError"))
         }
-        Value::Array(a) => a.iter().try_for_each(|x| check_numbers(x, finite)),
-        Value::Object(m) => m.values().try_for_each(|x| check_numbers(x, finite)),
-        _ => Ok(()),
+        other => other.into_error(text),
     }
 }
 
@@ -579,30 +575,6 @@ impl Backend {
     }
 }
 
-/// What a running call's output looks like so far: (stdout, stderr), the first RAW_PEEK bytes of each, decoded as
-/// UTF-8 with replacement (backends' snapshot lambda).
-pub type Snapshot<'s> = dyn Fn() -> (String, String) + Sync + 's;
-
-/// The watch a call runs under, as backends' `_wait` and `run_isolated` use it (Python duck-types `Watch` and
-/// `Leash`). `_wait` stops the call once it has run `limit_s()` seconds, returns 'stop' once `stop_is_set()`, and
-/// the first time the call has run `timeout_s` starts `soft(elapsed, snapshot)` in a thread of its own;
-/// `run_isolated` calls `set_done()` when the command has ended, then joins that thread before it returns.
-pub trait CallWatch: Sync {
-    /// `watch.limit_s`: the hard limit in seconds, counted from the call's start, setup included. The call is
-    /// stopped there and raises TimeoutExpired with `limit` set.
-    fn limit_s(&self) -> f64;
-    /// `watch.stop.is_set()`: the person (for a probe's Leash: the end of the watched call) asked to stop; `_wait`
-    /// returns 'stop' and run_isolated raises Stopped.
-    fn stop_is_set(&self) -> bool;
-    /// `watch.soft(elapsed, snapshot)`: run once, in its own thread, when the call passes its soft limit;
-    /// `elapsed` is the seconds since the call started. It may block until `set_done()`; it never fails the call
-    /// (a failure is printed).
-    fn soft(&self, elapsed: f64, snapshot: &Snapshot);
-    /// `watch.done.set()`: the command has ended (exited, stopped or killed), so a soft check waiting for a
-    /// decision, and its probe, end. run_isolated calls it before it joins the soft() thread.
-    fn set_done(&self);
-}
-
 // ---------------------------------------------------------------------------------------------------------------
 // Pure helpers
 
@@ -798,7 +770,11 @@ pub fn empty_listing(item: &Map<String, Value>) -> Result<bool> {
         Some(Value::String(s)) => s,
         Some(_) => return Ok(false), // json.loads of a non-str: TypeError, caught
     };
-    let Ok(listed) = loads(text, false) else { return Ok(false) };
+    let listed = match loads_default(text) {
+        Ok(v) => v,
+        Err(JsonFail::Recursion { what }) => return Err(json_failure(JsonFail::Recursion { what }, text)),
+        Err(_) => return Ok(false), // ValueError, caught
+    };
     Ok(matches!(&listed, Value::Object(m) if m.len() == 1 && matches!(m.get(key), Some(Value::Array(a)) if a.is_empty())))
 }
 
@@ -826,7 +802,7 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
         if py::strip(line).is_empty() {
             continue;
         }
-        let event = match loads(line, true) {
+        let event = match Decoder::strict().loads(line) {
             Ok(Value::Object(m)) => m,
             _ => {
                 reasons.push("a line that is not a JSON event".into());
@@ -933,7 +909,7 @@ pub fn limit_for_floor(soft_s: Num, floor: Num) -> Num {
 }
 
 /// 'person' for a call the person stopped, 'limit' for one stopped at its hard limit, else None.
-pub fn stop_reason(exc: &Error, watch: Option<&dyn CallWatch>) -> Option<&'static str> {
+pub fn stop_reason(exc: &Error, watch: Option<&dyn backends::Watch>) -> Option<&'static str> {
     if exc.exc == Exc::Stopped {
         return Some("person");
     }
@@ -969,7 +945,7 @@ pub fn tool_access(name: &str) -> &'static str {
 
 /// The SHA-256 of text's UTF-8, in hex.
 pub fn sha(text: &str) -> String {
-    sha256(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    crate::rt::sha256_hex(text.as_bytes())
 }
 
 /// Deterministic data framing preserves cacheability; labels mitigate, not eliminate, prompt injection.
@@ -994,61 +970,6 @@ pub fn checker_pass(plan: &Value, checker_spec: Option<&Backend>) -> Result<()> 
         }
     }
     Err(Error::value("a checker backend needs a plan with a verdicts pass"))
-}
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    const K: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98,
-        0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
-        0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8,
-        0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
-        0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819,
-        0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
-        0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
-    let mut h: [u32; 8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
-    let mut block = |chunk: &[u8; 64]| {
-        let mut w = [0u32; 64];
-        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
-            w[i] = u32::from_be_bytes(*word);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-        let mut v = h;
-        for i in 0..64 {
-            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
-            let ch = (v[4] & v[5]) ^ (!v[4] & v[6]);
-            let t1 = v[7].wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
-            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
-            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
-            let t2 = s0.wrapping_add(maj);
-            v = [t1.wrapping_add(t2), v[0], v[1], v[2], v[3].wrapping_add(t1), v[4], v[5], v[6]];
-        }
-        for (x, y) in h.iter_mut().zip(v) {
-            *x = x.wrapping_add(y);
-        }
-    };
-    let (chunks, rest) = data.as_chunks::<64>();
-    for chunk in chunks {
-        block(chunk);
-    }
-    let mut tail = [0u8; 128];
-    tail[..rest.len()].copy_from_slice(rest);
-    tail[rest.len()] = 0x80;
-    let end = if rest.len() < 56 { 64 } else { 128 };
-    tail[end - 8..end].copy_from_slice(&((data.len() as u64).wrapping_mul(8)).to_be_bytes());
-    for chunk in tail[..end].as_chunks::<64>().0 {
-        block(chunk);
-    }
-    let mut out = [0u8; 32];
-    for (o, x) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
-        *o = x.to_be_bytes();
-    }
-    out
 }
 
 /// `RECONNECT.search(line)` for `re.compile(r'reconnect|disconnect|stream error|retrying', re.I)`. Python's
@@ -1593,41 +1514,41 @@ fn summary_of(t: &Totals) -> Map<String, Value> {
 
 /// `probe_fn(done)`: one tiny recorded call to the same backend, stopped when done (the watched call's end) is
 /// set; returns probe()'s dict ({'status', 'seconds', ...}).
-pub type ProbeFn<'a> = Box<dyn Fn(&Event) -> Result<Map<String, Value>> + Send + Sync + 'a>;
+pub type ProbeFn = Box<dyn Fn(&Event) -> Result<Map<String, Value>> + Send + Sync>;
 
 /// One attempt's soft time limit. Past soft_s the call keeps running and soft() (run by backends' `_wait` in a
 /// thread) checks it for free, probes the backend with one tiny recorded call, writes an incident file and asks
 /// the person only when the evidence suggests a stall. Writing `stop` to the decision file stops the call (it is
 /// then retried once); `wait` keeps it. Nothing answers for the person: without a decision the call runs on until
 /// limit_s, where it is stopped and not retried.
-pub struct Watch<'a> {
-    pub run: &'a Run,
+pub struct Watch {
+    pub run: Arc<Run>,
     pub label: String,
     pub attempt: i64,
     pub backend: Backend,
     pub soft_s: Num,
     pub limit_s: Num,
     pub kind: String,
-    pub probe_fn: Option<ProbeFn<'a>>,
+    pub probe_fn: Option<ProbeFn>,
     pub stop: Event,
     pub done: Event,
     incident: Mutex<Option<Map<String, Value>>>,
 }
 
-impl<'a> Watch<'a> {
+impl Watch {
     #[allow(clippy::too_many_arguments)] // Python's signature
     pub fn new(
-        run: &'a Run,
+        run: &Arc<Run>,
         label: &str,
         attempt: i64,
         backend: &Backend,
         soft_s: Num,
         limit_s: Num,
         kind: &str,
-        probe_fn: Option<ProbeFn<'a>>,
-    ) -> Watch<'a> {
+        probe_fn: Option<ProbeFn>,
+    ) -> Watch {
         Watch {
-            run,
+            run: Arc::clone(run),
             label: label.into(),
             attempt,
             backend: backend.clone(),
@@ -1646,8 +1567,8 @@ impl<'a> Watch<'a> {
         lock(&self.incident).clone()
     }
 
-    pub fn soft(&self, elapsed: f64, snapshot: &Snapshot) {
-        if let Err(exc) = self.check(elapsed, snapshot) {
+    pub fn soft(&self, elapsed: f64, snapshot: Snapshot) {
+        if let Err(exc) = self.check(elapsed, &snapshot) {
             // the call itself must never fail because its watch did
             print_stderr(&format!("ringo: {}: soft-limit check failed: {}: {}", self.label, type_name(&exc), exc.msg));
         }
@@ -1662,15 +1583,17 @@ impl<'a> Watch<'a> {
         let folder = self.run.incident_folder()?;
         let name = format!("{}.{}", self.label, self.attempt);
         let (path, decision) = (join(&folder, &format!("{name}.json")), join(&folder, &format!("{name}.decision")));
-        let (stdout, stderr) = snapshot();
+        let (stdout, stderr) = snapshot()?;
         let lines: Vec<&str> = py::splitlines(&stdout, false).into_iter().filter(|l| !py::strip(l).is_empty()).collect();
         let events: Vec<Value> = lines
             .iter()
-            .map(|line| match loads(line, false) {
-                Ok(Value::Object(m)) => m.get("type").cloned().unwrap_or(Value::Null),
-                _ => Value::Null,
+            .map(|line| match loads_default(line) {
+                Ok(Value::Object(m)) => Ok(m.get("type").cloned().unwrap_or(Value::Null)),
+                Ok(_) => Ok(Value::Null), // AttributeError: no .get
+                Err(JsonFail::Recursion { what }) => Err(json_failure(JsonFail::Recursion { what }, line)),
+                Err(_) => Ok(Value::Null),
             })
-            .collect();
+            .collect::<Result<_>>()?;
         let comparable = self.run.comparable(&self.kind);
         let both = format!("{stdout}{stderr}");
         let reconnect_lines = py::splitlines(&both, false).into_iter().filter(|l| reconnect(l)).count();
@@ -1791,18 +1714,18 @@ impl<'a> Watch<'a> {
     }
 }
 
-impl CallWatch for Watch<'_> {
+impl backends::Watch for Watch {
     fn limit_s(&self) -> f64 {
         self.limit_s.as_f64()
     }
     fn stop_is_set(&self) -> bool {
         self.stop.is_set()
     }
-    fn soft(&self, elapsed: f64, snapshot: &Snapshot) {
-        Watch::soft(self, elapsed, snapshot)
-    }
     fn set_done(&self) {
         self.done.set()
+    }
+    fn soft(&self, elapsed: f64, snapshot: Snapshot) {
+        Watch::soft(self, elapsed, snapshot)
     }
 }
 
@@ -1820,23 +1743,1497 @@ impl Leash {
     }
 }
 
-impl CallWatch for Leash {
+impl backends::Watch for Leash {
     fn limit_s(&self) -> f64 {
         self.limit_s.as_f64()
     }
     fn stop_is_set(&self) -> bool {
         self.stop.is_set()
     }
-    fn soft(&self, _elapsed: f64, _snapshot: &Snapshot) {}
     fn set_done(&self) {
         self.done.set()
     }
+    fn soft(&self, _elapsed: f64, _snapshot: Snapshot) {}
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// Phase 2 (needs backends, context, pipelines): call, probe, accepts_watch, check_backends, backend, run_plan,
-// repo_material, findings_pr, write_findings, task, main. CallError is `call_error`; the probe a Watch runs is
-// `Box::new(move |done| probe(run, &backend, &format!("{label}.{attempt}"), call_fn, Some(done)))`.
+// Backends and calls
+
+/// `backend(spec)`: the backend a spec names. The style says how a call is made, declared by the spec and never
+/// guessed from the executable's name: 'claude' (system-prompt file, JSON reply with usage), 'codex' (Codex `exec
+/// --json` events, private CODEX_HOME and HOME) or 'plain'. A codex backend also declares `subscription_auth`,
+/// `lean` (the codex-chatgpt preset) and `tools`, the tool item types its turns may contain: the `codex` preset
+/// keeps its shell, a `codex:` command may search the web only when its own argv passes --search.
+pub fn backend(spec: &str) -> Result<Backend> {
+    let preset = |name: &str| split_command(backends::judge_preset(name).expect("a preset"));
+    let (mut subscription_auth, mut lean, mut tools) = (None, None, None);
+    let (argv, style) = if spec == "claude" {
+        (preset("claude")?, "claude")
+    } else if let Some(rest) = spec.strip_prefix("claude:") {
+        (split_command(rest)?, "claude")
+    } else if spec == "codex" || spec == "codex-chatgpt" {
+        let chatgpt = spec == "codex-chatgpt";
+        (subscription_auth, lean) = (Some(chatgpt), Some(chatgpt));
+        tools = Some(if chatgpt { vec![] } else { vec!["command_execution".to_string()] });
+        (preset(spec)?, "codex")
+    } else if let Some(rest) = spec.strip_prefix("codex:") {
+        let argv = split_command(rest)?;
+        if !argv.is_empty() && !argv.iter().any(|a| a == "--json") {
+            return Err(Error::value(format!(
+                "backend {}: a codex: command must pass --json so its events can be parsed",
+                py::repr(spec)
+            )));
+        }
+        subscription_auth = Some(false);
+        tools = Some(if argv.iter().any(|a| a == "--search") { vec!["web_search".to_string()] } else { vec![] });
+        (argv, "codex")
+    } else if let Some(model) = spec.strip_prefix("ollama:") {
+        (if model.is_empty() { vec![] } else { vec!["ollama".into(), "run".into(), model.into()] }, "plain")
+    } else {
+        (split_command(spec)?, "plain")
+    };
+    if argv.is_empty() {
+        return Err(Error::value(format!("backend {} has no command", py::repr(spec))));
+    }
+    Ok(Backend { name: spec.into(), argv, style: style.into(), subscription_auth, lean, tools })
+}
+
+/// ValueError unless every backend is tool-free or tools are explicitly allowed.
+pub fn check_backends(names: &[&str], allow_tools: bool) -> Result<()> {
+    let risky: Vec<String> = names.iter().filter(|n| tool_access(n) != "none").map(|n| py::repr(n)).collect();
+    if !risky.is_empty() && !allow_tools {
+        return Err(Error::value(format!(
+            "backends may read local files: [{}]; use external isolation or explicitly set allow_tool_backends",
+            risky.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// What a call returns: the reply text and its usage (None when the backend reports none).
+pub type CallResult = Result<(String, Option<Value>)>;
+/// A call function's body: (backend, system, message, timeout_s, model, watch).
+pub type CallBody = dyn Fn(&Backend, &str, &str, Num, Option<&str>, Option<Arc<dyn backends::Watch>>) -> CallResult + Send + Sync;
+
+/// A call function as run_plan and probe use it. Python tells a function that takes `watch=` by its code object
+/// (`accepts_watch`); here the function declares it. One that does not (evaluation wrappers) is called without a
+/// watch and so keeps a hard timeout.
+#[derive(Clone)]
+pub struct CallFn {
+    pub body: Arc<CallBody>,
+    pub accepts_watch: bool,
+}
+
+impl CallFn {
+    pub fn new(accepts_watch: bool, body: impl Fn(&Backend, &str, &str, Num, Option<&str>, Option<Arc<dyn backends::Watch>>) -> CallResult + Send + Sync + 'static) -> CallFn {
+        CallFn { body: Arc::new(body), accepts_watch }
+    }
+
+    /// `call` itself, which takes a watch.
+    pub fn real() -> CallFn {
+        CallFn::new(true, call)
+    }
+
+    pub fn call(&self, b: &Backend, system: &str, message: &str, timeout_s: Num, model: Option<&str>, watch: Option<Arc<dyn backends::Watch>>) -> CallResult {
+        (self.body)(b, system, message, timeout_s, model, if self.accepts_watch { watch } else { None })
+    }
+}
+
+/// True when a call function takes watch=; stand-in call functions without it keep a hard timeout.
+pub fn accepts_watch(f: &CallFn) -> bool {
+    f.accepts_watch
+}
+
+/// `exc.<name> = value` for an exception's attributes in `Error.data`.
+fn set_attrs(mut e: Error, attrs: &[(&str, Value)]) -> Error {
+    let mut data = match e.data.take() {
+        Some(Value::Object(m)) => m,
+        _ => Map::new(),
+    };
+    for (k, v) in attrs {
+        data.insert((*k).into(), v.clone());
+    }
+    e.data = Some(Value::Object(data));
+    e
+}
+
+/// (reply text, usage) of one isolated, single-turn call through backends::run_isolated (empty folder, no TypeSafe
+/// key, the whole process session killed on exit). usage is None when the backend does not report it. model
+/// overrides the backend's model for this call; only claude-style backends take one. watch: timeout_s is a soft
+/// limit (see Watch).
+pub fn call(backend: &Backend, system: &str, message: &str, timeout_s: Num, model: Option<&str>, watch: Option<Arc<dyn backends::Watch>>) -> CallResult {
+    let mut argv = backend.argv.clone();
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        if backend.style != "claude" {
+            return Err(Error::value(format!("a per-pass model needs a claude-style backend, not {}", backend.name)));
+        }
+        argv = with_model(&argv, m);
+    }
+    let timeout = timeout_s.as_f64();
+    if backend.style == "codex" {
+        let tools = backend.tools.clone().unwrap_or_default();
+        let kw = Isolated {
+            subscription_auth: backend.subscription_auth.unwrap_or(true),
+            codex_home: true,
+            lean: backend.lean.unwrap_or(false),
+            watch,
+        };
+        return match backends::run_isolated(&argv, &format!("{system}\n\n{message}"), timeout, kw) {
+            Ok(output) => codex_reply(&output, &backend.name, &tools).map(|(t, u)| (t, Some(Value::Object(u)))),
+            Err(exc) if exc.is(Exc::Judge) || exc.is(Exc::Timeout) => {
+                let stdout = attr(&exc, "stdout").and_then(Value::as_str).unwrap_or("").to_string();
+                let usage = match codex_reply(&stdout, &backend.name, &tools) {
+                    Ok((_, u)) => Value::Object(u),
+                    Err(parsed) if parsed.exc == Exc::Call => attr(&parsed, "usage").cloned().unwrap_or(Value::Null),
+                    Err(other) => return Err(other),
+                };
+                if exc.is(Exc::Timeout) {
+                    // same type, so the retry rule is unchanged
+                    return Err(set_attrs(exc, &[("usage", usage), ("raw", Value::String(stdout))]));
+                }
+                Err(call_error(exc.msg, Some(usage).filter(|u| !u.is_null()), Some(stdout)))
+            }
+            Err(exc) => Err(exc),
+        };
+    }
+    if backend.style == "plain" {
+        let kw = Isolated { watch, ..Isolated::default() };
+        return backends::run_isolated(&argv, &format!("{system}\n\n{message}"), timeout, kw).map(|out| (out, None));
+    }
+    let folder = mkdtemp("ringo-system-")?; // created 0700; removed after the call
+    let path = join(&folder, "system.txt");
+    let ran = write_file(&path, system.as_bytes()).and_then(|()| {
+        let mut full = argv.clone();
+        full.extend(["--system-prompt-file".to_string(), pstr(&path), "--output-format".into(), "json".into()]);
+        backends::run_isolated(&full, message, timeout, Isolated { watch, ..Isolated::default() })
+    });
+    let _ = fs::remove_dir_all(&folder);
+    let out = match ran {
+        Ok(out) => out,
+        Err(exc) if exc.is(Exc::Judge) => {
+            // a failed call may still have reported its cost
+            let stdout = attr(&exc, "stdout").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("null").to_string();
+            match loads_default(&stdout) {
+                Ok(Value::Object(reply)) => {
+                    let raw = attr(&exc, "stdout").and_then(Value::as_str).map(str::to_string);
+                    return Err(call_error(exc.msg, Some(Value::Object(claude_usage(&reply))), raw));
+                }
+                Err(JsonFail::Recursion { what }) => return Err(json_failure(JsonFail::Recursion { what }, &stdout)),
+                _ => return Err(exc),
+            }
+        }
+        Err(exc) => return Err(exc),
+    };
+    let reply = match loads_default(&out) {
+        Ok(v) => v,
+        Err(JsonFail::Recursion { what }) => return Err(json_failure(JsonFail::Recursion { what }, &out)),
+        Err(_) => return Err(call_error("claude did not return JSON", None, Some(out))),
+    };
+    let Value::Object(reply) = reply else {
+        return Err(call_error(format!("claude returned {}, not an object", type_of(&reply)), None, Some(out)));
+    };
+    let result = reply.get("result");
+    if reply.get("is_error").is_some_and(truthy) || !matches!(result, Some(Value::String(_))) {
+        let shown = py_str(result.unwrap_or(&Value::Null));
+        return Err(call_error(
+            format!("claude reported an error: {}", py::head(&shown, 200)),
+            Some(Value::Object(claude_usage(&reply))),
+            Some(out),
+        ));
+    }
+    let text = result.and_then(Value::as_str).expect("checked above").to_string();
+    Ok((text, Some(Value::Object(claude_usage(&reply)))))
+}
+
+/// `f'{type(exc).__name__}: {exc}'`.
+fn described(e: &Error) -> String {
+    format!("{}: {}", type_name(e), e.msg)
+}
+
+/// One tiny recorded call to the same backend, so a running call's silence can be told apart from a backend
+/// that answers nothing. It is stopped when stop (the watched call's end) is set. Skipped under a cost cap: those
+/// calls run one at a time and an unpriced probe would stop every later call.
+pub fn probe(run: &Arc<Run>, backend: &Backend, label: &str, call_fn: Option<&CallFn>, stop: Option<&Event>) -> Result<Map<String, Value>> {
+    let mut out = Map::new();
+    if run.max_cost.is_some() {
+        out.insert("status".into(), "skipped".into());
+        out.insert("reason".into(), "a cost cap is set".into());
+        return Ok(out);
+    }
+    let real = CallFn::real();
+    let f = call_fn.unwrap_or(&real);
+    run.reserve()?;
+    let mut rec = Map::new();
+    rec.insert("step".into(), Value::String(format!("{label}.probe")));
+    rec.insert("attempt".into(), Value::from(1));
+    rec.insert("backend".into(), Value::String(backend.name.clone()));
+    rec.insert("started".into(), float_value(now()));
+    run.record(&with(&rec, &[("status", "started".into())]), None, None)?; // so an interrupted probe is visible
+    let t0 = Instant::now();
+    let watch: Option<Arc<dyn backends::Watch>> =
+        Some(Arc::new(Leash::new(stop.cloned().unwrap_or_default(), PROBE_TIMEOUT_S)));
+    match f.call(backend, "", PROBE_MESSAGE, PROBE_TIMEOUT_S, None, watch) {
+        Err(exc) if !backends::is_keyboard_interrupt(&exc) => {
+            let seconds = float_value(py_round(t0.elapsed().as_secs_f64(), 1));
+            let text = described(&exc);
+            run.record(
+                &with(&rec, &[
+                    ("status", "error".into()),
+                    ("error", Value::String(py::head(&text, 500).into())),
+                    ("usage", attr(&exc, "usage").cloned().unwrap_or(Value::Null)),
+                    ("seconds", seconds.clone()),
+                ]),
+                None,
+                None,
+            )?;
+            out.insert("status".into(), "error".into());
+            out.insert("seconds".into(), seconds);
+            out.insert("error".into(), Value::String(py::head(&text, 300).into()));
+            Ok(out)
+        }
+        Err(exc) => Err(exc),
+        Ok((text, usage)) => {
+            let seconds = float_value(py_round(t0.elapsed().as_secs_f64(), 1));
+            let usage = usage.unwrap_or(Value::Null);
+            run.record(&with(&rec, &[("status", "ok".into()), ("usage", usage.clone()), ("seconds", seconds.clone())]), Some(&text), None)?;
+            out.insert("status".into(), "ok".into());
+            out.insert("seconds".into(), seconds);
+            out.insert("tokens".into(), total_tokens(Some(&usage))?.map_or(Value::Null, Num::to_value));
+            Ok(out)
+        }
+    }
+}
+
+/// `{**rec, k: v, ...}`.
+fn with(rec: &Map<String, Value>, fields: &[(&str, Value)]) -> Map<String, Value> {
+    let mut out = rec.clone();
+    for (k, v) in fields {
+        out.insert((*k).into(), v.clone());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// run_plan
+
+/// The shared state of one run_plan: replies, skipped passes, the warm-up gates and the stop after a failure.
+struct Plan<'p> {
+    plan: &'p Value,
+    system: String,
+    backend: &'p Backend,
+    checker: Option<&'p Backend>,
+    run: &'p Arc<Run>,
+    call_fn: &'p CallFn,
+    timeout_s: Num,
+    replies: Mutex<pipelines::Replies>,
+    skipped: Mutex<HashSet<String>>,
+    gates: Mutex<HashMap<(String, Option<String>), Event>>,
+    stop: Event,
+    failures: Mutex<Vec<Error>>,
+}
+
+fn pass_field<'v>(p: &'v Value, key: &str) -> &'v str {
+    p.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+impl Plan<'_> {
+    fn spec_for(&self, p: &Value) -> &Backend {
+        match self.checker {
+            Some(c) if pass_field(p, "reply") == "verdicts" => c,
+            _ => self.backend,
+        }
+    }
+
+    /// One call with its retry, behind the warm-up gate of its backend and model.
+    fn one(&self, label: &str, p: &Value, message: &str) -> Result<String> {
+        let model = p.get("model").and_then(Value::as_str).map(str::to_string);
+        let key = (self.spec_for(p).name.clone(), model); // each backend and model warms its own cache once
+        let (first, gate) = {
+            let mut gates = lock(&self.gates);
+            let first = !gates.contains_key(&key);
+            (first, gates.entry(key).or_default().clone())
+        };
+        if !first {
+            gate.wait(None);
+        }
+        let result = self.attempts(label, p, message);
+        if let Err(exc) = &result {
+            let mut failures = lock(&self.failures);
+            if failures.is_empty() {
+                failures.push(exc.clone());
+            }
+            self.stop.set();
+        }
+        if first {
+            gate.set();
+        }
+        result
+    }
+
+    fn attempts(&self, label: &str, p: &Value, message: &str) -> Result<String> {
+        let mut last: Option<Error> = None; // the earlier attempt's error, reported if the retry cannot start
+        let pass_id = py_str(p.get("id").unwrap_or(&Value::Null));
+        for attempt in [1i64, 2] {
+            let reserved = if self.stop.is_set() {
+                Err(budget_exceeded("run stopped after another pass failed"))
+            } else {
+                self.run.reserve()
+            };
+            if let Err(exc) = reserved {
+                return Err(match &last {
+                    Some(prev) if exc.is(Exc::Budget) => Error::new(
+                        exc.exc,
+                        format!("{}; retry not started after attempt {} failed: {}", exc.msg, attempt - 1, described(prev)),
+                    ),
+                    _ => exc,
+                });
+            }
+            let backend = self.spec_for(p).clone();
+            let mut rec = Map::new();
+            rec.insert("step".into(), Value::String(label.into()));
+            rec.insert("attempt".into(), Value::from(attempt));
+            rec.insert("pass".into(), p.get("id").cloned().unwrap_or(Value::Null));
+            rec.insert("backend".into(), Value::String(backend.name.clone()));
+            rec.insert("system_sha256".into(), Value::String(sha(&self.system)));
+            rec.insert("message_sha256".into(), Value::String(sha(message)));
+            rec.insert("started".into(), float_value(now()));
+            let mut watch: Option<Arc<Watch>> = None;
+            if accepts_watch(self.call_fn) {
+                // timeout_s is soft: probe and ask past it, stop at the limit
+                let (run, b, f, probe_label) = (Arc::clone(self.run), backend.clone(), self.call_fn.clone(), format!("{label}.{attempt}"));
+                let probe_fn: ProbeFn = Box::new(move |done| probe(&run, &b, &probe_label, Some(&f), Some(done)));
+                let w = Watch::new(self.run, label, attempt, &backend, self.timeout_s, limit_for(self.timeout_s), &pass_id, Some(probe_fn));
+                rec.insert("soft_s".into(), self.timeout_s.to_value());
+                rec.insert("limit_s".into(), w.limit_s.to_value());
+                watch = Some(Arc::new(w));
+            }
+            self.run.record(&with(&rec, &[("status", "started".into())]), None, None)?;
+            let t0 = Instant::now();
+            let seconds = || float_value(py_round(t0.elapsed().as_secs_f64(), 3));
+            let model = p.get("model").and_then(Value::as_str);
+            let as_watch = watch.clone().map(|w| w as Arc<dyn backends::Watch>);
+            let (text, usage) = match self.call_fn.call(&backend, &self.system, message, self.timeout_s, model, as_watch) {
+                Ok(reply) => reply,
+                Err(exc) if exc.is(Exc::Admission) => {
+                    self.run.refuse_reservation()?;
+                    self.run.record(&with(&rec, &[("status", "admission_refused".into()), ("error", Value::String(exc.msg.clone())), ("seconds", seconds())]), None, None)?;
+                    return Err(exc);
+                }
+                Err(exc) if exc.is(Exc::Os) => {
+                    // the command cannot run: every retry would fail too
+                    self.run.record(&with(&rec, &[("status", "fatal".into()), ("error", Value::String(described(&exc))), ("seconds", seconds())]), None, None)?;
+                    return Err(exc);
+                }
+                Err(exc) if backends::is_keyboard_interrupt(&exc) => {
+                    let usage = attr(&exc, "usage").cloned().unwrap_or(Value::Null);
+                    self.run.record(&with(&rec, &[("status", "error".into()), ("error", Value::String(described(&exc))), ("usage", usage), ("seconds", seconds())]), None, None)?;
+                    return Err(exc);
+                }
+                Err(exc) => {
+                    // no usable reply; the attempt is settled either way, its cost unknown if unreported
+                    let stopped = stop_reason(&exc, watch.as_deref().map(|w| w as &dyn backends::Watch));
+                    let mut fields = vec![
+                        ("status", Value::from("error")),
+                        ("error", Value::String(py::head(&described(&exc), 500).into())),
+                        ("usage", attr(&exc, "usage").cloned().unwrap_or(Value::Null)),
+                        ("seconds", seconds()),
+                    ];
+                    if let Some(s) = stopped {
+                        fields.push(("stopped", Value::from(s)));
+                    }
+                    let raw = attr(&exc, "raw").filter(|r| truthy(r)).or_else(|| attr(&exc, "stdout")).map(py_str);
+                    self.run.record(&with(&rec, &fields), None, raw.as_deref())?;
+                    let retried = exc.is(Exc::Judge) || exc.is(Exc::Value) || exc.is(Exc::Timeout);
+                    if attempt == 2 || stopped == Some("limit") || !retried {
+                        return Err(exc); // a call stopped at its hard limit already had its whole window: no retry
+                    }
+                    last = Some(exc);
+                    continue;
+                }
+            };
+            let usage = usage.unwrap_or(Value::Null);
+            // the reply is paid for whatever its shape, so it is charged before it is checked
+            if let Err(exc) = pipelines::check_reply(self.plan, p, &text) {
+                self.run.record(
+                    &with(&rec, &[("status", "malformed".into()), ("usage", usage.clone()), ("error", Value::String(py::head(&exc.msg, 500).into())), ("seconds", seconds())]),
+                    Some(&text),
+                    None,
+                )?;
+                if attempt == 2 {
+                    return Err(exc);
+                }
+                last = Some(exc);
+                continue;
+            }
+            let secs = seconds();
+            self.run.record(&with(&rec, &[("status", "ok".into()), ("usage", usage.clone()), ("seconds", secs.clone())]), Some(&text), None)?;
+            self.run.finish(&pass_id, Num::from_value(&secs).unwrap_or(Num::Float(0.0)), Some(&usage))?;
+            return Ok(text);
+        }
+        unreachable!("the second attempt returns")
+    }
+
+    /// `parallel(fn, values, workers)`: fn over values on up to `workers` threads, results in order. As with
+    /// ThreadPoolExecutor.map, the first failure in order sets stop (queued work then fails fast) and is raised
+    /// once every started task has ended, unless a call failed first (failures[0]).
+    fn parallel<T: Send, R: Send>(&self, values: Vec<T>, workers: usize, f: impl Fn(T) -> Result<R> + Sync) -> Result<Vec<R>> {
+        let n = values.len();
+        let queue = Mutex::new(values.into_iter().enumerate().collect::<std::collections::VecDeque<_>>());
+        let slots: Mutex<Vec<Option<Result<R>>>> = Mutex::new((0..n).map(|_| None).collect());
+        let ready = Condvar::new();
+        let outcome = std::thread::scope(|s| {
+            for _ in 0..workers.min(n) {
+                s.spawn(|| {
+                    loop {
+                        let Some((i, v)) = lock(&queue).pop_front() else { break };
+                        let r = f(v);
+                        lock(&slots)[i] = Some(r);
+                        ready.notify_all();
+                    }
+                });
+            }
+            let mut out = Vec::with_capacity(n);
+            for i in 0..n {
+                let mut guard = lock(&slots);
+                while guard[i].is_none() {
+                    guard = ready.wait(guard).unwrap_or_else(|e| e.into_inner());
+                }
+                match guard[i].take().expect("filled") {
+                    Ok(r) => out.push(r),
+                    Err(e) => {
+                        self.stop.set();
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(out)
+        });
+        outcome.map_err(|e| lock(&self.failures).first().cloned().unwrap_or(e))
+    }
+
+    fn step(&self, p: &Value) -> Result<()> {
+        let id = py_str(p.get("id").unwrap_or(&Value::Null));
+        if let Some(when) = p.get("when") {
+            let when = py_str(when);
+            let skip = lock(&self.skipped).contains(&when) || {
+                let replies = lock(&self.replies);
+                let reply = replies.get(&when).ok_or_else(|| key_error(&when))?;
+                !pipelines::has_issues(reply)
+            };
+            if skip {
+                lock(&self.skipped).insert(id.clone());
+                let mut rec = Map::new();
+                rec.insert("step".into(), Value::String(id.clone()));
+                rec.insert("attempt".into(), Value::from(0));
+                rec.insert("pass".into(), Value::String(id));
+                rec.insert("status".into(), "skipped".into());
+                return self.run.record(&rec, None, None);
+            }
+        }
+        let messages = pipelines::requests(self.plan, p, &lock(&self.replies));
+        if messages.is_empty() {
+            lock(&self.replies).insert(id, String::new()); // a checker with no findings to check
+            return Ok(());
+        }
+        let texts = if messages.len() == 1 || self.run.max_cost.is_some() {
+            // under a dollar cap, one call at a time
+            let mut texts = Vec::new();
+            for (k, m) in messages.iter().enumerate() {
+                let label = if messages.len() == 1 { id.clone() } else { format!("{id}.batch-{}", k + 1) };
+                texts.push(self.one(&label, p, m)?);
+            }
+            texts
+        } else {
+            let workers = messages.len().min(8);
+            self.parallel(messages.iter().enumerate().collect(), workers, |(k, m)| self.one(&format!("{id}.batch-{}", k + 1), p, m))?
+        };
+        let combined = pipelines::combine(self.plan, p, &lock(&self.replies), &texts);
+        lock(&self.replies).insert(id, combined);
+        Ok(())
+    }
+}
+
+/// Run every pass of the plan, then assemble; returns (result text, stats). Each reply in the wrong shape is
+/// asked once more; a failed call is retried once; a command that cannot start stops the run. The number of calls
+/// is structural: one per pass (one per batch of findings for a batched checker) plus one checker repair when a
+/// verdict is missing, each with at most one retry. checker_spec, when set, makes the verdicts pass and its repair,
+/// so a second model or provider checks the findings; every call still shares `run`, its cost cap and its trace.
+#[allow(clippy::too_many_arguments)] // Python's signature
+pub fn run_plan(
+    plan: &Value,
+    material: &str,
+    backend_spec: &Backend,
+    run: &Arc<Run>,
+    call_fn: &CallFn,
+    timeout_s: Num,
+    scope: Option<&str>,
+    checker_spec: Option<&Backend>,
+) -> Result<(String, Value)> {
+    if valid_price(&timeout_s.to_value()).is_none() || !Num::Int(0).py_cmp(timeout_s).is_some_and(Ordering::is_lt) {
+        return Err(Error::value("timeout_s must be finite and positive"));
+    }
+    checker_pass(plan, checker_spec)?;
+    let state = Plan {
+        plan,
+        system: String::new(),
+        backend: backend_spec,
+        checker: checker_spec,
+        run,
+        call_fn,
+        timeout_s,
+        replies: Mutex::new(pipelines::Replies::new()),
+        skipped: Mutex::new(HashSet::new()),
+        gates: Mutex::new(HashMap::new()),
+        stop: Event::new(),
+        failures: Mutex::new(Vec::new()),
+    };
+    let passes = plan.get("passes").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    if passes.iter().any(|p| p.get("model").is_some_and(truthy) && state.spec_for(p).style != "claude") {
+        return Err(Error::value("a per-pass model needs a claude-style backend"));
+    }
+    let role = plan.get("role").and_then(Value::as_str).unwrap_or("");
+    let lead = match scope.filter(|s| !s.is_empty()) {
+        Some(s) => format!("Evaluation scope: {s}\n"),
+        None => String::new(),
+    };
+    let system = format!("{lead}{role}\n\n{}", fence("MATERIAL", material, "untrusted change material written by its author"));
+    let state = Plan { system, ..state };
+    for wave in pipelines::waves(plan)? {
+        if wave.len() == 1 || run.max_cost.is_some() {
+            for p in wave {
+                state.step(p)?;
+            }
+        } else {
+            let workers = wave.len();
+            state.parallel(wave, workers, |p| state.step(p))?;
+        }
+    }
+    let assembled = pipelines::assemble(plan, &lock(&state.replies));
+    let need = match assembled {
+        Err(e) if e.exc == Exc::NeedVerdicts => pipelines::NeedVerdicts::from_error(&e).ok_or(e)?,
+        other => return other,
+    };
+    // ask the checker once more, then fail
+    let checker = passes.iter().find(|p| pass_field(p, "reply") == "verdicts").expect("a NeedVerdicts plan has a checker");
+    let checker_id = py_str(checker.get("id").unwrap_or(&Value::Null));
+    let request = pipelines::repair_request(plan, checker, &lock(&state.replies), &need);
+    let extra = state.one(&format!("{checker_id}.repair"), checker, &request)?;
+    {
+        let mut replies = lock(&state.replies);
+        let before = replies.get(&checker_id).cloned().unwrap_or_default();
+        replies.insert(checker_id, format!("{before}\n{}", pipelines::scope_verdicts(&extra, &need.ids)));
+    }
+    pipelines::assemble(plan, &lock(&state.replies))
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The review and design tasks
+
+/// The parsed command line (argparse's namespace). The review-only options are None for a design task.
+#[derive(Clone, Debug)]
+pub struct Args {
+    pub command: String,
+    pub input: Option<String>,
+    pub repo: Option<String>,
+    pub base: Option<String>,
+    pub head: Option<String>,
+    pub pr_text: Option<String>,
+    pub context_budget: Option<i64>,
+    pub findings_json: Option<String>,
+    pub rb_pr_json: Option<String>,
+    pub agent: String,
+    pub backend: String,
+    pub checker_backend: Option<String>,
+    pub pipeline: Option<String>,
+    pub out: Option<String>,
+    pub trace: Option<String>,
+    pub max_cost: Option<f64>,
+    pub unpriced_call_usd: Option<f64>,
+    pub timeout: Num,
+    pub max_calls: Option<String>,
+    /// Set by task from findings_pr (Python's `args.findings_pr`).
+    pub findings_pr: Map<String, Value>,
+}
+
+/// A set, non-empty string option (Python's truthiness of an optional str).
+fn given(v: &Option<String>) -> Option<&str> {
+    v.as_deref().filter(|s| !s.is_empty())
+}
+
+/// `Path(p).read_text(encoding='utf-8')`: strict UTF-8, universal newlines; a folder is IsADirectoryError.
+fn read_text(path: &str) -> Result<String> {
+    let p = py_path(Path::new(path));
+    let mut f = fs::File::open(&p).map_err(|e| os_err(&e, &p))?;
+    #[cfg(unix)]
+    if f.metadata().is_ok_and(|m| m.is_dir()) {
+        return Err(os_err(&std::io::Error::from_raw_os_error(libc::EISDIR), &p));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut f, &mut bytes)?;
+    let text = decode_utf8(bytes)?;
+    Ok(if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text })
+}
+
+/// `Path(p).write_text(text, encoding='utf-8')`.
+fn write_text(path: &str, text: &str) -> Result<()> {
+    write_file(&py_path(Path::new(path)), text.as_bytes())
+}
+
+/// Review material built from a repository (context.rs); the PR text file, if any, is read as UTF-8.
+pub fn repo_material(args: &Args) -> Result<String> {
+    let pr_text = match given(&args.pr_text) {
+        Some(p) => Some(read_text(p)?),
+        None => None,
+    };
+    let repo = args.repo.as_deref().unwrap_or("");
+    let budget = args.context_budget.unwrap_or(super::context::BUDGET);
+    super::context::build(Path::new(repo), args.base.as_deref().unwrap_or(""), args.head.as_deref().unwrap_or(""), pr_text.as_deref(), budget)
+}
+
+/// The pr block for --findings-json: repo and pr_number from --rb-pr-json (ReviewBench's pr.json), base and head
+/// as full commit ids from --repo; a pr.json base or head that names another commit is refused.
+pub fn findings_pr(args: &Args) -> Result<Map<String, Value>> {
+    let pr = match given(&args.rb_pr_json) {
+        Some(p) => {
+            let text = read_text(p)?;
+            loads_default(&text).map_err(|f| json_failure(f, &text))?
+        }
+        None => Value::Object(Map::new()),
+    };
+    let Value::Object(mut pr) = pr else { return Err(Error::value("--rb-pr-json must hold a JSON object")) };
+    if let Some(repo) = given(&args.repo) {
+        for (key, rev) in [("base", &args.base), ("head", &args.head)] {
+            let full = super::context::commit(Path::new(repo), rev.as_deref().unwrap_or(""), key)?;
+            if let Some(v) = pr.get(key).filter(|v| truthy(v))
+                && *v != Value::String(full.clone())
+            {
+                return Err(Error::value(format!("--rb-pr-json {key} {} is not --{key} {full}", py_str(v))));
+            }
+            pr.insert(key.into(), Value::String(full));
+        }
+    }
+    Ok(pr)
+}
+
+/// Write the review's findings as ReviewBench contract JSON to --findings-json (and the trace); anchors are
+/// checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary.
+pub fn write_findings(args: &Args, text: &str, run: &Run) -> Result<Map<String, Value>> {
+    let found = super::findings::parse(text)?;
+    let (kept, dropped) = match given(&args.repo) {
+        Some(repo) => super::findings::anchor(&found, Path::new(repo), args.head.as_deref().unwrap_or(""), args.base.as_deref())?,
+        None => (found, vec![]),
+    };
+    let data = format!("{}\n", pyjson::dumps_indent(&super::findings::reviewbench(&kept, &args.findings_pr, &args.agent)?, 1));
+    write_text(args.findings_json.as_deref().unwrap_or(""), &data)?;
+    if let Some(trace) = &run.trace {
+        write_file(&join(trace, "findings.json"), data.as_bytes())?;
+    }
+    let mut out = Map::new();
+    out.insert("findings_written".into(), Value::from(kept.len()));
+    out.insert("findings_dropped".into(), Value::from(dropped.len()));
+    out.insert("findings_anchored".into(), Value::Bool(given(&args.repo).is_some()));
+    Ok(out)
+}
+
+/// `releases.config_hash(plan)`: the canonical JSON hash of the plan without its prompts_dir.
+pub fn config_hash(plan: &Value) -> String {
+    let mut plan = plan.clone();
+    if let Some(m) = plan.as_object_mut() {
+        m.shift_remove("prompts_dir");
+    }
+    crate::rt::sha256_hex(crate::rt::canonical(&plan).as_bytes())
+}
+
+/// The errors task reports as a failed run (Python's `except (JudgeError, ValueError, OSError, TimeoutExpired,
+/// BudgetExceeded, NeedVerdicts)`); anything else ends the run as interrupted.
+fn reported(e: &Error) -> bool {
+    !backends::is_keyboard_interrupt(e)
+        && [Exc::Judge, Exc::Value, Exc::Os, Exc::Timeout, Exc::Budget, Exc::NeedVerdicts].iter().any(|k| e.is(*k))
+        && e.data.as_ref().and_then(|d| d.get("type")).is_none_or(|t| t == "UnicodeDecodeError")
+}
+
+/// A review or design task: exit code 0 (done), 2 (cannot start, failed, or cannot write the result) or 130
+/// (interrupted). identity is the implementation identity Python's releases.identity() returns.
+pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
+    let started = Instant::now();
+    let home = identity.get("root").and_then(Value::as_str).map_or_else(crate::ringo_home, PathBuf::from);
+    let mut run: Option<Arc<Run>> = None;
+    type Setup = (Value, String, Backend, Option<Backend>, Map<String, Value>);
+    let setup = (|| -> Result<Setup> {
+        let plan = pipelines::load_plan(&home, given(&args.pipeline).map(Path::new), kind)?;
+        let material = if given(&args.repo).is_some() { repo_material(args)? } else { read_text(args.input.as_deref().unwrap_or(""))? };
+        let b = backend(&args.backend)?;
+        let c = match given(&args.checker_backend) {
+            Some(spec) => Some(backend(spec)?),
+            None => None,
+        };
+        checker_pass(&plan, c.as_ref())?;
+        let mut names = Map::new();
+        names.insert("backend".into(), Value::String(b.name.clone()));
+        names.insert("checker_backend".into(), c.as_ref().map_or(Value::Null, |c| Value::String(c.name.clone())));
+        let plan_sha = config_hash(&plan);
+        let claim = identity.get("quality_claim");
+        let matched = match claim {
+            Some(Value::Object(m))
+                if kind == "review"
+                    && given(&args.pipeline).is_none()
+                    && m.get("plan_sha256") == Some(&Value::String(plan_sha.clone()))
+                    && m.get("backend") == Some(&Value::String(args.backend.clone()))
+                    && m.get("checker_backend").unwrap_or(&Value::Null)
+                        == &args.checker_backend.clone().map_or(Value::Null, Value::String) =>
+            {
+                claim.cloned().unwrap_or(Value::Null)
+            }
+            _ => Value::Null,
+        };
+        let mut implementation = identity.as_object().cloned().unwrap_or_default();
+        implementation.insert("plan_sha256".into(), Value::String(plan_sha));
+        let override_path = match given(&args.pipeline) {
+            Some(p) => Value::String(pstr(&realpath(Path::new(p))?)),
+            None => Value::Null,
+        };
+        implementation.insert("pipeline_override".into(), override_path);
+        implementation.insert("effective_quality_claim".into(), matched);
+        names.insert("implementation".into(), Value::Object(implementation));
+        if let Some(trace) = given(&args.trace) {
+            let mut roots = vec![PathBuf::from(&home)];
+            if let Some(root) = identity.get("checkout_root").and_then(Value::as_str) {
+                roots.push(PathBuf::from(root));
+            }
+            outside_repo_in(Path::new(trace), "trace", &roots)?;
+        }
+        if args.max_cost.is_some() && args.unpriced_call_usd.is_none() {
+            return Err(Error::value("--max-cost needs --unpriced-call-usd for attempts that report no cost, including timeouts"));
+        }
+        for out in [given(&args.out), given(&args.findings_json)].into_iter().flatten() {
+            let p = py_path(Path::new(out));
+            fs::OpenOptions::new().append(true).create(true).open(&p).map_err(|e| os_err(&e, &p))?;
+        }
+        if given(&args.findings_json).is_some() {
+            args.findings_pr = findings_pr(args)?;
+        }
+        let price = |v: Option<f64>| v.map(|f| if f.is_nan() { Value::String("nan".into()) } else { float_value(f) });
+        let r = Arc::new(Run::new(given(&args.trace).map(Path::new), price(args.max_cost).as_ref(), price(args.unpriced_call_usd).as_ref())?);
+        run = Some(Arc::clone(&r));
+        if let Some(trace) = &r.trace {
+            write_file(&join(trace, "material.txt"), material.as_bytes())?; // as sent, on every OS
+            write_file(&join(trace, "plan.json"), pyjson::dumps_indent(&plan, 1).as_bytes())?;
+            let mut chosen = Map::new();
+            chosen.insert("backend".into(), names["backend"].clone());
+            chosen.insert("checker_backend".into(), names["checker_backend"].clone());
+            write_file(&join(trace, "backends.json"), pyjson::dumps_indent(&Value::Object(chosen), 1).as_bytes())?;
+            write_file(&join(trace, "implementation.json"), pyjson::dumps_indent(&names["implementation"], 1).as_bytes())?;
+        }
+        Ok((plan, material, b, c, names))
+    })();
+    let (plan, material, b, c, names) = match setup {
+        Ok(parts) => parts,
+        Err(exc) if exc.is(Exc::Value) || exc.is(Exc::Os) => {
+            print_stderr(&format!("harness: {kind} cannot start: {}", exc.msg));
+            if let Some(r) = &run {
+                // its state already says running; a waiter must learn the run is over
+                let _ = r.state("failed", &[("error", Value::String(py::head(&format!("cannot start: {}", exc.msg), 500).into()))]);
+            }
+            return 2;
+        }
+        Err(exc) => return uncaught(&exc, run.as_deref()),
+    };
+    let run = run.expect("set by the setup");
+    let summary_of = |extra: &[&Map<String, Value>]| -> Map<String, Value> {
+        let mut m = run.summary();
+        for part in extra {
+            m.extend((*part).clone());
+        }
+        m
+    };
+    backends::install_interrupt();
+    let ran = run_plan(&plan, &material, &b, &run, &CallFn::real(), args.timeout, None, c.as_ref());
+    let ran = match ran {
+        Ok(_) if backends::interrupted() => Err(backends::keyboard_interrupt()),
+        other => other,
+    };
+    let (text, stats) = match ran {
+        Ok(parts) => parts,
+        Err(exc) if reported(&exc) => {
+            print_stderr(&format!("harness: {kind} failed: {}", exc.msg));
+            print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary_of(&[&names])))));
+            let _ = run.state("failed", &[("error", Value::String(py::head(&described(&exc), 500).into()))]);
+            return 2;
+        }
+        Err(exc) => {
+            let _ = run.state("interrupted", &[]);
+            return uncaught(&exc, None);
+        }
+    };
+    let stats = stats.as_object().cloned().unwrap_or_default();
+    let mut summary = summary_of(&[&stats, &names]);
+    summary.insert("elapsed_s".into(), float_value(started.elapsed().as_nanos() as f64 / 1e9));
+    let written = (|| -> Result<()> {
+        if given(&args.findings_json).is_some() {
+            summary.extend(write_findings(args, &text, &run)?);
+        }
+        if let Some(trace) = &run.trace {
+            write_file(&join(trace, "result.md"), format!("{text}\n").as_bytes())?;
+            write_file(&join(trace, "summary.json"), pyjson::dumps_indent(&Value::Object(summary.clone()), 1).as_bytes())?;
+        }
+        match given(&args.out) {
+            Some(out) => write_text(out, &format!("{text}\n"))?,
+            None => print_stdout(&text),
+        }
+        Ok(())
+    })();
+    if let Err(exc) = written {
+        if !(exc.is(Exc::Os) || exc.is(Exc::Value)) {
+            return uncaught(&exc, Some(&run));
+        }
+        print_stdout(&text);
+        print_stderr(&format!("harness: {kind} cannot write the result: {}", exc.msg));
+        print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
+        let _ = run.state("failed", &[("error", Value::String(py::head(&format!("cannot write the result: {}", exc.msg), 500).into()))]);
+        return 2;
+    }
+    print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
+    if let Some(trace) = &run.trace {
+        let result = match given(&args.out) {
+            Some(out) => pstr(&realpath(Path::new(out)).unwrap_or_else(|_| PathBuf::from(out))),
+            None => pstr(&join(trace, "result.md")),
+        };
+        let _ = run.state("done", &[("result", Value::String(result)), ("summary", Value::String(pstr(&join(trace, "summary.json"))))]);
+    }
+    0
+}
+
+/// An exception task does not handle: Python's traceback ends with `<type>: <message>`, the exit status is 1 (130
+/// for Ctrl-C, which also marks a traced run interrupted).
+fn uncaught(exc: &Error, run: Option<&Run>) -> i32 {
+    if backends::is_keyboard_interrupt(exc) {
+        if let Some(r) = run {
+            let _ = r.state("interrupted", &[]);
+        }
+        print_stderr("KeyboardInterrupt");
+        return 130;
+    }
+    print_stderr(&format!("Traceback (most recent call last):\n{}", described(exc)));
+    1
+}
+
+/// `print(text)`.
+fn print_stdout(text: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(format!("{text}\n").as_bytes());
+    let _ = out.flush();
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The command line: Python 3.14 argparse as harness.main builds its parser (parsing, usage, errors and help;
+// without colour, which argparse adds only on a terminal)
+
+/// How an option's value converts (argparse `type=`).
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Flag,
+    Str,
+    Int,
+    Float,
+}
+
+struct Opt {
+    flags: &'static [&'static str],
+    dest: &'static str,
+    kind: Kind,
+    required: bool,
+    /// None: argparse.SUPPRESS (accepted, never shown).
+    help: Option<String>,
+}
+
+const HELP: &str = "show this help message and exit";
+
+fn opt(flags: &'static [&'static str], dest: &'static str, kind: Kind, help: Option<String>) -> Opt {
+    Opt { flags, dest, kind, required: false, help }
+}
+
+/// The options of `ringo.py review` or `ringo.py design`, in harness.main's order.
+fn options(command: &str) -> Vec<Opt> {
+    let s = |t: &str| Some(t.to_string());
+    let mut out = vec![Opt { flags: &["-h", "--help"], dest: "help", kind: Kind::Flag, required: false, help: s(HELP) }];
+    if command == "review" {
+        out.extend([
+            opt(&["--input"], "input", Kind::Str, s("the material: the task and the code, as one text file (or use --repo)")),
+            opt(&["--repo"], "repo", Kind::Str, s("build the material from this git repository instead of --input (read-only, offline; an incomplete partial clone is refused)")),
+            opt(&["--base"], "base", Kind::Str, s("with --repo: the base commit; the change is the three-dot diff base...head")),
+            opt(&["--head"], "head", Kind::Str, s("with --repo: the head commit")),
+            opt(&["--pr-text"], "pr_text", Kind::Str, s("with --repo: a text file with the change description")),
+            opt(&["--context-budget"], "context_budget", Kind::Int, Some(format!(
+                "with --repo: material size limit in bytes (default {}); the change itself is never dropped, only unchanged context blocks",
+                super::context::BUDGET
+            ))),
+            opt(&["--findings-json"], "findings_json", Kind::Str, s("also write the findings as ReviewBench agent-contract JSON here (anchors checked against --head with --repo, unchecked otherwise)")),
+            opt(&["--rb-pr-json"], "rb_pr_json", Kind::Str, s("with --findings-json: ReviewBench's pr.json, for the pr block's repo and pr_number")),
+            opt(&["--agent"], "agent", Kind::Str, s("with --findings-json: the agent and producer name (default ringo)")),
+        ]);
+    } else {
+        out.push(Opt { required: true, ..opt(&["--input"], "input", Kind::Str, s("the material: the brief, as one text file")) });
+    }
+    out.extend([
+        opt(&["--backend"], "backend", Kind::Str, s("claude, codex, codex-chatgpt, ollama:MODEL, claude:<command>, codex:<command> (prints Codex exec --json events), or any stdin command")),
+        opt(&["--checker-backend"], "checker_backend", Kind::Str, s("a second backend (same forms as --backend) for the plan's verdicts pass and its repair, so another model or provider checks the findings; the plan needs a verdicts pass")),
+        opt(&["--pipeline"], "pipeline", Kind::Str, s("a plan JSON file (default: the built-in one-call plan)")),
+        opt(&["--out"], "out", Kind::Str, s("write the result here instead of stdout")),
+        opt(&["--trace"], "trace", Kind::Str, s("new/empty folder outside the repository for trace, replies and material (0700)")),
+        opt(&["--max-cost"], "max_cost", Kind::Float, s("stop starting calls once the cost reaches this many USD")),
+        opt(&["--unpriced-call-usd"], "unpriced_call_usd", Kind::Float, s("fallback cost for any attempt reporting no price; required with --max-cost")),
+        opt(&["--timeout"], "timeout", Kind::Float, Some(format!(
+            "soft seconds per call (default {}): a call past it is checked and probed, not killed, and stopped at twice it, never under {}s",
+            TIMEOUT_S.py_str(),
+            HARD_FLOOR_S.py_str()
+        ))),
+        opt(&["--max-calls"], "max_calls", Kind::Str, None),
+    ]);
+    out
+}
+
+/// How main ends early: text for stdout (help, exit 0) or for stderr (an error, exit 2).
+enum Exit {
+    Help(String),
+    Error(String),
+}
+
+/// `shutil.get_terminal_size().columns`: $COLUMNS, else stdout's terminal, else 80.
+fn columns() -> usize {
+    if let Some(c) = std::env::var("COLUMNS").ok().and_then(|v| py::strip(&v).parse::<i64>().ok()).filter(|c| *c > 0) {
+        return c as usize;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: winsize is plain data that TIOCGWINSZ fills.
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0 {
+            return size.ws_col as usize;
+        }
+    }
+    80
+}
+
+/// argparse's HelpFormatter for these parsers.
+struct Formatter {
+    width: usize,
+    max_help_position: usize,
+}
+
+impl Formatter {
+    fn new() -> Formatter {
+        let width = columns().saturating_sub(2);
+        Formatter { width, max_help_position: 24.min(width.saturating_sub(20).max(4)) }
+    }
+
+    /// `usage: <prog> <parts>`, wrapped as `_format_usage` wraps it.
+    fn usage(&self, prog: &str, opt_parts: &[String], pos_parts: &[String]) -> String {
+        let prefix = "usage: ";
+        let all: Vec<&str> = std::iter::once(prog).chain(opt_parts.iter().chain(pos_parts).map(String::as_str)).collect();
+        let usage = all.join(" ");
+        let text_width = self.width;
+        if prefix.len() + py::len(&usage) <= text_width {
+            return format!("{prefix}{usage}\n\n");
+        }
+        let get_lines = |parts: &[&str], indent: &str, prefix: Option<&str>| -> Vec<String> {
+            let (mut lines, mut line): (Vec<String>, Vec<&str>) = (vec![], vec![]);
+            let indent_length = indent.len();
+            let mut line_len = prefix.map_or(indent_length, str::len) as isize - 1;
+            for part in parts {
+                let part_len = py::len(part) as isize;
+                if line_len + 1 + part_len > text_width as isize && !line.is_empty() {
+                    lines.push(format!("{indent}{}", line.join(" ")));
+                    line.clear();
+                    line_len = indent_length as isize - 1;
+                }
+                line.push(part);
+                line_len += part_len + 1;
+            }
+            if !line.is_empty() {
+                lines.push(format!("{indent}{}", line.join(" ")));
+            }
+            if prefix.is_some() && !lines.is_empty() {
+                lines[0] = lines[0][indent_length..].to_string();
+            }
+            lines
+        };
+        let opts: Vec<&str> = opt_parts.iter().map(String::as_str).collect();
+        let poss: Vec<&str> = pos_parts.iter().map(String::as_str).collect();
+        let prog_len = py::len(prog);
+        let lines = if (prefix.len() + prog_len) as f64 <= 0.75 * text_width as f64 {
+            let indent = " ".repeat(prefix.len() + prog_len + 1);
+            if !opts.is_empty() {
+                let mut first = vec![prog];
+                first.extend(&opts);
+                let mut lines = get_lines(&first, &indent, Some(prefix));
+                lines.extend(get_lines(&poss, &indent, None));
+                lines
+            } else if !poss.is_empty() {
+                let mut first = vec![prog];
+                first.extend(&poss);
+                get_lines(&first, &indent, Some(prefix))
+            } else {
+                vec![prog.to_string()]
+            }
+        } else {
+            let indent = " ".repeat(prefix.len());
+            let mut parts = opts.clone();
+            parts.extend(&poss);
+            let mut lines = get_lines(&parts, &indent, None);
+            if lines.len() > 1 {
+                lines = get_lines(&opts, &indent, None);
+                lines.extend(get_lines(&poss, &indent, None));
+            }
+            std::iter::once(prog.to_string()).chain(lines).collect()
+        };
+        format!("{prefix}{}\n\n", lines.join("\n"))
+    }
+
+    /// One `_format_action` entry at indent, with the column help starts at.
+    fn action(&self, indent: usize, header: &str, help: Option<&str>, help_position: usize) -> String {
+        let help_width = self.width.saturating_sub(help_position).max(11);
+        let action_width = help_position as isize - indent as isize - 2;
+        if help.is_none_or(str::is_empty) {
+            return format!("{}{header}\n", " ".repeat(indent));
+        }
+        let (mut out, indent_first) = if (py::len(header) as isize) <= action_width {
+            (format!("{}{header:<width$}  ", " ".repeat(indent), width = action_width.max(0) as usize), 0)
+        } else {
+            (format!("{}{header}\n", " ".repeat(indent)), help_position)
+        };
+        let text = help.unwrap_or("");
+        if !py::strip(text).is_empty() {
+            let lines = textwrap(&collapse(text), help_width);
+            if let Some((first, rest)) = lines.split_first() {
+                out.push_str(&format!("{}{first}\n", " ".repeat(indent_first)));
+                for line in rest {
+                    out.push_str(&format!("{}{line}\n", " ".repeat(help_position)));
+                }
+            }
+        } else if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// argparse's `_whitespace_matcher.sub(' ', text).strip()` (ASCII whitespace).
+fn collapse(text: &str) -> String {
+    text.split(|c: char| c.is_ascii_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
+}
+
+static WORDSEP: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
+    let ws = r"[\t\n\x0b\x0c\r ]";
+    let nws = r"[^\t\n\x0b\x0c\r ]";
+    let wp = r#"[\p{L}\p{N}_!"'&.,?]"#;
+    let lt = r"[\p{L}\p{Nl}\p{No}_]";
+    fancy_regex::Regex::new(&format!(
+        r"({ws}+|(?<={wp})-{{2,}}(?=[\p{{L}}\p{{N}}_])|{nws}+?(?:-(?:(?<={lt}{{2}}-)|(?<={lt}-{lt}-))(?={lt}-?{lt})|(?={ws}|\z)|(?<={wp})(?=-{{2,}}[\p{{L}}\p{{N}}_])))"
+    ))
+    .expect("a valid pattern")
+});
+
+/// `textwrap.wrap(text, width)` for argparse's collapsed help text (break_on_hyphens, break_long_words,
+/// drop_whitespace; no tabs or sentence fixing).
+fn textwrap(text: &str, width: usize) -> Vec<String> {
+    let mut chunks: Vec<String> = Vec::new();
+    let mut at = 0;
+    for m in WORDSEP.find_iter(text).flatten() {
+        if m.start() > at {
+            chunks.push(text[at..m.start()].to_string());
+        }
+        if !m.as_str().is_empty() {
+            chunks.push(m.as_str().to_string());
+        }
+        at = m.end();
+    }
+    if at < text.len() {
+        chunks.push(text[at..].to_string());
+    }
+    chunks.reverse();
+    let blank = |c: &str| py::strip(c).is_empty();
+    let mut lines: Vec<String> = Vec::new();
+    while !chunks.is_empty() {
+        let (mut cur, mut cur_len): (Vec<String>, usize) = (vec![], 0);
+        if !lines.is_empty() && chunks.last().is_some_and(|c| blank(c)) {
+            chunks.pop();
+        }
+        while let Some(c) = chunks.last() {
+            let l = py::len(c);
+            if cur_len + l <= width {
+                cur_len += l;
+                cur.push(chunks.pop().expect("a chunk"));
+            } else {
+                break;
+            }
+        }
+        if let Some(chunk) = chunks.last().filter(|c| py::len(c) > width).cloned() {
+            // _handle_long_word
+            let space_left = if width < 1 { 1 } else { width.saturating_sub(cur_len) };
+            if space_left > 0 {
+                let mut end = space_left;
+                if py::len(&chunk) > space_left {
+                    let head: Vec<char> = chunk.chars().take(space_left).collect();
+                    if let Some(h) = head.iter().rposition(|&c| c == '-')
+                        && h > 0
+                        && head[..h].iter().any(|&c| c != '-')
+                    {
+                        end = h + 1;
+                    }
+                }
+                cur.push(py::head(&chunk, end).to_string());
+                *chunks.last_mut().expect("a chunk") = py::slice(&chunk, end, py::len(&chunk)).to_string();
+            } else if cur.is_empty() {
+                cur.push(chunks.pop().expect("a chunk"));
+            }
+        }
+        if cur.last().is_some_and(|c| blank(c)) {
+            cur.pop();
+        }
+        if !cur.is_empty() {
+            lines.push(cur.concat());
+        }
+    }
+    lines
+}
+
+fn opt_usage(o: &Opt) -> String {
+    let part = match o.kind {
+        Kind::Flag => o.flags[0].to_string(),
+        _ => format!("{} {}", o.flags[0], o.dest.to_uppercase()),
+    };
+    if o.required { part } else { format!("[{part}]") }
+}
+
+fn invocation(o: &Opt) -> String {
+    match o.kind {
+        Kind::Flag => o.flags.join(", "),
+        _ => format!("{} {}", o.flags.join(", "), o.dest.to_uppercase()),
+    }
+}
+
+const CHOICES: [(&str, &str); 2] = [
+    ("review", "run the review pipeline on the material in --input or built from --repo"),
+    ("design", "run the design pipeline on the material in --input"),
+];
+
+fn top_usage(prog: &str) -> String {
+    Formatter::new().usage(prog, &["[-h]".to_string()], &["{review,design} ...".to_string()])
+}
+
+fn sub_usage(prog: &str, opts: &[Opt]) -> String {
+    let parts: Vec<String> = opts.iter().filter(|o| o.help.is_some()).map(opt_usage).collect();
+    Formatter::new().usage(prog, &parts, &[])
+}
+
+fn top_help(prog: &str) -> String {
+    let f = Formatter::new();
+    let header = "{review,design}";
+    let longest = [py::len(header) + 2, 4 + CHOICES.iter().map(|(n, _)| n.len()).max().unwrap_or(0), 2 + "-h, --help".len()]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let help_position = (longest + 2).min(f.max_help_position);
+    let mut out = f.usage(prog, &["[-h]".to_string()], &["{review,design} ...".to_string()]);
+    out.push_str(&format!("{}\n\n", textwrap(&collapse("Run a Ringo review or design pipeline."), f.width.max(11)).join("\n")));
+    out.push_str("positional arguments:\n");
+    out.push_str(&f.action(2, header, None, help_position));
+    for (name, help) in CHOICES {
+        out.push_str(&f.action(4, name, Some(help), help_position));
+    }
+    out.push_str("\noptions:\n");
+    out.push_str(&f.action(2, "-h, --help", Some(HELP), help_position));
+    out
+}
+
+fn sub_help(prog: &str, opts: &[Opt]) -> String {
+    let f = Formatter::new();
+    let shown: Vec<&Opt> = opts.iter().filter(|o| o.help.is_some()).collect();
+    let longest = shown.iter().map(|o| py::len(&invocation(o)) + 2).max().unwrap_or(0);
+    let help_position = (longest + 2).min(f.max_help_position);
+    let mut out = sub_usage(prog, opts);
+    out.push_str("options:\n");
+    for o in shown {
+        out.push_str(&f.action(2, &invocation(o), o.help.as_deref(), help_position));
+    }
+    out
+}
+
+/// An error: usage, then `<prog>: error: <message>`.
+fn parser_error(usage: String, prog: &str, message: &str) -> Exit {
+    let usage = usage.trim_end_matches('\n');
+    Exit::Error(format!("{usage}\n{prog}: error: {message}\n"))
+}
+
+/// Python's `float(text)` for an option value: Python's whitespace stripped, underscores only between digits,
+/// the inf and nan words (ASCII digits only; Python also reads other Unicode decimal digits).
+fn arg_float(text: &str) -> Option<f64> {
+    let t = py::strip(text);
+    let chars: Vec<char> = t.chars().collect();
+    let ok = chars.iter().enumerate().all(|(i, &c)| {
+        c != '_' || (i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit())
+    });
+    if !ok || !t.is_ascii() {
+        return None;
+    }
+    t.chars().filter(|&c| c != '_').collect::<String>().parse().ok()
+}
+
+/// Python's `int(text)` for an option value (sign, ASCII digits, underscores between digits, at most 4300 digits);
+/// past i64 it saturates (Python's ints are unbounded; a budget that large is no limit either way).
+fn arg_int(text: &str) -> Option<i64> {
+    let t = py::strip(text);
+    let (sign, digits) = match t.strip_prefix('-') {
+        Some(d) => (-1i128, d),
+        None => (1, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let chars: Vec<char> = digits.chars().collect();
+    let ok = !chars.is_empty()
+        && chars.iter().enumerate().all(|(i, &c)| {
+            c.is_ascii_digit() || (c == '_' && i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit())
+        });
+    let cleaned: String = chars.into_iter().filter(|&c| c != '_').collect();
+    if !ok || cleaned.len() > 4300 {
+        return None;
+    }
+    let significant = cleaned.trim_start_matches('0');
+    let value = if significant.is_empty() { 0 } else { significant.parse::<i128>().unwrap_or(i128::MAX) };
+    Some((sign * value).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
+}
+
+static NEGATIVE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\A-\.?\d").expect("a valid pattern"));
+
+/// How argparse sees one argument string: an option (with any explicit value, and whether it came after '='), an
+/// option no action knows, or a value.
+enum Seen<'o> {
+    Opt(&'o Opt, Option<String>, bool),
+    Unknown,
+    Value,
+}
+
+fn classify<'o>(arg: &str, opts: &'o [Opt], prog: &str, usage: &dyn Fn() -> String) -> std::result::Result<Seen<'o>, Exit> {
+    if !arg.starts_with('-') || arg.len() == 1 {
+        return Ok(Seen::Value);
+    }
+    let exact = |s: &str| opts.iter().find(|o| o.flags.contains(&s));
+    if let Some(o) = exact(arg) {
+        return Ok(Seen::Opt(o, None, false));
+    }
+    if let Some((prefix, value)) = arg.split_once('=')
+        && let Some(o) = exact(prefix)
+    {
+        return Ok(Seen::Opt(o, Some(value.to_string()), true));
+    }
+    // _get_option_tuples: every option the (prefix of the) string abbreviates
+    let mut matches: Vec<(&Opt, &str, Option<String>, bool)> = Vec::new();
+    let (prefix, value) = arg.split_once('=').map_or((arg, None), |(p, v)| (p, Some(v.to_string())));
+    if arg.starts_with("--") {
+        for o in opts {
+            for flag in o.flags {
+                if flag.starts_with(prefix) {
+                    matches.push((o, flag, value.clone(), value.is_some()));
+                }
+            }
+        }
+    } else {
+        let (short, explicit) = (py::head(arg, 2), py::slice(arg, 2, py::len(arg)));
+        for o in opts {
+            for flag in o.flags {
+                if *flag == short {
+                    matches.push((o, flag, Some(explicit.to_string()), false));
+                } else if flag.starts_with(prefix) {
+                    matches.push((o, flag, value.clone(), value.is_some()));
+                }
+            }
+        }
+    }
+    if matches.len() > 1 {
+        let names: Vec<&str> = matches.iter().map(|m| m.1).collect();
+        return Err(parser_error(usage(), prog, &format!("ambiguous option: {arg} could match {}", names.join(", "))));
+    }
+    if let Some((o, _, value, sep)) = matches.pop() {
+        return Ok(Seen::Opt(o, value, sep));
+    }
+    if NEGATIVE.is_match(arg) || arg.contains(' ') {
+        return Ok(Seen::Value);
+    }
+    Ok(Seen::Unknown)
+}
+
+/// `-h`/`--help`: the help (exit 0), or argparse's error for a value given to it ('-hx' still means help).
+fn flag(o: &Opt, explicit: Option<String>, sep: bool, prog: &str, usage: &dyn Fn() -> String, help: impl Fn() -> String) -> Exit {
+    match explicit {
+        Some(v) if sep || v.is_empty() || v.starts_with('-') => {
+            parser_error(usage(), prog, &format!("argument {}: ignored explicit argument {}", o.flags.join("/"), py::repr(&v)))
+        }
+        _ => Exit::Help(help()),
+    }
+}
+
+/// `parse_args(argv)` for harness.main's parser: the namespace, or what argparse prints and exits with.
+fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
+    let top = || top_usage(prog);
+    let mut extras: Vec<String> = Vec::new();
+    let mut k = 0;
+    let mut command = None;
+    while k < argv.len() {
+        let arg = &argv[k];
+        k += 1;
+        if arg == "--" {
+            if k < argv.len() {
+                command = Some(argv[k].clone());
+                k += 1;
+            }
+            break;
+        }
+        let help = [Opt { flags: &["-h", "--help"], dest: "help", kind: Kind::Flag, required: false, help: Some(HELP.into()) }];
+        match classify(arg, &help, prog, &top)? {
+            Seen::Opt(o, explicit, sep) => return Err(flag(o, explicit, sep, prog, &top, || top_help(prog))),
+            Seen::Unknown => extras.push(arg.clone()),
+            Seen::Value => {
+                command = Some(arg.clone());
+                break;
+            }
+        }
+    }
+    let Some(command) = command else {
+        return Err(parser_error(top(), prog, "the following arguments are required: command"));
+    };
+    if !CHOICES.iter().any(|(n, _)| *n == command) {
+        return Err(parser_error(top(), prog, &format!("argument command: invalid choice: {} (choose from 'review', 'design')", py::repr(&command))));
+    }
+    let sub = format!("{prog} {command}");
+    let opts = options(&command);
+    let usage = || sub_usage(&sub, &opts);
+    let mut values: HashMap<&str, String> = HashMap::new();
+    let rest = &argv[k..];
+    let mut i = 0;
+    let mut only_values = false;
+    while i < rest.len() {
+        let arg = &rest[i];
+        i += 1;
+        if only_values {
+            extras.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            only_values = true;
+            extras.push(arg.clone());
+            continue;
+        }
+        match classify(arg, &opts, &sub, &usage)? {
+            Seen::Value | Seen::Unknown => extras.push(arg.clone()),
+            Seen::Opt(o, explicit, sep) => {
+                if o.kind == Kind::Flag {
+                    return Err(flag(o, explicit, sep, &sub, &usage, || sub_help(&sub, &opts)));
+                }
+                let name = o.flags.join("/");
+                let value = match explicit {
+                    Some(v) => v,
+                    None => {
+                        let next = rest.get(i).filter(|n| *n != "--" && matches!(classify(n, &opts, &sub, &usage), Ok(Seen::Value)));
+                        let Some(v) = next else {
+                            return Err(parser_error(usage(), &sub, &format!("argument {name}: expected one argument")));
+                        };
+                        i += 1;
+                        v.clone()
+                    }
+                };
+                let bad = |what: &str| parser_error(usage(), &sub, &format!("argument {name}: invalid {what} value: {}", py::repr(&value)));
+                match o.kind {
+                    Kind::Int if arg_int(&value).is_none() => return Err(bad("int")),
+                    Kind::Float if arg_float(&value).is_none() => return Err(bad("float")),
+                    _ => {}
+                }
+                values.insert(o.dest, value);
+            }
+        }
+    }
+    let missing: Vec<String> = opts.iter().filter(|o| o.required && !values.contains_key(o.dest)).map(|o| o.flags.join("/")).collect();
+    if !missing.is_empty() {
+        return Err(parser_error(usage(), &sub, &format!("the following arguments are required: {}", missing.join(", "))));
+    }
+    if !extras.is_empty() {
+        return Err(parser_error(top(), prog, &format!("unrecognized arguments: {}", extras.join(" "))));
+    }
+    let get = |k: &str| values.get(k).cloned();
+    let review = command == "review";
+    Ok(Args {
+        input: get("input"),
+        repo: get("repo"),
+        base: get("base"),
+        head: get("head"),
+        pr_text: get("pr_text"),
+        context_budget: get("context_budget").and_then(|v| arg_int(&v)),
+        findings_json: get("findings_json"),
+        rb_pr_json: get("rb_pr_json"),
+        agent: get("agent").unwrap_or_else(|| if review { "ringo".into() } else { String::new() }),
+        backend: get("backend").unwrap_or_else(|| "claude".into()),
+        checker_backend: get("checker_backend"),
+        pipeline: get("pipeline"),
+        out: get("out"),
+        trace: get("trace"),
+        max_cost: get("max_cost").and_then(|v| arg_float(&v)),
+        unpriced_call_usd: get("unpriced_call_usd").and_then(|v| arg_float(&v)),
+        timeout: get("timeout").and_then(|v| arg_float(&v)).map_or(TIMEOUT_S, Num::Float),
+        max_calls: get("max_calls"),
+        findings_pr: Map::new(),
+        command,
+    })
+}
+
+/// `harness.main(argv, prog='ringo.py')`: parse the command line and run the task; identity is what Python's
+/// releases.identity() would return (see `crate::rt::select`). Returns the exit code.
+pub fn main(argv: &[String], identity: Value) -> i32 {
+    let prog = "ringo.py";
+    let mut args = match parse_args(argv, prog) {
+        Ok(a) => a,
+        Err(Exit::Help(text)) => {
+            let _ = std::io::stdout().lock().write_all(text.as_bytes());
+            return 0;
+        }
+        Err(Exit::Error(text)) => {
+            let _ = std::io::stderr().lock().write_all(text.as_bytes());
+            return 2;
+        }
+    };
+    let fail = |message: &str| {
+        if let Exit::Error(text) = parser_error(top_usage(prog), prog, message) {
+            let _ = std::io::stderr().lock().write_all(text.as_bytes());
+        }
+        2
+    };
+    if args.command == "review" {
+        let flags: Vec<&str> = [("base", args.base.is_some()), ("head", args.head.is_some()), ("pr_text", args.pr_text.is_some()), ("context_budget", args.context_budget.is_some())]
+            .iter()
+            .filter(|(_, set)| *set)
+            .map(|(f, _)| *f)
+            .collect();
+        if args.input.is_none() == args.repo.is_none() {
+            return fail("review needs exactly one of --input and --repo");
+        }
+        if given(&args.repo).is_some() && (args.base.is_none() || args.head.is_none()) {
+            return fail("--repo needs --base and --head");
+        }
+        if given(&args.input).is_some() && !flags.is_empty() {
+            return fail(&format!("--{} works only with --repo", flags[0].replace('_', "-")));
+        }
+        if args.context_budget.is_some_and(|b| b <= 0) {
+            return fail("--context-budget must be a positive number of bytes");
+        }
+        if given(&args.rb_pr_json).is_some() && given(&args.findings_json).is_none() {
+            return fail("--rb-pr-json works only with --findings-json");
+        }
+        if given(&args.repo).is_some() && args.context_budget.is_none() {
+            args.context_budget = Some(super::context::BUDGET);
+        }
+    }
+    if args.max_calls.is_some() {
+        return fail("--max-calls was removed: the plan sets the number of calls (docs/HARNESS.md)");
+    }
+    let kind = args.command.clone();
+    task(&mut args, &kind, &identity)
+}
 
 #[cfg(test)]
 mod tests {
