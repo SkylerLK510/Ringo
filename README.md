@@ -442,7 +442,8 @@ Six tasks went from pass to fail and none the other way (exact McNemar p = 0.031
 They also used 35 more tokens per task (95% interval -43 to +118). The official EvalPlus evaluator agrees with the study's grader on all 300 graded files.
 The study cost 51.9 credits.
 
-**Why.** MBPP's prose is short, and its examples define the behaviour.
+**Why.** The study tests the four changes together, so these are per-task readings, not separate effects. MBPP's
+prose is short, and its examples define the behaviour.
 - The writer rule told the writer to follow the named behaviour over the examples. On 4 tasks it overrode correct
   examples.
 - The stop rule then ended 5 runs as disputes. On 4 of those tasks, V3 delivered a correct answer by fixing its code
@@ -502,8 +503,8 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 - **Tasks with headroom, measured against the agent.** On HumanEval+ the two tie on quality and Ringo costs far less
   (section 7). V3 passes 132 of 150 MBPP+ tasks at 2,631 tokens each (section 8). The agent on those same tasks, and
   harder sets such as LiveCodeBench, come next.
-- **Refinements need unseen tasks.** All four changes built from HumanEval+ failures did harm on MBPP+ (section 8). A
-  candidate is now built on one set and judged on a sealed one.
+- **Refinements need unseen tasks.** The four changes built from HumanEval+ failures, tested together, did harm on
+  MBPP+ (section 8). A candidate is now built on one set and judged on a sealed one.
 - **Choosing between two drafts.** Two drafts from different families pass more hidden tests than either alone, but
   the cheap signals tried so far cannot tell which one is right. A published e-process release rule
   (arXiv 2605.12947) and execution-based selection (DiffCodeGen, arXiv 2605.20473) are the starting points; both

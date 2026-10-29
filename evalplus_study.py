@@ -479,9 +479,20 @@ def credits(usage):
 
 
 def run_credits(run):
-    """Credits of every paid call in a run's trace, a call that failed or a run that wrote no report included."""
-    import shadow_labels
-    return sum(credits(usage) for _, usage in shadow_labels.usage_events(run / 'trace.jsonl'))
+    """Credits of every paid call in a run's trace, a call that failed or a run that wrote no report included. A
+    trace can be read while its run appends to it, so a line that does not parse yet is skipped."""
+    import ast
+    import harness
+    trace, total = run / 'trace.jsonl', 0.0
+    for line in trace.read_text(encoding='utf-8').splitlines() if trace.is_file() else []:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        usage = event.get('usage')
+        if event.get('status') in harness.PAID_STATUSES and usage:
+            total += credits(usage if isinstance(usage, dict) else ast.literal_eval(usage))
+    return total
 
 
 def spent(runs):
@@ -503,7 +514,11 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
     queue = [(t, name) for t in ids for name in arms if t in todo[name]]
     print(f'{len(queue)} runs to do over {len(arms)} arm(s), {jobs} at a time; each makes at most max_rounds + 1 '
           'model calls', flush=True)
-    failures, finished = 0, []
+    # the reserve is the costliest finished run, those of an earlier invocation included
+    failures = 0
+    finished = [run_credits(r) for f in folders.values() for r in run_folders(f) if (r / 'report.json').is_file()]
+    # tasks with an arm under way or done: their other arms are the rest of a pair, never a new one
+    begun = {t for t in ids for name in arms if (folders[name] / slug(t) / 'report.json').is_file()}
 
     def one(task_id, name):
         proc = subprocess.run([sys.executable, str(Path(arms[name]) / 'workflow.py'), '--spec',
@@ -512,7 +527,7 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
         return task_id, name, proc
 
     def affordable(active):
-        if max_credits is None or queue[0][1] != next(iter(arms)):
+        if max_credits is None or queue[0][0] in begun:
             return True  # no ceiling, or the rest of a pair already started
         total = sum(spent(f) for f in folders.values())
         reserve = max(finished) if finished else 1.0  # the V3 HumanEval+ runs averaged 0.23 credits
@@ -520,8 +535,11 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
 
     with concurrent.futures.ThreadPoolExecutor(jobs) as pool:
         active = set()
-        while queue and len(active) < jobs and affordable(active):
+        def launch():
+            begun.add(queue[0][0])
             active.add(pool.submit(one, *queue.pop(0)))
+        while queue and len(active) < jobs and affordable(active):
+            launch()
         while active:
             done, active = concurrent.futures.wait(active, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
@@ -533,7 +551,7 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
                 # Three runs in a row that end in an error (a usage limit, a lost login) stop new launches.
                 failures = failures + 1 if status in RETRY else 0
             while queue and failures < 3 and len(active) < jobs and affordable(active):
-                active.add(pool.submit(one, *queue.pop(0)))
+                launch()
             if failures >= 3:
                 print('stopping: three runs in a row failed; fix the cause and rerun to continue', flush=True)
                 queue.clear()
@@ -545,8 +563,9 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
 def grade_all(out):
     count = 0
     for run in [r for runs in sorted(out.glob('runs*')) if runs.is_dir() for r in run_folders(runs)]:
-        if not (run / 'report.json').is_file():
-            continue
+        if not (run / 'report.json').is_file() \
+                or json.loads((run / 'report.json').read_text(encoding='utf-8')).get('status') in RETRY:
+            continue  # an infrastructure failure is not a task outcome; a rerun replaces it
         task_id = task_of(run.name)
         drafts = [p for p in run.glob('round-*/*/solution.py')] + [run / 'final/solution.py']
         suspect = any(touches_files(p.read_text(encoding='utf-8', errors='replace')) for p in drafts if p.is_file())

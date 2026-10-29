@@ -354,6 +354,39 @@ class ArmTest(unittest.TestCase):
             failed.mkdir()  # a run that paid for a call and wrote no report still counts
             (failed / 'trace.jsonl').write_text(json.dumps({'step': 'writer-1', 'status': 'error', 'usage': {'output': 4_000}}) + '\n')
             self.assertEqual(study.spent(out / 'runs-a'), 4.0)
+            with (failed / 'trace.jsonl').open('a') as f:
+                f.write('{"step": "writer-2", "status": "ok", "us')  # a line still being written
+            self.assertEqual(study.spent(out / 'runs-a'), 4.0)
+
+    def test_a_resume_finishes_a_pair_whichever_arm_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            done = out / 'runs-b' / 'Mbpp-0'
+            done.mkdir(parents=True)
+            usage = {'input': 100_000, 'output': 30_000}  # 12.5 credits: the ceiling is nearly spent
+            (done / 'trace.jsonl').write_text(json.dumps({'step': 'writer-1', 'status': 'ok', 'usage': usage}) + '\n')
+            (done / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'usage': usage}))
+            launched = []
+
+            def fake(argv, **kw):
+                dest = Path(argv[argv.index('--out') + 1])
+                launched.append((dest.parent.name, dest.name))
+                dest.mkdir(parents=True)
+                (dest / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'usage': {}}))
+                return unittest.mock.Mock(stdout=json.dumps({'status': 'ready_for_review'}), stderr='')
+            with unittest.mock.patch.object(study.subprocess, 'run', side_effect=fake), unittest.mock.patch('sys.stdout'):
+                study.run_all(out, ['Mbpp/0', 'Mbpp/1'], 1, {'a': out / 'impl-a', 'b': out / 'impl-b'}, max_credits=13)
+            self.assertEqual(launched, [('runs-a', 'Mbpp-0')])  # the missing arm A runs; no new pair fits
+
+    def test_grading_skips_a_run_that_ended_in_an_infrastructure_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            run = out / 'runs-a' / 'Mbpp-1'
+            run.mkdir(parents=True)
+            (run / 'report.json').write_text(json.dumps({'status': 'error'}))
+            with unittest.mock.patch('sys.stdout'):
+                study.grade_all(out)
+            self.assertFalse((run / 'grade.json').exists())
 
     def test_compare_pairs_graded_tasks_and_counts_gains_harms_and_stands(self):
         with tempfile.TemporaryDirectory() as tmp:
