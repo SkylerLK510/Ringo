@@ -43,6 +43,10 @@ fn main() -> ExitCode {
             println!("ringo {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
+        Some("wait") => {
+            let rest: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
+            ExitCode::from(ringo_cli::rt::wait::main(&rest) as u8)
+        }
         _ => harness(args),
     }
 }
