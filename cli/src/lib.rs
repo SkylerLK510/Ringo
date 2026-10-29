@@ -119,7 +119,9 @@ pub struct Session {
     /// The backend Ringo pipelines use.
     pub backend: String,
     pub ringo_home: PathBuf,
-    pub python: OsString,
+    /// The command that runs a Ringo pipeline, before its arguments: the `ringo` binary itself in the shell (it
+    /// picks the native or the Python runtime as the release gate says); None means `python3 ringo_home/ringo.py`.
+    pub pipeline: Option<Vec<OsString>>,
     /// The program each agent runs; tests point these at fakes.
     pub programs: HashMap<Agent, PathBuf>,
     threads: HashMap<Agent, String>,
@@ -265,7 +267,7 @@ impl Session {
         let (tx, rx) = channel();
         let programs = Agent::ALL.iter().map(|a| (*a, PathBuf::from(a.name()))).collect();
         Ok(Session { repo, dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), python: python(), programs, threads: HashMap::new(), tx, rx })
+                     ringo_home: ringo_home(), pipeline: None, programs, threads: HashMap::new(), tx, rx })
     }
 
     pub fn running(&self) -> usize {
@@ -384,8 +386,9 @@ impl Session {
     pub fn launch_ringo(&mut self, title: &str, args: Vec<OsString>, trace: PathBuf) -> Result<usize, String> {
         let command = args.first().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
         let id = self.new_job(Kind::Ringo { command }, title)?;
-        let mut cmd = Command::new(&self.python);
-        cmd.arg(self.ringo_home.join("ringo.py")).args(args).current_dir(&self.repo);
+        let prefix = self.pipeline.clone().unwrap_or_else(|| vec![python(), self.ringo_home.join("ringo.py").into()]);
+        let mut cmd = Command::new(&prefix[0]);
+        cmd.args(&prefix[1..]).args(args).current_dir(&self.repo);
         self.spawn(id, cmd, Style::Trace, None, Some(trace))?;
         Ok(id)
     }

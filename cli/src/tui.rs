@@ -492,7 +492,12 @@ pub fn run() -> ExitCode {
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     let session = match Session::new(&cwd) {
-        Ok(s) => s,
+        Ok(mut s) => {
+            if let Ok(me) = std::env::current_exe() {
+                s.pipeline = Some(vec![me.into()]); // this binary: native pipelines unless a release says otherwise
+            }
+            s
+        }
         Err(e) => {
             eprintln!("ringo: {e}");
             return ExitCode::from(2);
