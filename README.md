@@ -463,6 +463,7 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
 | Letting a model rewrite an ambiguous brief directly | Below the original brief in 11 of 12 model-benchmark cells (SpecFix, arXiv 2505.07270) | Not tried: published as harmful |
 | Regenerating when the model seems uncertain | Lower pass@1 in 5 of 6 configurations (arXiv 2608.14659; small models) | Not tried: published as harmful |
 | Fixed multi-round repair | Repair with a noisy verifier turned correct answers wrong (arXiv 2607.17641); at a matched budget, more first drafts beat more repairs (Olausson et al., ICLR 2024) | Not tried; `max_rounds` stays bounded by the checks |
+| Context compaction (shrinking history or material) | Vendors compact with a model call over the whole context, which adds tokens; deterministic masking matched LLM summaries at half the cost on SWE-bench Verified (arXiv 2508.21433). Ringo's pipelines keep no history. Offline, windowing changed files to ±15 lines would cut review material 39%, with untested recall ([details](docs/CONTEXT-COMPACTION.md)) | Not adopted now; not tested |
 
 ### 10. What would move it next
 
