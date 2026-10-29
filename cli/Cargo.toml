@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 libc = "0.2.191"
 ratatui = "0.30.2"
-serde_json = "1.0.154"
+serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
 
 [lib]
 name = "ringo_cli"

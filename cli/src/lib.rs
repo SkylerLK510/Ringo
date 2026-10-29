@@ -3,6 +3,7 @@
 //! the IDE drive a `Session` and render its jobs.
 
 pub mod parse;
+pub mod rt;
 
 use parse::{Note, Parser, Style, Tokens};
 use std::collections::{BTreeSet, HashMap, VecDeque};
