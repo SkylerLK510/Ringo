@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use ringo_cli::rt::workflow::{self as wf, difflib};
-use ringo_cli::rt::harness::Backend;
+use ringo_cli::rt::harness::{Backend, CallFn, Num};
 use ringo_cli::rt::{pyjson, Error};
 use serde_json::{json, Map, Value};
 use std::io::Write;
@@ -142,15 +142,31 @@ def make_error(kind, msg, data):
     return ValueError(msg)
 
 
-def run_case(spec_path, out, replies):
+def run_case(spec_path, out, replies, mode):
+    import time
     seq, seen = iter(replies), []
 
-    def call(backend, system, message, timeout_s):
+    def body(backend, system, message, timeout_s, watch=None):
         seen.append([backend, harness.sha(system), message])
+        if message == harness.PROBE_MESSAGE:
+            return 'OK', {'input': 1, 'output': 1, 'cache_read': 0, 'cache_write': 0}
         item = next(seq)
+        if item.get('soft') and watch is not None:
+            # the soft limit passed and the call ended while its probe ran
+            watch.done.set()
+            watch.soft(1.5, lambda: ('{"type": "turn.started"}\nnot json\n', 'stream error: reconnecting\n'))
+        if item.get('sleep'):
+            time.sleep(item['sleep'])
         if 'raise' in item:
             raise make_error(*item['raise'])
         return item['reply'], item.get('usage', {})
+
+    if mode == 'watch':
+        def call(backend, system, message, timeout_s, watch=None):
+            return body(backend, system, message, timeout_s, watch)
+    else:
+        def call(backend, system, message, timeout_s):
+            return body(backend, system, message, timeout_s)
     try:
         result = {'report': workflow.run(spec_path, out, call_fn=call)}
     except BaseException as e:
@@ -1709,6 +1725,37 @@ fn make_error(kind: &str, msg: &str, data: &Value) -> Error {
     }
 }
 
+/// The driver's scripted call function in Rust: the replies in order (a probe answers OK without using one), an
+/// item's `soft` runs the watch's soft-limit check with the call already ended, `sleep` waits first, `raise` fails.
+fn fake_call(replies: Vec<Value>, watch: bool, seen: std::sync::Arc<std::sync::Mutex<Vec<Value>>>) -> CallFn {
+    let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    CallFn::new(watch, move |backend: &Backend, system: &str, message: &str, _timeout: Num, _model: Option<&str>, w: Option<std::sync::Arc<dyn ringo_cli::rt::backends::Watch>>| {
+        seen.lock().unwrap().push(json!([backend.to_value(), ringo_cli::rt::harness::sha(system), message]));
+        if message == ringo_cli::rt::harness::PROBE_MESSAGE {
+            return Ok(("OK".to_string(), Some(json!({"input": 1, "output": 1, "cache_read": 0, "cache_write": 0}))));
+        }
+        let Some(item) = replies.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else {
+            // Python's next() on the exhausted replies: StopIteration, which run() does not catch
+            return Err(Error::new(ringo_cli::rt::Exc::NeedVerdicts, "").with_data(json!({"python_type": "StopIteration"})));
+        };
+        if item.get("soft") == Some(&json!(true))
+            && let Some(w) = &w
+        {
+            w.set_done();
+            let snapshot: ringo_cli::rt::backends::Snapshot =
+                std::sync::Arc::new(|| Ok(("{\"type\": \"turn.started\"}\nnot json\n".to_string(), "stream error: reconnecting\n".to_string())));
+            w.soft(1.5, snapshot);
+        }
+        if let Some(t) = item.get("sleep").and_then(Value::as_f64) {
+            std::thread::sleep(std::time::Duration::from_secs_f64(t));
+        }
+        if let Some(r) = item.get("raise") {
+            return Err(make_error(s(&r[0]), s(&r[1]), &r[2]));
+        }
+        Ok((s(&item["reply"]).to_string(), Some(item.get("usage").cloned().unwrap_or(json!({})))))
+    })
+}
+
 /// Timing values (seconds, elapsed, state times, pid) as a marker, and the rs folder's paths as the py folder's.
 fn normalize(v: &mut Value, from: &str, to: &str) {
     match v {
@@ -1774,6 +1821,8 @@ struct RunCase {
     name: &'static str,
     spec: Value,
     replies: Vec<Value>,
+    /// The call function takes a watch (so run() builds harness's Watch and probe for each call).
+    watch: bool,
 }
 
 fn council_spec(dir: &Path) -> Value {
@@ -1805,58 +1854,82 @@ fn run_cases(dir: &Path) -> Vec<RunCase> {
     let base = council_spec(dir);
     let text = with(&base, json!({"protocol": "text"}));
     let good = "def f(x): return 2*x\n";
+    let plain_json = with(&base, json!({"council": null, "rubric": null, "samples": null}));
     let plain = json!({"version": 1, "brief": "Implement f(x).\n\nReturn twice x.\n", "files": {"value.py": ""},
         "fixtures": {"check.py": "from value import f\nassert f(5) == 10\n"}, "checks": [{"name": "reference", "argv": ["{python}", "-B", "check.py"]}],
         "writer": "fake", "judge": "fake", "allow_tool_backends": true, "allow_execution": true, "max_rounds": 3, "max_seconds": 60,
         "protocol": "text", "spec_tests": {"python": "{python}"}});
     vec![
-        RunCase { name: "ready", spec: base.clone(), replies: vec![proposal(good), accept(true), accept(true)] },
-        RunCase { name: "revise", spec: base.clone(), replies: vec![proposal("def f(x): return x\n"), proposal(good), accept(true), accept(true)] },
-        RunCase { name: "malformed", spec: base.clone(), replies: vec![reply("not json"), proposal("# keep\ndef f(x): return x\n"),
+        RunCase { watch: false, name: "ready", spec: base.clone(), replies: vec![proposal(good), accept(true), accept(true)] },
+        RunCase { watch: false, name: "revise", spec: base.clone(), replies: vec![proposal("def f(x): return x\n"), proposal(good), accept(true), accept(true)] },
+        RunCase { watch: false, name: "malformed", spec: base.clone(), replies: vec![reply("not json"), proposal("# keep\ndef f(x): return x\n"),
             reply(&pyjson::dumps(&json!({"edits": [{"path": "value.py", "old": "return 2*x", "new": "return x+x"}], "rationale": "r"}))),
             reply(&pyjson::dumps(&json!({"edits": [{"path": "value.py", "old": "return x", "new": "return 2*x"}], "rationale": "r"})))] },
-        RunCase { name: "escalate", spec: with(&base, json!({"samples": 4, "first_judges": 2})), replies: vec![proposal(good), accept(true), accept(false), accept(true), accept(true),
+        RunCase { watch: false, name: "escalate", spec: with(&base, json!({"samples": 4, "first_judges": 2})), replies: vec![proposal(good), accept(true), accept(false), accept(true), accept(true),
             proposal("def f(x): return x + x\n"), accept(true), accept(true)] },
-        RunCase { name: "exhausted", spec: base.clone(), replies: vec![proposal(good), accept(true)] },
-        RunCase { name: "repeated", spec: base.clone(), replies: vec![proposal("")] },
-        RunCase { name: "deep", spec: base.clone(), replies: vec![reply(&format!("{}0{}", "[".repeat(200_000), "]".repeat(200_000))), proposal(good), accept(true), accept(true)] },
-        RunCase { name: "admission", spec: base.clone(), replies: vec![raise("AdmissionRefused", "no room", json!({}))] },
-        RunCase { name: "call-error", spec: base.clone(), replies: vec![raise("CallError", "bad reply", json!({"usage": {"input": 4, "output": 0, "cache_read": 0, "cache_write": 0}, "raw": "events"}))] },
-        RunCase { name: "stopped-retry", spec: base.clone(), replies: vec![raise("Stopped", "", json!({})), proposal(good), accept(true), accept(true)] },
-        RunCase { name: "stopped-twice", spec: base.clone(), replies: vec![raise("Stopped", "", json!({})), raise("Stopped", "", json!({}))] },
-        RunCase { name: "judge-error", spec: base.clone(), replies: vec![proposal(good), raise("JudgeError", "the judge failed", json!({}))] },
-        RunCase { name: "key-error", spec: base.clone(), replies: vec![raise("KeyError", "k", json!({}))] },
-        RunCase { name: "mutation", spec: base.clone(), replies: vec![proposal("from pathlib import Path\nPath('check.py').write_text('pass')\ndef f(x): return 2*x\n")] },
-        RunCase { name: "crlf", spec: base.clone(), replies: vec![proposal("def f(x):\r\n    return 2*x\r\n")] },
-        RunCase { name: "timeout", spec: with(&base, json!({"checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(5)"], "timeout_s": 0.3}], "max_rounds": 1})),
+        RunCase { watch: false, name: "exhausted", spec: base.clone(), replies: vec![proposal(good), accept(true)] },
+        RunCase { watch: false, name: "repeated", spec: base.clone(), replies: vec![proposal("")] },
+        RunCase { watch: false, name: "deep", spec: base.clone(), replies: vec![reply(&format!("{}0{}", "[".repeat(200_000), "]".repeat(200_000))), proposal(good), accept(true), accept(true)] },
+        RunCase { watch: false, name: "admission", spec: base.clone(), replies: vec![raise("AdmissionRefused", "no room", json!({}))] },
+        RunCase { watch: false, name: "call-error", spec: base.clone(), replies: vec![raise("CallError", "bad reply", json!({"usage": {"input": 4, "output": 0, "cache_read": 0, "cache_write": 0}, "raw": "events"}))] },
+        RunCase { watch: false, name: "stopped-retry", spec: base.clone(), replies: vec![raise("Stopped", "", json!({})), proposal(good), accept(true), accept(true)] },
+        RunCase { watch: false, name: "stopped-twice", spec: base.clone(), replies: vec![raise("Stopped", "", json!({})), raise("Stopped", "", json!({}))] },
+        RunCase { watch: false, name: "judge-error", spec: base.clone(), replies: vec![proposal(good), raise("JudgeError", "the judge failed", json!({}))] },
+        RunCase { watch: false, name: "key-error", spec: base.clone(), replies: vec![raise("KeyError", "k", json!({}))] },
+        RunCase { watch: false, name: "mutation", spec: base.clone(), replies: vec![proposal("from pathlib import Path\nPath('check.py').write_text('pass')\ndef f(x): return 2*x\n")] },
+        RunCase { watch: false, name: "crlf", spec: base.clone(), replies: vec![proposal("def f(x):\r\n    return 2*x\r\n")] },
+        RunCase { watch: false, name: "timeout", spec: with(&base, json!({"checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(5)"], "timeout_s": 0.3}], "max_rounds": 1})),
             replies: vec![proposal(good)] },
-        RunCase { name: "all-fail", spec: with(&base, json!({"max_rounds": 2})), replies: vec![proposal("def f(x): return x\n"), proposal("def f(x): return 3*x\n")] },
-        RunCase { name: "budget", spec: with(&base, json!({"max_seconds": 0.5, "checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(3)"], "timeout_s": 10}]})),
+        RunCase { watch: false, name: "all-fail", spec: with(&base, json!({"max_rounds": 2})), replies: vec![proposal("def f(x): return x\n"), proposal("def f(x): return 3*x\n")] },
+        RunCase { watch: false, name: "budget", spec: with(&base, json!({"max_seconds": 0.5, "checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(3)"], "timeout_s": 10}]})),
             replies: vec![proposal(good)] },
-        RunCase { name: "repair", spec: with(&text, json!({"protocol_repair": true})), replies: vec![reply("@@@ REPLACE value.py\nnot there\n@@@ WITH\nx\n@@@ END\n"),
+        RunCase { watch: false, name: "repair", spec: with(&text, json!({"protocol_repair": true})), replies: vec![reply("@@@ REPLACE value.py\nnot there\n@@@ WITH\nx\n@@@ END\n"),
             reply("@@@ FILE value.py\ndef f(x):\n    return 2*x\n"), accept(true), accept(true)] },
-        RunCase { name: "text", spec: text.clone(), replies: vec![reply("@@@ RATIONALE\nwhy\n@@@ FILE value.py\ndef f(x):\n    return x\n"),
+        RunCase { watch: false, name: "text", spec: text.clone(), replies: vec![reply("@@@ RATIONALE\nwhy\n@@@ FILE value.py\ndef f(x):\n    return x\n"),
             reply("@@@ REPLACE value.py\n    return x\n@@@ WITH\n    return 2*x\n@@@ END\n"), accept(false), accept(true),
             reply("@@@ RATIONALE\nThe judges are wrong.\n"), accept(true), accept(true)] },
-        RunCase { name: "no-regression", spec: with(&text, json!({"no_regression": true})), replies: vec![reply("@@@ FILE value.py\ndef f(x):\n    return 2*x\n"), accept(false), accept(false),
+        RunCase { watch: false, name: "no-regression", spec: with(&text, json!({"no_regression": true})), replies: vec![reply("@@@ FILE value.py\ndef f(x):\n    return 2*x\n"), accept(false), accept(false),
             reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("@@@ FILE value.py\ndef f(x):\n    return x*2\n"), accept(true), accept(true)] },
-        RunCase { name: "unpriced", spec: with(&base, json!({"max_cost": 0.015, "unpriced_call_usd": 0.004})), replies: vec![proposal(good), accept(true), accept(true), proposal("x"), accept(true)] },
-        RunCase { name: "doc-script", spec: with(&text, json!({"files": {"REPORT.md": ""}, "fixtures": {"data.csv": "a,b\n1,2\n3,4\n", "check.py": "assert 'total' in open('REPORT.md').read()\n"},
+        RunCase { watch: false, name: "unpriced", spec: with(&base, json!({"max_cost": 0.015, "unpriced_call_usd": 0.004})), replies: vec![proposal(good), accept(true), accept(true), proposal("x"), accept(true)] },
+        RunCase { watch: false, name: "doc-script", spec: with(&text, json!({"files": {"REPORT.md": ""}, "fixtures": {"data.csv": "a,b\n1,2\n3,4\n", "check.py": "assert 'total' in open('REPORT.md').read()\n"},
             "checks": [{"name": "c", "argv": ["{python}", "-B", "check.py"]}], "scripts": {"python": "{python}"}, "no_regression": true})),
             replies: vec![reply("@@@ SCRIPT\nimport csv\nprint('total', sum(int(r['b']) for r in csv.DictReader(open('data.csv'))))\n@@@ FILE REPORT.md\ntotal: 6\n"), accept(false), accept(true),
                 reply("@@@ REPLACE REPORT.md\ntotal: 6\n@@@ WITH\ntotal: 9\n@@@ END\n"), reply("@@@ RATIONALE\nThe script shows 6.\n"), accept(true), accept(true)] },
-        RunCase { name: "spec-tests", spec: plain.clone(), replies: vec![reply(SPEC_TESTS_REPLY), reply("@@@ FILE value.py\ndef f(x):\n    return int(2*x)\n"),
+        RunCase { watch: false, name: "spec-tests", spec: plain.clone(), replies: vec![reply(SPEC_TESTS_REPLY), reply("@@@ FILE value.py\ndef f(x):\n    return int(2*x)\n"),
             reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("@@@ DISPUTE Brief.test_keeps_floats\n\"Return twice x.\"\n@@@ FILE value.py\ndef f(x):\n    return 3*x\n")] },
-        RunCase { name: "candidates", spec: with(&plain, json!({"candidates": 2, "max_cost": 10, "unpriced_call_usd": 0.0})),
+        RunCase { watch: false, name: "candidates", spec: with(&plain, json!({"candidates": 2, "max_cost": 10, "unpriced_call_usd": 0.0})),
             replies: vec![reply(THREE_SPEC_TESTS), reply("@@@ FILE value.py\ndef f(x):\n    return int(2*x)\n"), reply("@@@ FILE value.py\ndef f(x):\n    return abs(2*x)\n"),
                 reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("@@@ FILE value.py\ndef f(x):\n    return -x\n")] },
-        RunCase { name: "candidates-fail", spec: with(&plain, json!({"candidates": 3, "max_cost": 10, "unpriced_call_usd": 0.0, "max_rounds": 2, "spec_tests": null})),
+        RunCase { watch: false, name: "candidates-fail", spec: with(&plain, json!({"candidates": 3, "max_cost": 10, "unpriced_call_usd": 0.0, "max_rounds": 2, "spec_tests": null})),
             replies: vec![reply("@@@ FILE value.py\ndef f(x):\n    return x\n"), reply("not blocks"), reply("@@@ FILE value.py\ndef f(x):\n    return x\n"),
                 reply("@@@ FILE value.py\ndef f(x):\n    return 3*x\n")] },
-        RunCase { name: "script-only", spec: with(&plain, json!({"files": {"REPORT.md": ""}, "fixtures": {"check.py": "assert 'total' in open('REPORT.md').read()\n"},
+        RunCase { watch: false, name: "script-only", spec: with(&plain, json!({"files": {"REPORT.md": ""}, "fixtures": {"check.py": "assert 'total' in open('REPORT.md').read()\n"},
             "spec_tests": null, "scripts": {"python": "{python}"}, "candidates": 2, "max_cost": 10, "unpriced_call_usd": 0.0})),
             replies: vec![reply("@@@ SCRIPT\nprint('total', 6)\n"), reply("@@@ SCRIPT\nprint('total', 7)\n"), reply("@@@ FILE REPORT.md\nno word\n"), reply("@@@ FILE REPORT.md\nstill none\n")] },
-        RunCase { name: "spec-tests-none", spec: with(&plain, json!({"max_rounds": 2})), replies: vec![reply("no tests here"), reply("@@@ FILE value.py\ndef f(x):\n    return x\n"),
+        RunCase { watch: false, name: "plain-ready", spec: plain_json.clone(), replies: vec![proposal(good), reply("What this change does: f.\n\nNo defects found.")] },
+        RunCase { watch: false, name: "plain-findings", spec: plain_json.clone(), replies: vec![proposal(good), reply("### 1. Name (`value.py:1`)\n- Problem: rename.\n- Fix: rename."),
+            proposal("def f(x): return x + x\n")] },
+        RunCase { watch: false, name: "plain-findings-then-fail", spec: plain_json.clone(), replies: vec![proposal(good), reply("Unreadable review."),
+            proposal("def f(x): return x\n"), proposal("def f(x): return 2 * x\n")] },
+        RunCase { watch: false, name: "review-retry", spec: plain_json.clone(), replies: vec![proposal(good),
+            raise("CallError", "the reviewer failed", json!({"usage": {"input": 2, "output": 0, "cache_read": 0, "cache_write": 0}, "raw": "partial"})),
+            reply("No defects found.")] },
+        RunCase { watch: false, name: "review-bounded-refused", spec: with(&plain_json, json!({"max_seconds": 1.5})), replies: vec![proposal(good),
+            json!({"raise": ["JudgeError", "slow and failed", {}], "sleep": 1.6})] },
+        RunCase { watch: false, name: "review-doc", spec: with(&plain, json!({"files": {"REPORT.md": ""}, "fixtures": {"check.py": "assert 'total' in open('REPORT.md').read()\n"},
+            "checks": [{"name": "c", "argv": ["{python}", "-B", "check.py"]}], "spec_tests": null, "scripts": {"python": "{python}"}})),
+            replies: vec![reply("@@@ SCRIPT\nprint('total', 6)\n@@@ FILE REPORT.md\ntotal: 6\n"), reply("No defects found.")] },
+        RunCase { watch: false, name: "spec-tests-broken", spec: plain.clone(), replies: vec![reply("```python\nfrom value import g\nimport unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n```"),
+            reply("@@@ FILE value.py\ndef f(x):\n    return 2*x\n"), reply("No defects found.")] },
+        RunCase { watch: true, name: "watch-int", spec: with(&base, json!({"timeout_s": 120, "max_seconds": 1000})), replies: vec![proposal(good), accept(true), accept(true)] },
+        RunCase { watch: true, name: "watch-float", spec: with(&base, json!({"timeout_s": 2.5, "max_seconds": 1000})), replies: vec![proposal(good), accept(true), accept(true)] },
+        RunCase { watch: true, name: "watch-soft-probe", spec: with(&plain_json, json!({"timeout_s": 120, "max_seconds": 1000})),
+            replies: vec![json!({"reply": proposal(good)["reply"], "soft": true}), reply("No defects found.")] },
+        RunCase { watch: true, name: "watch-soft-cost-cap", spec: with(&base, json!({"timeout_s": 120, "max_seconds": 1000, "max_cost": 5, "unpriced_call_usd": 0.0})),
+            replies: vec![json!({"reply": proposal(good)["reply"], "soft": true}), accept(true), accept(true)] },
+        RunCase { watch: true, name: "watch-stopped", spec: with(&base, json!({"timeout_s": 120, "max_seconds": 1000})),
+            replies: vec![raise("Stopped", "", json!({})), proposal(good), accept(true), accept(true)] },
+        RunCase { watch: false, name: "spec-tests-none", spec: with(&plain, json!({"max_rounds": 2})), replies: vec![reply("no tests here"), reply("@@@ FILE value.py\ndef f(x):\n    return x\n"),
             reply("@@@ FILE value.py\ndef f(x):\n    return x + 1\n")] },
     ]
 }
@@ -1872,31 +1945,21 @@ fn run_matches_python_with_a_fake_call_function() {
     for c in &cases {
         let path = temp.0.join(format!("{}.json", c.name));
         std::fs::write(&path, pyjson::dumps(&c.spec)).unwrap();
-        py_cases.push(json!([path.to_string_lossy(), temp.0.join(format!("py-{}", c.name)).to_string_lossy(), c.replies]));
+        let mode = if c.watch { "watch" } else { "plain" };
+        py_cases.push(json!([path.to_string_lossy(), temp.0.join(format!("py-{}", c.name)).to_string_lossy(), c.replies, mode]));
     }
     let want = python("run", &py_cases);
     for (c, want) in cases.iter().zip(&want) {
         let (py_out, rs_out) = (temp.0.join(format!("py-{}", c.name)), temp.0.join(format!("rs-{}", c.name)));
-        let seen = std::sync::Mutex::new(Vec::new());
-        let next = std::sync::atomic::AtomicUsize::new(0);
-        let call = |backend: &Backend, system: &str, message: &str, _timeout: f64| -> Result<(String, Value), Error> {
-            seen.lock().unwrap().push(json!([backend.to_value(), ringo_cli::rt::harness::sha(system), message]));
-            let Some(item) = c.replies.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else {
-                // Python's next() on the exhausted replies: StopIteration, which run() does not catch
-                return Err(Error::new(ringo_cli::rt::Exc::NeedVerdicts, "").with_data(json!({"python_type": "StopIteration"})));
-            };
-            if let Some(r) = item.get("raise") {
-                return Err(make_error(s(&r[0]), s(&r[1]), &r[2]));
-            }
-            Ok((s(&item["reply"]).to_string(), item.get("usage").cloned().unwrap_or(json!({}))))
-        };
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let call = fake_call(c.replies.clone(), c.watch, std::sync::Arc::clone(&seen));
         let spec_path = temp.0.join(format!("{}.json", c.name));
         let result = match wf::run(&spec_path, &rs_out, Some(&call), &identity) {
             Ok(report) => json!({"report": report}),
             Err(e) => json!({"raised": [wf::exc_name(&e), e.msg]}),
         };
         let mut result = result;
-        result["seen"] = Value::Array(seen.into_inner().unwrap());
+        result["seen"] = Value::Array(seen.lock().unwrap().clone());
         let (from, to) = (rs_out.to_string_lossy().into_owned(), py_out.to_string_lossy().into_owned());
         let (from_real, to_real) = (
             ringo_cli::rt::harness::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
@@ -1924,41 +1987,69 @@ fn run_matches_python_with_a_fake_call_function() {
     eprintln!("run: {} cases identical (report, calls and files)", cases.len());
 }
 
-/// What run() cannot do yet: its default call function (harness.call) and the review (harness.run_plan) are the
-/// marked gaps; a run that needs them ends as an error report naming the gap.
+/// Ctrl-C during a check: both runtimes kill the check's process tree, write the report and state as interrupted
+/// and exit (Python by its KeyboardInterrupt, the binary with 130, as harness::task does).
 #[test]
-fn run_reports_the_harness_gaps() {
-    let temp = Temp::new("gaps");
-    let identity = json!({"mode": "checkout", "id": "x", "root": "/r", "quality_claim": null});
-    let spec = temp.0.join("council.json");
-    std::fs::write(&spec, pyjson::dumps(&council_spec(&temp.0))).unwrap();
-    let report = wf::run(&spec, &temp.0.join("default-call"), None, &identity).unwrap();
-    assert_eq!(report["status"], "error");
-    assert!(s(&report["error"]).contains("harness.call"), "{}", report["error"]);
-    let plain = with(&council_spec(&temp.0), json!({"council": null, "rubric": null, "samples": null}));
-    let spec = temp.0.join("plain.json");
-    std::fs::write(&spec, pyjson::dumps(&plain)).unwrap();
-    let call = |_: &Backend, _: &str, _: &str, _: f64| -> Result<(String, Value), Error> {
-        Ok((pyjson::dumps(&json!({"files": {"value.py": "def f(x): return 2*x\n"}, "rationale": "r"})), json!({})))
+fn work_interrupted_by_sigint_matches_python() {
+    let temp = Temp::new("sigint");
+    std::fs::write(temp.0.join("writer.py"), "import json, sys\nsys.stdin.read()\nprint(json.dumps({'files': {'value.py': 'x = 1\\n'}, 'rationale': 'r'}))\n").unwrap();
+    let spec = json!({"version": 1, "brief": "b", "files": {"value.py": ""}, "fixtures": {},
+        "checks": [{"name": "slow", "argv": ["{python}", "-c",
+            "import subprocess, sys, time; subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3); open(\"late\", \"w\").write(\"x\")']); time.sleep(30)"]}],
+        "writer": format!("{} {}", py3(), temp.0.join("writer.py").display()), "judge": "fake", "allow_tool_backends": true,
+        "allow_execution": true, "max_rounds": 1, "max_seconds": 1000});
+    let spec_path = temp.0.join("spec.json");
+    std::fs::write(&spec_path, pyjson::dumps(&spec)).unwrap();
+    let state = temp.0.join("release-state");
+    let mut outcomes = Vec::new();
+    for arm in ["python", "native"] {
+        let out = temp.0.join(arm);
+        let mut cmd = if arm == "python" {
+            let mut c = Command::new(py3());
+            c.arg(root().join("ringo.py"));
+            c
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_ringo"))
+        };
+        cmd.args(["work", "--spec"]).arg(&spec_path).arg("--out").arg(&out);
+        cmd.env("RINGO_HOME", root()).env("RINGO_RELEASE_HOME", &state).env_remove("RINGO_CHILD").env_remove("RINGO_PINNED");
+        let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+        let log = out.join("round-1/check-1.out");
+        let started = std::time::Instant::now();
+        while !log.exists() && started.elapsed().as_secs() < 30 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+        let done = child.wait_with_output().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3500)); // past the check child's write
+        assert!(!out.join("round-1/candidate/late").exists(), "{arm}: the check's child outlived the interrupt");
+        let stderr = String::from_utf8_lossy(&done.stderr).into_owned();
+        assert!(stderr.trim_end().ends_with("KeyboardInterrupt"), "{arm}: {stderr}");
+        outcomes.push((out, done.status));
+    }
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(outcomes[0].1.signal().map(|s| 128 + s).or(outcomes[0].1.code()), Some(130), "python's exit");
+    assert_eq!(outcomes[1].1.code(), Some(130), "the binary's exit");
+    let (py_out, rs_out) = (outcomes[0].0.clone(), outcomes[1].0.clone());
+    let (from, to) = (
+        ringo_cli::rt::harness::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
+        ringo_cli::rt::harness::realpath(&py_out).unwrap().to_string_lossy().into_owned(),
+    );
+    let (a, b) = (tree(&py_out, "\u{0}", "\u{0}"), tree(&rs_out, &from, &to));
+    let skip = |name: &str| name.contains("implementation") || name == "source.json";
+    for ((na, ta), (nb, tb)) in a.iter().zip(&b) {
+        assert_eq!(na, nb, "interrupted runs wrote different files");
+        if !skip(na) && na != "report.json" {
+            assert_eq!(ta, tb, "interrupted run: {na}");
+        }
+    }
+    let report = |t: &[(String, String)]| -> Value {
+        let text = &t.iter().find(|x| x.0 == "report.json").unwrap().1;
+        let mut r: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap(); // tree() wrote it normalized
+        r.as_object_mut().unwrap().remove("implementation"); // which runtime ran is the one intended difference
+        r
     };
-    let report = wf::run(&spec, &temp.0.join("review"), Some(&call), &identity).unwrap();
-    assert_eq!(report["status"], "error");
-    assert!(s(&report["error"]).contains("harness.run_plan"), "{}", report["error"]);
-    assert_eq!(report["rounds"][0]["checks"][0]["status"], "pass");
-    // A spec-test suite that cannot load is dropped (spec_runner.py ran it) before the review's gap.
-    let mut plain = with(&plain, json!({"protocol": "text", "spec_tests": {"python": "{python}"}}));
-    plain["fixtures"] = json!({"check.py": "from value import f\nassert f(5) == 10\n"});
-    plain["checks"] = json!([{"name": "reference", "argv": ["{python}", "-B", "check.py"]}]);
-    let spec = temp.0.join("broken.json");
-    std::fs::write(&spec, pyjson::dumps(&plain)).unwrap();
-    let replies = ["```python\nfrom value import g\nimport unittest\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n```",
-        "@@@ FILE value.py\ndef f(x):\n    return 2*x\n"];
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let call = |_: &Backend, _: &str, _: &str, _: f64| -> Result<(String, Value), Error> {
-        Ok((replies[next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)].to_string(), json!({})))
-    };
-    let report = wf::run(&spec, &temp.0.join("broken"), Some(&call), &identity).unwrap();
-    assert!(s(&report["spec_tests"]["dropped"]).contains("ImportError"), "{}", report["spec_tests"]);
-    assert_eq!(report["rounds"][0]["spec_tests"]["status"], "broken");
-    assert!(s(&report["error"]).contains("harness.run_plan"), "{}", report["error"]);
+    assert_eq!(report(&a), report(&b), "interrupted run: report.json");
+    assert_eq!(report(&b)["status"], "interrupted");
 }
