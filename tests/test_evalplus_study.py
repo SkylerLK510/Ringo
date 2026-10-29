@@ -260,3 +260,120 @@ class ProbeTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+MBPP = {'task_id': 'Mbpp/2', 'entry_point': 'similar_elements',
+        'prompt': '"""\nWrite a function to find the shared elements from the given two lists.\n'
+                  'assert set(similar_elements((3, 4, 5, 6),(5, 7, 4, 10))) == set((4, 5))\n"""\n',
+        'canonical_solution': '\ndef similar_elements(test_tup1, test_tup2):\n  return tuple(set(test_tup1) & set(test_tup2))\n',
+        'assertion': '\nassert similar_elements((3, 4, 5, 6),(5, 7, 4, 10)) == (4, 5)\n',
+        'base_input': [[[3, 4, 5, 6], [5, 7, 4, 10]]], 'plus_input': [[[1, 2], [2, 1]]], 'atol': 0}
+
+
+class MbppTest(unittest.TestCase):
+    def test_an_mbpp_task_is_a_spec_with_an_empty_file_and_the_original_asserts(self):
+        spec = study.task_spec(MBPP, study.HERE / 'examples' / 'v3-codex.json')
+        self.assertEqual(spec['files'], {'solution.py': ''})
+        self.assertTrue(spec['brief'].startswith('Write `similar_elements` in solution.py. The task:\n\nWrite a function'))
+        self.assertNotIn('"""', spec['brief'])
+        self.assertIn('import math\nimport sys\n', spec['fixtures']['check_base.py'])
+        self.assertNotIn('plus_input', json.dumps(spec))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'task.json'
+            path.write_text(json.dumps(spec))
+            loaded = workflow.load_spec(path)
+            self.assertTrue(study.base_passes(loaded, 'def similar_elements(a, b):\n    return tuple(sorted(set(a) & set(b)))\n'))
+            self.assertFalse(study.base_passes(loaded, 'def similar_elements(a, b):\n    return ()\n'))
+
+    def test_mbpp_grading_deserializes_inputs_and_uses_evalplus_oracles(self):
+        # Mbpp/2 compares as sets and gets tuples back from JSON lists
+        self.assertTrue(study.grade_here(MBPP, 'def similar_elements(a, b):\n    assert isinstance(a, tuple)\n'
+                                               '    return tuple(sorted(set(a) & set(b), reverse=True))\n'))
+        self.assertFalse(study.grade_here(MBPP, 'def similar_elements(a, b):\n    return (4,)\n'))
+        regex = {'task_id': 'Mbpp/737', 'entry_point': 'check_str', 'prompt': '',
+                 'canonical_solution': 'import re\ndef check_str(s):\n    return re.search("^[aeiou]", s)\n',
+                 'base_input': [['apple'], ['xyz']], 'plus_input': {}, 'atol': 0}  # an empty plus set stored as {}
+        self.assertTrue(study.grade_here(regex, 'def check_str(s):\n    return s[:1] in "aeiou" and s != ""\n'))
+        self.assertTrue(study.grade_here(regex, 'import re\ndef check_str(s):\n    return re.match("[aeiou]", s)\n'))
+        self.assertFalse(study.grade_here(regex, 'def check_str(s):\n    return True\n'))
+        self.assertTrue(study.same(0, 7, 0, 'sum_div', [], mbpp=True))
+        self.assertFalse(study.same(0, 7, 0, 'other', [], mbpp=True))
+        self.assertTrue(study.same(None, 'x', 0, 'are_equivalent', [], mbpp=True))
+
+    def test_task_of_reads_any_dataset_folder_name(self):
+        self.assertEqual(study.task_of('Mbpp-2'), 'Mbpp/2')
+        self.assertEqual(study.task_of('HumanEval-47.incomplete-0'), 'HumanEval/47')
+
+    def test_a_study_folder_keeps_one_dataset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            self.assertEqual(study.study_dataset(out), 'humaneval')
+            self.assertEqual(study.study_dataset(out, 'mbpp'), 'mbpp')
+            self.assertEqual(study.study_dataset(out), 'mbpp')
+            with self.assertRaisesRegex(ValueError, 'holds the mbpp study'):
+                study.study_dataset(out, 'humaneval')
+
+
+class ArmTest(unittest.TestCase):
+    def test_exact_mcnemar_and_a_paired_interval(self):
+        self.assertEqual(study.mcnemar_exact(0, 0), 1.0)
+        self.assertEqual(study.mcnemar_exact(5, 0), 0.0625)
+        self.assertEqual(study.mcnemar_exact(3, 1), 0.625)
+        low, high = study.paired_ci([1, 0, 0, 0, -1, 0, 1, 0])
+        self.assertLessEqual(low, 0.125)
+        self.assertGreaterEqual(high, 0.125)
+        self.assertEqual(study.credits({'input': 1_000_000, 'output': 1_000_000, 'cache_read': 0}), 300.0)
+
+    def test_arms_run_side_by_side_and_the_ceiling_never_splits_a_pair(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            launched = []
+
+            def fake(argv, **kw):
+                dest = Path(argv[argv.index('--out') + 1])
+                launched.append((Path(argv[1]).parent.name, dest.parent.name, dest.name))
+                dest.mkdir(parents=True)
+                (dest / 'report.json').write_text(json.dumps(
+                    {'status': 'ready_for_review', 'usage': {'input': 10_000, 'output': 2_000}}))  # 1.0 credit
+                return unittest.mock.Mock(stdout=json.dumps({'status': 'ready_for_review'}), stderr='')
+            ids = [f'Mbpp/{i}' for i in range(10)]
+            arms = {'a': out / 'impl-a', 'b': out / 'impl-b'}
+            with unittest.mock.patch.object(study.subprocess, 'run', side_effect=fake):
+                study.run_all(out, ids, 1, arms, max_credits=6.5)
+            self.assertEqual([x[:2] for x in launched[:4]],
+                             [('impl-a', 'runs-a'), ('impl-b', 'runs-b'), ('impl-a', 'runs-a'), ('impl-b', 'runs-b')])
+            self.assertEqual([x[2] for x in launched[::2]], [x[2] for x in launched[1::2]])  # same task order
+            self.assertEqual(len(launched) % 2, 0)
+            self.assertLessEqual(sum(study.spent(out / f'runs-{n}') for n in arms), 6.5)
+            self.assertEqual(len(launched), 6)  # three pairs at 1.0 credit a run fit under 6.5
+
+    def test_compare_pairs_graded_tasks_and_counts_gains_harms_and_stands(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            plan = {'a': {'Mbpp/1': (True, 100), 'Mbpp/2': (True, 100), 'Mbpp/3': (False, 300), 'Mbpp/4': (True, 50)},
+                    'b': {'Mbpp/1': (True, 90), 'Mbpp/2': (False, 80), 'Mbpp/3': (True, 200), 'Mbpp/5': (True, 1)}}
+            for arm, tasks in plan.items():
+                for task_id, (passed, tokens) in tasks.items():
+                    run = out / f'runs-{arm}' / study.slug(task_id)
+                    (run / 'round-1').mkdir(parents=True)
+                    rounds = [{'round': 1, 'candidate_sha256': 'x', 'checks': [{'status': 'fail'}]},
+                              {'round': 2, 'candidate_sha256': 'x', 'checks': [{'status': 'fail'}]}] \
+                        if task_id == 'Mbpp/3' and arm == 'a' else [{'round': 1, 'checks': [{'status': 'pass'}],
+                                                                     'review_findings': 0}]
+                    (run / 'round-1' / 'proposal.json').write_text(json.dumps(
+                        {'files': {'solution.py': 'def f(v):\n    if v == [1, 2]:\n        return 3\n'
+                                   if task_id == 'Mbpp/2' else 'def f(v):\n    return v\n'}}))
+                    (run / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'rounds': rounds,
+                                                                 'usage': {'input': tokens, 'output': 0, 'calls': 2}}))
+                    (run / 'grade.json').write_text(json.dumps({'round1_pass': passed, 'delivered_pass': passed,
+                                                                'suspect': False}))
+            with unittest.mock.patch('sys.stdout'):
+                result = study.compare_all(out, ['a', 'b'], .05)
+            self.assertEqual(result['paired'], 3)
+            self.assertEqual(result['unpaired'], ['Mbpp/4', 'Mbpp/5'])
+            self.assertEqual((result['pass']['gains'], result['pass']['harms']), (['Mbpp/3'], ['Mbpp/2']))
+            self.assertEqual(result['pass']['mcnemar_p'], 1.0)
+            self.assertAlmostEqual(result['tokens']['diff'], (-10 - 20 - 100) / 3)
+            self.assertEqual(result['a_detail']['stands'], {'Mbpp/3': [2]})
+            self.assertEqual(set(result['b_detail']['noted']), {'Mbpp/2'})
+            self.assertTrue((out / 'compare-a-b.json').is_file())
