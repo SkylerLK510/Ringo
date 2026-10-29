@@ -9,7 +9,7 @@ evaluation, unless --arm names other checkouts.
   run     prepare and run tasks, J at a time (model calls: at most max_rounds + 1 per task); --dataset mbpp picks
           MBPP+, --sample N --seed S a seeded random subset in a fixed order, --arm NAME=CHECKOUT (repeatable) runs
           each task once per implementation checkout, interleaved, into runs-NAME, and --max-credits stops new
-          launches before the spend at Sol rates passes the ceiling (a started pair is always finished)
+          launches before the spend at Sol rates passes the ceiling (the ceiling never splits a pair)
   grade   score round 1 and the delivered files against the hidden tests (no model calls)
   compare paired comparison of two arms' graded runs: hidden passes, exact McNemar, tokens, credits (no model calls)
   seed    plant a defect the public check misses into correct round-1 drafts and give each one review (one call each);
@@ -69,8 +69,8 @@ def study_dataset(out, name=None):
     recorded = json.loads(path.read_text(encoding='utf-8'))['dataset'] if path.is_file() else 'humaneval'
     if name and path.is_file() and name != recorded:
         raise ValueError(f'{out} holds the {recorded} study; use another --out for {name}')
-    if name and not path.is_file():
-        path.write_text(json.dumps({'dataset': name}) + '\n', encoding='utf-8')
+    if not path.is_file():  # the first command fixes it, the implicit humaneval default too
+        path.write_text(json.dumps({'dataset': name or recorded}) + '\n', encoding='utf-8')
     return name or recorded
 
 
@@ -487,7 +487,8 @@ def run_all(out, ids, jobs, arms=None, max_credits=None):
     """Run each task once per arm (name -> implementation checkout; default: this checkout into runs/). The arms of
     one task are queued together, so arms run side by side in the same task order. With max_credits, a task's first
     arm is launched only while the spend so far, the runs in flight and this task's arms, each at the mean cost of a
-    finished run, stay under the ceiling; a task's other arms are always launched, so every started pair finishes."""
+    finished run, stay under the ceiling; a task's other arms are always launched, so the ceiling never splits a pair.
+    Three failed runs in a row stop all launches, a started pair's other arms too; a rerun runs what is missing."""
     arms = arms or {'': HERE}
     folders = {name: out / (f'runs-{name}' if name else 'runs') for name in arms}
     for folder in folders.values():
@@ -911,6 +912,8 @@ def arm_row(run):
     stands = [r['round'] for prev, r in zip(rounds, rounds[1:]) if prev.get('checks') and r.get('candidate_sha256')
               and r.get('candidate_sha256') == prev.get('candidate_sha256')
               and any(c['status'] != 'pass' for c in prev['checks'])]
+    if report.get('dispute'):  # the dispute rule stopped on a stand, before the round recorded its digest
+        stands.append(report['dispute']['round'])
     import workflow
     notes = [r['round'] for r in rounds if (run / f"round-{r['round']}" / 'proposal.json').is_file()
              and workflow.special_cases(json.loads((run / f"round-{r['round']}" / 'proposal.json')

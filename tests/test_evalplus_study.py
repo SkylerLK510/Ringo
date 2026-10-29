@@ -307,7 +307,10 @@ class MbppTest(unittest.TestCase):
     def test_a_study_folder_keeps_one_dataset(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
-            self.assertEqual(study.study_dataset(out), 'humaneval')
+            self.assertEqual(study.study_dataset(out), 'humaneval')  # the implicit default is fixed too
+            with self.assertRaisesRegex(ValueError, 'holds the humaneval study'):
+                study.study_dataset(out, 'mbpp')
+            (out / 'study.json').unlink()
             self.assertEqual(study.study_dataset(out, 'mbpp'), 'mbpp')
             self.assertEqual(study.study_dataset(out), 'mbpp')
             with self.assertRaisesRegex(ValueError, 'holds the mbpp study'):
@@ -363,8 +366,10 @@ class ArmTest(unittest.TestCase):
                     (run / 'round-1' / 'proposal.json').write_text(json.dumps(
                         {'files': {'solution.py': 'def f(v):\n    if v == [1, 2]:\n        return 3\n'
                                    if task_id == 'Mbpp/2' else 'def f(v):\n    return v\n'}}))
+                    dispute = {'dispute': {'round': 2}} if task_id == 'Mbpp/3' and arm == 'b' else {}
                     (run / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'rounds': rounds,
-                                                                 'usage': {'input': tokens, 'output': 0, 'calls': 2}}))
+                                                                 'usage': {'input': tokens, 'output': 0, 'calls': 2},
+                                                                 **dispute}))
                     (run / 'grade.json').write_text(json.dumps({'round1_pass': passed, 'delivered_pass': passed,
                                                                 'suspect': False}))
             with unittest.mock.patch('sys.stdout'):
@@ -375,5 +380,6 @@ class ArmTest(unittest.TestCase):
             self.assertEqual(result['pass']['mcnemar_p'], 1.0)
             self.assertAlmostEqual(result['tokens']['diff'], (-10 - 20 - 100) / 3)
             self.assertEqual(result['a_detail']['stands'], {'Mbpp/3': [2]})
+            self.assertEqual(result['b_detail']['stands'], {'Mbpp/3': [2]})  # a dispute stop is a stand
             self.assertEqual(set(result['b_detail']['noted']), {'Mbpp/2'})
             self.assertTrue((out / 'compare-a-b.json').is_file())
