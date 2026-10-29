@@ -102,6 +102,12 @@ The example asks for a small `slugify` function with explicit rules. Ringo then:
 calls, about 2,800 tokens and 14 seconds. Run folders must be outside the Ringo checkout, which keeps private
 material out of the repository. Ringo creates them with owner-only permissions.
 
+### The `ringo` shell
+
+`cargo install --path cli`, then type `ringo`: Ringo's own terminal session, in which you route work to Codex, Claude
+Code and Grok, run Ringo's pipelines with them, and watch every job and subagent in a live panel. The first start
+connects and signs in your agents. See [docs/SHELL.md](docs/SHELL.md).
+
 ## Run
 
 Python 3.11+ and the standard library. From this checkout:

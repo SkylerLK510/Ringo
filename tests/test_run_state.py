@@ -176,3 +176,11 @@ class WaitTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ChildGuardTest(unittest.TestCase):
+    def test_refuses_inside_an_agent_ringo_launched(self):
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {'RINGO_CHILD': '1'}), contextlib.redirect_stderr(err):
+            self.assertEqual(ringo.main(['wait', '/nonexistent']), 2)
+        self.assertIn('RINGO_CHILD', err.getvalue())

@@ -1,0 +1,21 @@
+[package]
+name = "ringo-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libc = "0.2.191"
+ratatui = "0.30.2"
+serde_json = "1.0.154"
+
+[lib]
+name = "ringo_cli"
+
+[[bin]]
+name = "ringo"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
