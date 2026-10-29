@@ -28,7 +28,7 @@ Agents (full agent turns: far more tokens per task; the panel shows each one's c
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
   /use NAME            default agent for lines without @ (now: {default})
   /setup               add another agent and sign in to it
-  /theme [NAME]        colours: siamese, siamese-light, midnight or mono (now: {theme})
+  /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono (now: {theme})
 Jobs: /show N  /diff N  /apply N  /drop N (remove its worktree)  /kill N  /quit
 Keys: Tab / Shift-Tab select a job, PgUp / PgDn scroll, Up / Down history, Esc clear, Ctrl-C twice quits.";
 

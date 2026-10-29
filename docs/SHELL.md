@@ -104,6 +104,7 @@ same-files warning amber.
 |---|---|
 | `siamese` | dark terminals (default) |
 | `siamese-light` | light terminals |
+| `pink` | dark terminals, blush and berry |
 | `midnight` | dark terminals, navy and violet |
 | `mono` | no colour: bold, dim and reverse only |
 

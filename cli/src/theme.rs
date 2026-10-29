@@ -1,6 +1,6 @@
 //! Colours for the shell. The default, `siamese`, takes its palette from a seal-point Siamese: cream and fawn fur,
 //! seal-brown points, and sapphire eyes, which mark whatever is running. `siamese-light` is the same cat for light
-//! terminals, `midnight` a second dark theme, and `mono` uses no colour at all.
+//! terminals, `pink` blush and berry, `midnight` navy and violet, and `mono` uses no colour at all.
 //!
 //! The theme is picked once (RINGO_THEME, else the saved choice, else `siamese`) and fitted to the terminal once:
 //! 24-bit colour where the terminal says it has it, the nearest of the 256 xterm colours otherwise, and `mono` when
@@ -8,7 +8,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-pub const NAMES: [&str; 4] = ["siamese", "siamese-light", "midnight", "mono"];
+pub const NAMES: [&str; 5] = ["siamese", "siamese-light", "pink", "midnight", "mono"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Theme {
@@ -51,6 +51,14 @@ const SIAMESE_LIGHT: Palette = Palette([
     (0xB8, 0xA4, 0x8C), (0x2F, 0x6F, 0xB0), (0x3A, 0x2C, 0x24), (0x7D, 0x6B, 0x58), (0xE6, 0xD8, 0xC3),
     (0x2F, 0x6F, 0xB0), (0x3F, 0x7F, 0x46), (0xB2, 0x3B, 0x3B), (0xA2, 0x65, 0x0A), (0x8A, 0x7B, 0x6E),
     (0x1F, 0x8A, 0x68), (0xB3, 0x5A, 0x36), (0x5B, 0x62, 0x70), (0x2F, 0x6F, 0xB0),
+]);
+
+const PINK: Palette = Palette([
+    (0xFF, 0xE4, 0xEE), (0x5A, 0x2A, 0x43), // blush on berry
+    (0xFF, 0x8F, 0xC0),                     // bubblegum
+    (0x8C, 0x5A, 0x73), (0xFF, 0x8F, 0xC0), (0xFF, 0xE4, 0xEE), (0xC7, 0x9A, 0xB0), (0x4A, 0x22, 0x36),
+    (0xFF, 0x6F, 0xAE), (0x9B, 0xD8, 0xA8), (0xFF, 0x6B, 0x6B), (0xFF, 0xC2, 0x7A), (0x8E, 0x74, 0x80),
+    (0x7F, 0xD8, 0xC3), (0xF2, 0xA0, 0x7B), (0xD6, 0xCF, 0xE0), (0xFF, 0xA6, 0xD0),
 ]);
 
 const MIDNIGHT: Palette = Palette([
@@ -105,6 +113,7 @@ impl Theme {
         let palette = match name {
             "siamese" => &SIAMESE,
             "siamese-light" => &SIAMESE_LIGHT,
+            "pink" => &PINK,
             "midnight" => &MIDNIGHT,
             "mono" => return Some(Theme::mono()),
             _ => return None,
