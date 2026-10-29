@@ -153,7 +153,8 @@ README were measured on the Python runtime. The port counts only where it sends 
   runtime (`ringo.py release stage --native BIN --native-gate REPORT`).
 - Activation still needs the latency evidence and your approval.
 - The binary checks the pinned release itself before running it: the bundle, its hashes, the active pointer and
-  the approval record (`cli/tests/gate_release.rs`).
+  the approval record. `cli/tests/gate_release.rs` stages a real native release and checks the genuine chain and
+  seven forgeries.
 - With no release state, the binary runs as checkout code, as `ringo.py` runs its own checkout.
 - With release state, `ringo.py` decides which runtime runs.
 - Windows keeps the Python runtime.
@@ -168,7 +169,7 @@ README were measured on the Python runtime. The port counts only where it sends 
 **Bugs the port found and fixed, in both runtimes:**
 - The `claude` preset now removes API keys and endpoint overrides, so its calls stay on your subscription login
   (`claude:<command>` keeps your environment).
-- A refreshed Codex login is never copied back through a symlink.
+- A refreshed Codex login is copied back only from a regular file: never through a symlink, never from a FIFO.
 - A review of a submodule bump to a commit the repository lacks no longer fails.
 - Trace folders are private from the moment they are created.
 - Codex's setup call is killed with everything it started.
