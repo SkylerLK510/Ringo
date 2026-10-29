@@ -11,7 +11,8 @@ design trace folder: material.txt plus steps/*.txt replies) through both runtime
 Compared exactly: every request (argv, stdin, the system prompt file, the private Codex home's files and modes, the
 environment variables that decide auth), exit codes, stdout, and every file the run wrote. Normalised, and only these:
 wall-clock fields (started, updated, seconds, elapsed_s), pid, the run's own temporary paths, and the implementation
-identity (which runtime ran is the one intended difference).
+identity fields (mode, id, root, checkout_root, bootstrap_sha256, runtime, binary_sha256): which runtime ran is the one
+intended difference.
 """
 import argparse
 import hashlib
@@ -211,7 +212,8 @@ def gate_repository(root):
 
 def normalise(value, run_root):
     if isinstance(value, dict):
-        return {k: ('<identity>' if k in IDENTITY else normalise(v, run_root)) for k, v in value.items() if k not in TIMES}
+        # Which runtime ran is the one intended difference: its identity fields are left out, not compared.
+        return {k: normalise(v, run_root) for k, v in value.items() if k not in TIMES and k not in IDENTITY}
     if isinstance(value, list):
         return [normalise(v, run_root) for v in value]
     if isinstance(value, str):
