@@ -731,7 +731,8 @@ pub fn run() -> ExitCode {
                 // Updates start only with no job running, and no job starts until they finish.
                 let names: Vec<&str> = pending.iter().filter(|u| u.unattended).map(|u| u.agent.name()).collect();
                 app.s.hold = Some(format!("updating {}", names.join(", ")));
-                app.say(format!("  updating {} (/update auto off stops this)", names.join(", ")));
+                app.say(format!("  updating {}; jobs wait until it finishes (/update auto off: not next time)",
+                                names.join(", ")));
                 let (done, state) = (notes.clone(), ringo_cli::state_root().join("engine-versions.json"));
                 std::thread::spawn(move || {
                     let _ = done.send((true, crate::updates::apply_unattended(pending, &state)));

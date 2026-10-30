@@ -84,7 +84,9 @@ fn source(agent: Agent, path: &Path) -> Option<(String, Update)> {
 /// Runs `cmd` with stdin closed and its output in `log`; kills it past `limit`. Returns whether it exited 0.
 // ceiling: kills the direct child only; a package manager's own children can outlive a timeout.
 fn bounded(mut cmd: Command, log: &Path, limit: Duration) -> Option<bool> {
-    let out = fs::File::create(log).ok()?;
+    // A fresh file, never one already there: create_new does not follow a planted symlink.
+    let _ = fs::remove_file(log);
+    let out = fs::OpenOptions::new().write(true).create_new(true).open(log).ok()?;
     let mut child = cmd.stdin(Stdio::null()).stdout(out.try_clone().ok()?).stderr(out).spawn().ok()?;
     let start = Instant::now();
     loop {
@@ -109,8 +111,8 @@ fn fetch_version(url: &str) -> Option<String> {
 
 /// `PROGRAM --version`, given 10 seconds: an agent that hangs is stopped and skipped, not waited on.
 fn installed_version(path: &Path) -> Option<String> {
-    let log = std::env::temp_dir().join(format!("ringo-version-{}-{:?}.txt", std::process::id(),
-                                                std::thread::current().id()));
+    let log = ringo_cli::state_root().join(format!("version-probe-{}-{:?}.txt", std::process::id(),
+                                                    std::thread::current().id()));
     let mut cmd = Command::new(path);
     cmd.arg("--version");
     let ok = bounded(cmd, &log, Duration::from_secs(10)).is_some();
