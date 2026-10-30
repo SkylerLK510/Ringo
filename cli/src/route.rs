@@ -6,6 +6,7 @@
 #[derive(Debug, PartialEq)]
 pub enum Route {
     Ask,
+    Research,
     Design,
     Review(Option<usize>),
     Edit,
@@ -13,6 +14,9 @@ pub enum Route {
 
 const DESIGN: [&str; 8] = ["design", "architect", "architecture", "propose", "proposal", "tradeoff", "tradeoffs", "trade-off"];
 const DESIGN_PHRASES: [&str; 6] = ["how should we", "how should i", "should we use", "should i use", "pros and cons", "approach for"];
+const RESEARCH: [&str; 11] = ["cite", "citation", "citations", "sources", "references", "papers", "studies", "literature",
+                               "evidence", "research", "statistics"];
+const RESEARCH_PHRASES: [&str; 4] = ["state of the art", "latest findings", "what does the research", "find sources"];
 const REVIEW: [&str; 3] = ["review", "critique", "audit"];
 const EDIT: [&str; 14] = ["implement", "fix", "add", "refactor", "rename", "remove", "delete", "update", "change", "write",
                           "create", "migrate", "port", "make"];
@@ -22,9 +26,12 @@ pub fn classify(line: &str, git: bool) -> Route {
     let lower = line.to_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '#')).filter(|w| !w.is_empty()).collect();
     let job = words.iter().find_map(|w| w.strip_prefix('#').and_then(|n| n.parse::<usize>().ok()));
-    let asks_review = words.first().is_some_and(|w| REVIEW.contains(w)) || words.windows(2).any(|p| p == ["code", "review"]);
+    let asks_review = words.first().is_some_and(|w| REVIEW.contains(w)); // "review my change", not "code review agents"
     if git && asks_review {
         return Route::Review(job);
+    }
+    if words.iter().any(|w| RESEARCH.contains(w)) || RESEARCH_PHRASES.iter().any(|p| lower.contains(p)) {
+        return Route::Research;
     }
     if words.iter().any(|w| DESIGN.contains(w)) || DESIGN_PHRASES.iter().any(|p| lower.contains(p)) {
         return Route::Design;
@@ -40,6 +47,8 @@ pub fn classify(line: &str, git: bool) -> Route {
 pub fn suggestion(route: &Route, line: &str, agent: &str) -> Option<(String, &'static str)> {
     match route {
         Route::Ask => None,
+        Route::Research => Some((format!("/research {line}"), "a live web search call and a write call; every cited quote is \
+                                 fetched and checked by code; about 70k tokens")),
         Route::Design => Some((format!("/design {line}"), "one design call, about 2-4k tokens")),
         Route::Review(Some(n)) => Some((format!("/review #{n}"), "one review call of that job's change")),
         Route::Review(None) => Some(("/review HEAD~1".into(), "one review call of the last commit; edit BASE to review more")),
@@ -64,6 +73,9 @@ mod tests {
     #[test]
     fn tasks_get_their_route() {
         assert_eq!(classify("Design a cache for slugify results", true), Route::Design);
+        assert_eq!(classify("find papers on context compaction for agents", false), Route::Research);
+        assert_eq!(classify("what is the state of the art in code review agents?", true), Route::Research);
+        assert_eq!(classify("give me sources on the JetBrains masking study", true), Route::Research);
         assert_eq!(classify("how should we store the session state?", true), Route::Design);
         assert_eq!(classify("review #3 please", true), Route::Review(Some(3)));
         assert_eq!(classify("review my last change", true), Route::Review(None));

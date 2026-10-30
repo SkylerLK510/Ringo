@@ -21,6 +21,8 @@ Ringo's pipelines run the models as tool-free workers with executable checks and
   /review #N           Ringo reviews job N's change (task text as the change description)
   /review BASE [HEAD]  Ringo reviews BASE...HEAD of this repository
   /design TEXT         Ringo's one-call design pipeline on TEXT
+  /research TOPIC      Ringo's research: one live web search call, every quoted source fetched and checked in code,
+                       one write call that cites only what was verified (about 70k tokens, mostly search results)
   /work SPEC.json      Ringo's checked work loop on a task spec
   /backend SPEC        backend for those pipelines (now: {backend})
 Agents (full agent turns: about 17,000 tokens before they start, far more when they search your files; the panel
@@ -49,6 +51,7 @@ pub enum Cmd {
     ReviewJob(usize),
     ReviewRepo(String, String),
     Design(String),
+    Research(String),
     Work(String),
     Help,
     Setup,
@@ -91,6 +94,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 _ => Err("/review #N, or /review BASE [HEAD]".into()),
             },
             "design" if !tail.is_empty() => Ok(Cmd::Design(tail.into())),
+            "research" if !tail.is_empty() => Ok(Cmd::Research(tail.into())),
             "work" if !tail.is_empty() => Ok(Cmd::Work(tail.into())),
             _ => Err(format!("unknown or incomplete command /{name}; /help lists them")),
         };
@@ -310,6 +314,11 @@ impl App {
             Cmd::Ask(question) => {
                 let question = self.s.expand(&question)?;
                 let id = self.s.ask(&question)?;
+                started(id, self)
+            }
+            Cmd::Research(topic) => {
+                let topic = self.s.expand(&topic)?;
+                let id = self.s.research(&topic)?;
                 started(id, self)
             }
             Cmd::Work(spec) => {

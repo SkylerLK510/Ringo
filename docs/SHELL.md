@@ -81,6 +81,7 @@ panel moves above the chat, one row per job.
 | `/review #N` | Ringo reviews job N's change, with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
+| `/research TOPIC` | Ringo's research role: one live web search call, every quoted source fetched and its quote checked in code, one write call that cites only verified evidence ([details](RESEARCH-ROLE.md)). Measured once at about 68,000 tokens, most of them search results |
 | `/work SPEC.json` | Ringo's checked work loop on a task spec |
 | `@codex TASK` | an agent turn that may read the repository but not change it; the agent's conversation continues across these turns |
 | `@codex! TASK` | an agent turn that may edit, in a private git worktree from `HEAD`; nothing reaches your tree until `/apply` |

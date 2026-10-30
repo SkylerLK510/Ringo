@@ -515,6 +515,17 @@ impl Session {
         Ok(id)
     }
 
+    /// `/research TOPIC`: Ringo's research role: one search call, sources fetched and every quote checked in code,
+    /// one write call citing only verified evidence (at most two calls).
+    pub fn research(&mut self, topic: &str) -> Result<usize, String> {
+        let dir = self.next_dir()?;
+        fs::write(dir.join("brief.md"), topic).map_err(|e| e.to_string())?;
+        let mut args: Vec<OsString> = vec!["research".into(), "--input".into(), dir.join("brief.md").into()];
+        args.extend(["--backend", &self.backend].map(Into::into));
+        args.extend(["--trace".into(), dir.join("trace").into(), "--out".into(), dir.join("reply.md").into()]);
+        self.launch_ringo(topic, args, dir.join("trace"))
+    }
+
     /// `/work SPEC`: Ringo's checked work loop on a task spec.
     pub fn work(&mut self, spec: &Path) -> Result<usize, String> {
         let dir = self.next_dir()?;
