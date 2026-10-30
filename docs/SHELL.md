@@ -114,8 +114,9 @@ update that matches how each agent was installed (`brew upgrade --cask codex`, `
 and no tokens are used. `/update auto on` makes the shell run Homebrew, npm and `claude update` updates by itself
 when it opens (output in `engine-update-NAME.log` in Ringo's state folder); install-script updates still wait for
 `/update`. It is off by default because a new engine version can change answers and token use, and benchmark
-results are only comparable on the same version. `/update` waits while jobs run, since it replaces the agent's
-program. Claude Code installed with its own installer already updates itself; the shell reports when that happened.
+results are only comparable on the same version. An update replaces the agent's program, so `/update` waits while
+jobs run, an automatic update starts only when none is running, and no job starts until it finishes. An update
+that fails or brings no newer version stays on the list for the next `/update`. Claude Code installed with its own installer already updates itself; the shell reports when that happened.
 
 The release lookup asks the Homebrew or npm registry about each agent at most once a day (no account);
 `RINGO_NO_UPDATE_CHECK=1` turns it off. Versions are kept in `engine-versions.json` in Ringo's state folder. Grok is

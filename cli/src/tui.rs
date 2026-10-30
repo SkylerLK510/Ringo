@@ -284,8 +284,11 @@ impl App {
                 }
             }
             Cmd::Update(None) => match &self.pending {
+                _ if self.s.hold.is_some() => {
+                    self.s.hold.as_ref().map(|why| format!("  {why}; it reports here when done"))
+                }
                 None => Some("  the update check is still running; try again in a moment".into()),
-                Some(p) if p.is_empty() => Some("  every agent is up to date (checked when the shell opened)".into()),
+                Some(p) if p.is_empty() => Some("  nothing to update (checked when the shell opened)".into()),
                 Some(_) if self.s.running() > 0 => {
                     Some("  wait for the running jobs, or /kill them: an update replaces the agent's program".into())
                 }
@@ -684,15 +687,9 @@ pub fn run() -> ExitCode {
     let (notes, news) = std::sync::mpsc::channel();
     let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
     let auto = crate::theme::setting("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
-    // ceiling: an unattended update runs while you can already start jobs; a job started mid-update can fail once.
+    let check = notes.clone();
     std::thread::spawn(move || {
-        let (mut lines, mut pending) = crate::updates::check(&agents, &state);
-        if auto && !pending.is_empty() {
-            let (done, left) = crate::updates::apply_unattended(pending, &state);
-            lines.extend(done);
-            pending = left;
-        }
-        let _ = notes.send((lines, pending));
+        let _ = check.send((false, crate::updates::check(&agents, &state)));
     });
 
     let mut terminal = ratatui::init();
@@ -725,18 +722,33 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
-        while let Ok((lines, pending)) = news.try_recv() {
+        while let Ok((applied, (lines, pending))) = news.try_recv() {
             lines.iter().for_each(|line| app.say(line));
-            app.pending = Some(pending);
             dirty = true;
+            if applied {
+                app.s.hold = None;
+            } else if auto && app.s.running() == 0 && pending.iter().any(|u| u.unattended) {
+                // Updates start only with no job running, and no job starts until they finish.
+                let names: Vec<&str> = pending.iter().filter(|u| u.unattended).map(|u| u.agent.name()).collect();
+                app.s.hold = Some(format!("updating {}", names.join(", ")));
+                app.say(format!("  updating {} (/update auto off stops this)", names.join(", ")));
+                let (done, state) = (notes.clone(), ringo_cli::state_root().join("engine-versions.json"));
+                std::thread::spawn(move || {
+                    let _ = done.send((true, crate::updates::apply_unattended(pending, &state)));
+                });
+                continue;
+            } else if auto && pending.iter().any(|u| u.unattended) {
+                app.say("  jobs were already running, so the automatic update waits: /update when they finish");
+            }
+            app.pending = Some(pending);
         }
         if app.update {
             ratatui::restore(); // the updates run in the plain terminal, so their prompts and progress show
             println!("Updating agents; the shell comes back when they finish.");
-            let lines = crate::updates::apply_here(app.pending.as_deref().unwrap_or_default());
+            let (lines, left) = crate::updates::apply_here(app.pending.take().unwrap_or_default());
             terminal = ratatui::init();
             lines.iter().for_each(|line| app.say(line));
-            app.pending = Some(Vec::new());
+            app.pending = Some(left);
             app.update = false;
             dirty = true;
         }

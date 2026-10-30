@@ -7,7 +7,6 @@ use ringo_cli::Agent;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DAY_S: u64 = 24 * 3600;
@@ -108,15 +107,16 @@ fn fetch_version(url: &str) -> Option<String> {
     v.get("version").or_else(|| v.get("versions")?.get("stable"))?.as_str().and_then(version)
 }
 
-/// `PROGRAM --version`, given 10 seconds: an agent that hangs is skipped, not waited on.
+/// `PROGRAM --version`, given 10 seconds: an agent that hangs is stopped and skipped, not waited on.
 fn installed_version(path: &Path) -> Option<String> {
-    let (tx, rx) = mpsc::channel();
-    let path = path.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = tx.send(Command::new(&path).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output());
-    });
-    let out = rx.recv_timeout(Duration::from_secs(10)).ok()?.ok()?;
-    version(&String::from_utf8_lossy(&out.stdout))
+    let log = std::env::temp_dir().join(format!("ringo-version-{}-{:?}.txt", std::process::id(),
+                                                std::thread::current().id()));
+    let mut cmd = Command::new(path);
+    cmd.arg("--version");
+    let ok = bounded(cmd, &log, Duration::from_secs(10)).is_some();
+    let text = fs::read_to_string(&log).unwrap_or_default();
+    let _ = fs::remove_file(&log);
+    version(&text).filter(|_| ok)
 }
 
 fn now_s() -> u64 {
@@ -180,13 +180,13 @@ fn shell(command: &str) -> Command {
     cmd
 }
 
-/// What an agent reports after its update ran.
-fn after(update: &Update, ran: Option<bool>, log: Option<&Path>) -> String {
+/// What an agent reports after its update ran, and whether it is now newer than when the check ran.
+fn after(update: &Update, ran: Option<bool>, log: Option<&Path>) -> (String, bool) {
     let name = update.agent.name();
     let now = locate(name).and_then(|p| installed_version(&p));
     let output = log.map_or("its output is above the shell".into(), |l| format!("its output is in {}", l.display()));
-    match (ran, now) {
-        (Some(true), Some(v)) if v != update.have => format!("  {name} updated: {} -> {v}", update.have),
+    let line = match (ran, &now) {
+        (Some(true), Some(v)) if newer(v, &update.have) => format!("  {name} updated: {} -> {v}", update.have),
         (Some(true), Some(v)) => format!("  {name}: `{}` ran, but {name} is still {v} (the release may not have \
                                           reached that installer yet)", update.command),
         (Some(false), _) => format!("  {name}: `{}` failed; {output}", update.command),
@@ -194,11 +194,13 @@ fn after(update: &Update, ran: Option<bool>, log: Option<&Path>) -> String {
         (Some(true), None) => {
             format!("  {name}: `{}` finished, but `{name} --version` no longer answers", update.command)
         }
-    }
+    };
+    (line, now.is_some_and(|v| newer(&v, &update.have)))
 }
 
 /// Runs package-manager updates unattended (for `/update auto on`); output goes to `engine-update-NAME.log` beside
-/// `state`. Installer-script updates are left for `/update` and returned.
+/// `state`. Returns what happened and every update still to do: installer scripts (left for `/update`) and any
+/// that did not bring a newer version.
 pub fn apply_unattended(pending: Vec<Update>, state: &Path) -> (Vec<String>, Vec<Update>) {
     let (mut lines, mut left) = (Vec::new(), Vec::new());
     for update in pending {
@@ -207,19 +209,28 @@ pub fn apply_unattended(pending: Vec<Update>, state: &Path) -> (Vec<String>, Vec
             continue;
         }
         let log = state.with_file_name(format!("engine-update-{}.log", update.agent.name()));
-        let ran = bounded(shell(&update.command), &log, Duration::from_secs(600));
-        lines.push(after(&update, ran, Some(&log)));
+        let (line, done) = after(&update, bounded(shell(&update.command), &log, Duration::from_secs(600)), Some(&log));
+        lines.push(line);
+        if !done {
+            left.push(update);
+        }
     }
     (lines, left)
 }
 
 /// `/update`: runs each update in this terminal (the shell steps aside, as for /setup), so prompts and progress show.
-pub fn apply_here(pending: &[Update]) -> Vec<String> {
-    pending.iter().map(|update| {
+/// Returns what happened and the updates that did not bring a newer version.
+pub fn apply_here(pending: Vec<Update>) -> (Vec<String>, Vec<Update>) {
+    let (mut lines, mut left) = (Vec::new(), Vec::new());
+    for update in pending {
         println!("\n$ {}", update.command);
-        let ran = shell(&update.command).status().ok().map(|s| s.success());
-        after(update, ran, None)
-    }).collect()
+        let (line, done) = after(&update, shell(&update.command).status().ok().map(|s| s.success()), None);
+        lines.push(line);
+        if !done {
+            left.push(update);
+        }
+    }
+    (lines, left)
 }
 
 #[cfg(test)]

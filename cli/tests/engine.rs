@@ -195,6 +195,21 @@ fn limits_are_refused_clearly() {
 }
 
 #[test]
+fn no_job_starts_while_an_agent_update_holds_the_session() {
+    let r = repo("hold");
+    let quick = fake(&root(), "codex-hold", "#!/bin/sh\nexit 0\n");
+    let mut s = session(&r, Agent::Codex, &quick);
+    s.hold = Some("updating codex".into());
+    let err = s.launch_agent(Agent::Codex, false, "x").unwrap_err();
+    assert!(err.contains("updating codex"), "{err}");
+    assert!(s.ask("why?").unwrap_err().contains("updating codex"));
+    assert!(s.jobs.is_empty());
+    s.hold = None;
+    let id = s.launch_agent(Agent::Codex, false, "x").unwrap();
+    wait(&mut s, id);
+}
+
+#[test]
 fn arguments_pass_through_to_ringo_py() {
     let out = Command::new(env!("CARGO_BIN_EXE_ringo")).args(["wait", "/nonexistent-ringo-run", "--timeout", "0"])
         .output().unwrap();

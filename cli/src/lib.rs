@@ -128,6 +128,8 @@ pub struct Session {
     pub pipeline: Option<Vec<OsString>>,
     /// The program each agent runs; tests point these at fakes.
     pub programs: HashMap<Agent, PathBuf>,
+    /// Why no job may start now (an agent update is replacing a program), if one may not.
+    pub hold: Option<String>,
     threads: HashMap<Agent, String>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
@@ -287,7 +289,7 @@ impl Session {
         let (tx, rx) = channel();
         let programs = Agent::ALL.iter().map(|a| (*a, PathBuf::from(a.name()))).collect();
         Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), pipeline: None, programs, threads: HashMap::new(), tx, rx })
+                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), tx, rx })
     }
 
     pub fn running(&self) -> usize {
@@ -307,6 +309,9 @@ impl Session {
     }
 
     fn new_job(&mut self, kind: Kind, title: &str) -> Result<usize, String> {
+        if let Some(why) = &self.hold {
+            return Err(format!("{why}; try again when it finishes"));
+        }
         if self.running() >= self.max_jobs {
             return Err(format!("{} jobs are running (limit {}); wait for one or /kill it", self.running(), self.max_jobs));
         }
