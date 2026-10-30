@@ -546,7 +546,8 @@ fn parse_line(line: &str) -> Value {
 /// compared, normalised, step by step).
 fn normalise_files(files: &mut Value) {
     for (name, entry) in files.as_object_mut().unwrap() {
-        if name.ends_with("state.json") {
+        // state.json and an incident record carry wall-clock times; their contents are compared normalised elsewhere
+        if name.ends_with("state.json") || (name.contains("incidents/") && name.ends_with(".json")) {
             entry.as_array_mut().unwrap().truncate(2);
         }
     }

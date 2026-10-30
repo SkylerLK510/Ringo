@@ -40,7 +40,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.14'
-      - run: cargo test --locked
+      - run: cargo test --locked --no-fail-fast  # report every failing test file, not just the first
         working-directory: cli
         env:
           RINGO_RELEASE_HOME: ${{ runner.temp }}/ringo-cli-state
