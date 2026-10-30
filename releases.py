@@ -13,10 +13,10 @@ from latency import canonical, read_json, sha
 
 HERE = Path(__file__).resolve().parent
 RUNTIME = ('ringo.py', 'harness.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
-           'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
+           'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py', 'research.py')
 # Files that joined the runtime after releases already existed. New bundles always include them; a bundle staged
 # before one joined still verifies without it, since that bundle has no feature that runs it.
-LATER_RUNTIME = {'spec_runner.py'}
+LATER_RUNTIME = {'spec_runner.py', 'research.py'}
 IDENT = re.compile(r'[0-9a-f]{64}')
 # A release may also carry the Rust runtime (the `ringo` binary built from cli/), with the differential gate report
 # that proved it sends the same requests as this Python runtime. Then review, design and work run the bundled binary.
@@ -478,14 +478,21 @@ def execute(bundle, metadata, argv):
     sys.dont_write_bytecode = True
     sys.argv = [str(bundle / 'ringo.py'), *argv]
     if argv in ([], ['--help'], ['-h']):
-        parser = argparse.ArgumentParser(prog='ringo.py', description='Pinned Ringo runtime: review, design, work.')
-        for name in ('review', 'design', 'work'):
+        parser = argparse.ArgumentParser(prog='ringo.py', description='Pinned Ringo runtime: review, design, work, research.')
+        for name in ('review', 'design', 'work', 'research'):
             parser.add_argument_group(name)
         parser.print_help()
         return 0 if argv else 2
     if argv[:1] == ['work']:
         import workflow
         return workflow.main(argv[1:])
+    if argv[:1] == ['research']:  # Python only, also under a native bundle; a bundle staged before it has no research
+        if not (bundle / 'research.py').is_file():
+            print('ringo: the active release predates research; stage a new release or roll back to run it',
+                  file=sys.stderr)
+            return 2
+        import research
+        return research.main(argv[1:])
     import harness
     return harness.main(argv, prog='ringo.py')
 

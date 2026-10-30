@@ -1,4 +1,4 @@
-"""Ringo CLI: review, design and bounded council-guided work."""
+"""Ringo CLI: review, design, research and bounded council-guided work."""
 import argparse
 import sys
 
@@ -99,6 +99,7 @@ def main(argv=None):
         commands = parser.add_subparsers(dest='command')
         for name, help_text in [('review', 'review code'), ('design', 'propose a design'),
                                 ('work', 'revise artifacts with checks and one review'),
+                                ('research', 'search the web once, verify quotes in code, write one cited report'),
                                 ('wait', 'block until a traced run finishes and print its state'),
                                 ('release', 'stage, activate, inspect or roll back local releases')]:
             commands.add_parser(name, help=help_text)
@@ -107,6 +108,9 @@ def main(argv=None):
     if argv[:1] == ['work']:
         import workflow
         return workflow.main(argv[1:])
+    if argv[:1] == ['research']:
+        import research
+        return research.main(argv[1:])
     import harness
     return harness.main(argv, prog='ringo.py')
 
