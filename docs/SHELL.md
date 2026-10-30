@@ -87,7 +87,7 @@ panel moves above the chat, one row per job.
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once |
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
-| `/show N`, `/kill N`, `/use NAME`, `/backend SPEC`, `/setup`, `/quit` | select a job, stop it with everything it started, set the default agent or pipeline backend, add an agent, quit |
+| `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | select a job, stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
 (`@agent!`, in a worktree) and `/review BASE` reviews its commits; in any other folder, a repository that holds your
