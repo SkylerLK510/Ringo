@@ -107,13 +107,19 @@ compares the agents' own edit events as they arrive.
 
 ### Agent updates
 
-When the shell opens it says, in the background, which agents changed version since the last session and which have
-a newer release out, with the command that updates that install (`brew upgrade --cask codex`, `claude update`, or
-`npm install -g ...@latest`). Ringo never updates an agent itself: a new version of the engine can change answers and
-token use, so it is your call when to take one. The release lookup asks the Homebrew or npm registry at most once a
-day (no model call, no account); `RINGO_NO_UPDATE_CHECK=1` turns it off. Versions are kept in
-`engine-versions.json` in Ringo's state folder. Grok is only reported when its version changes: it has no public
-release feed.
+When the shell opens it checks, in the background, which agents changed version since the last session and which
+have a newer release out, and says so. `/update` installs those releases for you: the shell steps aside, runs the
+update that matches how each agent was installed (`brew upgrade --cask codex`, `npm install -g @openai/codex@latest`,
+`claude update`, or the vendor's install script), then comes back and reports the new versions. No model call is made
+and no tokens are used. `/update auto on` makes the shell run Homebrew, npm and `claude update` updates by itself
+when it opens (output in `engine-update-NAME.log` in Ringo's state folder); install-script updates still wait for
+`/update`. It is off by default because a new engine version can change answers and token use, and benchmark
+results are only comparable on the same version. `/update` waits while jobs run, since it replaces the agent's
+program. Claude Code installed with its own installer already updates itself; the shell reports when that happened.
+
+The release lookup asks the Homebrew or npm registry about each agent at most once a day (no account);
+`RINGO_NO_UPDATE_CHECK=1` turns it off. Versions are kept in `engine-versions.json` in Ringo's state folder. Grok is
+only reported when its version changes: it has no public release feed.
 
 ## Colours
 

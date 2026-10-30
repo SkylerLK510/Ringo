@@ -32,6 +32,8 @@ counts every one), for questions about your code and for changes:
   @codex @claude TASK  the same task to several agents at once; @all means codex and claude
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
   /setup               add another agent and sign in to it
+  /update              update the agents the opening check found out of date, in this terminal (no tokens);
+                       /update auto on|off: do it by itself when the shell opens
   /route on|off        suggest a command for a line that reads like a research, design, review or edit task or
                        a question about this folder's files, for you to send (Enter), change, or ask as a plain
                        question (Esc); no model call (now: {route})
@@ -58,6 +60,8 @@ pub enum Cmd {
     Setup,
     Theme(Option<String>),
     Route(bool),
+    /// `/update` (None) or `/update auto on|off`.
+    Update(Option<bool>),
     Quit,
 }
 
@@ -82,6 +86,12 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 Some("on") => Ok(Cmd::Route(true)),
                 Some("off") => Ok(Cmd::Route(false)),
                 _ => Err("/route on or /route off".into()),
+            },
+            "update" => match (words.next(), words.next()) {
+                (None, _) => Ok(Cmd::Update(None)),
+                (Some("auto"), Some("on")) => Ok(Cmd::Update(Some(true))),
+                (Some("auto"), Some("off")) => Ok(Cmd::Update(Some(false))),
+                _ => Err("/update, or /update auto on|off".into()),
             },
             "backend" if !tail.is_empty() => Ok(Cmd::Backend(tail.into())),
             "show" => job_number(words.next()).map(Cmd::Show),
@@ -164,6 +174,9 @@ struct App {
     /// Route suggestions on (/route on), and the plain line a suggestion is standing in for.
     route: bool,
     suggested: Option<String>,
+    /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
+    pending: Option<Vec<crate::updates::Update>>,
+    update: bool,
 }
 
 /// The running mark: a braille spinner, one frame per SPIN_MS while anything runs (the only redraws then).
@@ -269,6 +282,22 @@ impl App {
                     }
                     None => Some(format!("  no theme {name}: {}", crate::theme::NAMES.join(", "))),
                 }
+            }
+            Cmd::Update(None) => match &self.pending {
+                None => Some("  the update check is still running; try again in a moment".into()),
+                Some(p) if p.is_empty() => Some("  every agent is up to date (checked when the shell opened)".into()),
+                Some(_) if self.s.running() > 0 => {
+                    Some("  wait for the running jobs, or /kill them: an update replaces the agent's program".into())
+                }
+                Some(_) => {
+                    self.update = true;
+                    None
+                }
+            },
+            Cmd::Update(Some(on)) => {
+                let saved = crate::theme::set_setting("auto_update", serde_json::json!(on)).err()
+                    .map_or(" (saved)".to_string(), |e| format!(" (not saved: {e})"));
+                Some(format!("  automatic agent updates {} when the shell opens{saved}", if on { "on" } else { "off" }))
             }
             Cmd::Quit => {
                 self.quit = true;
@@ -646,17 +675,24 @@ pub fn run() -> ExitCode {
     let mut app = App { s: session, input: Vec::new(), cursor: 0, history: Vec::new(), hist: 0, selected: 0, scroll: 0,
                         log_height: 0, console: VecDeque::new(), quit_armed: false, quit: false,
                         setup: false, label, agents, theme: Theme::load(), started: Instant::now(),
-                        route: crate::theme::setting("route").and_then(|v| v.as_bool()).unwrap_or(false), suggested: None };
+                        route: crate::theme::setting("route").and_then(|v| v.as_bool()).unwrap_or(false),
+                        suggested: None, pending: None, update: false };
     let found: Vec<&str> = app.agents.iter().map(|a| a.name()).collect();
     app.say(format!("Ringo shell in {}. Agents: {} (/setup adds another).", app.s.repo.display(), found.join(", ")));
     app.say(format!("Private state: {}", app.s.dir.display()));
     app.help();
     let (notes, news) = std::sync::mpsc::channel();
     let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
+    let auto = crate::theme::setting("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
+    // ceiling: an unattended update runs while you can already start jobs; a job started mid-update can fail once.
     std::thread::spawn(move || {
-        for note in crate::updates::notices(&agents, &state) {
-            let _ = notes.send(note);
+        let (mut lines, mut pending) = crate::updates::check(&agents, &state);
+        if auto && !pending.is_empty() {
+            let (done, left) = crate::updates::apply_unattended(pending, &state);
+            lines.extend(done);
+            pending = left;
         }
+        let _ = notes.send((lines, pending));
     });
 
     let mut terminal = ratatui::init();
@@ -689,8 +725,19 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
-        while let Ok(note) = news.try_recv() {
-            app.say(note);
+        while let Ok((lines, pending)) = news.try_recv() {
+            lines.iter().for_each(|line| app.say(line));
+            app.pending = Some(pending);
+            dirty = true;
+        }
+        if app.update {
+            ratatui::restore(); // the updates run in the plain terminal, so their prompts and progress show
+            println!("Updating agents; the shell comes back when they finish.");
+            let lines = crate::updates::apply_here(app.pending.as_deref().unwrap_or_default());
+            terminal = ratatui::init();
+            lines.iter().for_each(|line| app.say(line));
+            app.pending = Some(Vec::new());
+            app.update = false;
             dirty = true;
         }
         if app.s.running() > 0 && tick.elapsed() >= Duration::from_millis(SPIN_MS as u64) {
@@ -714,6 +761,10 @@ mod tests {
         let parse = |line: &str, _: Agent| super::parse(line, &all);
         assert_eq!(parse("why is it slow?", Codex), Ok(Cmd::Ask("why is it slow?".into())));
         assert!(parse("   ", Codex).is_err());
+        assert_eq!(parse("/update", Codex), Ok(Cmd::Update(None)));
+        assert_eq!(parse("/update auto on", Codex), Ok(Cmd::Update(Some(true))));
+        assert_eq!(parse("/update auto off", Codex), Ok(Cmd::Update(Some(false))));
+        assert!(parse("/update auto", Codex).is_err());
         assert_eq!(parse("@codex why is it slow?", Codex), Ok(Cmd::Agents(vec![(Codex, false)], "why is it slow?".into())));
         assert_eq!(parse("@claude! fix it", Codex), Ok(Cmd::Agents(vec![(Claude, true)], "fix it".into())));
         assert_eq!(parse("@codex @claude! do x", Grok), Ok(Cmd::Agents(vec![(Codex, false), (Claude, true)], "do x".into())));
