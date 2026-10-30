@@ -32,8 +32,9 @@ counts every one), for questions about your code and for changes:
   @codex @claude TASK  the same task to several agents at once; @all means codex and claude
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
   /setup               add another agent and sign in to it
-  /route on|off        suggest a command for a line that reads like a design, review or edit task, for you to
-                       send (Enter), change, or ask as a plain question (Esc); no model call (now: {route})
+  /route on|off        suggest a command for a line that reads like a research, design, review or edit task or
+                       a question about this folder's files, for you to send (Enter), change, or ask as a plain
+                       question (Esc); no model call (now: {route})
   /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono (now: {theme})
 Jobs: /show N  /diff N  /apply N  /drop N (remove its worktree)  /kill N  /quit
 Keys: Tab / Shift-Tab select a job, PgUp / PgDn scroll, Up / Down history, Esc clear, Ctrl-C twice quits.";
