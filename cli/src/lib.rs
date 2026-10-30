@@ -598,7 +598,8 @@ impl Session {
                     if exited {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(300));
+                    // A pipeline's end is seen within one poll: 50 ms, one stat and read each, instead of 300
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
             let exit = child.wait();

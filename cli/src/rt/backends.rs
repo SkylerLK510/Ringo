@@ -43,7 +43,7 @@ pub const JUDGE_PRESETS: [(&str, &str); 4] = [
          --disable sleep_tool --disable goals --disable view_image --disable image_generation \
          --disable default_mode_request_user_input -c include_environment_context=false \
          -c include_permissions_instructions=false -c skills.include_instructions=false \
-         -c include_collaboration_mode_instructions=false \
+         -c include_collaboration_mode_instructions=false -c analytics.enabled=false \
          -c 'project_doc_max_bytes=0' -c 'forced_login_method=\"chatgpt\"' \
          -c 'model_provider=\"openai\"' -c 'web_search=\"disabled\"' \
          --skip-git-repo-check --ephemeral -s read-only --color never --json -",
@@ -57,7 +57,7 @@ pub const JUDGE_PRESETS: [(&str, &str); 4] = [
          --disable sleep_tool --disable goals --disable view_image --disable image_generation \
          --disable default_mode_request_user_input -c include_environment_context=false \
          -c include_permissions_instructions=false -c skills.include_instructions=false \
-         -c include_collaboration_mode_instructions=false \
+         -c include_collaboration_mode_instructions=false -c analytics.enabled=false \
          -c 'project_doc_max_bytes=0' -c 'forced_login_method=\"chatgpt\"' \
          -c 'model_provider=\"openai\"' -c 'web_search=\"live\"' \
          --skip-git-repo-check --ephemeral -s read-only --color never --json -",
