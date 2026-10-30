@@ -257,9 +257,10 @@ class ParseTest(unittest.TestCase):
         return json.dumps(s)
 
     def test_a_deeply_nested_reply_is_judged_not_crashed(self):
-        deep = '[' * 50_000 + ']' * 50_000
-        obj = research.strict_json('{"a": ' + deep + ', "b": 1}')
-        self.assertFalse(research.repeats_a_key(obj))
+        deep = []
+        for _ in range(50_000):  # built directly: how deep JSON text parses depends on the Python and its stack
+            deep = [deep]
+        self.assertFalse(research.repeats_a_key({'a': deep, 'b': 1}))
         with self.assertRaises(research.Rejected):
             research.parse_sources(json.dumps({'url': 'https://example.org/a', 'title': 'T', 'claims': [], 'x': 1})[:-1]
                                    + ', "deep": ' + '[' * 900 + ']' * 900 + '}')
