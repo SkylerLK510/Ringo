@@ -51,14 +51,11 @@ pub static COMMON: LazyLock<BTreeSet<&'static str>> =
     LazyLock::new(|| KEYWORDS.iter().chain(MORE_COMMON).copied().collect());
 pub const KIND_ORDER: [&str; 4] = ["definition", "subclass", "reference", "test"];
 
-#[cfg(not(unix))]
-const NOT_UNIX: &str = "the native runtime runs on macOS and Linux; on Windows ringo uses the Python runtime";
 
 /// A Python `re` pattern (str, no flags) in Rust syntax: `\w`, `\s` and `\b` are Python's (`\w` is str.isalnum()
 /// or '_', `\s` is str.isspace(), which also counts U+001C..U+001F); everything else is passed through.
 fn py_re(pattern: &str) -> String {
-    const W: &str = r"\p{L}\p{N}_";
-    const S: &str = r"\s\x1c-\x1f";
+    use py::{SPACE as S, WORD as W};
     let boundary = format!("(?:(?<=[{W}])(?![{W}])|(?<![{W}])(?=[{W}]))");
     let mut out = String::new();
     let mut class = false;
@@ -115,9 +112,6 @@ static HUNK: LazyLock<Regex> = LazyLock::new(|| plain(r"^@@ -(\d+)(?:,(\d+))? \+
 /// Names git prints unquoted.
 static PLAIN: LazyLock<Regex> = LazyLock::new(|| plain(r#"^[^"\\\s\x00-\x1f\x7f]+\z"#));
 static TEST_NAME: LazyLock<Regex> = LazyLock::new(|| plain(r"(_test|_spec|\.test|\.spec|Tests?)\.\w+\n?\z"));
-static DIGIT: LazyLock<Regex> = LazyLock::new(|| plain(r"^\d\z"));
-static NONPRINTABLE: LazyLock<Regex> =
-    LazyLock::new(|| plain(r"^[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]\z"));
 
 fn found_all(re: &Fancy, text: &str) -> Vec<String> {
     re.captures_iter(text)
@@ -133,85 +127,10 @@ fn ctx(msg: impl Into<String>) -> Error {
     Error::new(Exc::Context, msg)
 }
 
-/// `repr(s)` exactly as Python prints it (quote choice, escapes, and \x/\u/\U for every non-printable code point).
-pub fn repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
-    let mut out = String::from(quote);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            c if c == ' ' || (c.is_ascii() && !c.is_ascii_control()) => out.push(c),
-            c if c.is_ascii() || NONPRINTABLE.is_match(c.encode_utf8(&mut [0; 4])) => {
-                let n = c as u32;
-                out.push_str(&if n <= 0xff {
-                    format!("\\x{n:02x}")
-                } else if n <= 0xffff {
-                    format!("\\u{n:04x}")
-                } else {
-                    format!("\\U{n:08x}")
-                });
-            }
-            c => out.push(c),
-        }
-    }
-    out.push(quote);
-    out
-}
-
-/// Python's `int()` of a `\d+` match: Unicode decimal digits count too (each Nd run is whole 0..9 sets).
-/// Line numbers past u64 saturate; no file has that many lines, so no output changes.
+/// Python's `int()` of a `\d+` match: Unicode decimal digits count too. Line numbers past u64 saturate; no file
+/// has that many lines, so no output changes.
 fn digits(s: &str) -> u64 {
-    s.chars().fold(0u64, |acc, c| {
-        let value = if c.is_ascii_digit() {
-            c as u64 - '0' as u64
-        } else {
-            let mut zero = c as u32;
-            while let Some(p) = zero.checked_sub(1).and_then(char::from_u32) {
-                if !DIGIT.is_match(p.encode_utf8(&mut [0; 4])) {
-                    break;
-                }
-                zero -= 1;
-            }
-            ((c as u32 - zero) % 10) as u64
-        };
-        acc.saturating_mul(10).saturating_add(value)
-    })
-}
-
-/// `str(Path(p))`: repeated and trailing slashes and '.' parts dropped, '' as '.'; exactly two leading slashes stay.
-pub fn python_path(p: &Path) -> PathBuf {
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
-        let b = p.as_os_str().as_bytes();
-        let root: &[u8] = if b.starts_with(b"//") && !b.starts_with(b"///") {
-            b"//"
-        } else if b.starts_with(b"/") {
-            b"/"
-        } else {
-            b""
-        };
-        let parts: Vec<&[u8]> = b.split(|c| *c == b'/').filter(|x| !x.is_empty() && *x != b".").collect();
-        let mut out = root.to_vec();
-        out.extend(parts.join(&b'/'));
-        if out.is_empty() {
-            out.push(b'.');
-        }
-        PathBuf::from(std::ffi::OsString::from_vec(out))
-    }
-    #[cfg(not(unix))]
-    p.to_path_buf()
-}
-
-fn spawn_error(e: &std::io::Error, program: &str) -> Error {
-    Error::os(py::os_error(e, Some(program)))
+    s.chars().fold(0u64, |acc, c| acc.saturating_mul(10).saturating_add(py::decimal_digit(c).unwrap_or(0) as u64))
 }
 
 fn decode(data: Vec<u8>) -> String {
@@ -227,7 +146,7 @@ pub fn git_binary_ok(repo: &Path, args: &[&str], ok: &[i32]) -> Result<Vec<u8>> 
     #[cfg(not(unix))]
     {
         let _ = (repo, args, ok);
-        Err(Error::os(NOT_UNIX))
+        Err(Error::os(crate::rt::NATIVE_ONLY))
     }
     #[cfg(unix)]
     {
@@ -239,7 +158,7 @@ pub fn git_binary_ok(repo: &Path, args: &[&str], ok: &[i32]) -> Result<Vec<u8>> 
             .envs(ENV)
             .stdin(Stdio::inherit())
             .output()
-            .map_err(|e| spawn_error(&e, "git"))?;
+            .map_err(|e| Error::io(&e, Some("git")))?;
         let code = p.status.code().unwrap_or_else(|| -p.status.signal().unwrap_or(0));
         // bytes.strip(): ASCII whitespace including \x0b, which trim_ascii keeps
         if !ok.contains(&code) || (code != 0 && p.stderr.iter().any(|c| !b" \t\n\r\x0b\x0c".contains(c))) {
@@ -268,12 +187,12 @@ pub fn git_ok(repo: &Path, args: &[&str], ok: &[i32]) -> Result<String> {
 /// Full commit id of rev; a leading '-' is refused so a revision can never become a git option.
 pub fn commit(repo: &Path, rev: &str, what: &str) -> Result<String> {
     if rev.is_empty() || rev.starts_with('-') {
-        return Err(ctx(format!("{what} must be a commit, not {}", repr(rev))));
+        return Err(ctx(format!("{what} must be a commit, not {}", py::repr(rev))));
     }
     match git(repo, &["rev-parse", "--verify", "--quiet", "--end-of-options", &format!("{rev}^{{commit}}")]) {
         Ok(out) => Ok(py::strip(&out).to_string()),
         Err(e) if e.is(Exc::Context) => {
-            Err(ctx(format!("{what} {} is not a commit in {}", repr(rev), repo.to_string_lossy())))
+            Err(ctx(format!("{what} {} is not a commit in {}", py::repr(rev), repo.to_string_lossy())))
         }
         Err(e) => Err(e),
     }
@@ -368,7 +287,7 @@ impl Objects {
         #[cfg(not(unix))]
         {
             let _ = (rev, path);
-            Err(Error::os(NOT_UNIX))
+            Err(Error::os(crate::rt::NATIVE_ONLY))
         }
         #[cfg(unix)]
         {
@@ -382,7 +301,7 @@ impl Objects {
                     .stdout(Stdio::piped())
                     .stderr(Stdio::null())
                     .spawn()
-                    .map_err(|e| spawn_error(&e, "git"))?;
+                    .map_err(|e| Error::io(&e, Some("git")))?;
                 let stdin = child.stdin.take().expect("piped");
                 let stdout = BufReader::new(child.stdout.take().expect("piped"));
                 self.proc = Some(Batch { child, stdin, stdout });
@@ -402,7 +321,7 @@ impl Objects {
                 return self.not_a_blob(rev, path);
             }
             let (Some(kind), Some(size)) = (fields.get(1), fields.get(2)) else {
-                return Err(Error::new(Exc::Type, "list index out of range").with_data(serde_json::json!({"exception": "IndexError"})));
+                return Err(Error::new(Exc::Index, "list index out of range"));
             };
             let kind = String::from_utf8_lossy(kind).into_owned();
             let Some(size) = std::str::from_utf8(size).ok().and_then(|s| s.parse::<usize>().ok()) else {
@@ -602,14 +521,14 @@ main()
 );
 
 /// python_symbols of every (source, lines) in one `python3` process; Err is the first exception CPython raised
-/// (RecursionError, MemoryError: kind Type, the Python class name in `data["exception"]`).
+/// (RecursionError, MemoryError, ...), its class named as Python names it.
 pub fn python_symbols_many(requests: &[(&str, &BTreeSet<u64>)]) -> Result<Vec<Symbols>> {
     if requests.is_empty() {
         return Ok(Vec::new());
     }
     #[cfg(not(unix))]
     {
-        Err(Error::os(NOT_UNIX))
+        Err(Error::os(crate::rt::NATIVE_ONLY))
     }
     #[cfg(unix)]
     {
@@ -622,7 +541,7 @@ pub fn python_symbols_many(requests: &[(&str, &BTreeSet<u64>)]) -> Result<Vec<Sy
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()) // ast.parse's SyntaxWarnings reach stderr, as in the Python runtime
             .spawn()
-            .map_err(|e| spawn_error(&e, "python3"))?;
+            .map_err(|e| Error::io(&e, Some("python3")))?;
         let mut stdin = child.stdin.take().expect("piped");
         let written = stdin.write_all(input.to_string().as_bytes());
         drop(stdin);
@@ -631,8 +550,10 @@ pub fn python_symbols_many(requests: &[(&str, &BTreeSet<u64>)]) -> Result<Vec<Sy
         let status = child.wait()?;
         written?;
         read?;
-        let parsed: Option<Vec<serde_json::Value>> =
-            if status.success() { serde_json::from_slice(&out).ok() } else { None };
+        let parsed = match std::str::from_utf8(&out).ok().filter(|_| status.success()).map(crate::rt::pyjson::loads) {
+            Some(Ok(serde_json::Value::Array(items))) => Some(items),
+            _ => None,
+        };
         let Some(parsed) = parsed else {
             return Err(Error::os(format!("python3 could not run python_symbols ({status})")));
         };
@@ -642,9 +563,9 @@ pub fn python_symbols_many(requests: &[(&str, &BTreeSet<u64>)]) -> Result<Vec<Sy
         let mut results = Vec::new();
         for item in parsed {
             if let Some(raised) = item.get("raised") {
-                let name = raised[0].as_str().unwrap_or("Exception").to_string();
+                let name = raised[0].as_str().unwrap_or("Exception");
                 let msg = raised[1].as_str().unwrap_or("").to_string();
-                return Err(Error::new(Exc::Type, msg).with_data(serde_json::json!({"exception": name})));
+                return Err(Error::new(Exc::from_name(name), msg));
             }
             results.push(if item.is_null() { None } else { Some((set(&item[0]), set(&item[1]))) });
         }
@@ -841,7 +762,7 @@ pub fn matches(repo: &Path, head: &str, syms: &[String], owners: &[String], excl
         }
         let path = &bits[0][prefix.len()..];
         let lineno: u64 = py::strip(bits[1]).parse().map_err(|_| {
-            Error::value(format!("invalid literal for int() with base 10: {}", repr(bits[1])))
+            Error::value(format!("invalid literal for int() with base 10: {}", py::repr(bits[1])))
         })?;
         let text = bits[2..].join("\0");
         if exclude.contains(path) {
@@ -1021,7 +942,7 @@ pub fn listing(items: &[String]) -> Vec<String> {
 /// The review material for base...head in repo, as one string of at most `budget` UTF-8 bytes unless the change
 /// itself (PR text, diff, changed files, README) is already larger; then it has no context blocks.
 pub fn build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i64) -> Result<String> {
-    let repo = python_path(repo);
+    let repo = py::path(repo);
     if budget <= 0 {
         return Err(ctx("the context budget must be a positive number of bytes"));
     }

@@ -7,8 +7,8 @@
 //! `json.dumps(plan)`. Python's `PROMPTS` and `PLANS` live next to the module; here they are folders under the Ringo
 //! home (`ringo_cli::ringo_home()`): [`prompts_dir`] and [`plans_dir`], and [`load_plan`] takes the home.
 //!
-//! Regex notes: Python's `\w` is `str.isalnum() or '_'`, which is exactly Unicode L and N ([`WORD`]); its `\s` is
-//! `str.isspace()` ([`SPACE`]); its `re.I` lets `i` match U+0130/U+0131 as well, so the case-insensitive words are
+//! Regex notes: Python's `\w` is `str.isalnum() or '_'`, which is exactly Unicode L and N ([`py::WORD`]); its `\s` is
+//! `str.isspace()` ([`py::SPACE`]); its `re.I` lets `i` match U+0130/U+0131 as well, so the case-insensitive words are
 //! spelled out as classes. Python's `\b` is written as the character test it stands for.
 
 use crate::rt::{Error, Exc, Result, py, pyjson};
@@ -27,10 +27,6 @@ pub const PASS_KEYS: [&str; 7] = ["id", "prompt", "reply", "inputs", "batch", "w
 pub const PLAN_KEYS: [&str; 5] = ["version", "kind", "role", "passes", "prompts_dir"];
 /// Per findings reply in a batched plan: its checker makes at most ceil(readers x 50 / batch) calls.
 pub const MAX_FINDINGS: usize = 50;
-/// Python's `\w` (inside a character class).
-pub const WORD: &str = r"\p{L}\p{N}_";
-/// Python's `\s` (inside a character class).
-pub const SPACE: &str = r"\s\x1C-\x1F";
 /// Python's `ID = r'[A-Za-z][\w-]*'`, in Rust regex syntax.
 pub const ID: &str = r"[A-Za-z][\p{L}\p{N}_-]*";
 
@@ -75,7 +71,6 @@ static OPENING: LazyLock<Regex> = LazyLock::new(|| re(r"(?m)^[ \t]{0,3}(`{3,}|~{
 static ID_FULL: LazyLock<Regex> = LazyLock::new(|| re(r"\A[A-Za-z][\p{L}\p{N}_-]*\z"));
 static MODEL: LazyLock<Regex> = LazyLock::new(|| re(r"\A[\p{L}\p{N}_.:-]+\z"));
 static PROMPT: LazyLock<Regex> = LazyLock::new(|| re(r"\A[\p{L}\p{N}_.-]+\.md\z"));
-static NONPRINTABLE: LazyLock<Regex> = LazyLock::new(|| re(r"[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]"));
 
 /// Python's `re.fullmatch(ID, s)`.
 pub fn is_id(s: &str) -> bool {
@@ -134,12 +129,12 @@ impl From<NeedVerdicts> for Error {
 
 /// Python's `PROMPTS`: `<home, resolved>/prompts`.
 pub fn prompts_dir(home: &Path) -> PathBuf {
-    resolve(home).unwrap_or_else(|_| home.to_path_buf()).join("prompts")
+    py::realpath(home).unwrap_or_else(|_| home.to_path_buf()).join("prompts")
 }
 
 /// Python's `PLANS`: `<home, resolved>/plans`.
 pub fn plans_dir(home: &Path) -> PathBuf {
-    resolve(home).unwrap_or_else(|_| home.to_path_buf()).join("plans")
+    py::realpath(home).unwrap_or_else(|_| home.to_path_buf()).join("plans")
 }
 
 /// The plan in the JSON file at path (default: the built-in `plans/<kind>.json` under home), validated.
@@ -149,14 +144,14 @@ pub fn load_plan(home: &Path, path: Option<&Path>, kind: &str) -> Result<Value> 
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => plans_dir(home).join(format!("{kind}.json")),
     };
-    let text = read_text(&path, &path_str(&path))?;
-    let plan = json_loads(&text)?;
+    let text = py::read_text(&path)?;
+    let plan = pyjson::loads(&text)?;
     let Value::Object(obj) = &plan else { return Err(Error::value("a plan is a JSON object")) };
     if obj.get("kind").and_then(Value::as_str) != Some(kind) {
         return Err(Error::value(format!("a {kind} task needs a {kind} plan")));
     }
     let base = match obj.get("prompts_dir") {
-        Some(Value::String(d)) => resolve(&path.parent().unwrap_or(Path::new("/")).join(d))?,
+        Some(Value::String(d)) => py::realpath(&path.parent().unwrap_or(Path::new("/")).join(d))?,
         _ => prompts_dir(home),
     };
     validate(plan, &base)
@@ -181,7 +176,7 @@ fn inputs(p: &Value) -> impl Iterator<Item = &str> {
 /// Python's text of an integer JSON number (no fraction or exponent), as `type(x) is int` tells.
 fn int_text(v: &Value) -> Option<String> {
     match v {
-        Value::Number(n) => Some(n.to_string()).filter(|t| !t.contains(['.', 'e', 'E'])),
+        Value::Number(n) => Some(n.to_string()).filter(|t| !py::is_float_text(t)),
         _ => None,
     }
 }
@@ -201,26 +196,7 @@ fn batch(p: &Value) -> Option<usize> {
 }
 
 fn truthy(v: Option<&Value>) -> bool {
-    match v {
-        None | Some(Value::Null) => false,
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => n.as_f64().is_some_and(|f| f != 0.0),
-        Some(Value::String(s)) => !s.is_empty(),
-        Some(Value::Array(a)) => !a.is_empty(),
-        Some(Value::Object(m)) => !m.is_empty(),
-    }
-}
-
-/// Python's `x == 1` for a JSON value (True and 1.0 are equal to 1 too).
-fn is_one(v: Option<&Value>) -> bool {
-    match v {
-        Some(Value::Bool(b)) => *b,
-        Some(Value::Number(n)) => {
-            let t = n.to_string();
-            if t.contains(['.', 'e', 'E']) { t.parse::<f64>() == Ok(1.0) } else { t == "1" }
-        }
-        _ => false,
-    }
+    v.is_some_and(py::truthy)
 }
 
 /// The plan with each pass's prompt text loaded; ValueError on anything malformed.
@@ -229,8 +205,8 @@ pub fn validate(mut plan: Value, prompts_dir: &Path) -> Result<Value> {
     let mut unknown: Vec<&str> = obj.keys().map(String::as_str).filter(|k| !PLAN_KEYS.contains(k)).collect();
     unknown.sort_unstable();
     let kind = obj.get("kind").and_then(Value::as_str).filter(|k| matches!(*k, "review" | "design")).map(str::to_string);
-    let Some(kind) = kind.filter(|_| unknown.is_empty() && is_one(obj.get("version"))) else {
-        let keys: Vec<String> = unknown.iter().map(|k| repr_str(k)).collect();
+    let Some(kind) = kind.filter(|_| unknown.is_empty() && obj.get("version").is_some_and(|v| py::eq(v, &Value::from(1)))) else {
+        let keys: Vec<String> = unknown.iter().map(|k| py::repr(k)).collect();
         return Err(Error::value(format!(
             "a plan needs version 1 and kind review or design; unknown keys: [{}]",
             keys.join(", ")
@@ -247,14 +223,14 @@ pub fn validate(mut plan: Value, prompts_dir: &Path) -> Result<Value> {
     let mut kinds: Vec<String> = Vec::new();
     for p in passes.iter_mut() {
         let Some(m) = p.as_object_mut().filter(|m| m.keys().all(|k| PASS_KEYS.contains(&k.as_str()))) else {
-            return Err(Error::value(format!("pass {}: unknown keys", repr(p))));
+            return Err(Error::value(format!("pass {}: unknown keys", py::value_repr(p))));
         };
         let pid = match m.get("id") {
             Some(Value::String(s)) if ID_FULL.is_match(s) && !seen.contains_key(s) => s.clone(),
             other => {
                 return Err(Error::value(format!(
                     "pass id {} is missing, malformed or repeated",
-                    other.map_or("None".into(), repr)
+                    other.map_or("None".into(), py::value_repr)
                 )));
             }
         };
@@ -285,12 +261,12 @@ pub fn validate(mut plan: Value, prompts_dir: &Path) -> Result<Value> {
             Some(Value::String(s)) if PROMPT.is_match(s) => s.clone(),
             _ => return Err(Error::value(format!("pass {pid}: prompt must be a .md file name"))),
         };
-        let file = resolve(&prompts_dir.join(&name))?;
-        let parent_ok = file.parent().is_some_and(|d| resolve(prompts_dir).is_ok_and(|base| d == base));
+        let file = py::realpath(&prompts_dir.join(&name))?;
+        let parent_ok = file.parent().is_some_and(|d| py::realpath(prompts_dir).is_ok_and(|base| d == base));
         if !parent_ok || !std::fs::metadata(&file).is_ok_and(|md| md.is_file()) {
             return Err(Error::value(format!("pass {pid}: prompt {name} not found in {}", prompts_dir.display())));
         }
-        let text = read_text(&file, &file.to_string_lossy())?;
+        let text = py::read_text(&file)?;
         m.insert("text".into(), Value::String(py::strip(&text).to_string()));
         seen.insert(pid, reply.clone());
         kinds.push(reply);
@@ -316,18 +292,10 @@ pub fn validate(mut plan: Value, prompts_dir: &Path) -> Result<Value> {
     Ok(plan)
 }
 
-/// What Python raises when validate() is handed a JSON value that is not an object. AttributeError has no `Exc`
-/// kind and is reported as `Exc::Type`; lists holding non-string scalars sort (or fail to) in ways not mirrored.
+/// What Python raises when validate() is handed a JSON value that is not an object; lists holding non-string
+/// scalars sort (or fail to) in ways not mirrored.
 fn not_an_object(plan: &Value) -> Error {
-    let type_name = match plan {
-        Value::Null => "NoneType",
-        Value::Bool(_) => "bool",
-        Value::Number(_) if int_text(plan).is_some() => "int",
-        Value::Number(_) => "float",
-        Value::String(_) => "str",
-        Value::Array(_) => "list",
-        Value::Object(_) => "dict",
-    };
+    let type_name = py::type_name(plan);
     let elements: Vec<String> = match plan {
         Value::String(s) => s.chars().map(String::from).collect(),
         Value::Array(a) => {
@@ -344,11 +312,11 @@ fn not_an_object(plan: &Value) -> Error {
     };
     let mut unknown: Vec<&str> = elements.iter().map(String::as_str).filter(|k| !PLAN_KEYS.contains(k)).collect();
     if unknown.is_empty() {
-        return Error::new(Exc::Type, format!("'{type_name}' object has no attribute 'get'"));
+        return Error::new(Exc::Attribute, format!("'{type_name}' object has no attribute 'get'"));
     }
     unknown.sort_unstable();
     unknown.dedup();
-    let keys: Vec<String> = unknown.iter().map(|k| repr_str(k)).collect();
+    let keys: Vec<String> = unknown.iter().map(|k| py::repr(k)).collect();
     Error::value(format!("a plan needs version 1 and kind review or design; unknown keys: [{}]", keys.join(", ")))
 }
 
@@ -504,7 +472,7 @@ pub fn all_findings(plan: &Value, replies: &Replies) -> IndexMap<String, String>
 fn py_str(v: Option<&Value>) -> String {
     match v {
         Some(Value::String(s)) => s.clone(),
-        Some(v) => repr(v),
+        Some(v) => py::value_repr(v),
         None => String::new(),
     }
 }
@@ -794,407 +762,16 @@ fn unique(lines: Option<&Vec<String>>) -> Vec<&str> {
     lines.into_iter().flatten().map(String::as_str).filter(|l| seen.insert(*l)).collect()
 }
 
-/// Python's `repr()` of a str: printable text as is, other code points escaped as `str.isprintable()` decides.
-fn repr_str(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push(quote);
-    let mut buf = [0u8; 4];
-    for c in s.chars() {
-        let n = c as u32;
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c == quote => {
-                out.push('\\');
-                out.push(c);
-            }
-            _ if n < 0x20 || n == 0x7f => out.push_str(&format!("\\x{n:02x}")),
-            _ if n < 0x7f || c == ' ' || !NONPRINTABLE.is_match(c.encode_utf8(&mut buf)) => out.push(c),
-            _ if n <= 0xff => out.push_str(&format!("\\x{n:02x}")),
-            _ if n <= 0xffff => out.push_str(&format!("\\u{n:04x}")),
-            _ => out.push_str(&format!("\\U{n:08x}")),
-        }
-    }
-    out.push(quote);
-    out
-}
-
-/// Python's `repr()` of the value json.loads makes of v.
-fn repr(v: &Value) -> String {
-    match v {
-        Value::Null => "None".into(),
-        Value::Bool(b) => if *b { "True" } else { "False" }.into(),
-        Value::Number(n) => match int_text(v) {
-            Some(t) => if t == "-0" { "0".into() } else { t },
-            None => match n.to_string().parse::<f64>() {
-                Ok(f) if f.is_infinite() => if f > 0.0 { "inf" } else { "-inf" }.into(),
-                Ok(f) => pyjson::float(f),
-                Err(_) => n.to_string(),
-            },
-        },
-        Value::String(s) => repr_str(s),
-        Value::Array(a) => format!("[{}]", a.iter().map(repr).collect::<Vec<_>>().join(", ")),
-        Value::Object(m) => {
-            let items: Vec<String> = m.iter().map(|(k, v)| format!("{}: {}", repr_str(k), repr(v))).collect();
-            format!("{{{}}}", items.join(", "))
-        }
-    }
-}
-
-/// `str(Path(p))`: Python's normalized spelling of a POSIX path.
-fn path_str(p: &Path) -> String {
-    let s = p.to_string_lossy();
-    let root = if s.starts_with("//") && !s.starts_with("///") {
-        "//"
-    } else if s.starts_with('/') {
-        "/"
-    } else {
-        ""
-    };
-    let parts: Vec<&str> = s.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
-    let out = format!("{root}{}", parts.join("/"));
-    if out.is_empty() { ".".into() } else { out }
-}
-
-/// `Path(p).resolve()` (non-strict `os.path.realpath`, Python 3.14): symlinks resolved as far as they exist,
-/// `..` applied after each resolution, missing parts kept, OS errors ignored.
-#[cfg(unix)]
-fn resolve(p: &Path) -> Result<PathBuf> {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let filename = p.as_os_str().as_bytes();
-    let mut rest: Vec<Option<Vec<u8>>> = filename.split(|&b| b == b'/').rev().map(|s| Some(s.to_vec())).collect();
-    let mut part_count = rest.len();
-    let mut path: Vec<u8> =
-        if filename.starts_with(b"/") { b"/".to_vec() } else { std::env::current_dir()?.into_os_string().into_vec() };
-    let mut seen: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
-    while part_count > 0 {
-        let Some(entry) = rest.pop() else { break };
-        let Some(name) = entry else {
-            // A resolved symlink marker: the link below it now resolves to path.
-            if let Some(Some(link)) = rest.pop() {
-                seen.insert(link, Some(path.clone()));
-            }
-            continue;
-        };
-        part_count -= 1;
-        if name.is_empty() || name == b"." {
-            continue;
-        }
-        if name == b".." {
-            let cut = path.iter().rposition(|&b| b == b'/').unwrap_or(0);
-            path.truncate(cut);
-            if path.is_empty() {
-                path.push(b'/');
-            }
-            continue;
-        }
-        let mut newpath = path.clone();
-        if path != b"/" {
-            newpath.push(b'/');
-        }
-        newpath.extend_from_slice(&name);
-        if newpath.contains(&0) {
-            return Err(Error::value("lstat: embedded null character in path"));
-        }
-        let as_path = Path::new(std::ffi::OsStr::from_bytes(&newpath));
-        let is_link = std::fs::symlink_metadata(as_path).is_ok_and(|m| m.file_type().is_symlink());
-        if !is_link {
-            path = newpath;
-            continue;
-        }
-        if let Some(known) = seen.get(&newpath) {
-            path = known.clone().unwrap_or(newpath);
-            continue;
-        }
-        let Ok(target) = std::fs::read_link(as_path) else {
-            path = newpath;
-            continue;
-        };
-        let target = target.into_os_string().into_vec();
-        if target.starts_with(b"/") {
-            path = b"/".to_vec();
-        }
-        seen.insert(newpath.clone(), None);
-        rest.push(Some(newpath));
-        rest.push(None);
-        let parts: Vec<Option<Vec<u8>>> = target.split(|&b| b == b'/').rev().map(|s| Some(s.to_vec())).collect();
-        part_count += parts.len();
-        rest.extend(parts);
-    }
-    Ok(PathBuf::from(OsString::from_vec(path)))
-}
-
-#[cfg(not(unix))]
-fn resolve(_: &Path) -> Result<PathBuf> {
-    Err(Error::os("the native runtime runs on macOS and Linux; on Windows ringo uses the Python runtime"))
-}
-
-/// `path.read_text(encoding='utf-8')`: Python's OSError and UnicodeDecodeError texts, universal newlines.
-fn read_text(path: &Path, shown: &str) -> Result<String> {
-    let bytes = std::fs::read(path).map_err(|e| Error::os(py::os_error(&e, Some(shown))))?;
-    let text = match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(e) => {
-            let (b, start) = (e.as_bytes(), e.utf8_error().valid_up_to());
-            let (end, reason) = match e.utf8_error().error_len() {
-                None => (b.len(), "unexpected end of data"),
-                Some(n) if matches!(b[start], 0x80..=0xC1 | 0xF5..=0xFF) => (start + n, "invalid start byte"),
-                Some(n) => (start + n, "invalid continuation byte"),
-            };
-            return Err(Error::value(if end == start + 1 {
-                format!("'utf-8' codec can't decode byte 0x{:02x} in position {start}: {reason}", b[start])
-            } else {
-                format!("'utf-8' codec can't decode bytes in position {start}-{}: {reason}", end - 1)
-            }));
-        }
-    };
-    Ok(if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text })
-}
-
-/// `json.loads(text)` with Python's error texts (JSONDecodeError and the int digit limit). Documents Python
-/// accepts that serde cannot hold (NaN, Infinity, lone surrogates, nesting past 128) fail with serde's text.
-fn json_loads(text: &str) -> Result<Value> {
-    if let Some(msg) = json_error(text) {
-        return Err(Error::value(msg));
-    }
-    pyjson::loads(text)
-}
-
-enum Fail {
-    /// StopIteration(idx): "Expecting value".
-    Stop(usize),
-    At(&'static str, usize),
-    Raw(String),
-}
-
-/// What json.loads raises for text (CPython's C scanner), or None when it parses.
-fn json_error(text: &str) -> Option<String> {
-    let s: Vec<char> = text.chars().collect();
-    let at = |msg: &str, pos: usize| {
-        let before = &s[..pos.min(s.len())];
-        let line = before.iter().filter(|&&c| c == '\n').count() + 1;
-        let col = before.iter().rposition(|&c| c == '\n').map_or(pos + 1, |i| pos - i);
-        format!("{msg}: line {line} column {col} (char {pos})")
-    };
-    if s.first() == Some(&'\u{feff}') {
-        return Some(at("Unexpected UTF-8 BOM (decode using utf-8-sig)", 0));
-    }
-    match scan(&s, ws(&s, 0), 0) {
-        Err(Fail::Stop(i)) => Some(at("Expecting value", i)),
-        Err(Fail::At(msg, i)) => Some(at(msg, i)),
-        Err(Fail::Raw(msg)) => Some(msg),
-        Ok(end) => {
-            let end = ws(&s, end);
-            (end != s.len()).then(|| at("Extra data", end))
-        }
-    }
-}
-
-fn ws(s: &[char], mut i: usize) -> usize {
-    while i < s.len() && matches!(s[i], ' ' | '\t' | '\n' | '\r') {
-        i += 1;
-    }
-    i
-}
-
-fn starts(s: &[char], i: usize, word: &str) -> bool {
-    let w: Vec<char> = word.chars().collect();
-    s.get(i..i + w.len()) == Some(w.as_slice())
-}
-
-fn scan(s: &[char], idx: usize, depth: usize) -> std::result::Result<usize, Fail> {
-    if idx >= s.len() {
-        return Err(Fail::Stop(idx));
-    }
-    if depth > 2000 {
-        return Err(Fail::Raw("maximum recursion depth exceeded while decoding a JSON document".into()));
-    }
-    match s[idx] {
-        '"' => json_string(s, idx + 1),
-        '{' => json_object(s, idx + 1, depth + 1),
-        '[' => json_array(s, idx + 1, depth + 1),
-        'n' if starts(s, idx, "null") => Ok(idx + 4),
-        't' if starts(s, idx, "true") => Ok(idx + 4),
-        'f' if starts(s, idx, "false") => Ok(idx + 5),
-        'N' if starts(s, idx, "NaN") => Ok(idx + 3),
-        'I' if starts(s, idx, "Infinity") => Ok(idx + 8),
-        '-' if starts(s, idx, "-Infinity") => Ok(idx + 9),
-        _ => json_number(s, idx),
-    }
-}
-
-fn json_number(s: &[char], start: usize) -> std::result::Result<usize, Fail> {
-    let digit = |i: usize| s.get(i).is_some_and(char::is_ascii_digit);
-    let len = s.len();
-    let mut idx = start;
-    if s[idx] == '-' {
-        idx += 1;
-        if idx >= len {
-            return Err(Fail::Stop(start));
-        }
-    }
-    if ('1'..='9').contains(&s[idx]) {
-        idx += 1;
-        while digit(idx) {
-            idx += 1;
-        }
-    } else if s[idx] == '0' {
-        idx += 1;
-    } else {
-        return Err(Fail::Stop(start));
-    }
-    let mut is_float = false;
-    if idx + 1 < len && s[idx] == '.' && digit(idx + 1) {
-        is_float = true;
-        idx += 2;
-        while digit(idx) {
-            idx += 1;
-        }
-    }
-    if idx + 1 < len && matches!(s[idx], 'e' | 'E') {
-        let e_start = idx;
-        idx += 1;
-        if idx + 1 < len && matches!(s[idx], '-' | '+') {
-            idx += 1;
-        }
-        while digit(idx) {
-            idx += 1;
-        }
-        if digit(idx - 1) {
-            is_float = true;
-        } else {
-            idx = e_start;
-        }
-    }
-    let digits = idx - start - usize::from(s[start] == '-');
-    if !is_float && digits > 4300 {
-        return Err(Fail::Raw(format!(
-            "Exceeds the limit (4300 digits) for integer string conversion: value has {digits} digits; use sys.set_int_max_str_digits() to increase the limit"
-        )));
-    }
-    Ok(idx)
-}
-
-fn hex4(s: &[char]) -> Option<u32> {
-    s.iter().try_fold(0u32, |acc, c| c.to_digit(16).map(|d| acc * 16 + d))
-}
-
-fn json_string(s: &[char], mut end: usize) -> std::result::Result<usize, Fail> {
-    let len = s.len();
-    let begin = end - 1;
-    loop {
-        let mut next = end;
-        while next < len && s[next] != '"' && s[next] != '\\' {
-            if (s[next] as u32) <= 0x1f {
-                return Err(Fail::At("Invalid control character at", next));
-            }
-            next += 1;
-        }
-        if next == len {
-            return Err(Fail::At("Unterminated string starting at", begin));
-        }
-        if s[next] == '"' {
-            return Ok(next + 1);
-        }
-        next += 1;
-        if next == len {
-            return Err(Fail::At("Unterminated string starting at", begin));
-        }
-        if s[next] != 'u' {
-            end = next + 1;
-            if !matches!(s[next], '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') {
-                return Err(Fail::At("Invalid \\escape", end - 2));
-            }
-            continue;
-        }
-        next += 1;
-        end = next + 4;
-        if end > len {
-            return Err(Fail::At("Invalid \\uXXXX escape", next - 1));
-        }
-        let Some(c) = hex4(&s[next..end]) else { return Err(Fail::At("Invalid \\uXXXX escape", end - 5)) };
-        if (0xd800..=0xdbff).contains(&c) && end + 6 < len && s[end] == '\\' && s[end + 1] == 'u' {
-            let end2 = end + 6;
-            let Some(c2) = hex4(&s[end + 2..end2]) else { return Err(Fail::At("Invalid \\uXXXX escape", end2 - 5)) };
-            if (0xdc00..=0xdfff).contains(&c2) {
-                end = end2;
-            }
-        }
-    }
-}
-
-fn json_object(s: &[char], idx: usize, depth: usize) -> std::result::Result<usize, Fail> {
-    let len = s.len();
-    let mut idx = ws(s, idx);
-    if idx < len && s[idx] == '}' {
-        return Ok(idx + 1);
-    }
-    loop {
-        if idx >= len || s[idx] != '"' {
-            return Err(Fail::At("Expecting property name enclosed in double quotes", idx));
-        }
-        idx = ws(s, json_string(s, idx + 1)?);
-        if idx >= len || s[idx] != ':' {
-            return Err(Fail::At("Expecting ':' delimiter", idx));
-        }
-        idx = ws(s, scan(s, ws(s, idx + 1), depth)?);
-        if idx < len && s[idx] == '}' {
-            return Ok(idx + 1);
-        }
-        if idx >= len || s[idx] != ',' {
-            return Err(Fail::At("Expecting ',' delimiter", idx));
-        }
-        let comma = idx;
-        idx = ws(s, idx + 1);
-        if idx < len && s[idx] == '}' {
-            return Err(Fail::At("Illegal trailing comma before end of object", comma));
-        }
-    }
-}
-
-fn json_array(s: &[char], idx: usize, depth: usize) -> std::result::Result<usize, Fail> {
-    let len = s.len();
-    let mut idx = ws(s, idx);
-    if idx < len && s[idx] == ']' {
-        return Ok(idx + 1);
-    }
-    loop {
-        idx = ws(s, scan(s, idx, depth)?);
-        if idx < len && s[idx] == ']' {
-            return Ok(idx + 1);
-        }
-        if idx >= len || s[idx] != ',' {
-            return Err(Fail::At("Expecting ',' delimiter", idx));
-        }
-        let comma = idx;
-        idx = ws(s, idx + 1);
-        if idx < len && s[idx] == ']' {
-            return Err(Fail::At("Illegal trailing comma before end of array", comma));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn python_reprs_and_paths() {
-        assert_eq!(repr(&json!({"id": "a'b", "n": [1, 2.5, true, null], "x": "\u{a0}\u{2000}é"})),
+        assert_eq!(py::value_repr(&json!({"id": "a'b", "n": [1, 2.5, true, null], "x": "\u{a0}\u{2000}é"})),
                    format!("{{'id': \"a'b\", 'n': [1, 2.5, True, None], 'x': '\\xa0\\{}é'}}", "u2000"));
-        assert_eq!(path_str(Path::new("a//b/./c/")), "a/b/c");
-        assert_eq!(path_str(Path::new("//a")), "//a");
-        assert_eq!(path_str(Path::new("")), ".");
-    }
-
-    #[test]
-    fn json_errors_read_as_python_writes_them() {
-        assert_eq!(json_error("[1,]").as_deref(), Some("Illegal trailing comma before end of array: line 1 column 3 (char 2)"));
-        assert_eq!(json_error("{\"a\" 1}").as_deref(), Some("Expecting ':' delimiter: line 1 column 6 (char 5)"));
-        assert_eq!(json_error(" {} "), None);
+        assert_eq!(py::path(Path::new("a//b/./c/")), Path::new("a/b/c"));
+        assert_eq!(py::path(Path::new("//a")), Path::new("//a"));
+        assert_eq!(py::path(Path::new("")), Path::new("."));
     }
 }

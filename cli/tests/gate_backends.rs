@@ -5,7 +5,8 @@
 //! Rust (this test binary re-run as a driver), and every observable is compared. Never touches the real ~/.codex.
 #![cfg(unix)]
 
-use ringo_cli::rt::backends::{self, Decoder, Isolated, JsonFail, Snapshot, Watch};
+use ringo_cli::rt::backends::{self, Isolated, Snapshot, Watch};
+use ringo_cli::rt::pyjson::{Decoder, JsonFail};
 use ringo_cli::rt::pyjson;
 use serde_json::{Value, json};
 use std::fs;
@@ -241,8 +242,8 @@ fn top_level_objects_matches_python_at_the_budget_bounds() {
     texts.push(("x".repeat(99) + "{").repeat(5_000) + "{\"answer\": 1}");
     // too deep for either to parse, and as deep as Rust keeps (MAX_DEPTH)
     texts.push("{\"a\":".repeat(120_000) + "1" + &"}".repeat(120_000));
-    texts.push("{\"a\":".repeat(backends::MAX_DEPTH) + "1" + &"}".repeat(backends::MAX_DEPTH));
-    texts.push("{\"a\": ".to_string() + &"[".repeat(backends::MAX_DEPTH - 1) + &"]".repeat(backends::MAX_DEPTH - 1) + "}");
+    texts.push("{\"a\":".repeat(pyjson::MAX_DEPTH) + "1" + &"}".repeat(pyjson::MAX_DEPTH));
+    texts.push("{\"a\": ".to_string() + &"[".repeat(pyjson::MAX_DEPTH - 1) + &"]".repeat(pyjson::MAX_DEPTH - 1) + "}");
     // int() refuses more than 4300 digits (Python raises out of the generator); floats have no such limit
     for digits in [4300, 4301, 5000] {
         texts.push(format!("{{\"n\": {}}}", "7".repeat(digits)));
@@ -265,11 +266,11 @@ fn reported_deviation_objects_nested_deeper_than_rust_keeps() {
     // Python 3.14 parses about 116,000 levels (stack-bound); Rust stops at MAX_DEPTH, because deeper serde_json
     // values overflow the stack when dropped or written.
     let deep = |d: usize| "{\"a\":".repeat(d) + "1" + &"}".repeat(d);
-    let texts = [deep(backends::MAX_DEPTH + 1), deep(20_000)];
+    let texts = [deep(pyjson::MAX_DEPTH + 1), deep(20_000)];
     let py: Vec<Value> = serde_json::from_str(&python(TOP_LEVEL_PY, &pyjson::dumps(&json!(texts)))).unwrap();
     let outer = |v: &Value| v["ok"][0][0].as_str().map(|t| t.len());
-    assert_eq!(outer(&py[0]), Some(deep(backends::MAX_DEPTH + 1).len() + backends::MAX_DEPTH + 1)); // the whole object
-    assert_eq!(outer(&top_level_rust(&texts[0])), Some(deep(backends::MAX_DEPTH).len() + backends::MAX_DEPTH)); // the inner one
+    assert_eq!(outer(&py[0]), Some(deep(pyjson::MAX_DEPTH + 1).len() + pyjson::MAX_DEPTH + 1)); // the whole object
+    assert_eq!(outer(&top_level_rust(&texts[0])), Some(deep(pyjson::MAX_DEPTH).len() + pyjson::MAX_DEPTH)); // the inner one
     assert_eq!(outer(&py[1]), Some(deep(20_000).len() + 20_000));
     assert_eq!(top_level_rust(&texts[1]), json!({"ok": []}));
 }
@@ -334,7 +335,7 @@ fn strict_loads_matches_python_values_and_error_texts() {
         texts.push(t.to_string());
     }
     texts.push("[".repeat(200_000));
-    texts.push("[".repeat(backends::MAX_DEPTH) + &"]".repeat(backends::MAX_DEPTH));
+    texts.push("[".repeat(pyjson::MAX_DEPTH) + &"]".repeat(pyjson::MAX_DEPTH));
     let (ok, errs) = compare_loads(&texts);
     eprintln!("strict loads: {} texts, {ok} values, {errs} error texts", texts.len());
     assert_eq!(backends::no_constant("NaN").unwrap_err().msg, "NaN is not a JSON number");
@@ -449,7 +450,7 @@ fn scanner_matches_python_on_every_short_input() {
     }
     let constant = |name: &str| Ok(json!(format!("C{name}")));
     let float = |text: &str| Ok(json!(format!("F{text}")));
-    let decoder = Decoder { parse_constant: &constant, parse_float: &float, object_pairs_hook: &backends::dict, max_depth: backends::MAX_DEPTH };
+    let decoder = Decoder { parse_constant: &constant, parse_float: &float, ..Decoder::default() };
     let mut compared = 0;
     for chunk in texts.chunks(100_000) {
         let py: Vec<Value> = serde_json::from_str(&python(RAW_DECODE_PY, &pyjson::dumps(&json!(chunk)))).unwrap();
@@ -1278,15 +1279,15 @@ fn reported_deviations_in_lean_catalogs() {
     let (py, rs) = lean("deviation-surrogate", "surrogate");
     assert!(py.report["files"]["model_catalog_json"].as_str().unwrap().contains("\\ud800"));
     assert!(rs.report["files"]["model_catalog_json"].as_str().unwrap().contains("\\ufffd"));
-    // RecursionError has no Exc kind: Python raises RecursionError, Rust reports it as TypeError
+    // both raise RecursionError
     let (py, rs) = lean("deviation-deep", "deep");
     assert_eq!(py.result["exc"], json!("RecursionError"));
-    assert_eq!(rs.result["exc"], json!("TypeError"));
+    assert_eq!(rs.result["exc"], json!("RecursionError"));
     assert_eq!(rs.result["msg"], json!("maximum recursion depth exceeded while decoding a JSON array from a unicode string"));
     assert_eq!((py.owner, py.tmp_left, rs.tmp_left), (rs.owner, json!({}), json!({})));
-    // a refreshed login nested deeper than Python 3.14 parses: both raise out of the call (RecursionError / TypeError)
+    // a refreshed login nested deeper than Python 3.14 parses: both raise RecursionError out of the call
     let (py, rs) = run_case(&codex_case("deviation-deep-login").env("FAKE_REFRESH", "deep"));
-    assert_eq!((py.result["exc"].as_str(), rs.result["exc"].as_str()), (Some("RecursionError"), Some("TypeError")));
+    assert_eq!((py.result["exc"].as_str(), rs.result["exc"].as_str()), (Some("RecursionError"), Some("RecursionError")));
     assert_eq!((py.owner, py.tmp_left, rs.tmp_left), (rs.owner, json!({}), json!({})));
 }
 

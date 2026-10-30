@@ -55,7 +55,7 @@ fn python(cases: &[Value]) -> Vec<String> {
 }
 
 fn type_name(e: &Error) -> String {
-    ringo_cli::rt::harness::type_name(e)
+    e.type_name().to_string()
 }
 
 fn result(r: Result<Value, Error>) -> String {

@@ -4,7 +4,7 @@
 #![cfg(unix)]
 
 use ringo_cli::rt::pipelines::{self as pl, NeedVerdicts, Replies};
-use ringo_cli::rt::{Error, pyjson};
+use ringo_cli::rt::{Error, Exc, pyjson};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,8 +21,8 @@ import pipelines as pl
 def cat(e):
     if isinstance(e, pl.NeedVerdicts):
         return 'NeedVerdicts'
-    for name, t in (('ValueError', ValueError), ('OSError', OSError), ('TypeError', (TypeError, AttributeError)),
-                    ('KeyError', KeyError)):
+    for name, t in (('ValueError', ValueError), ('OSError', OSError), ('TypeError', TypeError),
+                    ('AttributeError', AttributeError), ('KeyError', KeyError)):
         if isinstance(e, t):
             return name
     return type(e).__name__
@@ -101,7 +101,9 @@ fn python(cases: &[(String, Vec<Value>)]) -> Vec<String> {
 
 fn err_json(e: &Error) -> Value {
     let mut m = Map::new();
-    m.insert("err".into(), json!(e.exc.name()));
+    // the class cat() names: the first base it is an instance of, else its own
+    let bases = [Exc::Value, Exc::Os, Exc::Type, Exc::Attribute, Exc::Key];
+    m.insert("err".into(), json!(bases.into_iter().find(|b| e.is(*b)).unwrap_or(e.exc).name()));
     m.insert("msg".into(), json!(e.msg));
     if let Some(n) = NeedVerdicts::from_error(e) {
         m.insert("ids".into(), json!(n.ids));
@@ -552,8 +554,8 @@ print(json.dumps([runs(r'\w+'), runs(r'\s+'), runs(r'\d+'), cands]))
         }
         Value::Array(out)
     };
-    assert_eq!(runs(&format!("[{}]+", pl::WORD)), want[0], "\\w");
-    assert_eq!(runs(&format!("[{}]+", pl::SPACE)), want[1], "\\s");
+    assert_eq!(runs(&format!("[{}]+", ringo_cli::rt::py::WORD)), want[0], "\\w");
+    assert_eq!(runs(&format!("[{}]+", ringo_cli::rt::py::SPACE)), want[1], "\\s");
     assert_eq!(runs(r"\d+"), want[2], "\\d");
     let cands: Vec<char> = want[3].as_array().unwrap().iter().map(|c| st(c).chars().next().unwrap()).collect();
     eprintln!("case candidates: {}", cands.len());
@@ -1077,7 +1079,7 @@ fn plan_files_match_python() {
     let parses = python_parses(&docs);
     let mut skipped = 0;
     for (i, doc) in docs.iter().enumerate() {
-        if parses[i] && pyjson::loads(doc).is_err() {
+        if parses[i] && serde_json::from_str::<Value>(doc).is_err() {
             skipped += 1;
             continue;
         }

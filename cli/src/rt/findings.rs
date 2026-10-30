@@ -22,8 +22,7 @@ use std::sync::LazyLock;
 
 /// Characters per message.
 pub const MESSAGE: usize = 2500;
-const W: &str = r"\p{L}\p{N}_";
-const S: &str = r"\s\x1C-\x1F";
+use py::{SPACE as S, WORD as W};
 
 fn seg() -> String {
     format!(r"[{W}.@+\-\[\]]")
@@ -54,7 +53,6 @@ static FIELDS: LazyLock<HashMap<&'static str, Regex>> = LazyLock::new(|| {
         .map(|name| (name, re(&format!(r"(?m)^[{S}]*[-*][{S}]*\**{}\**[{S}]*:[{S}]*\**[{S}]*(.*?)[{S}]*\**[{S}]*$", ignorecase(name)))))
         .collect()
 });
-static DECIMAL: LazyLock<Regex> = LazyLock::new(|| re(r"\A\d\z"));
 
 fn re(pattern: &str) -> Regex {
     Regex::new(pattern).expect("a valid pattern")
@@ -87,25 +85,9 @@ fn int_digits(text: &str) -> Result<String> {
              sys.set_int_max_str_digits() to increase the limit"
         )));
     }
-    let ascii: String = text.chars().map(decimal_value).map(|d| char::from(b'0' + d)).collect();
+    let ascii: String = text.chars().map(|c| char::from(b'0' + py::decimal_digit(c).unwrap_or(0) as u8)).collect();
     let trimmed = ascii.trim_start_matches('0');
     Ok(if trimmed.is_empty() { "0".into() } else { trimmed.into() })
-}
-
-/// The value of a Unicode decimal digit: every run of them is made of whole 0..9 sequences, so it is the distance
-/// from the run's start, modulo 10.
-fn decimal_value(c: char) -> u8 {
-    if c.is_ascii_digit() {
-        return c as u8 - b'0';
-    }
-    let mut start = c as u32;
-    while let Some(prev) = start.checked_sub(1).and_then(char::from_u32) {
-        if !DECIMAL.is_match(prev.encode_utf8(&mut [0; 4])) {
-            break;
-        }
-        start -= 1;
-    }
-    ((c as u32 - start) % 10) as u8
 }
 
 /// A non-negative Python int kept as its digits (no leading zeros), ordered by value.
@@ -359,7 +341,7 @@ fn isdigit(c: char) -> bool {
         (0x24ff, 0x24ff), (0x2776, 0x277e), (0x2780, 0x2788), (0x278a, 0x2792), (0x10a40, 0x10a43),
         (0x10e60, 0x10e68), (0x11052, 0x1105a), (0x1f100, 0x1f10a),
     ];
-    DECIMAL.is_match(c.encode_utf8(&mut [0; 4])) || DIGITS.iter().any(|&(a, b)| (a..=b).contains(&(c as u32)))
+    py::decimal_digit(c).is_some() || DIGITS.iter().any(|&(a, b)| (a..=b).contains(&(c as u32)))
 }
 
 /// The ReviewBench agent-contract JSON object: {pr: {repo, pr_number, base, head}, agent, findings}. pr holds what
@@ -371,7 +353,7 @@ pub fn reviewbench(found: &[Map<String, Value>], pr: &Map<String, Value>, agent:
         && !s.is_empty()
         && s.chars().all(isdigit)
     {
-        if !s.chars().all(|c| DECIMAL.is_match(c.encode_utf8(&mut [0; 4]))) {
+        if !s.chars().all(|c| py::decimal_digit(c).is_some()) {
             return Err(Error::value(format!("invalid literal for int() with base 10: {}", py::repr(s))));
         }
         number = Line(int_digits(s)?).to_value();
