@@ -185,6 +185,7 @@ python3 ringo.py review --repo ../project --base BASE_SHA --head HEAD_SHA --pr-t
 python3 ringo.py review --input change.txt --backend codex-chatgpt --timeout 180
 python3 ringo.py design --input brief.md --out proposal.md
 python3 ringo.py work --spec task.json --out /ABSOLUTE/PATH/TO/new-run
+python3 ringo.py research --input brief.md --trace /ABSOLUTE/PATH/TO/new-trace --out /ABSOLUTE/PATH/TO/report.md
 python3 -m unittest discover -s tests -q
 ```
 
@@ -265,6 +266,59 @@ script or spec-test command means the interpreter running Ringo, so one spec run
 (writer-computed numbers for documents) is opt-in and not part of V3: it adds 1–2k tokens per document. Use it only
 for a document whose numbers must be computed.
 
+### Research
+
+`research` answers a brief from web sources that Ringo checks itself. It is new and unmeasured: nothing here
+claims it finds better sources, or costs fewer tokens, than asking a model directly.
+
+It makes at most two model calls, with no retry, repair or probe call (`--timeout` is a hard limit per call,
+default 600 seconds):
+1. **Gather.** One call on the `codex-search` preset: `codex-chatgpt` (ChatGPT login, API keys removed, read-only,
+   shell and other tools off) with live web search on (`codex --search exec`). A web search is the only tool item it
+   may contain; any other fails the call. It replies with one JSON line per source: the URL, the title, the date if
+   the page states one, and narrow claims, each with an exact quote copied from the page.
+2. **Verify**, in code, at no token cost. Ringo fetches every URL itself and accepts a quote only if it finds it
+   inside one passage of that URL's final page, after normalising whitespace, curly quotes and dashes. A match that
+   differs only in case is accepted and flagged. DOIs and arXiv ids in a URL or claim are looked up (doi.org, arXiv
+   abstract pages) and their titles compared with the claimed work.
+3. **Write.** One tool-free call (`--backend`, default `codex-chatgpt`; `claude` and `ollama:MODEL` also work) that
+   sees only the verified evidence and replies with JSON blocks naming evidence ids. Ringo numbers the citations,
+   writes the source list (address, retrieval time, content hash, signals and each quote), and checks that every
+   citation maps to verified evidence. A reply in the wrong form is rejected, and the verified evidence list is
+   written instead.
+
+Calls per outcome: a report, or a writer reply that fails or is rejected, 2; no verified source, a malformed search
+reply or a failed search call, 1; a search turn that made no web search, 1, reported as unavailable because its
+sources would come from the model's memory; a private brief without consent, or a Codex CLI without live search or
+without the features the preset turns off, 0. Research never falls back to an API key, to a model's own knowledge
+or to an agent turn.
+
+The fetcher accepts only http and https, refuses URLs with credentials, resolves each host and refuses loopback,
+private, link-local, multicast, reserved and cloud-metadata addresses (IPv4 addresses inside IPv6 forms too), checks
+again on every redirect, and connects only to addresses it checked. It sends no cookies, credentials or referrer and
+uses no proxy. Each job fetches at most 10 URLs, with 3 redirects each, 2 MiB transferred and 2 MiB decompressed per
+page, 10 seconds per fetch and 60 seconds in all, two at a time. A source is **verified** (a quote was found on its
+page), **not checkable** (a PDF, a paywall or login, a page with no extractable text, a redirect loop; listed as a
+limitation, never cited) or **dropped** (unreachable, blocked, oversized, or no quote found on that page; a quote
+found only on another page does not count). An identifier that does not exist, or names a different work, drops the
+source when it is in the URL and the claim when it is in the claim.
+
+"Verified" means the quoted text was on the page when Ringo fetched it. It does not mean the page is true, that the
+report's sentences follow from the quotes, or that the source is the best one. The final check covers evidence ids,
+eligibility, citations and structure; it cannot catch every sentence the evidence does not support. Review the
+claim-to-evidence support yourself for anything that matters.
+
+Primary sources are preferred by transparent rules on the address and page metadata, never by a quality score:
+standards bodies, resolver-confirmed DOIs and arXiv ids, scholarly repositories and scholarly page metadata,
+government and academic domains, and documentation hosts and paths rank first; aggregators and user-generated sites
+are labelled and rank last; other sources stay eligible in between. The same work at several addresses (the same
+final or canonical URL, the same content or the same confirmed identifier) is one citation.
+
+The brief is sent to a web search. A brief that holds a file path, a code block, a credential, an email address or a
+marker such as CONFIDENTIAL is refused unless you pass `--allow-private-search`. `--trace` and `--out` must be outside
+this checkout: the trace keeps the brief, both replies and a record of every fetch. The Rust `ringo` binary does not
+run research yet. The [research guide](docs/RESEARCH-ROLE.md) has the formats, bounds, rules and outcomes.
+
 ### Backends, findings and usage
 
 `review --findings-json FILE` also writes the findings as
@@ -275,7 +329,7 @@ Ringo as a ReviewBench reviewer image, so runs can be reproduced and scored with
 the benchmark's own judge. No ReviewBench result is claimed here.
 
 Backends include Claude Code, Codex, local Ollama and commands that read stdin.
-Every Codex backend (`codex`, `codex-chatgpt` and `codex:<command>`) runs with a
+Every Codex backend (`codex`, `codex-chatgpt`, `codex-search` and `codex:<command>`) runs with a
 private, per-call `CODEX_HOME` holding only a copy of your `auth.json` and an empty
 `HOME`, so your global Codex instructions (`~/.codex/AGENTS.md`), skills
 (`~/.codex/skills`, `~/.agents/skills`) and memories do not load in the child. A
