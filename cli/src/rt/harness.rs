@@ -3,15 +3,17 @@
 //! and `Leash`, which backends' `_wait` drives as `backends::Watch`), Codex and Claude reply parsing, the review and
 //! design tasks (`task`) and their command line (`main`).
 //!
-//! Python values keep their Python type where it reaches a record or a message: a number is a `Num` (an int or a
+//! Python values keep their Python type where it reaches a record or a message: a number is a `py::Num` (an int or a
 //! float: `soft_s: 900` and `900.0` differ in a record, `$1` and `$1.0` in a message), records and usage are
 //! insertion-ordered JSON objects, and the attributes Python code reads off an exception (`usage`, `raw`,
 //! `stdout`, `limit`) live in `Error.data` under the same names (see `attr`). Python ints are unbounded; here they
 //! are 128-bit, and a sum past that is an error.
 
-use super::backends::{self, Decoder, Isolated, JsonFail, Snapshot};
-use super::{py, pyjson, Error, Exc, Result};
-use serde_json::{Map, Number, Value};
+use super::backends::{self, Isolated, Snapshot};
+use super::pyjson::{Decoder, JsonFail};
+use super::py::{self, Num};
+use super::{pyjson, Error, Exc, Result};
+use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use super::pipelines;
 use std::collections::{HashMap, HashSet};
@@ -40,154 +42,9 @@ pub const EMPTY_LISTINGS: [((&str, &str), &str); 2] = [
 pub const TOKEN_KEYS: [&str; 4] = ["input", "cache_write", "cache_read", "output"];
 /// Every attempt is paid for, a failed one too.
 pub const PAID_STATUSES: [&str; 3] = ["ok", "malformed", "error"];
-#[cfg(not(unix))]
-const NATIVE_ONLY: &str = "the native runtime runs on macOS and Linux; on Windows ringo uses the Python runtime";
 
 // ---------------------------------------------------------------------------------------------------------------
 // Python numbers
-
-/// A Python number: an int stays an int and a float a float, as Python keeps them.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Num {
-    Int(i128),
-    Float(f64),
-}
-
-impl Num {
-    /// The number json.loads makes of a JSON number (None for any other value, and for an int past 128 bits).
-    pub fn from_value(v: &Value) -> Option<Num> {
-        let Value::Number(n) = v else { return None };
-        let s = n.as_str();
-        if is_float_text(s) { s.parse().ok().map(Num::Float) } else { s.parse().ok().map(Num::Int) }
-    }
-
-    /// The JSON value json.dumps writes for it (an infinity as Infinity; NaN has no JSON value here: null).
-    pub fn to_value(self) -> Value {
-        match self {
-            Num::Int(i) => Value::Number(Number::from_i128(i).expect("arbitrary_precision holds any i128")),
-            Num::Float(f) => float_value(f),
-        }
-    }
-
-    pub fn as_f64(self) -> f64 {
-        match self {
-            Num::Int(i) => i as f64,
-            Num::Float(f) => f,
-        }
-    }
-
-    /// `str(x)`.
-    pub fn py_str(self) -> String {
-        match self {
-            Num::Int(i) => i.to_string(),
-            Num::Float(f) => float_repr(f),
-        }
-    }
-
-    fn type_name(self) -> &'static str {
-        match self {
-            Num::Int(_) => "int",
-            Num::Float(_) => "float",
-        }
-    }
-
-    /// Python's comparison, exact between an int and a float (None when a NaN is involved).
-    pub fn py_cmp(self, other: Num) -> Option<Ordering> {
-        match (self, other) {
-            (Num::Int(a), Num::Int(b)) => Some(a.cmp(&b)),
-            (Num::Float(a), Num::Float(b)) => a.partial_cmp(&b),
-            (Num::Int(a), Num::Float(b)) => cmp_int_float(a, b),
-            (Num::Float(a), Num::Int(b)) => cmp_int_float(b, a).map(Ordering::reverse),
-        }
-    }
-
-    pub fn gt(self, other: Num) -> bool {
-        self.py_cmp(other) == Some(Ordering::Greater)
-    }
-
-    /// `max(self, other)`: other only when it is greater, as Python's max keeps the first of equals.
-    pub fn max(self, other: Num) -> Num {
-        if other.gt(self) { other } else { self }
-    }
-
-    /// `k * self` (an int past 128 bits saturates).
-    pub fn times(self, k: i128) -> Num {
-        match self {
-            Num::Int(i) => Num::Int(i.saturating_mul(k)),
-            Num::Float(f) => Num::Float(k as f64 * f),
-        }
-    }
-
-    /// `self + other` for ints and floats.
-    pub fn plus(self, other: Num) -> Result<Num> {
-        match (self, other) {
-            (Num::Int(a), Num::Int(b)) => a.checked_add(b).map(Num::Int).ok_or_else(too_big),
-            (a, b) => Ok(Num::Float(a.as_f64() + b.as_f64())),
-        }
-    }
-
-    /// `f'{x:.{prec}f}'` (an int is formatted as a float, as Python does; ties round to even).
-    pub fn format_f(self, prec: usize) -> String {
-        format!("{:.*}", prec, self.as_f64())
-    }
-}
-
-fn cmp_int_float(i: i128, f: f64) -> Option<Ordering> {
-    const TWO_127: f64 = 170141183460469231731687303715884105728.0;
-    if f.is_nan() {
-        return None;
-    }
-    if f >= TWO_127 {
-        return Some(Ordering::Less);
-    }
-    if f < -TWO_127 {
-        return Some(Ordering::Greater);
-    }
-    let t = f.trunc();
-    Some(match i.cmp(&(t as i128)) {
-        Ordering::Equal => (0.0).partial_cmp(&(f - t))?,
-        o => o,
-    })
-}
-
-fn too_big() -> Error {
-    Error::new(Exc::Value, "the native runtime keeps integers within 128 bits").with_data(type_data("OverflowError"))
-}
-
-fn is_float_text(s: &str) -> bool {
-    s.contains(['.', 'e', 'E'])
-}
-
-/// A float as the JSON value json.dumps writes for it.
-fn float_value(f: f64) -> Value {
-    if f.is_finite() {
-        return pyjson::float_value(f);
-    }
-    if f.is_nan() {
-        return Value::Null;
-    }
-    let text = if f > 0.0 { "1e400" } else { "-1e400" }; // overflows to the infinity, so pyjson writes Infinity
-    Value::Number(text.parse().expect("a JSON number"))
-}
-
-/// `repr(float)`.
-fn float_repr(f: f64) -> String {
-    if f.is_nan() {
-        "nan".into()
-    } else if f.is_infinite() {
-        if f > 0.0 { "inf".into() } else { "-inf".into() }
-    } else {
-        pyjson::float(f)
-    }
-}
-
-/// `round(x, ndigits)` for a float: correctly rounded, ties to even.
-pub fn py_round(x: f64, ndigits: usize) -> f64 {
-    if !x.is_finite() {
-        return x;
-    }
-    format!("{x:.ndigits$}").parse().expect("a formatted float parses")
-}
 
 /// `round(x)` of a float as the int's decimal digits.
 fn round_int(f: f64) -> Result<String> {
@@ -195,7 +52,7 @@ fn round_int(f: f64) -> Result<String> {
         return Err(Error::value("cannot convert float NaN to integer"));
     }
     if f.is_infinite() {
-        return Err(Error::new(Exc::Type, "cannot convert float infinity to integer").with_data(type_data("OverflowError")));
+        return Err(Error::new(Exc::Overflow, "cannot convert float infinity to integer"));
     }
     let s = format!("{:.0}", f.round_ties_even());
     Ok(if s == "-0" { "0".into() } else { s })
@@ -217,102 +74,9 @@ fn group_thousands(digits: &str) -> String {
 // ---------------------------------------------------------------------------------------------------------------
 // Python values: type names, truth, str()
 
-/// `type(x).__name__` of the object json.loads makes of a value.
-fn type_of(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "NoneType",
-        Value::Bool(_) => "bool",
-        Value::Number(n) if is_float_text(n.as_str()) => "float",
-        Value::Number(_) => "int",
-        Value::String(_) => "str",
-        Value::Array(_) => "list",
-        Value::Object(_) => "dict",
-    }
-}
-
-/// `bool(x)`.
-fn truthy(v: &Value) -> bool {
-    match v {
-        Value::Null => false,
-        Value::Bool(b) => *b,
-        Value::Number(_) => match Num::from_value(v) {
-            Some(Num::Int(i)) => i != 0,
-            Some(Num::Float(f)) => f != 0.0,
-            None => true, // an int past 128 bits is not zero
-        },
-        Value::String(s) => !s.is_empty(),
-        Value::Array(a) => !a.is_empty(),
-        Value::Object(m) => !m.is_empty(),
-    }
-}
-
-/// `str(x)` of the object json.loads makes of a value. Strings inside containers use `py::repr`.
-pub fn py_str(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        other => py_repr(other),
-    }
-}
-
-fn py_repr(v: &Value) -> String {
-    match v {
-        Value::Null => "None".into(),
-        Value::Bool(true) => "True".into(),
-        Value::Bool(false) => "False".into(),
-        Value::Number(n) => {
-            let s = n.as_str();
-            if is_float_text(s) {
-                float_repr(s.parse().unwrap_or(f64::NAN))
-            } else if s == "-0" {
-                "0".into()
-            } else {
-                s.into()
-            }
-        }
-        Value::String(s) => py::repr(s),
-        Value::Array(a) => format!("[{}]", a.iter().map(py_repr).collect::<Vec<_>>().join(", ")),
-        Value::Object(m) => {
-            let items: Vec<String> = m.iter().map(|(k, x)| format!("{}: {}", py::repr(k), py_repr(x))).collect();
-            format!("{{{}}}", items.join(", "))
-        }
-    }
-}
-
-/// `json.loads(text)` with Python's default hooks: NaN and the infinities parse (NaN, which serde_json cannot
-/// hold, as null); nesting past backends::MAX_DEPTH is a RecursionError, as Python's is past its stack limit.
-fn loads_default(text: &str) -> std::result::Result<Value, JsonFail> {
-    fn constant(name: &str) -> Result<Value> {
-        Ok(float_value(match name {
-            "NaN" => f64::NAN,
-            "-Infinity" => f64::NEG_INFINITY,
-            _ => f64::INFINITY,
-        }))
-    }
-    fn float(text: &str) -> Result<Value> {
-        text.parse::<f64>().map(float_value).map_err(|_| Error::value(format!("could not convert string to float: {}", py::repr(text))))
-    }
-    Decoder { parse_constant: &constant, parse_float: &float, object_pairs_hook: &backends::dict, max_depth: backends::MAX_DEPTH }
-        .loads(text)
-}
-
-/// A json.loads failure as the exception Python raises: a ValueError, or a RecursionError (which only
-/// `except Exception` catches).
-fn json_failure(fail: JsonFail, text: &str) -> Error {
-    match fail {
-        JsonFail::Recursion { .. } => {
-            let e = fail.into_error(text);
-            Error::new(Exc::Type, e.msg).with_data(type_data("RecursionError"))
-        }
-        other => other.into_error(text),
-    }
-}
-
 /// A non-negative JSON int (`type(value) is int and value >= 0`).
 fn nonneg_int(v: Option<&Value>) -> Option<i128> {
-    match v {
-        Some(Value::Number(n)) if !is_float_text(n.as_str()) => n.as_str().parse::<i128>().ok().filter(|i| *i >= 0),
-        _ => None,
-    }
+    v.and_then(py::int_of).filter(|i| *i >= 0)
 }
 
 /// What Python adds a value as: a number (a bool as its int, `True + 0 == 1`), or, for anything else, the type
@@ -322,8 +86,8 @@ type Operand = std::result::Result<Num, &'static str>;
 fn operand(v: &Value) -> Result<Operand> {
     match v {
         Value::Bool(b) => Ok(Ok(Num::Int(*b as i128))),
-        Value::Number(_) => Num::from_value(v).map(Ok).ok_or_else(too_big),
-        _ => Ok(Err(type_of(v))),
+        Value::Number(_) => Num::from_value(v).map(Ok).ok_or_else(py::too_big),
+        _ => Ok(Err(py::type_name(v))),
     }
 }
 
@@ -349,7 +113,7 @@ fn py_sum(values: &[Operand]) -> Result<Num> {
     let mut total = Num::Int(0);
     for v in it.by_ref() {
         match (total, *v) {
-            (Num::Int(t), Ok(Num::Int(b))) => total = Num::Int(t.checked_add(b).ok_or_else(too_big)?),
+            (Num::Int(t), Ok(Num::Int(b))) => total = Num::Int(t.checked_add(b).ok_or_else(py::too_big)?),
             (_, x) => {
                 total = add_operand(total, x, "+")?;
                 break;
@@ -409,83 +173,8 @@ pub fn attr<'e>(err: &'e Error, name: &str) -> Option<&'e Value> {
     err.data.as_ref()?.get(name).filter(|v| !v.is_null())
 }
 
-fn type_data(name: &str) -> Value {
-    let mut data = Map::new();
-    data.insert("type".into(), Value::String(name.into()));
-    Value::Object(data)
-}
-
-/// `type(exc).__name__`, as records and messages print it: an OSError is named by its errno as Python names the
-/// subclass it raises (FileNotFoundError, PermissionError, ...), and `Error.data["type"]` names a class `Exc` has
-/// no variant for (UnicodeDecodeError, AttributeError, OverflowError).
-pub fn type_name(err: &Error) -> String {
-    if let Some(Value::String(t)) = err.data.as_ref().and_then(|d| d.get("type")) {
-        return t.clone();
-    }
-    if err.exc == Exc::Os
-        && let Some(name) = errno_of(&err.msg).and_then(os_subclass) {
-            return name.into();
-        }
-    err.exc.name().into()
-}
-
-fn errno_of(msg: &str) -> Option<i32> {
-    msg.strip_prefix("[Errno ")?.split(']').next()?.parse().ok()
-}
-
-#[cfg(unix)]
-fn os_subclass(errno: i32) -> Option<&'static str> {
-    use libc::*;
-    Some(match errno {
-        EAGAIN | EALREADY | EINPROGRESS => "BlockingIOError",
-        e if e == EWOULDBLOCK => "BlockingIOError",
-        ECHILD => "ChildProcessError",
-        EPIPE | ESHUTDOWN => "BrokenPipeError",
-        ECONNABORTED => "ConnectionAbortedError",
-        ECONNREFUSED => "ConnectionRefusedError",
-        ECONNRESET => "ConnectionResetError",
-        EEXIST => "FileExistsError",
-        ENOENT => "FileNotFoundError",
-        EISDIR => "IsADirectoryError",
-        ENOTDIR => "NotADirectoryError",
-        EINTR => "InterruptedError",
-        EACCES | EPERM => "PermissionError",
-        ESRCH => "ProcessLookupError",
-        ETIMEDOUT => "TimeoutError",
-        _ => return None,
-    })
-}
-
-#[cfg(not(unix))]
-fn os_subclass(_errno: i32) -> Option<&'static str> {
-    None
-}
-
 fn key_error(key: &str) -> Error {
     Error::new(Exc::Key, py::repr(key))
-}
-
-/// `bytes.decode('utf-8')`: the UnicodeDecodeError Python raises names the bytes and the reason.
-fn decode_utf8(bytes: Vec<u8>) -> Result<String> {
-    String::from_utf8(bytes).map_err(|e| {
-        let bytes = e.as_bytes();
-        let err = e.utf8_error();
-        let at = err.valid_up_to();
-        let first = bytes[at];
-        let (end, reason) = if matches!(first, 0x80..=0xc1 | 0xf5..=0xff) {
-            (at, "invalid start byte")
-        } else if let Some(n) = err.error_len() {
-            (at + n - 1, "invalid continuation byte")
-        } else {
-            (bytes.len() - 1, "unexpected end of data")
-        };
-        let what = if end == at {
-            format!("byte 0x{first:02x} in position {at}")
-        } else {
-            format!("bytes in position {at}-{end}")
-        };
-        Error::value(format!("'utf-8' codec can't decode {what}: {reason}")).with_data(type_data("UnicodeDecodeError"))
-    })
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -596,7 +285,7 @@ pub fn claude_usage(reply: &Map<String, Value>) -> Map<String, Value> {
         _ => &empty,
     };
     let tokens = |key: &str| match u.get(key) {
-        Some(v @ Value::Number(n)) if !is_float_text(n.as_str()) && (!n.as_str().starts_with('-') || n.as_str() == "-0") => {
+        Some(v @ Value::Number(n)) if !py::is_float_text(n.as_str()) && (!n.as_str().starts_with('-') || n.as_str() == "-0") => {
             v.clone()
         }
         _ => Value::from(0),
@@ -756,11 +445,11 @@ pub fn empty_listing(item: &Map<String, Value>) -> Result<bool> {
     let key = EMPTY_LISTINGS.iter().find(|((s, t), _)| server == *s && tool == *t).map(|(_, k)| *k);
     let result = item.get("result");
     let Some(key) = key else { return Ok(false) };
-    if item.get("error").is_some_and(truthy) {
+    if item.get("error").is_some_and(py::truthy) {
         return Ok(false);
     }
     let Some(Value::Object(result)) = result else { return Ok(false) };
-    if result.get("structured_content").is_some_and(truthy) {
+    if result.get("structured_content").is_some_and(py::truthy) {
         return Ok(false);
     }
     let Some(Value::Array(content)) = result.get("content") else { return Ok(false) };
@@ -770,9 +459,9 @@ pub fn empty_listing(item: &Map<String, Value>) -> Result<bool> {
         Some(Value::String(s)) => s,
         Some(_) => return Ok(false), // json.loads of a non-str: TypeError, caught
     };
-    let listed = match loads_default(text) {
+    let listed = match Decoder::default().loads(text) {
         Ok(v) => v,
-        Err(JsonFail::Recursion { what }) => return Err(json_failure(JsonFail::Recursion { what }, text)),
+        Err(f @ JsonFail::Recursion { .. }) => return Err(f.into_error(text)),
         Err(_) => return Ok(false), // ValueError, caught
     };
     Ok(matches!(&listed, Value::Object(m) if m.len() == 1 && matches!(m.get(key), Some(Value::Array(a)) if a.is_empty())))
@@ -780,7 +469,7 @@ pub fn empty_listing(item: &Map<String, Value>) -> Result<bool> {
 
 /// The type name of a value Python cannot hash (a list or a dict).
 fn unhashable(v: &Value) -> Option<&'static str> {
-    matches!(v, Value::Array(_) | Value::Object(_)).then(|| type_of(v))
+    matches!(v, Value::Array(_) | Value::Object(_)).then(|| py::type_name(v))
 }
 
 /// Text and reported tokens from a single native Codex JSONL turn; price stays unknown. Fails closed (CallError)
@@ -827,12 +516,12 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
                 (1, tokens("cache_write_input_tokens")),
                 (3, tokens("output_tokens")),
             ] {
-                tok[k] = tok[k].checked_add(add).ok_or_else(too_big)?;
+                tok[k] = tok[k].checked_add(add).ok_or_else(py::too_big)?;
             }
         }
         if kind.is_some_and(|k| k == "item.completed")
             && let Some(Value::Object(item)) = event.get("item") {
-                let item_type = py_str(item.get("type").unwrap_or(&Value::Null));
+                let item_type = py::value_str(item.get("type").unwrap_or(&Value::Null));
                 match items.iter_mut().find(|(k, _)| *k == item_type) {
                     Some((_, n)) => *n += 1,
                     None => items.push((item_type.clone(), 1)),
@@ -840,7 +529,7 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
                 if item_type == "agent_message" && let Some(Value::String(text)) = item.get("text") {
                     messages.push(text.clone());
                 } else if item_type == "error" {
-                    let message = py_str(item.get("message").unwrap_or(&Value::String(String::new())));
+                    let message = py::value_str(item.get("message").unwrap_or(&Value::String(String::new())));
                     warnings.push(Value::String(py::head(&message, 300).into()));
                 } else if TOOL_ITEMS.contains(&item_type.as_str())
                     && !tools.contains(&item_type)
@@ -855,10 +544,10 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
         }
         if let Some(Value::String(k)) = kind
             && (k == "error" || k == "turn.failed") {
-                let message = event.get("message").filter(|v| truthy(v));
+                let message = event.get("message").filter(|v| py::truthy(v));
                 let detail = message.or_else(|| event.get("error"));
-                match detail.filter(|v| truthy(v)) {
-                    Some(d) => reasons.push(format!("{k}: {}", py::head(&py_str(d), 200))),
+                match detail.filter(|v| py::truthy(v)) {
+                    Some(d) => reasons.push(format!("{k}: {}", py::head(&py::value_str(d), 200))),
                     None => reasons.push(k.clone()),
                 }
             }
@@ -913,7 +602,7 @@ pub fn stop_reason(exc: &Error, watch: Option<&dyn backends::Watch>) -> Option<&
     if exc.exc == Exc::Stopped {
         return Some("person");
     }
-    if watch.is_some() && exc.is(Exc::Timeout) && attr(exc, "limit").is_some_and(truthy) {
+    if watch.is_some() && exc.is(Exc::Timeout) && attr(exc, "limit").is_some_and(py::truthy) {
         return Some("limit");
     }
     None
@@ -994,231 +683,15 @@ fn pstr(p: &Path) -> String {
     p.to_string_lossy().into_owned()
 }
 
-fn os_err(e: &std::io::Error, p: &Path) -> Error {
-    Error::os(py::os_error(e, Some(&pstr(p))))
-}
-
-/// `Path(p)` as pathlib normalises it: repeated and trailing separators and `.` parts dropped (exactly two
-/// leading slashes kept), '' as '.'.
-pub fn py_path(p: &Path) -> PathBuf {
-    let s = pstr(p);
-    let root = if !s.starts_with('/') {
-        ""
-    } else if s.starts_with("//") && !s.starts_with("///") {
-        "//"
-    } else {
-        "/"
-    };
-    let parts: Vec<&str> = s.split('/').filter(|x| !x.is_empty() && *x != ".").collect();
-    let out = format!("{root}{}", parts.join("/"));
-    PathBuf::from(if out.is_empty() { ".".to_string() } else { out })
-}
-
-/// `base / name`.
-fn join(base: &Path, name: &str) -> PathBuf {
-    py_path(&base.join(name))
-}
-
-/// `Path.parent`.
-fn py_parent(p: &Path) -> PathBuf {
-    match p.parent() {
-        None => p.to_path_buf(),
-        Some(q) if q.as_os_str().is_empty() => PathBuf::from("."),
-        Some(q) => q.to_path_buf(),
-    }
-}
-
-/// `Path.write_text` / `write_bytes`: created or truncated, 0o666 less the umask.
-fn write_file(path: &Path, data: &[u8]) -> Result<()> {
-    let mut f = fs::File::create(path).map_err(|e| os_err(&e, path))?;
-    f.write_all(data).map_err(Error::from)
-}
-
-/// `os.replace(src, dst)`.
-fn replace(src: &Path, dst: &Path) -> Result<()> {
-    fs::rename(src, dst).map_err(|e| {
-        Error::os(format!("{}: {} -> {}", py::os_error(&e, None), py::repr(&pstr(src)), py::repr(&pstr(dst))))
-    })
-}
-
-/// `Path.mkdir(mode, parents, exist_ok)`.
-#[cfg(unix)]
-fn mkdir(path: &Path, mode: u32, parents: bool, exist_ok: bool) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    match fs::DirBuilder::new().mode(mode).create(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let parent = py_parent(path);
-            if !parents || parent == path {
-                return Err(os_err(&e, path));
-            }
-            mkdir(&parent, 0o777, true, true)?;
-            mkdir(path, mode, false, exist_ok)
-        }
-        Err(e) => {
-            if !exist_ok || !path.is_dir() {
-                Err(os_err(&e, path))
-            } else {
-                Ok(())
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-fn mkdir(_path: &Path, _mode: u32, _parents: bool, _exist_ok: bool) -> Result<()> {
-    Err(Error::os(NATIVE_ONLY))
-}
-
 #[cfg(unix)]
 fn chmod(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| os_err(&e, path))
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|e| py::path_error(&e, path))
 }
 
 #[cfg(not(unix))]
 fn chmod(_path: &Path, _mode: u32) -> Result<()> {
-    Err(Error::os(NATIVE_ONLY))
-}
-
-/// `os.path.normpath` (lexical: `..` removes the part before it).
-fn normpath(s: &str) -> String {
-    let slashes = if !s.starts_with('/') {
-        0
-    } else if s.starts_with("//") && !s.starts_with("///") {
-        2
-    } else {
-        1
-    };
-    let mut parts: Vec<&str> = Vec::new();
-    for comp in s.split('/') {
-        if comp.is_empty() || comp == "." {
-            continue;
-        }
-        if comp != ".." || (slashes == 0 && parts.is_empty()) || parts.last() == Some(&"..") {
-            parts.push(comp);
-        } else if !parts.is_empty() {
-            parts.pop();
-        }
-    }
-    let out = format!("{}{}", "/".repeat(slashes), parts.join("/"));
-    if out.is_empty() { ".".into() } else { out }
-}
-
-/// `os.path.abspath`.
-fn abspath(p: &Path) -> Result<PathBuf> {
-    let full = if p.is_absolute() { p.to_path_buf() } else { std::env::current_dir()?.join(p) };
-    Ok(PathBuf::from(normpath(&pstr(&full))))
-}
-
-/// `tempfile.mkdtemp(prefix=prefix)`: a new 0700 folder in the first usable candidate of $TMPDIR, $TEMP, $TMP,
-/// /tmp, /var/tmp, /usr/tmp and the working folder, named prefix plus eight random characters.
-#[cfg(unix)]
-fn mkdtemp(prefix: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let mut dirs: Vec<PathBuf> = ["TMPDIR", "TEMP", "TMP"]
-        .iter()
-        .filter_map(|k| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from))
-        .collect();
-    dirs.extend(["/tmp", "/var/tmp", "/usr/tmp"].map(PathBuf::from));
-    dirs.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-    let mut seed = nanos ^ ((std::process::id() as u64) << 32) ^ COUNTER.fetch_add(1, AtomicOrdering::Relaxed).wrapping_mul(0x9e3779b97f4a7c15);
-    for dir in &dirs {
-        let dir = abspath(dir)?;
-        for _ in 0..100 {
-            let name: String = (0..8)
-                .map(|_| {
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    b"abcdefghijklmnopqrstuvwxyz0123456789_"[(seed % 37) as usize] as char
-                })
-                .collect();
-            let path = dir.join(format!("{prefix}{name}"));
-            match fs::DirBuilder::new().mode(0o700).create(&path) {
-                Ok(()) => return abspath(&path),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(_) => break,
-            }
-        }
-    }
-    let listed: Vec<String> = dirs.iter().map(|d| py::repr(&pstr(d))).collect();
-    Err(Error::os(format!("[Errno 2] No usable temporary directory found in [{}]", listed.join(", "))))
-}
-
-#[cfg(not(unix))]
-fn mkdtemp(_prefix: &str) -> Result<PathBuf> {
-    Err(Error::os(NATIVE_ONLY))
-}
-
-/// `os.path.realpath(path)` (strict=False), as Python 3.14 resolves it: absolute, symbolic links resolved as far
-/// as they exist, `..` applied to the resolved path; a component that cannot be examined, and a symlink loop,
-/// stay as they are.
-#[cfg(unix)]
-pub fn realpath(path: &Path) -> Result<PathBuf> {
-    use std::ffi::OsString;
-    use std::os::unix::ffi::{OsStrExt, OsStringExt};
-    let filename = path.as_os_str().as_bytes();
-    let split = |b: &[u8]| -> Vec<Option<Vec<u8>>> { b.split(|c| *c == b'/').rev().map(|p| Some(p.to_vec())).collect() };
-    let mut rest = split(filename);
-    let mut part_count = rest.len();
-    let mut path: Vec<u8> =
-        if filename.starts_with(b"/") { b"/".to_vec() } else { std::env::current_dir()?.into_os_string().into_vec() };
-    let mut seen: HashMap<Vec<u8>, Option<Vec<u8>>> = HashMap::new();
-    while part_count > 0 {
-        let Some(name) = rest.pop().expect("a part") else {
-            let link = rest.pop().expect("the link").expect("a path");
-            seen.insert(link, Some(path.clone()));
-            continue;
-        };
-        part_count -= 1;
-        if name.is_empty() || name == b"." {
-            continue;
-        }
-        if name == b".." {
-            let i = path.iter().rposition(|c| *c == b'/').unwrap_or(0);
-            path = if i == 0 { b"/".to_vec() } else { path[..i].to_vec() };
-            continue;
-        }
-        let mut newpath = path.clone();
-        if path != b"/" {
-            newpath.push(b'/');
-        }
-        newpath.extend_from_slice(&name);
-        let os = PathBuf::from(OsString::from_vec(newpath.clone()));
-        let is_link = fs::symlink_metadata(&os).is_ok_and(|m| m.file_type().is_symlink());
-        if !is_link {
-            path = newpath;
-            continue;
-        }
-        if let Some(resolved) = seen.get(&newpath) {
-            path = resolved.clone().unwrap_or(newpath); // None: a symlink loop, left unresolved
-            continue;
-        }
-        let Ok(target) = fs::read_link(&os) else {
-            path = newpath;
-            continue;
-        };
-        let target = target.into_os_string().into_vec();
-        if target.starts_with(b"/") {
-            path = b"/".to_vec();
-        }
-        seen.insert(newpath.clone(), None);
-        rest.push(Some(newpath));
-        rest.push(None);
-        let parts = split(&target);
-        part_count += parts.len();
-        rest.extend(parts);
-    }
-    Ok(PathBuf::from(OsString::from_vec(path)))
-}
-
-#[cfg(not(unix))]
-pub fn realpath(_path: &Path) -> Result<PathBuf> {
-    Err(Error::os(NATIVE_ONLY))
+    Err(Error::os(crate::rt::NATIVE_ONLY))
 }
 
 /// Sensitive runtime artifacts belong outside this public repository: the resolved path, or a ValueError when it
@@ -1230,9 +703,9 @@ pub fn outside_repo(path: &Path, what: &str) -> Result<PathBuf> {
 /// outside_repo against the given roots: Python's are harness.py's folder and, in a pinned release, the
 /// checkout root (`sys._ringo_release['checkout_root']`).
 pub fn outside_repo_in(path: &Path, what: &str, roots: &[PathBuf]) -> Result<PathBuf> {
-    let p = realpath(path)?;
+    let p = py::realpath(path)?;
     for root in roots {
-        let r = realpath(root)?;
+        let r = py::realpath(root)?;
         if p == r || p.starts_with(&r) {
             return Err(Error::value(format!(
                 "keep the {what} outside the repository (checkout and runtime bundle); it holds private material"
@@ -1245,10 +718,10 @@ pub fn outside_repo_in(path: &Path, what: &str, roots: &[PathBuf]) -> Result<Pat
 /// Atomically replace folder/state.json: the small run state an agent waits on (`ringo.py wait`) and reads
 /// instead of the trace or logs.
 pub fn write_state(folder: &Path, state: &Value) -> Result<()> {
-    let path = join(folder, "state.json");
-    let tmp = join(&py_parent(&path), &format!(".state.{}.{}.tmp", std::process::id(), thread_ident()));
-    write_file(&tmp, format!("{}\n", pyjson::dumps_compact(state)).as_bytes())?;
-    replace(&tmp, &path)
+    let path = py::join(folder, "state.json");
+    let tmp = py::join(&py::parent(&path), &format!(".state.{}.{}.tmp", std::process::id(), thread_ident()));
+    py::write_file(&tmp, format!("{}\n", pyjson::dumps_compact(state)).as_bytes())?;
+    py::replace(&tmp, &path)
 }
 
 #[cfg(unix)]
@@ -1311,19 +784,19 @@ impl Run {
                 return Err(Error::value(format!("{label} must be a finite, non-negative number")));
             }
         }
-        let trace = trace_dir.filter(|p| !p.as_os_str().is_empty()).map(py_path);
+        let trace = trace_dir.filter(|p| !p.as_os_str().is_empty()).map(py::path);
         if let Some(t) = &trace {
             if fs::metadata(t).is_ok() {
-                let mut entries = fs::read_dir(t).map_err(|e| os_err(&e, t))?;
+                let mut entries = fs::read_dir(t).map_err(|e| py::path_error(&e, t))?;
                 if let Some(entry) = entries.next() {
-                    entry.map_err(|e| os_err(&e, t))?;
+                    entry.map_err(|e| py::path_error(&e, t))?;
                     return Err(Error::value("the trace folder must be new or empty"));
                 }
             }
             // Private from creation (umask can only narrow 0700), not tightened afterwards: it holds the material.
-            mkdir(t, 0o700, true, true)?;
+            py::mkdir(t, 0o700, true, true)?;
             chmod(t, 0o700)?;
-            mkdir(&join(t, "steps"), 0o700, false, false)?; // exclusive creation also refuses concurrent trace writers
+            py::mkdir(&py::join(t, "steps"), 0o700, false, false)?; // exclusive creation also refuses concurrent trace writers
         }
         let run = Run {
             trace,
@@ -1388,15 +861,14 @@ impl Run {
         let usage = rec.get("usage");
         let fields = match usage {
             Some(Value::Object(m)) => Some(m),
-            Some(v) if truthy(v) => {
-                return Err(Error::new(Exc::Type, format!("'{}' object has no attribute 'get'", type_of(v)))
-                    .with_data(type_data("AttributeError")));
+            Some(v) if py::truthy(v) => {
+                return Err(Error::new(Exc::Attribute, format!("'{}' object has no attribute 'get'", py::type_name(v))));
             }
             _ => None,
         };
         let zero = Value::from(0);
         for (i, k) in TOKEN_KEYS.iter().enumerate() {
-            let x = fields.and_then(|m| m.get(*k)).filter(|v| truthy(v)).unwrap_or(&zero);
+            let x = fields.and_then(|m| m.get(*k)).filter(|v| py::truthy(v)).unwrap_or(&zero);
             t.tokens[i] = py_add(t.tokens[i], x, "+=")?;
         }
         if matches!(rec.get("status"), Some(Value::String(s)) if PAID_STATUSES.contains(&s.as_str())) {
@@ -1412,8 +884,8 @@ impl Run {
             }
         }
         let Some(trace) = &self.trace else { return Ok(()) };
-        let path = join(trace, "trace.jsonl");
-        let mut f = fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| os_err(&e, &path))?;
+        let path = py::join(trace, "trace.jsonl");
+        let mut f = fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| py::path_error(&e, &path))?;
         f.write_all(format!("{}\n", pyjson::dumps(&Value::Object(rec.clone()))).as_bytes())?;
         drop(f);
         t.last = Value::Object(
@@ -1421,15 +893,15 @@ impl Run {
         );
         self.write_state(&t, "running", &[])?;
         if reply.is_some() || raw.is_some_and(|r| !r.is_empty()) {
-            let step = py_str(rec.get("step").ok_or_else(|| key_error("step"))?);
-            let attempt = py_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?);
-            let steps = join(trace, "steps");
+            let step = py::value_str(rec.get("step").ok_or_else(|| key_error("step"))?);
+            let attempt = py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?);
+            let steps = py::join(trace, "steps");
             if let Some(reply) = reply {
-                write_file(&join(&steps, &format!("{step}.{attempt}.txt")), reply.as_bytes())?;
+                py::write_file(&py::join(&steps, &format!("{step}.{attempt}.txt")), reply.as_bytes())?;
             }
             if let Some(raw) = raw.filter(|r| !r.is_empty()) {
                 let bytes = raw.as_bytes();
-                write_file(&join(&steps, &format!("{step}.{attempt}.raw.txt")), &bytes[..bytes.len().min(RAW_LIMIT)])?;
+                py::write_file(&py::join(&steps, &format!("{step}.{attempt}.raw.txt")), &bytes[..bytes.len().min(RAW_LIMIT)])?;
             }
         }
         Ok(())
@@ -1457,11 +929,11 @@ impl Run {
         let mut t = lock(&self.totals);
         if t.incident_dir.is_none() {
             if let Some(trace) = &self.trace {
-                let dir = join(trace, "incidents");
+                let dir = py::join(trace, "incidents");
                 t.incident_dir = Some(dir.clone()); // set before the mkdir, as in Python
-                mkdir(&dir, 0o700, false, true)?;
+                py::mkdir(&dir, 0o700, false, true)?;
             } else {
-                t.incident_dir = Some(mkdtemp("ringo-incidents-")?);
+                t.incident_dir = Some(py::mkdtemp("ringo-incidents-")?);
             }
         }
         Ok(t.incident_dir.clone().expect("set above"))
@@ -1480,8 +952,8 @@ impl Run {
         state.insert("version".into(), Value::from(1));
         state.insert("status".into(), Value::String(status.into()));
         state.insert("pid".into(), Value::from(std::process::id()));
-        state.insert("started".into(), float_value(py_round(self.started, 3)));
-        state.insert("updated".into(), float_value(py_round(now(), 3)));
+        state.insert("started".into(), pyjson::float_value(py::round(self.started, 3)));
+        state.insert("updated".into(), pyjson::float_value(py::round(now(), 3)));
         state.insert("last".into(), t.last.clone());
         state.extend(summary_of(t));
         for (k, v) in extra {
@@ -1500,7 +972,7 @@ impl Run {
 fn summary_of(t: &Totals) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("calls".into(), Value::from(t.calls));
-    m.insert("cost_usd".into(), float_value(py_round(t.cost, 6)));
+    m.insert("cost_usd".into(), pyjson::float_value(py::round(t.cost, 6)));
     m.insert("unpriced_calls".into(), Value::from(t.unpriced));
     m.insert("untokened_calls".into(), Value::from(t.untokened));
     m.insert("admission_refusals".into(), Value::from(t.admission_refusals));
@@ -1572,7 +1044,7 @@ impl Watch {
     pub fn soft(&self, elapsed: f64, snapshot: Snapshot) {
         if let Err(exc) = self.check(elapsed, &snapshot) {
             // the call itself must never fail because its watch did
-            print_stderr(&format!("ringo: {}: soft-limit check failed: {}: {}", self.label, type_name(&exc), exc.msg));
+            print_stderr(&format!("ringo: {}: soft-limit check failed: {}: {}", self.label, exc.type_name(), exc.msg));
         }
     }
 
@@ -1584,15 +1056,15 @@ impl Watch {
         let soft_started = Instant::now();
         let folder = self.run.incident_folder()?;
         let name = format!("{}.{}", self.label, self.attempt);
-        let (path, decision) = (join(&folder, &format!("{name}.json")), join(&folder, &format!("{name}.decision")));
+        let (path, decision) = (py::join(&folder, &format!("{name}.json")), py::join(&folder, &format!("{name}.decision")));
         let (stdout, stderr) = snapshot()?;
         let lines: Vec<&str> = py::splitlines(&stdout, false).into_iter().filter(|l| !py::strip(l).is_empty()).collect();
         let events: Vec<Value> = lines
             .iter()
-            .map(|line| match loads_default(line) {
+            .map(|line| match Decoder::default().loads(line) {
                 Ok(Value::Object(m)) => Ok(m.get("type").cloned().unwrap_or(Value::Null)),
                 Ok(_) => Ok(Value::Null), // AttributeError: no .get
-                Err(JsonFail::Recursion { what }) => Err(json_failure(JsonFail::Recursion { what }, line)),
+                Err(f @ JsonFail::Recursion { .. }) => Err(f.into_error(line)),
                 Err(_) => Ok(Value::Null),
             })
             .collect::<Result<_>>()?;
@@ -1613,7 +1085,7 @@ impl Watch {
         incident.insert("backend".into(), Value::String(self.backend.name.clone()));
         incident.insert("soft_s".into(), self.soft_s.to_value());
         incident.insert("limit_s".into(), self.limit_s.to_value());
-        incident.insert("elapsed_s".into(), float_value(py_round(elapsed, 1)));
+        incident.insert("elapsed_s".into(), pyjson::float_value(py::round(elapsed, 1)));
         incident.insert("checks".into(), Value::Object(checks));
         for key in ["probe", "diagnosis", "decision"] {
             incident.insert(key.into(), Value::Null);
@@ -1692,11 +1164,11 @@ impl Watch {
         ));
         while !self.done.wait(Some(Duration::from_secs(1))) {
             let Ok(bytes) = fs::read(&decision) else { continue };
-            let answer = py::strip(&decode_utf8(bytes)?).to_lowercase();
+            let answer = py::strip(&py::decode_utf8(bytes)?).to_lowercase();
             if answer == "stop" || answer == "wait" {
                 let after = elapsed + soft_started.elapsed().as_secs_f64();
                 incident.insert("decision".into(), Value::String(answer.clone()));
-                incident.insert("decided_after_s".into(), float_value(py_round(after, 1)));
+                incident.insert("decided_after_s".into(), pyjson::float_value(py::round(after, 1)));
                 self.publish(&incident);
                 self.write(&path, &incident)?;
                 if answer == "stop" {
@@ -1711,8 +1183,8 @@ impl Watch {
     fn write(&self, path: &Path, incident: &Map<String, Value>) -> Result<()> {
         // path.with_suffix('.tmp'): the incident path always ends in .json
         let tmp = PathBuf::from(format!("{}.tmp", pstr(path).strip_suffix(".json").unwrap_or(&pstr(path))));
-        write_file(&tmp, pyjson::dumps_indent(&Value::Object(incident.clone()), 1).as_bytes())?;
-        replace(&tmp, path)
+        py::write_file(&tmp, pyjson::dumps_indent(&Value::Object(incident.clone()), 1).as_bytes())?;
+        py::replace(&tmp, path)
     }
 }
 
@@ -1903,42 +1375,42 @@ pub fn call(backend: &Backend, system: &str, message: &str, timeout_s: Num, mode
         let kw = Isolated { watch, ..Isolated::default() };
         return backends::run_isolated(&argv, &format!("{system}\n\n{message}"), timeout, kw).map(|out| (out, None));
     }
-    let folder = mkdtemp("ringo-system-")?; // created 0700; removed after the call
-    let path = join(&folder, "system.txt");
-    let ran = write_file(&path, system.as_bytes()).and_then(|()| {
+    let folder = py::mkdtemp("ringo-system-")?; // created 0700; removed after the call
+    let path = py::join(&folder, "system.txt");
+    let ran = py::write_file(&path, system.as_bytes()).and_then(|()| {
         let mut full = argv.clone();
         full.extend(["--system-prompt-file".to_string(), pstr(&path), "--output-format".into(), "json".into()]);
         let subscription_auth = backend.subscription_auth.unwrap_or(false);
         backends::run_isolated(&full, message, timeout, Isolated { subscription_auth, watch, ..Isolated::default() })
     });
-    let _ = fs::remove_dir_all(&folder);
+    let _ = py::rmtree(&folder);
     let out = match ran {
         Ok(out) => out,
         Err(exc) if exc.is(Exc::Judge) => {
             // a failed call may still have reported its cost
             let stdout = attr(&exc, "stdout").and_then(Value::as_str).filter(|s| !s.is_empty()).unwrap_or("null").to_string();
-            match loads_default(&stdout) {
+            match Decoder::default().loads(&stdout) {
                 Ok(Value::Object(reply)) => {
                     let raw = attr(&exc, "stdout").and_then(Value::as_str).map(str::to_string);
                     return Err(call_error(exc.msg, Some(Value::Object(claude_usage(&reply))), raw));
                 }
-                Err(JsonFail::Recursion { what }) => return Err(json_failure(JsonFail::Recursion { what }, &stdout)),
+                Err(f @ JsonFail::Recursion { .. }) => return Err(f.into_error(&stdout)),
                 _ => return Err(exc),
             }
         }
         Err(exc) => return Err(exc),
     };
-    let reply = match loads_default(&out) {
+    let reply = match Decoder::default().loads(&out) {
         Ok(v) => v,
-        Err(JsonFail::Recursion { what }) => return Err(json_failure(JsonFail::Recursion { what }, &out)),
+        Err(f @ JsonFail::Recursion { .. }) => return Err(f.into_error(&out)),
         Err(_) => return Err(call_error("claude did not return JSON", None, Some(out))),
     };
     let Value::Object(reply) = reply else {
-        return Err(call_error(format!("claude returned {}, not an object", type_of(&reply)), None, Some(out)));
+        return Err(call_error(format!("claude returned {}, not an object", py::type_name(&reply)), None, Some(out)));
     };
     let result = reply.get("result");
-    if reply.get("is_error").is_some_and(truthy) || !matches!(result, Some(Value::String(_))) {
-        let shown = py_str(result.unwrap_or(&Value::Null));
+    if reply.get("is_error").is_some_and(py::truthy) || !matches!(result, Some(Value::String(_))) {
+        let shown = py::value_str(result.unwrap_or(&Value::Null));
         return Err(call_error(
             format!("claude reported an error: {}", py::head(&shown, 200)),
             Some(Value::Object(claude_usage(&reply))),
@@ -1951,7 +1423,7 @@ pub fn call(backend: &Backend, system: &str, message: &str, timeout_s: Num, mode
 
 /// `f'{type(exc).__name__}: {exc}'`.
 fn described(e: &Error) -> String {
-    format!("{}: {}", type_name(e), e.msg)
+    format!("{}: {}", e.type_name(), e.msg)
 }
 
 /// One tiny recorded call to the same backend, so a running call's silence can be told apart from a backend
@@ -1971,14 +1443,14 @@ pub fn probe(run: &Arc<Run>, backend: &Backend, label: &str, call_fn: Option<&Ca
     rec.insert("step".into(), Value::String(format!("{label}.probe")));
     rec.insert("attempt".into(), Value::from(1));
     rec.insert("backend".into(), Value::String(backend.name.clone()));
-    rec.insert("started".into(), float_value(now()));
+    rec.insert("started".into(), pyjson::float_value(now()));
     run.record(&with(&rec, &[("status", "started".into())]), None, None)?; // so an interrupted probe is visible
     let t0 = Instant::now();
     let watch: Option<Arc<dyn backends::Watch>> =
         Some(Arc::new(Leash::new(stop.cloned().unwrap_or_default(), PROBE_TIMEOUT_S)));
     match f.call(backend, "", PROBE_MESSAGE, PROBE_TIMEOUT_S, None, watch) {
-        Err(exc) if !backends::is_keyboard_interrupt(&exc) => {
-            let seconds = float_value(py_round(t0.elapsed().as_secs_f64(), 1));
+        Err(exc) if !exc.is(Exc::KeyboardInterrupt) => {
+            let seconds = pyjson::float_value(py::round(t0.elapsed().as_secs_f64(), 1));
             let text = described(&exc);
             run.record(
                 &with(&rec, &[
@@ -1997,7 +1469,7 @@ pub fn probe(run: &Arc<Run>, backend: &Backend, label: &str, call_fn: Option<&Ca
         }
         Err(exc) => Err(exc),
         Ok((text, usage)) => {
-            let seconds = float_value(py_round(t0.elapsed().as_secs_f64(), 1));
+            let seconds = pyjson::float_value(py::round(t0.elapsed().as_secs_f64(), 1));
             let usage = usage.unwrap_or(Value::Null);
             run.record(&with(&rec, &[("status", "ok".into()), ("usage", usage.clone()), ("seconds", seconds.clone())]), Some(&text), None)?;
             out.insert("status".into(), "ok".into());
@@ -2076,7 +1548,7 @@ impl Plan<'_> {
 
     fn attempts(&self, label: &str, p: &Value, message: &str) -> Result<String> {
         let mut last: Option<Error> = None; // the earlier attempt's error, reported if the retry cannot start
-        let pass_id = py_str(p.get("id").unwrap_or(&Value::Null));
+        let pass_id = py::value_str(p.get("id").unwrap_or(&Value::Null));
         for attempt in [1i64, 2] {
             let reserved = if self.stop.is_set() {
                 Err(budget_exceeded("run stopped after another pass failed"))
@@ -2100,7 +1572,7 @@ impl Plan<'_> {
             rec.insert("backend".into(), Value::String(backend.name.clone()));
             rec.insert("system_sha256".into(), Value::String(sha(&self.system)));
             rec.insert("message_sha256".into(), Value::String(sha(message)));
-            rec.insert("started".into(), float_value(now()));
+            rec.insert("started".into(), pyjson::float_value(now()));
             let mut watch: Option<Arc<Watch>> = None;
             if accepts_watch(self.call_fn) {
                 // timeout_s is soft: probe and ask past it, stop at the limit
@@ -2113,7 +1585,7 @@ impl Plan<'_> {
             }
             self.run.record(&with(&rec, &[("status", "started".into())]), None, None)?;
             let t0 = Instant::now();
-            let seconds = || float_value(py_round(t0.elapsed().as_secs_f64(), 3));
+            let seconds = || pyjson::float_value(py::round(t0.elapsed().as_secs_f64(), 3));
             let model = p.get("model").and_then(Value::as_str);
             let as_watch = watch.clone().map(|w| w as Arc<dyn backends::Watch>);
             let (text, usage) = match self.call_fn.call(&backend, &self.system, message, self.timeout_s, model, as_watch) {
@@ -2128,7 +1600,7 @@ impl Plan<'_> {
                     self.run.record(&with(&rec, &[("status", "fatal".into()), ("error", Value::String(described(&exc))), ("seconds", seconds())]), None, None)?;
                     return Err(exc);
                 }
-                Err(exc) if backends::is_keyboard_interrupt(&exc) => {
+                Err(exc) if exc.is(Exc::KeyboardInterrupt) => {
                     let usage = attr(&exc, "usage").cloned().unwrap_or(Value::Null);
                     self.run.record(&with(&rec, &[("status", "error".into()), ("error", Value::String(described(&exc))), ("usage", usage), ("seconds", seconds())]), None, None)?;
                     return Err(exc);
@@ -2145,7 +1617,7 @@ impl Plan<'_> {
                     if let Some(s) = stopped {
                         fields.push(("stopped", Value::from(s)));
                     }
-                    let raw = attr(&exc, "raw").filter(|r| truthy(r)).or_else(|| attr(&exc, "stdout")).map(py_str);
+                    let raw = attr(&exc, "raw").filter(|r| py::truthy(r)).or_else(|| attr(&exc, "stdout")).map(py::value_str);
                     self.run.record(&with(&rec, &fields), None, raw.as_deref())?;
                     let retried = exc.is(Exc::Judge) || exc.is(Exc::Value) || exc.is(Exc::Timeout);
                     if attempt == 2 || stopped == Some("limit") || !retried {
@@ -2216,9 +1688,9 @@ impl Plan<'_> {
     }
 
     fn step(&self, p: &Value) -> Result<()> {
-        let id = py_str(p.get("id").unwrap_or(&Value::Null));
+        let id = py::value_str(p.get("id").unwrap_or(&Value::Null));
         if let Some(when) = p.get("when") {
-            let when = py_str(when);
+            let when = py::value_str(when);
             let skip = lock(&self.skipped).contains(&when) || {
                 let replies = lock(&self.replies);
                 let reply = replies.get(&when).ok_or_else(|| key_error(&when))?;
@@ -2292,7 +1764,7 @@ pub fn run_plan(
         failures: Mutex::new(Vec::new()),
     };
     let passes = plan.get("passes").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
-    if passes.iter().any(|p| p.get("model").is_some_and(truthy) && state.spec_for(p).style != "claude") {
+    if passes.iter().any(|p| p.get("model").is_some_and(py::truthy) && state.spec_for(p).style != "claude") {
         return Err(Error::value("a per-pass model needs a claude-style backend"));
     }
     let role = plan.get("role").and_then(Value::as_str).unwrap_or("");
@@ -2319,7 +1791,7 @@ pub fn run_plan(
     };
     // ask the checker once more, then fail
     let checker = passes.iter().find(|p| pass_field(p, "reply") == "verdicts").expect("a NeedVerdicts plan has a checker");
-    let checker_id = py_str(checker.get("id").unwrap_or(&Value::Null));
+    let checker_id = py::value_str(checker.get("id").unwrap_or(&Value::Null));
     let request = pipelines::repair_request(plan, checker, &lock(&state.replies), &need);
     let extra = state.one(&format!("{checker_id}.repair"), checker, &request)?;
     {
@@ -2364,23 +1836,14 @@ fn given(v: &Option<String>) -> Option<&str> {
     v.as_deref().filter(|s| !s.is_empty())
 }
 
-/// `Path(p).read_text(encoding='utf-8')`: strict UTF-8, universal newlines; a folder is IsADirectoryError.
+/// `Path(p).read_text(encoding='utf-8')`.
 fn read_text(path: &str) -> Result<String> {
-    let p = py_path(Path::new(path));
-    let mut f = fs::File::open(&p).map_err(|e| os_err(&e, &p))?;
-    #[cfg(unix)]
-    if f.metadata().is_ok_and(|m| m.is_dir()) {
-        return Err(os_err(&std::io::Error::from_raw_os_error(libc::EISDIR), &p));
-    }
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut f, &mut bytes)?;
-    let text = decode_utf8(bytes)?;
-    Ok(if text.contains('\r') { text.replace("\r\n", "\n").replace('\r', "\n") } else { text })
+    py::read_text(Path::new(path))
 }
 
 /// `Path(p).write_text(text, encoding='utf-8')`.
 fn write_text(path: &str, text: &str) -> Result<()> {
-    write_file(&py_path(Path::new(path)), text.as_bytes())
+    py::write_file(&py::path(Path::new(path)), text.as_bytes())
 }
 
 /// Review material built from a repository (context.rs); the PR text file, if any, is read as UTF-8.
@@ -2400,7 +1863,7 @@ pub fn findings_pr(args: &Args) -> Result<Map<String, Value>> {
     let pr = match given(&args.rb_pr_json) {
         Some(p) => {
             let text = read_text(p)?;
-            loads_default(&text).map_err(|f| json_failure(f, &text))?
+            Decoder::default().loads(&text).map_err(|f| f.into_error(&text))?
         }
         None => Value::Object(Map::new()),
     };
@@ -2408,10 +1871,10 @@ pub fn findings_pr(args: &Args) -> Result<Map<String, Value>> {
     if let Some(repo) = given(&args.repo) {
         for (key, rev) in [("base", &args.base), ("head", &args.head)] {
             let full = super::context::commit(Path::new(repo), rev.as_deref().unwrap_or(""), key)?;
-            if let Some(v) = pr.get(key).filter(|v| truthy(v))
+            if let Some(v) = pr.get(key).filter(|v| py::truthy(v))
                 && *v != Value::String(full.clone())
             {
-                return Err(Error::value(format!("--rb-pr-json {key} {} is not --{key} {full}", py_str(v))));
+                return Err(Error::value(format!("--rb-pr-json {key} {} is not --{key} {full}", py::value_str(v))));
             }
             pr.insert(key.into(), Value::String(full));
         }
@@ -2430,7 +1893,7 @@ pub fn write_findings(args: &Args, text: &str, run: &Run) -> Result<Map<String, 
     let data = format!("{}\n", pyjson::dumps_indent(&super::findings::reviewbench(&kept, &args.findings_pr, &args.agent)?, 1));
     write_text(args.findings_json.as_deref().unwrap_or(""), &data)?;
     if let Some(trace) = &run.trace {
-        write_file(&join(trace, "findings.json"), data.as_bytes())?;
+        py::write_file(&py::join(trace, "findings.json"), data.as_bytes())?;
     }
     let mut out = Map::new();
     out.insert("findings_written".into(), Value::from(kept.len()));
@@ -2451,9 +1914,7 @@ pub fn config_hash(plan: &Value) -> String {
 /// The errors task reports as a failed run (Python's `except (JudgeError, ValueError, OSError, TimeoutExpired,
 /// BudgetExceeded, NeedVerdicts)`); anything else ends the run as interrupted.
 fn reported(e: &Error) -> bool {
-    !backends::is_keyboard_interrupt(e)
-        && [Exc::Judge, Exc::Value, Exc::Os, Exc::Timeout, Exc::Budget, Exc::NeedVerdicts].iter().any(|k| e.is(*k))
-        && e.data.as_ref().and_then(|d| d.get("type")).is_none_or(|t| t == "UnicodeDecodeError")
+    [Exc::Judge, Exc::Value, Exc::Os, Exc::Timeout, Exc::Budget, Exc::NeedVerdicts].iter().any(|k| e.is(*k))
 }
 
 /// A review or design task: exit code 0 (done), 2 (cannot start, failed, or cannot write the result) or 130
@@ -2493,7 +1954,7 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
         let mut implementation = identity.as_object().cloned().unwrap_or_default();
         implementation.insert("plan_sha256".into(), Value::String(plan_sha));
         let override_path = match given(&args.pipeline) {
-            Some(p) => Value::String(pstr(&realpath(Path::new(p))?)),
+            Some(p) => Value::String(pstr(&py::realpath(Path::new(p))?)),
             None => Value::Null,
         };
         implementation.insert("pipeline_override".into(), override_path);
@@ -2510,23 +1971,23 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
             return Err(Error::value("--max-cost needs --unpriced-call-usd for attempts that report no cost, including timeouts"));
         }
         for out in [given(&args.out), given(&args.findings_json)].into_iter().flatten() {
-            let p = py_path(Path::new(out));
-            fs::OpenOptions::new().append(true).create(true).open(&p).map_err(|e| os_err(&e, &p))?;
+            let p = py::path(Path::new(out));
+            fs::OpenOptions::new().append(true).create(true).open(&p).map_err(|e| py::path_error(&e, &p))?;
         }
         if given(&args.findings_json).is_some() {
             args.findings_pr = findings_pr(args)?;
         }
-        let price = |v: Option<f64>| v.map(|f| if f.is_nan() { Value::String("nan".into()) } else { float_value(f) });
+        let price = |v: Option<f64>| v.map(|f| if f.is_nan() { Value::String("nan".into()) } else { pyjson::float_value(f) });
         let r = Arc::new(Run::new(given(&args.trace).map(Path::new), price(args.max_cost).as_ref(), price(args.unpriced_call_usd).as_ref())?);
         run = Some(Arc::clone(&r));
         if let Some(trace) = &r.trace {
-            write_file(&join(trace, "material.txt"), material.as_bytes())?; // as sent, on every OS
-            write_file(&join(trace, "plan.json"), pyjson::dumps_indent(&plan, 1).as_bytes())?;
+            py::write_file(&py::join(trace, "material.txt"), material.as_bytes())?; // as sent, on every OS
+            py::write_file(&py::join(trace, "plan.json"), pyjson::dumps_indent(&plan, 1).as_bytes())?;
             let mut chosen = Map::new();
             chosen.insert("backend".into(), names["backend"].clone());
             chosen.insert("checker_backend".into(), names["checker_backend"].clone());
-            write_file(&join(trace, "backends.json"), pyjson::dumps_indent(&Value::Object(chosen), 1).as_bytes())?;
-            write_file(&join(trace, "implementation.json"), pyjson::dumps_indent(&names["implementation"], 1).as_bytes())?;
+            py::write_file(&py::join(trace, "backends.json"), pyjson::dumps_indent(&Value::Object(chosen), 1).as_bytes())?;
+            py::write_file(&py::join(trace, "implementation.json"), pyjson::dumps_indent(&names["implementation"], 1).as_bytes())?;
         }
         Ok((plan, material, b, c, names))
     })();
@@ -2571,14 +2032,14 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
     };
     let stats = stats.as_object().cloned().unwrap_or_default();
     let mut summary = summary_of(&[&stats, &names]);
-    summary.insert("elapsed_s".into(), float_value(started.elapsed().as_nanos() as f64 / 1e9));
+    summary.insert("elapsed_s".into(), pyjson::float_value(started.elapsed().as_nanos() as f64 / 1e9));
     let written = (|| -> Result<()> {
         if given(&args.findings_json).is_some() {
             summary.extend(write_findings(args, &text, &run)?);
         }
         if let Some(trace) = &run.trace {
-            write_file(&join(trace, "result.md"), format!("{text}\n").as_bytes())?;
-            write_file(&join(trace, "summary.json"), pyjson::dumps_indent(&Value::Object(summary.clone()), 1).as_bytes())?;
+            py::write_file(&py::join(trace, "result.md"), format!("{text}\n").as_bytes())?;
+            py::write_file(&py::join(trace, "summary.json"), pyjson::dumps_indent(&Value::Object(summary.clone()), 1).as_bytes())?;
         }
         match given(&args.out) {
             Some(out) => write_text(out, &format!("{text}\n"))?,
@@ -2599,10 +2060,10 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
     print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
     if let Some(trace) = &run.trace {
         let result = match given(&args.out) {
-            Some(out) => pstr(&realpath(Path::new(out)).unwrap_or_else(|_| PathBuf::from(out))),
-            None => pstr(&join(trace, "result.md")),
+            Some(out) => pstr(&py::realpath(Path::new(out)).unwrap_or_else(|_| PathBuf::from(out))),
+            None => pstr(&py::join(trace, "result.md")),
         };
-        let _ = run.state("done", &[("result", Value::String(result)), ("summary", Value::String(pstr(&join(trace, "summary.json"))))]);
+        let _ = run.state("done", &[("result", Value::String(result)), ("summary", Value::String(pstr(&py::join(trace, "summary.json"))))]);
     }
     0
 }
@@ -2610,7 +2071,7 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
 /// An exception task does not handle: Python's traceback ends with `<type>: <message>`, the exit status is 1 (130
 /// for Ctrl-C, which also marks a traced run interrupted).
 fn uncaught(exc: &Error, run: Option<&Run>) -> i32 {
-    if backends::is_keyboard_interrupt(exc) {
+    if exc.is(Exc::KeyboardInterrupt) {
         if let Some(r) = run {
             let _ = r.state("interrupted", &[]);
         }
@@ -2704,7 +2165,7 @@ enum Exit {
 
 /// `shutil.get_terminal_size().columns`: $COLUMNS, else stdout's terminal, else 80.
 fn columns() -> usize {
-    if let Some(c) = std::env::var("COLUMNS").ok().and_then(|v| py::strip(&v).parse::<i64>().ok()).filter(|c| *c > 0) {
+    if let Some(c) = std::env::var("COLUMNS").ok().and_then(|v| py::int(&v)).filter(|c| *c > 0) {
         return c as usize;
     }
     #[cfg(unix)]
@@ -2807,7 +2268,7 @@ impl Formatter {
         };
         let text = help.unwrap_or("");
         if !py::strip(text).is_empty() {
-            let lines = textwrap(&collapse(text), help_width);
+            let lines = py::textwrap::wrap(&collapse(text), help_width as i64, "", "");
             if let Some((first, rest)) = lines.split_first() {
                 out.push_str(&format!("{}{first}\n", " ".repeat(indent_first)));
                 for line in rest {
@@ -2824,81 +2285,6 @@ impl Formatter {
 /// argparse's `_whitespace_matcher.sub(' ', text).strip()` (ASCII whitespace).
 fn collapse(text: &str) -> String {
     text.split(|c: char| c.is_ascii_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
-}
-
-static WORDSEP: LazyLock<fancy_regex::Regex> = LazyLock::new(|| {
-    let ws = r"[\t\n\x0b\x0c\r ]";
-    let nws = r"[^\t\n\x0b\x0c\r ]";
-    let wp = r#"[\p{L}\p{N}_!"'&.,?]"#;
-    let lt = r"[\p{L}\p{Nl}\p{No}_]";
-    fancy_regex::Regex::new(&format!(
-        r"({ws}+|(?<={wp})-{{2,}}(?=[\p{{L}}\p{{N}}_])|{nws}+?(?:-(?:(?<={lt}{{2}}-)|(?<={lt}-{lt}-))(?={lt}-?{lt})|(?={ws}|\z)|(?<={wp})(?=-{{2,}}[\p{{L}}\p{{N}}_])))"
-    ))
-    .expect("a valid pattern")
-});
-
-/// `textwrap.wrap(text, width)` for argparse's collapsed help text (break_on_hyphens, break_long_words,
-/// drop_whitespace; no tabs or sentence fixing).
-fn textwrap(text: &str, width: usize) -> Vec<String> {
-    let mut chunks: Vec<String> = Vec::new();
-    let mut at = 0;
-    for m in WORDSEP.find_iter(text).flatten() {
-        if m.start() > at {
-            chunks.push(text[at..m.start()].to_string());
-        }
-        if !m.as_str().is_empty() {
-            chunks.push(m.as_str().to_string());
-        }
-        at = m.end();
-    }
-    if at < text.len() {
-        chunks.push(text[at..].to_string());
-    }
-    chunks.reverse();
-    let blank = |c: &str| py::strip(c).is_empty();
-    let mut lines: Vec<String> = Vec::new();
-    while !chunks.is_empty() {
-        let (mut cur, mut cur_len): (Vec<String>, usize) = (vec![], 0);
-        if !lines.is_empty() && chunks.last().is_some_and(|c| blank(c)) {
-            chunks.pop();
-        }
-        while let Some(c) = chunks.last() {
-            let l = py::len(c);
-            if cur_len + l <= width {
-                cur_len += l;
-                cur.push(chunks.pop().expect("a chunk"));
-            } else {
-                break;
-            }
-        }
-        if let Some(chunk) = chunks.last().filter(|c| py::len(c) > width).cloned() {
-            // _handle_long_word
-            let space_left = if width < 1 { 1 } else { width.saturating_sub(cur_len) };
-            if space_left > 0 {
-                let mut end = space_left;
-                if py::len(&chunk) > space_left {
-                    let head: Vec<char> = chunk.chars().take(space_left).collect();
-                    if let Some(h) = head.iter().rposition(|&c| c == '-')
-                        && h > 0
-                        && head[..h].iter().any(|&c| c != '-')
-                    {
-                        end = h + 1;
-                    }
-                }
-                cur.push(py::head(&chunk, end).to_string());
-                *chunks.last_mut().expect("a chunk") = py::slice(&chunk, end, py::len(&chunk)).to_string();
-            } else if cur.is_empty() {
-                cur.push(chunks.pop().expect("a chunk"));
-            }
-        }
-        if cur.last().is_some_and(|c| blank(c)) {
-            cur.pop();
-        }
-        if !cur.is_empty() {
-            lines.push(cur.concat());
-        }
-    }
-    lines
 }
 
 fn opt_usage(o: &Opt) -> String {
@@ -2939,7 +2325,7 @@ fn top_help(prog: &str) -> String {
         .unwrap_or(0);
     let help_position = (longest + 2).min(f.max_help_position);
     let mut out = f.usage(prog, &["[-h]".to_string()], &["{review,design} ...".to_string()]);
-    out.push_str(&format!("{}\n\n", textwrap(&collapse("Run a Ringo review or design pipeline."), f.width.max(11)).join("\n")));
+    out.push_str(&format!("{}\n\n", py::textwrap::wrap(&collapse("Run a Ringo review or design pipeline."), f.width.max(11) as i64, "", "").join("\n")));
     out.push_str("positional arguments:\n");
     out.push_str(&f.action(2, header, None, help_position));
     for (name, help) in CHOICES {
@@ -2967,42 +2353,6 @@ fn sub_help(prog: &str, opts: &[Opt]) -> String {
 fn parser_error(usage: String, prog: &str, message: &str) -> Exit {
     let usage = usage.trim_end_matches('\n');
     Exit::Error(format!("{usage}\n{prog}: error: {message}\n"))
-}
-
-/// Python's `float(text)` for an option value: Python's whitespace stripped, underscores only between digits,
-/// the inf and nan words (ASCII digits only; Python also reads other Unicode decimal digits).
-fn arg_float(text: &str) -> Option<f64> {
-    let t = py::strip(text);
-    let chars: Vec<char> = t.chars().collect();
-    let ok = chars.iter().enumerate().all(|(i, &c)| {
-        c != '_' || (i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit())
-    });
-    if !ok || !t.is_ascii() {
-        return None;
-    }
-    t.chars().filter(|&c| c != '_').collect::<String>().parse().ok()
-}
-
-/// Python's `int(text)` for an option value (sign, ASCII digits, underscores between digits, at most 4300 digits);
-/// past i64 it saturates (Python's ints are unbounded; a budget that large is no limit either way).
-fn arg_int(text: &str) -> Option<i64> {
-    let t = py::strip(text);
-    let (sign, digits) = match t.strip_prefix('-') {
-        Some(d) => (-1i128, d),
-        None => (1, t.strip_prefix('+').unwrap_or(t)),
-    };
-    let chars: Vec<char> = digits.chars().collect();
-    let ok = !chars.is_empty()
-        && chars.iter().enumerate().all(|(i, &c)| {
-            c.is_ascii_digit() || (c == '_' && i > 0 && i + 1 < chars.len() && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit())
-        });
-    let cleaned: String = chars.into_iter().filter(|&c| c != '_').collect();
-    if !ok || cleaned.len() > 4300 {
-        return None;
-    }
-    let significant = cleaned.trim_start_matches('0');
-    let value = if significant.is_empty() { 0 } else { significant.parse::<i128>().unwrap_or(i128::MAX) };
-    Some((sign * value).clamp(i64::MIN as i128, i64::MAX as i128) as i64)
 }
 
 static NEGATIVE: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\A-\.?\d").expect("a valid pattern"));
@@ -3145,8 +2495,8 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
                 };
                 let bad = |what: &str| parser_error(usage(), &sub, &format!("argument {name}: invalid {what} value: {}", py::repr(&value)));
                 match o.kind {
-                    Kind::Int if arg_int(&value).is_none() => return Err(bad("int")),
-                    Kind::Float if arg_float(&value).is_none() => return Err(bad("float")),
+                    Kind::Int if py::int(&value).is_none() => return Err(bad("int")),
+                    Kind::Float if py::float(&value).is_err() => return Err(bad("float")),
                     _ => {}
                 }
                 values.insert(o.dest, value);
@@ -3168,7 +2518,7 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
         base: get("base"),
         head: get("head"),
         pr_text: get("pr_text"),
-        context_budget: get("context_budget").and_then(|v| arg_int(&v)),
+        context_budget: get("context_budget").and_then(|v| py::int(&v)),
         findings_json: get("findings_json"),
         rb_pr_json: get("rb_pr_json"),
         agent: get("agent").unwrap_or_else(|| if review { "ringo".into() } else { String::new() }),
@@ -3177,9 +2527,9 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
         pipeline: get("pipeline"),
         out: get("out"),
         trace: get("trace"),
-        max_cost: get("max_cost").and_then(|v| arg_float(&v)),
-        unpriced_call_usd: get("unpriced_call_usd").and_then(|v| arg_float(&v)),
-        timeout: get("timeout").and_then(|v| arg_float(&v)).map_or(TIMEOUT_S, Num::Float),
+        max_cost: get("max_cost").and_then(|v| py::float(&v).ok()),
+        unpriced_call_usd: get("unpriced_call_usd").and_then(|v| py::float(&v).ok()),
+        timeout: get("timeout").and_then(|v| py::float(&v).ok()).map_or(TIMEOUT_S, Num::Float),
         max_calls: get("max_calls"),
         findings_pr: Map::new(),
         command,
@@ -3254,15 +2604,6 @@ mod tests {
     }
 
     #[test]
-    fn paths_normalise_as_pathlib_and_posixpath() {
-        for (raw, want) in [("a//b/./c/", "a/b/c"), ("//a", "//a"), ("///a", "/a"), ("", "."), ("./", ".")] {
-            assert_eq!(py_path(Path::new(raw)), PathBuf::from(want), "{raw}");
-        }
-        assert_eq!(normpath("/a/../../b/./c/.."), "/b");
-        assert_eq!(normpath("../a/.."), "..");
-    }
-
-    #[test]
     fn numbers_compare_and_print_as_python() {
         assert!(Num::Float(2.5).gt(Num::Int(2)));
         assert!(!Num::Int(3).gt(Num::Float(3.0)));
@@ -3271,6 +2612,5 @@ mod tests {
         assert_eq!(group_thousands("-1234567"), "-1,234,567");
         assert_eq!(round_int(2.5).unwrap(), "2");
         assert_eq!(round_int(-0.4).unwrap(), "0");
-        assert_eq!(py_round(0.0078125, 6), 0.007812);
     }
 }

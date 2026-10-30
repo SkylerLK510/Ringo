@@ -4,7 +4,8 @@
 #![cfg(unix)]
 
 use ringo_cli::rt::workflow::{self as wf, difflib};
-use ringo_cli::rt::harness::{Backend, CallFn, Num};
+use ringo_cli::rt::harness::{Backend, CallFn};
+use ringo_cli::rt::py::Num;
 use ringo_cli::rt::{pyjson, Error};
 use serde_json::{json, Map, Value};
 use std::io::Write;
@@ -245,7 +246,7 @@ fn python_with(function: &str, cases: &[Value], flags: &[&str]) -> Vec<String> {
 fn enc(result: Result<Value, Error>) -> String {
     match result {
         Ok(v) => pyjson::dumps(&json!({ "ok": v })),
-        Err(e) => pyjson::dumps(&json!({ "err": [wf::exc_name(&e), e.msg] })),
+        Err(e) => pyjson::dumps(&json!({ "err": [e.type_name(), e.msg] })),
     }
 }
 
@@ -370,7 +371,7 @@ fn mutate(r: &mut Rng, text: &str) -> String {
 
 fn strict_rust(case: &Value) -> String {
     match wf::strict_json(s(&case[0])) {
-        Err(e) if wf::exc_name(&e) == "UnicodeEncodeError" => enc(Ok(json!({ "__surrogate__": true }))),
+        Err(e) if e.type_name() == "UnicodeEncodeError" => enc(Ok(json!({ "__surrogate__": true }))),
         other => enc(other),
     }
 }
@@ -419,13 +420,13 @@ fn strict_json_nesting_limits_match_python() {
     cases.push(json!([format!("[{}]", "1,".repeat(1000) + "1")]));
     gate("strict_kind", &cases, |case| {
         enc(wf::strict_json(s(&case[0])).map(|v| {
-            wf::dispose(v);
+            pyjson::dispose(v);
             json!("ok")
         }))
     });
     let deep = |text: &str| match wf::strict_json(text) {
         Ok(v) => {
-            wf::dispose(v); // a recursive drop of a value this deep would overflow the stack
+            pyjson::dispose(v); // a recursive drop of a value this deep would overflow the stack
             false
         }
         Err(e) => e.msg == "JSON nesting exceeds the parser limit",
@@ -587,7 +588,7 @@ fn json_protocol_parse_matches_python() {
     // The known deviation: Python keeps a lone surrogate outside file text (here the rationale); Rust refuses it.
     let e = wf::strict_json(r#"{"files": {"a.py": "x", "b.py": ""}, "rationale": "\ud800"}"#).unwrap_err();
     let want = "'utf-8' codec can't encode character '\\ud800' in position 0: surrogates not allowed";
-    assert_eq!((wf::exc_name(&e).as_str(), e.msg.as_str()), ("UnicodeEncodeError", want));
+    assert_eq!((e.type_name(), e.msg.as_str()), ("UnicodeEncodeError", want));
 }
 
 // ------------------------------------------------------------------------------------------------------------
@@ -687,11 +688,11 @@ fn parse_text_reply_and_materialize_text_match_python() {
     gate("text_pipeline", &cases, |c| {
         let (current, declared) = (files(&c[0]), files(&c[1]));
         enc(match wf::parse_text_reply(s(&c[2])) {
-            Err(e) if wf::exc_name(&e) == "UnicodeEncodeError" => Ok(json!({ "__surrogate__": true })),
+            Err(e) if e.type_name() == "UnicodeEncodeError" => Ok(json!({ "__surrogate__": true })),
             Err(e) => Err(e),
             Ok(reply) => Ok(match wf::materialize_text(&current, &declared, &reply) {
                 Ok(f) => json!({ "reply": reply, "files": f }),
-                Err(e) => json!({ "reply": reply, "error": [wf::exc_name(&e), e.msg] }),
+                Err(e) => json!({ "reply": reply, "error": [e.type_name(), e.msg] }),
             }),
         })
     });
@@ -786,7 +787,7 @@ fn repr_matches_python_for_every_code_point() {
     for t in ["", "'", "\"", "'\"", "it's", "a\\b", "\u{0}\u{7f}\u{80}\u{a0}\u{ad}", "😀\u{e000}\u{10ffff}"] {
         cases.push(json!([t]));
     }
-    gate("repr", &cases, |c| enc(Ok(Value::String(wf::repr(s(&c[0]))))));
+    gate("repr", &cases, |c| enc(Ok(Value::String(ringo_cli::rt::py::repr(s(&c[0]))))));
 }
 
 #[test]
@@ -1720,7 +1721,7 @@ fn make_error(kind: &str, msg: &str, data: &Value) -> Error {
         "JudgeError" => backends::judge_error(msg, false),
         "Stopped" => backends::stopped(&["x".to_string()], 1.0),
         "TimeoutExpired" => backends::timeout_expired(&["x".to_string()], 1.0),
-        "KeyError" => Error::new(Exc::Key, wf::repr(msg)),
+        "KeyError" => Error::new(Exc::Key, ringo_cli::rt::py::repr(msg)),
         _ => Error::value(msg),
     }
 }
@@ -1736,7 +1737,7 @@ fn fake_call(replies: Vec<Value>, watch: bool, seen: std::sync::Arc<std::sync::M
         }
         let Some(item) = replies.get(next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)) else {
             // Python's next() on the exhausted replies: StopIteration, which run() does not catch
-            return Err(Error::new(ringo_cli::rt::Exc::NeedVerdicts, "").with_data(json!({"python_type": "StopIteration"})));
+            return Err(Error::new(ringo_cli::rt::Exc::StopIteration, ""));
         };
         if item.get("soft") == Some(&json!(true))
             && let Some(w) = &w
@@ -1956,14 +1957,14 @@ fn run_matches_python_with_a_fake_call_function() {
         let spec_path = temp.0.join(format!("{}.json", c.name));
         let result = match wf::run(&spec_path, &rs_out, Some(&call), &identity) {
             Ok(report) => json!({"report": report}),
-            Err(e) => json!({"raised": [wf::exc_name(&e), e.msg]}),
+            Err(e) => json!({"raised": [e.type_name(), e.msg]}),
         };
         let mut result = result;
         result["seen"] = Value::Array(seen.lock().unwrap().clone());
         let (from, to) = (rs_out.to_string_lossy().into_owned(), py_out.to_string_lossy().into_owned());
         let (from_real, to_real) = (
-            ringo_cli::rt::harness::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
-            ringo_cli::rt::harness::realpath(&py_out).unwrap().to_string_lossy().into_owned(),
+            ringo_cli::rt::py::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
+            ringo_cli::rt::py::realpath(&py_out).unwrap().to_string_lossy().into_owned(),
         );
         normalize(&mut result, &from_real, &to_real);
         normalize(&mut result, &from, &to);
@@ -2033,8 +2034,8 @@ fn work_interrupted_by_sigint_matches_python() {
     assert_eq!(outcomes[1].1.code(), Some(130), "the binary's exit");
     let (py_out, rs_out) = (outcomes[0].0.clone(), outcomes[1].0.clone());
     let (from, to) = (
-        ringo_cli::rt::harness::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
-        ringo_cli::rt::harness::realpath(&py_out).unwrap().to_string_lossy().into_owned(),
+        ringo_cli::rt::py::realpath(&rs_out).unwrap().to_string_lossy().into_owned(),
+        ringo_cli::rt::py::realpath(&py_out).unwrap().to_string_lossy().into_owned(),
     );
     let (a, b) = (tree(&py_out, "\u{0}", "\u{0}"), tree(&rs_out, &from, &to));
     let skip = |name: &str| name.contains("implementation") || name == "source.json";

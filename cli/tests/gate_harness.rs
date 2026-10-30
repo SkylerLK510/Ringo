@@ -13,7 +13,8 @@
 #![cfg(unix)]
 
 use ringo_cli::rt::backends::{Snapshot, Watch as CallWatch};
-use ringo_cli::rt::harness::{self as h, Backend, Event, Leash, Num, ProbeFn, Run, Watch};
+use ringo_cli::rt::harness::{self as h, Backend, Event, Leash, ProbeFn, Run, Watch};
+use ringo_cli::rt::py::Num;
 use ringo_cli::rt::{pyjson, Error, Exc};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -447,7 +448,7 @@ fn reset(dir: &Path) {
 }
 
 fn err_value(e: &Error) -> Value {
-    json!({"err": [h::type_name(e), e.msg]})
+    json!({"err": [e.type_name(), e.msg]})
 }
 
 fn ok_or_err(r: Result<Value, Error>) -> Value {
@@ -767,7 +768,7 @@ fn rust_codex(case: &Value) -> String {
     let output = case[0].as_str().unwrap();
     let result = match h::codex_reply(output, case[1].as_str().unwrap(), &strings(&case[2])) {
         Ok((text, usage)) => json!({"ok": [text, usage]}),
-        Err(e) => json!({"err": [h::type_name(&e), e.msg, h::attr(&e, "usage").cloned().unwrap_or(Value::Null),
+        Err(e) => json!({"err": [e.type_name(), e.msg, h::attr(&e, "usage").cloned().unwrap_or(Value::Null),
                                  h::attr(&e, "raw").is_some_and(|r| r == output)]}),
     };
     pyjson::dumps(&result)
@@ -2141,7 +2142,7 @@ fn call_matches_python_for_claude_and_plain_backends() {
                             c["model"].as_str(), None);
             pyjson::dumps(&match r {
                 Ok((text, usage)) => json!({"ok": [text, usage]}),
-                Err(e) => json!({"err": [h::type_name(&e), e.msg, h::attr(&e, "usage").cloned(), h::attr(&e, "raw").cloned(), h::attr(&e, "limit").cloned()]}),
+                Err(e) => json!({"err": [e.type_name(), e.msg, h::attr(&e, "usage").cloned(), h::attr(&e, "raw").cloned(), h::attr(&e, "limit").cloned()]}),
             })
         })
         .collect();

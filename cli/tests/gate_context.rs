@@ -123,8 +123,7 @@ fn one(name: &str, args: Value) -> Value {
 }
 
 fn err(e: &Error) -> Value {
-    let name = e.data.as_ref().and_then(|d| d["exception"].as_str()).unwrap_or(e.exc.name());
-    json!({"err": [name, e.msg]})
+    json!({"err": [e.type_name(), e.msg]})
 }
 
 macro_rules! res {

@@ -4,12 +4,13 @@
 //! or a stop kills whole. A Codex child also gets a private CODEX_HOME and HOME holding only a copy of the owner's
 //! login (and model cache); a login it refreshed is written back to the owner under a lock, compare-and-swap.
 //!
-//! The JSON reader is CPython 3.14's `json` C scanner (positions, messages, hooks), because `top_level_objects`
-//! charges failed attempts by the error positions it reports.
+//! JSON is read with `pyjson::Decoder`, CPython 3.14's `json` C scanner (positions, messages, hooks), because
+//! `top_level_objects` charges failed attempts by the error positions it reports.
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
 
-use crate::rt::{Error, Exc, Result, py, pyjson};
-use serde_json::{Map, Number, Value};
+use crate::rt::pyjson::{self, Decoder, JsonFail, skip_ws};
+use crate::rt::{Error, Exc, Result, py};
+use serde_json::{Map, Value};
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs::File;
@@ -63,8 +64,6 @@ pub const CODEX_INSTRUCTIONS: &str = "Follow the instructions in the user messag
 /// instructions to every request; no config flag removes them in codex-cli 0.164.
 pub const CATALOG_TOOL_FIELDS: [&str; 4] = ["tool_mode", "multi_agent_version", "multi_agent_reasoning_effort", "apply_patch_tool_type"];
 
-#[cfg(not(unix))]
-const UNSUPPORTED: &str = "the native runtime runs on macOS and Linux; on Windows ringo uses the Python runtime";
 
 // ---------- exceptions ----------
 
@@ -90,7 +89,7 @@ pub fn stopped(cmd: &[String], timeout: f64) -> Error {
 fn timed_out(exc: Exc, cmd: &[String], timeout: f64) -> Error {
     let list = cmd.iter().map(|a| py::repr(a)).collect::<Vec<_>>().join(", ");
     Error::new(exc, format!("Command '[{list}]' timed out after {} seconds", pyjson::float(timeout)))
-        .with_data(serde_json::json!({"cmd": cmd, "timeout": float_json(timeout)}))
+        .with_data(serde_json::json!({"cmd": cmd, "timeout": pyjson::float_value(timeout)}))
 }
 
 fn with_fields(mut e: Error, fields: Value) -> Error {
@@ -105,10 +104,6 @@ fn with_fields(mut e: Error, fields: Value) -> Error {
     e
 }
 
-/// Python's `round(x, 1)`: correctly rounded, ties to even.
-fn round1(x: f64) -> f64 {
-    format!("{x:.1}").parse().unwrap_or(x)
-}
 
 // ---------- file_lock ----------
 
@@ -134,7 +129,7 @@ pub fn file_lock(f: &File, blocking: bool) -> io::Result<FileLock<'_>> {
     #[cfg(not(unix))]
     {
         let _ = (f, blocking);
-        Err(io::Error::other(UNSUPPORTED))
+        Err(io::Error::other(crate::rt::NATIVE_ONLY))
     }
 }
 
@@ -233,15 +228,15 @@ pub fn spawn(argv: &[String], kw: Popen) -> Result<Child> {
         }
         cmd.spawn().map_err(|e| match e.raw_os_error() {
             Some(code) if code >= CHDIR_FAILED => {
-                Error::os(py::os_error(&io::Error::from_raw_os_error(code - CHDIR_FAILED), shown.as_deref()))
+                Error::io(&io::Error::from_raw_os_error(code - CHDIR_FAILED), shown.as_deref())
             }
-            _ => Error::os(py::os_error(&e, Some(program))),
+            _ => Error::io(&e, Some(program)),
         })
     }
     #[cfg(not(unix))]
     {
         let _ = (argv, kw);
-        Err(Error::os(UNSUPPORTED))
+        Err(Error::os(crate::rt::NATIVE_ONLY))
     }
 }
 
@@ -260,7 +255,7 @@ pub fn kill_tree(proc: &Child) -> io::Result<()> {
     #[cfg(not(unix))]
     {
         let _ = proc;
-        Err(io::Error::other(UNSUPPORTED))
+        Err(io::Error::other(crate::rt::NATIVE_ONLY))
     }
 }
 
@@ -273,49 +268,11 @@ pub fn no_constant(name: &str) -> Result<f64> {
 
 /// `_finite_float(text)`: a parse_float hook that refuses a number that overflows to infinity.
 pub fn finite_float(text: &str) -> Result<f64> {
-    let value = py_float(text)?;
+    let value = py::float(text)?;
     if !value.is_finite() {
         return Err(Error::value(format!("{text} is not a finite number")));
     }
     Ok(value)
-}
-
-/// Python's `float(text)` for the number texts JSON hooks receive (and Python's strip, sign, inf/nan words and
-/// digit underscores).
-fn py_float(text: &str) -> Result<f64> {
-    let t = py::strip(text);
-    let bad = || Error::value(format!("could not convert string to float: {}", py::repr(text)));
-    let cleaned: String = if t.contains('_') {
-        let b: Vec<char> = t.chars().collect();
-        let ok = b.iter().enumerate().all(|(i, &c)| {
-            c != '_' || (i > 0 && i + 1 < b.len() && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit())
-        });
-        if !ok {
-            return Err(bad());
-        }
-        b.into_iter().filter(|&c| c != '_').collect()
-    } else {
-        t.to_string()
-    };
-    if cleaned.is_empty() || !cleaned.is_ascii() {
-        return Err(bad());
-    }
-    cleaned.parse::<f64>().map_err(|_| bad())
-}
-
-/// A float as the JSON value Ringo keeps for it: infinities as a number that pyjson writes as Python does
-/// (`Infinity`); NaN, which serde_json cannot hold, as null.
-fn float_json(f: f64) -> Value {
-    if let Some(n) = Number::from_f64(f) {
-        return Value::Number(n);
-    }
-    if f.is_infinite() {
-        let text = if f > 0.0 { "1e999" } else { "-1e999" };
-        if let Ok(n) = text.parse::<Number>() {
-            return Value::Number(n);
-        }
-    }
-    Value::Null
 }
 
 /// `_Object`: an object `top_level_objects` found, and whether its text repeats a key (`repeats_a_key`). Only the
@@ -374,21 +331,21 @@ pub fn top_level_objects(text: &str) -> Result<Vec<Object>> {
     let repeats = Cell::new(false); // the outermost object's pairs arrive last
     let constant = |_: &str| -> Result<Value> {
         refused.set(true);
-        Ok(float_json(0.0))
+        Ok(pyjson::float_value(0.0))
     };
     let number = |token: &str| -> Result<Value> {
-        let value = py_float(token)?;
+        let value = py::float(token)?;
         if !value.is_finite() {
             refused.set(true);
         }
-        Ok(float_json(value))
+        Ok(pyjson::float_value(value))
     };
     let pairs = |pairs: Vec<(String, Value)>| -> Result<Value> {
         let obj = object(pairs);
         repeats.set(obj.repeats_a_key);
         Ok(Value::Object(obj.map))
     };
-    let decoder = Decoder { parse_constant: &constant, parse_float: &number, object_pairs_hook: &pairs, max_depth: MAX_DEPTH };
+    let decoder = Decoder { parse_constant: &constant, parse_float: &number, object_pairs_hook: &pairs, ..Decoder::default() };
     let (mut parse, mut starts, mut start) = (FAILED_PARSE * (s.len() as i64 + 1), FAILED_STARTS, 0);
     let mut found = Vec::new();
     while let Some(at) = object_start(&s, start) {
@@ -421,476 +378,20 @@ pub fn top_level_objects(text: &str) -> Result<Vec<Object>> {
 /// (measured: 116,194 nested objects in `top_level_objects`; the bound moves by tens with the mix of arrays and
 /// objects, and with the thread's stack size and the platform). Used where only validity matters (a login file).
 pub const PY_MAX_DEPTH: usize = 116_194;
-/// Nesting levels a decoded value may have where Rust keeps it: serde_json values are dropped and written
-/// recursively, and a few thousand levels overflow a 2 MB thread stack. Deeper input is a RecursionError here,
-/// where Python 3.14 still parses it (a reported deviation); 1000 is Python's own default recursion limit.
-pub const MAX_DEPTH: usize = 1_000;
-/// `sys.get_int_max_str_digits()` default: a longer integer makes `int()` (and so json) raise ValueError.
-pub const INT_MAX_STR_DIGITS: usize = 4300;
-
-/// How a JSON read failed.
-#[derive(Debug)]
-pub enum JsonFail {
-    /// `json.JSONDecodeError` (a ValueError): `msg` at code point `pos`; `into_error` formats its text.
-    Decode { msg: &'static str, pos: usize },
-    /// `RecursionError` while entering a nested JSON `what` ("object" or "array").
-    Recursion { what: &'static str },
-    /// An exception a hook or `int()` raised, propagated unchanged.
-    Raised(Error),
-}
-
-impl JsonFail {
-    /// The exception as Python reports it for the document `doc`. RecursionError has no `Exc` kind: it is
-    /// reported as `Exc::Type`, which like RecursionError is neither a ValueError nor an OSError.
-    pub fn into_error(self, doc: &str) -> Error {
-        match self {
-            JsonFail::Decode { msg, pos } => Error::value(decode_error_text(msg, doc.chars(), pos)),
-            JsonFail::Recursion { what } => recursion_error(what),
-            JsonFail::Raised(e) => e,
-        }
-    }
-}
-
-fn recursion_error(what: &str) -> Error {
-    Error::new(Exc::Type, format!("maximum recursion depth exceeded while decoding a JSON {what} from a unicode string"))
-}
-
-/// `str(JSONDecodeError(msg, doc, pos))`: "msg: line L column C (char pos)".
-pub fn decode_error_text(msg: &str, doc: impl Iterator<Item = char>, pos: usize) -> String {
-    let (mut line, mut last) = (1, None);
-    for (i, c) in doc.take(pos).enumerate() {
-        if c == '\n' {
-            line += 1;
-            last = Some(i);
-        }
-    }
-    let col = last.map_or(pos + 1, |i| pos - i);
-    format!("{msg}: line {line} column {col} (char {pos})")
-}
-
-/// A hook taking a number or constant's text (`parse_float`, `parse_constant`).
-pub type TextHook<'a> = &'a dyn Fn(&str) -> Result<Value>;
-/// `object_pairs_hook`: an object's pairs in order; called innermost first, the outermost object last.
-pub type PairsHook<'a> = &'a dyn Fn(Vec<(String, Value)>) -> Result<Value>;
-
-/// `json.JSONDecoder(parse_constant=..., parse_float=..., object_pairs_hook=...)` as CPython 3.14's C scanner runs
-/// it (strict strings, integers through `int()`). Positions are code points. Unpaired surrogate escapes, which a
-/// Rust string cannot hold, become U+FFFD. Nesting past `max_depth` is a RecursionError.
-pub struct Decoder<'a> {
-    pub parse_constant: TextHook<'a>,
-    pub parse_float: TextHook<'a>,
-    pub object_pairs_hook: PairsHook<'a>,
-    pub max_depth: usize,
-}
-
-/// The default object hook: a plain dict.
-pub fn dict(pairs: Vec<(String, Value)>) -> Result<Value> {
-    Ok(Value::Object(object(pairs).map))
-}
-
-fn strict_constant(name: &str) -> Result<Value> {
-    no_constant(name).map(float_json)
-}
-
-fn strict_float(text: &str) -> Result<Value> {
-    finite_float(text).map(float_json)
-}
-
-enum Frame {
-    Array(Vec<Value>),
-    Object(Vec<(String, Value)>, String),
-}
-
-/// The open containers of a parse; dropped without recursion, however deep their finished parts are.
-struct Frames(Vec<Frame>);
-
-impl Drop for Frames {
-    fn drop(&mut self) {
-        for frame in self.0.drain(..) {
-            match frame {
-                Frame::Array(items) => items.into_iter().for_each(dismantle),
-                Frame::Object(pairs, _) => pairs.into_iter().for_each(|(_, v)| dismantle(v)),
-            }
-        }
-    }
-}
-
-/// Drops a value of any depth without recursion.
-pub fn dismantle(value: Value) {
-    let mut stack = vec![value];
-    while let Some(v) = stack.pop() {
-        match v {
-            Value::Array(items) => stack.extend(items),
-            Value::Object(map) => stack.extend(map.into_iter().map(|(_, v)| v)),
-            _ => {}
-        }
-    }
-}
-
-fn is_ws(c: char) -> bool {
-    matches!(c, ' ' | '\t' | '\n' | '\r')
-}
-
-fn skip_ws(s: &[char], mut i: usize) -> usize {
-    while i < s.len() && is_ws(s[i]) {
-        i += 1;
-    }
-    i
-}
-
-fn fail(msg: &'static str, pos: usize) -> JsonFail {
-    JsonFail::Decode { msg, pos }
-}
-
-fn starts(s: &[char], at: usize, word: &str) -> bool {
-    word.chars().enumerate().all(|(k, c)| s.get(at + k) == Some(&c))
-}
-
 impl Decoder<'static> {
     /// `json.loads(text, parse_constant=_no_constant, parse_float=_finite_float)`: plain dicts, no NaN or
     /// infinities.
     pub fn strict() -> Decoder<'static> {
-        Decoder { parse_constant: &strict_constant, parse_float: &strict_float, object_pairs_hook: &dict, max_depth: MAX_DEPTH }
+        Decoder { parse_constant: &strict_constant, parse_float: &strict_float, ..Decoder::default() }
     }
 }
 
-impl Decoder<'_> {
-    /// `json.loads(text, ...)` for a str: a leading BOM is refused, whitespace around the value is allowed.
-    pub fn loads(&self, text: &str) -> std::result::Result<Value, JsonFail> {
-        let s: Vec<char> = text.chars().collect();
-        if s.first() == Some(&'\u{feff}') {
-            return Err(fail("Unexpected UTF-8 BOM (decode using utf-8-sig)", 0));
-        }
-        self.decode(&s)
-    }
-
-    /// `json.loads(data, ...)` for bytes: the encoding detected as json does (UTF-8, -16 or -32), decoded with
-    /// surrogatepass. A decode failure is a ValueError, as Python's JSONDecodeError and UnicodeDecodeError are;
-    /// the UnicodeDecodeError text is not Python's.
-    pub fn loads_bytes(&self, data: &[u8]) -> std::result::Result<Value, JsonFail> {
-        let s = decode_bytes(data).map_err(JsonFail::Raised)?;
-        self.decode(&s).map_err(|e| match e {
-            JsonFail::Decode { msg, pos } => JsonFail::Raised(Error::value(decode_error_text(msg, s.iter().copied(), pos))),
-            other => other,
-        })
-    }
-
-    /// `JSONDecoder.decode(s)`: one value, whitespace around it, "Extra data" after it.
-    pub fn decode(&self, s: &[char]) -> std::result::Result<Value, JsonFail> {
-        let (value, end) = self.raw_decode(s, skip_ws(s, 0))?;
-        let end = skip_ws(s, end);
-        if end != s.len() {
-            return Err(fail("Extra data", end));
-        }
-        Ok(value)
-    }
-
-    /// `JSONDecoder.raw_decode(s, idx)`: the value starting at code point idx and the index after it.
-    pub fn raw_decode(&self, s: &[char], mut idx: usize) -> std::result::Result<(Value, usize), JsonFail> {
-        let n = s.len();
-        let mut frames = Frames(Vec::new());
-        let stack = &mut frames.0;
-        'scan: loop {
-            // one value at idx, or the start of a container
-            let (mut value, mut end) = 'value: {
-                if idx >= n {
-                    return Err(fail("Expecting value", idx)); // StopIteration(idx)
-                }
-                match s[idx] {
-                    '"' => {
-                        let (text, end) = scanstring(s, idx + 1)?;
-                        (Value::String(text), end)
-                    }
-                    '{' => {
-                        if stack.len() >= self.max_depth {
-                            return Err(JsonFail::Recursion { what: "object" });
-                        }
-                        let i = skip_ws(s, idx + 1);
-                        if i < n && s[i] == '}' {
-                            break 'value ((self.object_pairs_hook)(Vec::new()).map_err(JsonFail::Raised)?, i + 1);
-                        }
-                        let (key, i) = key(s, i)?;
-                        stack.push(Frame::Object(Vec::new(), key));
-                        idx = i;
-                        continue 'scan;
-                    }
-                    '[' => {
-                        if stack.len() >= self.max_depth {
-                            return Err(JsonFail::Recursion { what: "array" });
-                        }
-                        let i = skip_ws(s, idx + 1);
-                        if i < n && s[i] == ']' {
-                            break 'value (Value::Array(Vec::new()), i + 1);
-                        }
-                        stack.push(Frame::Array(Vec::new()));
-                        idx = i;
-                        continue 'scan;
-                    }
-                    'n' if idx + 3 < n && starts(s, idx + 1, "ull") => (Value::Null, idx + 4),
-                    't' if idx + 3 < n && starts(s, idx + 1, "rue") => (Value::Bool(true), idx + 4),
-                    'f' if idx + 4 < n && starts(s, idx + 1, "alse") => (Value::Bool(false), idx + 5),
-                    'N' if idx + 2 < n && starts(s, idx + 1, "aN") => {
-                        ((self.parse_constant)("NaN").map_err(JsonFail::Raised)?, idx + 3)
-                    }
-                    'I' if idx + 7 < n && starts(s, idx + 1, "nfinity") => {
-                        ((self.parse_constant)("Infinity").map_err(JsonFail::Raised)?, idx + 8)
-                    }
-                    '-' if idx + 8 < n && starts(s, idx + 1, "Infinity") => {
-                        ((self.parse_constant)("-Infinity").map_err(JsonFail::Raised)?, idx + 9)
-                    }
-                    _ => self.number(s, idx)?,
-                }
-            };
-            // attach the value to the open containers, closing every one that ends here
-            loop {
-                let Some(top) = stack.last_mut() else {
-                    return Ok((value, end));
-                };
-                let close = if matches!(top, Frame::Array(_)) { ']' } else { '}' };
-                match top {
-                    Frame::Array(items) => items.push(value),
-                    Frame::Object(pairs, key) => pairs.push((std::mem::take(key), value)),
-                }
-                let i = skip_ws(s, end);
-                if i < n && s[i] == close {
-                    value = match stack.pop() {
-                        Some(Frame::Array(items)) => Value::Array(items),
-                        Some(Frame::Object(pairs, _)) => (self.object_pairs_hook)(pairs).map_err(JsonFail::Raised)?,
-                        None => unreachable!("a container is open"),
-                    };
-                    end = i + 1;
-                    continue;
-                }
-                if i >= n || s[i] != ',' {
-                    return Err(fail("Expecting ',' delimiter", i));
-                }
-                let j = skip_ws(s, i + 1);
-                if j < n && s[j] == close {
-                    return Err(fail(
-                        if close == ']' { "Illegal trailing comma before end of array" } else { "Illegal trailing comma before end of object" },
-                        i,
-                    ));
-                }
-                idx = j;
-                if let Some(Frame::Object(_, pending)) = stack.last_mut() {
-                    let (k, after) = key(s, j)?;
-                    *pending = k;
-                    idx = after;
-                }
-                break;
-            }
-        }
-    }
-
-    /// `_match_number_unicode`: an integer (through `int()`, with its digit limit) or a float (parse_float).
-    fn number(&self, s: &[char], start: usize) -> std::result::Result<(Value, usize), JsonFail> {
-        let end_idx = s.len() - 1;
-        let digit = |i: usize| s[i].is_ascii_digit();
-        let mut idx = start;
-        if s[idx] == '-' {
-            idx += 1;
-            if idx > end_idx {
-                return Err(fail("Expecting value", start));
-            }
-        }
-        if ('1'..='9').contains(&s[idx]) {
-            idx += 1;
-            while idx <= end_idx && digit(idx) {
-                idx += 1;
-            }
-        } else if s[idx] == '0' {
-            idx += 1;
-        } else {
-            return Err(fail("Expecting value", start));
-        }
-        let mut is_float = false;
-        if idx < end_idx && s[idx] == '.' && digit(idx + 1) {
-            is_float = true;
-            idx += 2;
-            while idx <= end_idx && digit(idx) {
-                idx += 1;
-            }
-        }
-        if idx < end_idx && (s[idx] == 'e' || s[idx] == 'E') {
-            let e_start = idx;
-            idx += 1;
-            if idx < end_idx && (s[idx] == '-' || s[idx] == '+') {
-                idx += 1;
-            }
-            while idx <= end_idx && digit(idx) {
-                idx += 1;
-            }
-            if digit(idx - 1) {
-                is_float = true;
-            } else {
-                idx = e_start;
-            }
-        }
-        let text: String = s[start..idx].iter().collect();
-        if is_float {
-            return Ok(((self.parse_float)(&text).map_err(JsonFail::Raised)?, idx));
-        }
-        let digits = text.trim_start_matches('-').len();
-        if digits > INT_MAX_STR_DIGITS {
-            return Err(JsonFail::Raised(Error::value(format!(
-                "Exceeds the limit ({INT_MAX_STR_DIGITS} digits) for integer string conversion: value has {digits} \
-                 digits; use sys.set_int_max_str_digits() to increase the limit"
-            ))));
-        }
-        let n: Number = text.parse().expect("an integer token is a JSON number");
-        Ok((Value::Number(n), idx))
-    }
+fn strict_constant(name: &str) -> Result<Value> {
+    no_constant(name).map(pyjson::float_value)
 }
 
-/// An object key, its ':' and the whitespace before the value (`_parse_object_unicode`).
-fn key(s: &[char], i: usize) -> std::result::Result<(String, usize), JsonFail> {
-    if i >= s.len() || s[i] != '"' {
-        return Err(fail("Expecting property name enclosed in double quotes", i));
-    }
-    let (k, i) = scanstring(s, i + 1)?;
-    let i = skip_ws(s, i);
-    if i >= s.len() || s[i] != ':' {
-        return Err(fail("Expecting ':' delimiter", i));
-    }
-    Ok((k, skip_ws(s, i + 1)))
-}
-
-fn hex4(s: &[char], at: usize) -> Option<u32> {
-    s[at..at + 4].iter().try_fold(0u32, |acc, c| c.to_digit(16).map(|d| (acc << 4) | d))
-}
-
-/// `scanstring_unicode(s, end, strict=True)`: the string whose opening quote is at end - 1, and the index after it.
-fn scanstring(s: &[char], mut end: usize) -> std::result::Result<(String, usize), JsonFail> {
-    let (n, begin) = (s.len(), end - 1);
-    let mut out = String::new();
-    loop {
-        let mut next = end;
-        while next < n && s[next] != '"' && s[next] != '\\' {
-            if (s[next] as u32) <= 0x1f {
-                return Err(fail("Invalid control character at", next));
-            }
-            next += 1;
-        }
-        if next >= n {
-            return Err(fail("Unterminated string starting at", begin));
-        }
-        out.extend(&s[end..next]);
-        let terminator = s[next];
-        next += 1;
-        if terminator == '"' {
-            return Ok((out, next));
-        }
-        if next == n {
-            return Err(fail("Unterminated string starting at", begin));
-        }
-        let esc = s[next];
-        if esc != 'u' {
-            end = next + 1;
-            out.push(match esc {
-                '"' => '"',
-                '\\' => '\\',
-                '/' => '/',
-                'b' => '\u{8}',
-                'f' => '\u{c}',
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                _ => return Err(fail("Invalid \\escape", end - 2)),
-            });
-            continue;
-        }
-        next += 1;
-        end = next + 4;
-        if end > n {
-            return Err(fail("Invalid \\uXXXX escape", next - 1));
-        }
-        let mut c = hex4(s, next).ok_or_else(|| fail("Invalid \\uXXXX escape", end - 5))?;
-        if (0xd800..=0xdbff).contains(&c) && end + 6 <= n && s[end] == '\\' && s[end + 1] == 'u' {
-            let c2 = hex4(s, end + 2).ok_or_else(|| fail("Invalid \\uXXXX escape", end + 1))?;
-            if (0xdc00..=0xdfff).contains(&c2) {
-                c = 0x10000 + ((c - 0xd800) << 10) + (c2 - 0xdc00);
-                end += 6;
-            }
-        }
-        out.push(char::from_u32(c).unwrap_or('\u{fffd}')); // an unpaired surrogate: Python keeps it
-    }
-}
-
-/// `json.detect_encoding(b)` then `b.decode(encoding, 'surrogatepass')`, unpaired surrogates as U+FFFD.
-fn decode_bytes(b: &[u8]) -> Result<Vec<char>> {
-    let bad = |enc: &str| Error::value(format!("'{enc}' codec can't decode the bytes"));
-    let units = |b: &[u8], size: usize, big: bool| -> Vec<u32> {
-        b.chunks(size)
-            .map(|c| c.iter().enumerate().fold(0u32, |acc, (i, &x)| acc | ((x as u32) << (8 * if big { size - 1 - i } else { i }))))
-            .collect()
-    };
-    let utf16 = |b: &[u8], big: bool, enc: &str| -> Result<Vec<char>> {
-        if !b.len().is_multiple_of(2) {
-            return Err(bad(enc));
-        }
-        let u: Vec<u16> = units(b, 2, big).into_iter().map(|x| x as u16).collect();
-        Ok(char::decode_utf16(u).map(|r| r.unwrap_or('\u{fffd}')).collect())
-    };
-    let utf32 = |b: &[u8], big: bool, enc: &str| -> Result<Vec<char>> {
-        if !b.len().is_multiple_of(4) {
-            return Err(bad(enc));
-        }
-        units(b, 4, big)
-            .into_iter()
-            .map(|x| match x {
-                0xd800..=0xdfff => Ok('\u{fffd}'),
-                _ => char::from_u32(x).ok_or_else(|| bad(enc)),
-            })
-            .collect()
-    };
-    match b {
-        [0, 0, 0xfe, 0xff, rest @ ..] => utf32(rest, true, "utf-32"),
-        [0xff, 0xfe, 0, 0, rest @ ..] => utf32(rest, false, "utf-32"),
-        [0xfe, 0xff, rest @ ..] => utf16(rest, true, "utf-16"),
-        [0xff, 0xfe, rest @ ..] => utf16(rest, false, "utf-16"),
-        [0xef, 0xbb, 0xbf, rest @ ..] => utf8(rest).ok_or_else(|| bad("utf-8-sig")),
-        [0, x, _, _, ..] => {
-            if *x != 0 {
-                utf16(b, true, "utf-16-be")
-            } else {
-                utf32(b, true, "utf-32-be")
-            }
-        }
-        [_, 0, x, y, ..] => {
-            if *x != 0 || *y != 0 {
-                utf16(b, false, "utf-16-le")
-            } else {
-                utf32(b, false, "utf-32-le")
-            }
-        }
-        [0, _] => utf16(b, true, "utf-16-be"),
-        [_, 0] => utf16(b, false, "utf-16-le"),
-        _ => utf8(b).ok_or_else(|| bad("utf-8")),
-    }
-}
-
-/// Strict UTF-8 that also passes encoded surrogates (ED A0..BF xx), as U+FFFD.
-fn utf8(mut b: &[u8]) -> Option<Vec<char>> {
-    let mut out = Vec::with_capacity(b.len());
-    loop {
-        match std::str::from_utf8(b) {
-            Ok(t) => {
-                out.extend(t.chars());
-                return Some(out);
-            }
-            Err(e) => {
-                let (ok, rest) = b.split_at(e.valid_up_to());
-                out.extend(std::str::from_utf8(ok).expect("valid prefix").chars());
-                match rest {
-                    [0xed, 0xa0..=0xbf, 0x80..=0xbf, ..] => {
-                        out.push('\u{fffd}');
-                        b = &rest[3..];
-                    }
-                    _ => return None,
-                }
-            }
-        }
-    }
+fn strict_float(text: &str) -> Result<Value> {
+    finite_float(text).map(pyjson::float_value)
 }
 
 // ---------- the private Codex home ----------
@@ -902,59 +403,6 @@ struct Login {
     copy: PathBuf,
 }
 
-/// `str(PurePosixPath(p))`: one root ('/' or exactly '//'), no empty or '.' parts, '.' when nothing is left.
-fn pure_path(p: &[u8]) -> Vec<u8> {
-    let root: &[u8] = if p.starts_with(b"//") && !p.starts_with(b"///") {
-        b"//"
-    } else if p.starts_with(b"/") {
-        b"/"
-    } else {
-        b""
-    };
-    let parts: Vec<&[u8]> = p.split(|&c| c == b'/').filter(|x| !x.is_empty() && *x != b".").collect();
-    let mut out = root.to_vec();
-    out.extend(parts.join(&b'/'));
-    if out.is_empty() {
-        out.push(b'.');
-    }
-    out
-}
-
-/// `PurePosixPath(base) / name`.
-fn pure_join(base: &[u8], name: &str) -> Vec<u8> {
-    let mut p = base.to_vec();
-    p.push(b'/');
-    p.extend(name.as_bytes());
-    pure_path(&p)
-}
-
-/// `PurePosixPath(p).parent` of a pure path with at least one part.
-fn pure_parent(p: &[u8]) -> Vec<u8> {
-    match p.iter().rposition(|&c| c == b'/') {
-        None => b".".to_vec(),
-        Some(0) => b"/".to_vec(),
-        Some(1) if p.starts_with(b"//") => b"//".to_vec(),
-        Some(i) => p[..i].to_vec(),
-    }
-}
-
-/// `pathlib.PurePath(p).name`: the last part, '' for none.
-fn pathlib_name(p: &str) -> &str {
-    p.split('/').rfind(|x| !x.is_empty() && *x != ".").unwrap_or("")
-}
-
-#[cfg(unix)]
-fn bytes_path(b: Vec<u8>) -> PathBuf {
-    use std::os::unix::ffi::OsStringExt;
-    PathBuf::from(OsString::from_vec(b))
-}
-
-#[cfg(unix)]
-fn path_bytes(p: &Path) -> &[u8] {
-    use std::os::unix::ffi::OsStrExt;
-    p.as_os_str().as_bytes()
-}
-
 /// `Path.home()`: `os.path.expanduser('~')`, HOME when set (trailing slashes stripped, '/' when nothing is left),
 /// else the password database.
 #[cfg(unix)]
@@ -964,34 +412,28 @@ fn home() -> Result<Vec<u8>> {
         Some(h) => h.as_bytes().to_vec(),
         None => {
             // SAFETY: getpwuid returns a pointer into static storage or null; the bytes are copied at once.
-            // Python raises RuntimeError, which has no Exc kind; TypeError is likewise neither ValueError nor OSError.
             unsafe {
                 let pw = libc::getpwuid(libc::getuid());
                 if pw.is_null() || (*pw).pw_dir.is_null() {
-                    return Err(Error::new(Exc::Type, "Could not determine home directory."));
+                    return Err(Error::new(Exc::Runtime, "Could not determine home directory."));
                 }
                 std::ffi::CStr::from_ptr((*pw).pw_dir).to_bytes().to_vec()
             }
         }
     };
     let trimmed = raw.iter().rposition(|&c| c != b'/').map_or(&raw[..0], |i| &raw[..=i]);
-    Ok(if trimmed.is_empty() { b"/".to_vec() } else { pure_path(trimmed) })
+    Ok(if trimmed.is_empty() { b"/".to_vec() } else { py::pure_path(trimmed) })
 }
 
 /// `_owner_auth()`: the login file a Codex child would otherwise share: $CODEX_HOME/auth.json, else
 /// ~/.codex/auth.json.
 #[cfg(unix)]
 fn owner_auth() -> Result<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
     let base = match std::env::var_os("CODEX_HOME") {
-        Some(v) if !v.is_empty() => v.as_bytes().to_vec(),
-        _ => pure_join(&home()?, ".codex"),
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => py::join(&py::path_of(home()?), ".codex"),
     };
-    Ok(bytes_path(pure_join(&base, "auth.json")))
-}
-
-fn os_err(e: &io::Error, path: &Path) -> Error {
-    Error::os(py::os_error(e, Some(&path.to_string_lossy())))
+    Ok(py::join(&base, "auth.json"))
 }
 
 /// `os.open(path, O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, 0o600)` and the bytes written to it.
@@ -1005,18 +447,12 @@ fn create_private(path: &Path, data: &[u8]) -> Result<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .mode(0o600)
         .open(path)
-        .map_err(|e| os_err(&e, path))?;
-    f.write_all(data).map_err(|e| Error::os(py::os_error(&e, None)))
-}
-
-#[cfg(unix)]
-fn mkdir(path: &Path, mode: u32) -> Result<()> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().mode(mode).create(path).map_err(|e| os_err(&e, path))
+        .map_err(|e| py::path_error(&e, path))?;
+    f.write_all(data).map_err(Error::from)
 }
 
 /// `env.update(key=value)`: in place when the key is there, else appended.
-fn env_set(env: &mut Env, key: &str, value: OsString) {
+pub(crate) fn env_set(env: &mut Env, key: &str, value: OsString) {
     match env.iter_mut().find(|(k, _)| k == key) {
         Some(slot) => slot.1 = value,
         None => env.push((key.into(), value)),
@@ -1030,8 +466,8 @@ fn env_set(env: &mut Env, key: &str, value: OsString) {
 #[cfg(unix)]
 fn codex_home(root: &Path, env: &mut Env) -> Result<Login> {
     let (home_dir, private) = (root.join("home"), root.join("codex"));
-    mkdir(&home_dir, 0o700)?;
-    mkdir(&private, 0o700)?;
+    py::mkdir(&home_dir, 0o700, false, false)?;
+    py::mkdir(&private, 0o700, false, false)?;
     let owner = owner_auth()?;
     let snapshot = std::fs::read(&owner).ok(); // no login to copy: the call runs without one and fails the normal way
     let copy = private.join("auth.json");
@@ -1040,7 +476,7 @@ fn codex_home(root: &Path, env: &mut Env) -> Result<Login> {
     }
     // The owner's model catalog cache: without it every call's `codex debug models` (see lean_codex) fetches the
     // same catalog over the network, about 0.5-1 s; with it, about 15 ms. It holds no instructions. Not copied back.
-    let cache = bytes_path(pure_join(&pure_parent(path_bytes(&owner)), "models_cache.json"));
+    let cache = py::join(&py::parent(&owner), "models_cache.json");
     if let Ok(catalog) = std::fs::read(&cache) {
         create_private(&private.join("models_cache.json"), &catalog)?;
     }
@@ -1058,7 +494,7 @@ pub fn lean_codex(argv: &[String], private: &Path, env: &Env, timeout_s: f64) ->
     #[cfg(unix)]
     {
         let instructions = private.join("ringo-instructions.md");
-        std::fs::write(&instructions, CODEX_INSTRUCTIONS).map_err(|e| os_err(&e, &instructions))?;
+        std::fs::write(&instructions, CODEX_INSTRUCTIONS).map_err(|e| py::path_error(&e, &instructions))?;
         let mut extra = vec!["-c".to_string(), format!("model_instructions_file={}", pyjson::quote(&instructions.to_string_lossy()))];
         let program = argv.first().ok_or_else(|| Error::value("list index out of range"))?;
         let listed = run_checked(&[program.clone(), "debug".into(), "models".into()], env, private, timeout_s);
@@ -1074,7 +510,7 @@ pub fn lean_codex(argv: &[String], private: &Path, env: &Env, timeout_s: f64) ->
     #[cfg(not(unix))]
     {
         let _ = (argv, private, env, timeout_s);
-        Err(Error::os(UNSUPPORTED))
+        Err(Error::os(crate::rt::NATIVE_ONLY))
     }
 }
 
@@ -1084,16 +520,16 @@ fn catalog_without_tools(listed: &[u8]) -> Result<Option<String>> {
     let constant = |name: &str| -> Result<Value> {
         match name {
             "NaN" => Err(Error::value("NaN cannot be kept")),
-            "Infinity" => Ok(float_json(f64::INFINITY)),
-            _ => Ok(float_json(f64::NEG_INFINITY)),
+            "Infinity" => Ok(pyjson::float_value(f64::INFINITY)),
+            _ => Ok(pyjson::float_value(f64::NEG_INFINITY)),
         }
     };
-    let float = |text: &str| py_float(text).map(float_json);
-    let decoder = Decoder { parse_constant: &constant, parse_float: &float, object_pairs_hook: &dict, max_depth: MAX_DEPTH };
+    let float = |text: &str| py::float(text).map(pyjson::float_value);
+    let decoder = Decoder { parse_constant: &constant, parse_float: &float, ..Decoder::default() };
     let mut catalog = match decoder.loads_bytes(listed) {
         Ok(Value::Object(m)) => m,
         Ok(_) => return Ok(None), // a list, str or number has no ['models']: TypeError
-        Err(JsonFail::Recursion { what }) => return Err(recursion_error(what)),
+        Err(f @ JsonFail::Recursion { .. }) => return Err(f.into_error("")),
         Err(_) => return Ok(None),
     };
     match catalog.get_mut("models") {
@@ -1211,7 +647,7 @@ struct OwnerLock(File);
 fn owner_lock(owner: &Path) -> std::result::Result<OwnerLock, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    let path = bytes_path(pure_join(&pure_parent(path_bytes(owner)), ".ringo-auth.lock"));
+    let path = py::join(&py::parent(owner), ".ringo-auth.lock");
     let f = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1251,11 +687,11 @@ fn sync_codex_auth(login: &Login) -> Result<()> {
         return Ok(());
     }
     let accept = |_: &str| Ok(Value::Null);
-    let float = |text: &str| py_float(text).map(float_json);
-    let validator = Decoder { parse_constant: &accept, parse_float: &float, object_pairs_hook: &dict, max_depth: PY_MAX_DEPTH };
+    let float = |text: &str| py::float(text).map(pyjson::float_value);
+    let validator = Decoder { parse_constant: &accept, parse_float: &float, max_depth: PY_MAX_DEPTH, ..Decoder::default() };
     match validator.loads_bytes(&new) {
-        Ok(v) => dismantle(v),
-        Err(JsonFail::Recursion { what }) => return Err(recursion_error(what)),
+        Ok(v) => pyjson::dispose(v),
+        Err(f @ JsonFail::Recursion { .. }) => return Err(f.into_error("")),
         Err(_) => return Ok(()), // half-written or garbage: never hand it to the owner
     }
     if let Err(reason) = write_back(&login.owner, snapshot, &new) {
@@ -1294,8 +730,8 @@ fn write_back(owner: &Path, snapshot: &[u8], new: &[u8]) -> std::result::Result<
     if current != snapshot {
         return Ok(());
     }
-    let parent = bytes_path(pure_parent(path_bytes(owner)));
-    let (mut f, tmp) = mkstemp(".ringo-auth-", &parent).map_err(|e| e.msg)?; // created 0600
+    let parent = py::parent(owner);
+    let (mut f, tmp) = py::mkstemp(".ringo-auth-", &parent).map_err(|e| e.msg)?; // created 0600
     let written = (|| -> io::Result<()> {
         f.write_all(new)?;
         f.flush()?;
@@ -1307,203 +743,11 @@ fn write_back(owner: &Path, snapshot: &[u8], new: &[u8]) -> std::result::Result<
     })()
     .map_err(|e| py::os_error(&e, None));
     drop(f);
-    let replaced = written.and_then(|()| {
-        std::fs::rename(&tmp, owner).map_err(|e| {
-            format!("{}: {} -> {}", py::os_error(&e, None), py::repr(&tmp.to_string_lossy()), py::repr(&owner.to_string_lossy()))
-        })
-    });
+    let replaced = written.and_then(|()| py::replace(&tmp, owner).map_err(|e| e.msg));
     if replaced.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     replaced
-}
-
-// ---------- tempfile ----------
-
-#[cfg(unix)]
-const NAME_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789_";
-
-/// tempfile's `_RandomNameSequence`: eight characters of [a-z0-9_].
-#[cfg(unix)]
-fn candidate_name() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-    h.write_u64(COUNT.fetch_add(1, Ordering::Relaxed));
-    let mut x = h.finish();
-    (0..8)
-        .map(|_| {
-            let c = NAME_CHARS[(x % NAME_CHARS.len() as u64) as usize] as char;
-            x /= NAME_CHARS.len() as u64;
-            c
-        })
-        .collect()
-}
-
-/// `os.path.normpath`.
-#[cfg(unix)]
-fn normpath(p: &[u8]) -> Vec<u8> {
-    if p.is_empty() {
-        return b".".to_vec();
-    }
-    let initial = if p.starts_with(b"//") && !p.starts_with(b"///") { 2 } else { usize::from(p.starts_with(b"/")) };
-    let mut comps: Vec<&[u8]> = Vec::new();
-    for comp in p.split(|&c| c == b'/') {
-        if comp.is_empty() || comp == b"." {
-            continue;
-        }
-        if comp != b".." || (initial == 0 && comps.is_empty()) || comps.last() == Some(&&b".."[..]) {
-            comps.push(comp);
-        } else if !comps.is_empty() {
-            comps.pop();
-        }
-    }
-    let mut out = vec![b'/'; initial];
-    out.extend(comps.join(&b'/'));
-    if out.is_empty() {
-        out.push(b'.');
-    }
-    out
-}
-
-/// `os.path.abspath`.
-#[cfg(unix)]
-fn abspath(p: &Path) -> PathBuf {
-    let b = path_bytes(p);
-    if b.starts_with(b"/") {
-        return bytes_path(normpath(b));
-    }
-    let mut full = std::env::current_dir().map(|d| path_bytes(&d).to_vec()).unwrap_or_default();
-    full.push(b'/');
-    full.extend(b);
-    bytes_path(normpath(&full))
-}
-
-/// `tempfile.gettempdir()`: the first of $TMPDIR, $TEMP, $TMP, /tmp, /var/tmp, /usr/tmp and the working folder in
-/// which a file can be created, made absolute; found once per process.
-#[cfg(unix)]
-fn gettempdir() -> Result<PathBuf> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if let Some(dir) = DIR.get() {
-        return Ok(dir.clone());
-    }
-    let mut dirs: Vec<PathBuf> =
-        ["TMPDIR", "TEMP", "TMP"].iter().filter_map(std::env::var_os).filter(|v| !v.is_empty()).map(PathBuf::from).collect();
-    dirs.extend(["/tmp", "/var/tmp", "/usr/tmp"].map(PathBuf::from));
-    dirs.push(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    for dir in &dirs {
-        let dir = if dir.as_os_str() == "." { dir.clone() } else { abspath(dir) };
-        for _ in 0..100 {
-            let name = dir.join(candidate_name());
-            let opened = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .mode(0o600)
-                .open(&name);
-            match opened {
-                Ok(mut f) => {
-                    let wrote = f.write_all(b"blat");
-                    drop(f);
-                    let removed = std::fs::remove_file(&name);
-                    if wrote.is_err() || removed.is_err() {
-                        break;
-                    }
-                    return Ok(DIR.get_or_init(|| dir).clone());
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(_) => break,
-            }
-        }
-    }
-    let list = dirs.iter().map(|d| py::repr(&d.to_string_lossy())).collect::<Vec<_>>().join(", ");
-    Err(Error::os(format!("[Errno 2] No usable temporary directory found in [{list}]")))
-}
-
-/// `tempfile.mkdtemp(prefix=prefix)`: a new folder, mode 0700, in gettempdir.
-#[cfg(unix)]
-fn mkdtemp(prefix: &str) -> Result<PathBuf> {
-    use std::os::unix::fs::DirBuilderExt;
-    let dir = gettempdir()?;
-    for _ in 0..10_000 {
-        let path = dir.join(format!("{prefix}{}", candidate_name()));
-        match std::fs::DirBuilder::new().mode(0o700).create(&path) {
-            Ok(()) => return Ok(path),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(os_err(&e, &path)),
-        }
-    }
-    Err(Error::os("[Errno 17] No usable temporary directory name found"))
-}
-
-/// `tempfile.mkstemp(prefix=prefix, dir=dir)`: a new file, mode 0600, never through a symlink, and its absolute path.
-#[cfg(unix)]
-fn mkstemp(prefix: &str, dir: &Path) -> Result<(File, PathBuf)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = abspath(dir);
-    for _ in 0..10_000 {
-        let path = dir.join(format!("{prefix}{}", candidate_name()));
-        let opened =
-            std::fs::OpenOptions::new().read(true).write(true).create_new(true).custom_flags(libc::O_NOFOLLOW).mode(0o600).open(&path);
-        match opened {
-            Ok(f) => return Ok((f, path)),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(os_err(&e, &path)),
-        }
-    }
-    Err(Error::os("[Errno 17] No usable temporary file name found"))
-}
-
-/// `TemporaryDirectory` cleanup: everything under path removed, permissions and (macOS) file flags that block the
-/// removal reset first, as tempfile's error handler does; a folder already gone is no error.
-#[cfg(unix)]
-fn rmtree(path: &Path) -> Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {}
-    }
-    // ceiling: the reset walks paths, so a process that escaped the session could race it with symlinks; it only
-    // changes modes (never through a symlink), and the removal itself is std's symlink-safe one.
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&p) else { continue };
-        if meta.file_type().is_symlink() {
-            continue;
-        }
-        reset_perms(&p);
-        if meta.is_dir()
-            && let Ok(entries) = std::fs::read_dir(&p)
-        {
-            stack.extend(entries.flatten().map(|e| e.path()));
-        }
-    }
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(os_err(&e, path)),
-    }
-}
-
-/// tempfile's `_resetperms` for a path that is not a symlink: no file flags, mode 0700. macOS changes the link
-/// itself if the path became one meanwhile (lchflags, lchmod); elsewhere Python checks, then follows, and so does this.
-#[cfg(unix)]
-fn reset_perms(p: &Path) {
-    let Ok(c) = std::ffi::CString::new(path_bytes(p)) else { return };
-    // SAFETY: c is a valid NUL-terminated path for each call.
-    unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            libc::lchflags(c.as_ptr(), 0);
-            libc::fchmodat(libc::AT_FDCWD, c.as_ptr(), 0o700, libc::AT_SYMLINK_NOFOLLOW);
-        }
-        #[cfg(not(target_os = "macos"))]
-        libc::chmod(c.as_ptr(), 0o700);
-    }
 }
 
 // ---------- the wait ----------
@@ -1545,14 +789,9 @@ pub fn interrupted() -> bool {
     INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// `KeyboardInterrupt()`: `str()` is empty; `Error.data["type"]` names the class, which no `Exc` stands for
-/// (it is not an Exception, so only a BaseException handler sees it).
+/// `KeyboardInterrupt()`: `str()` is empty.
 pub fn keyboard_interrupt() -> Error {
-    Error::new(Exc::Type, "").with_data(serde_json::json!({"type": "KeyboardInterrupt"}))
-}
-
-pub fn is_keyboard_interrupt(e: &Error) -> bool {
-    e.data.as_ref().and_then(|d| d.get("type")).is_some_and(|t| t == "KeyboardInterrupt")
+    Error::new(Exc::KeyboardInterrupt, "")
 }
 
 /// `snapshot()`: the first RAW_PEEK bytes of the running command's stdout and stderr, decoded with 'replace'.
@@ -1662,7 +901,7 @@ pub fn wait(
     #[cfg(not(unix))]
     {
         let _ = (proc, timeout_s, watch, snapshot, started, threads);
-        Err(Error::os(UNSUPPORTED))
+        Err(Error::os(crate::rt::NATIVE_ONLY))
     }
 }
 
@@ -1670,8 +909,8 @@ pub fn wait(
 /// runs: POSIX: an anonymous temporary file in gettempdir (folder and name are for Windows).
 #[cfg(unix)]
 fn spool(_folder: &Path, _name: &str) -> Result<File> {
-    let (f, path) = mkstemp("tmp", &gettempdir()?)?;
-    std::fs::remove_file(&path).map_err(|e| os_err(&e, &path))?;
+    let (f, path) = py::mkstemp("tmp", &py::gettempdir()?)?;
+    std::fs::remove_file(&path).map_err(|e| py::path_error(&e, &path))?;
     Ok(f)
 }
 
@@ -1757,9 +996,9 @@ pub fn run_isolated(argv: &[String], prompt: &str, timeout_s: f64, kw: Isolated)
         if kw.subscription_auth {
             env.retain(|(k, _)| !scrubbed(k));
         }
-        let tmp = mkdtemp("council-judge-")?;
+        let tmp = py::mkdtemp("council-judge-")?;
         let inside = isolated_call(&tmp, argv, prompt, timeout_s, &kw, env);
-        let cleanup = rmtree(&tmp);
+        let cleanup = py::rmtree(&tmp);
         let call = match inside {
             Ok(call) => call,
             Err(e) => {
@@ -1769,7 +1008,7 @@ pub fn run_isolated(argv: &[String], prompt: &str, timeout_s: f64, kw: Isolated)
         };
         cleanup?;
         if let Some(ended) = call.ended {
-            let timeout = round1(call.started.elapsed().as_secs_f64());
+            let timeout = py::round(call.started.elapsed().as_secs_f64(), 1);
             let exc = if ended == Ended::Stop { stopped(&call.argv, timeout) } else { timeout_expired(&call.argv, timeout) };
             // the events before the kill: what the call cost, and why it hung
             return Err(with_fields(exc, serde_json::json!({"limit": ended == Ended::Limit, "stdout": call.stdout})));
@@ -1778,7 +1017,7 @@ pub fn run_isolated(argv: &[String], prompt: &str, timeout_s: f64, kw: Isolated)
         if code != 0 {
             let squeezed = py::split(&call.stderr).join(" ");
             let tail = py::tail(&squeezed, 300);
-            let mut message = format!("{} exited with {code}", pathlib_name(&call.argv[0]));
+            let mut message = format!("{} exited with {code}", py::path_name(&call.argv[0]));
             if !tail.is_empty() {
                 message.push_str(": ");
                 message.push_str(tail);
@@ -1791,7 +1030,7 @@ pub fn run_isolated(argv: &[String], prompt: &str, timeout_s: f64, kw: Isolated)
     #[cfg(not(unix))]
     {
         let _ = (argv, prompt, timeout_s, kw);
-        Err(Error::os(UNSUPPORTED))
+        Err(Error::os(crate::rt::NATIVE_ONLY))
     }
 }
 
@@ -1809,7 +1048,7 @@ fn isolated_call(tmp: &Path, argv: &[String], prompt: &str, timeout_s: f64, kw: 
     stdin.write_all(prompt.as_bytes())?;
     stdin.seek(SeekFrom::Start(0))?;
     let cwd = tmp.join("work");
-    std::fs::create_dir(&cwd).map_err(|e| os_err(&e, &cwd))?;
+    std::fs::create_dir(&cwd).map_err(|e| py::path_error(&e, &cwd))?;
     let started = Instant::now(); // the limit counts setup too
     let (mut ended, mut returncode, mut threads) = (None, None, Vec::new());
     let limit = kw.watch.as_ref().map_or(timeout_s, |w| w.limit_s());
@@ -1874,36 +1113,3 @@ fn isolated_call(tmp: &Path, argv: &[String], prompt: &str, timeout_s: f64, kw: 
     Ok(Call { argv, started, ended, returncode, stdout, stderr })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round1_is_pythons_round() {
-        for (x, want) in [(0.25, 0.2), (0.35, 0.3), (0.05, 0.1), (1.15, 1.1), (2.5, 2.5), (12.34, 12.3), (0.0, 0.0), (9.96, 10.0)] {
-            assert_eq!(round1(x), want, "{x}");
-        }
-    }
-
-    #[test]
-    fn pure_paths_match_pathlib() {
-        for (p, want) in [("", "."), (".", "."), ("/", "/"), ("//", "//"), ("///a", "/a"), ("//a/./b/", "//a/b"), ("a/../b", "a/../b")] {
-            assert_eq!(pure_path(p.as_bytes()), want.as_bytes(), "{p}");
-        }
-        assert_eq!(pure_join(b".", "auth.json"), b"auth.json");
-        assert_eq!(pure_parent(b"auth.json"), b".");
-        assert_eq!(pure_parent(b"/auth.json"), b"/");
-        assert_eq!(pure_parent(b"//auth.json"), b"//");
-        assert_eq!(pathlib_name("/usr/bin/"), "bin");
-        assert_eq!(pathlib_name(".."), "..");
-        assert_eq!(pathlib_name("a/."), "a");
-        assert_eq!(pathlib_name("/"), "");
-    }
-
-    #[test]
-    fn infinity_survives_as_python_writes_it() {
-        assert_eq!(pyjson::dumps(&float_json(f64::INFINITY)), "Infinity");
-        assert_eq!(pyjson::dumps(&float_json(f64::NEG_INFINITY)), "-Infinity");
-        assert_eq!(pyjson::dumps(&float_json(1.5)), "1.5");
-    }
-}

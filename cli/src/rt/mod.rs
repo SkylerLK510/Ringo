@@ -15,14 +15,34 @@ pub mod workflow;
 
 use std::fmt;
 
+/// What the native runtime's functions fail with on other platforms (the crate still builds there).
+pub const NATIVE_ONLY: &str = "the native runtime runs on macOS and Linux; on Windows ringo uses the Python runtime";
+
 /// The Python exception class an error stands for. `name()` is what Python prints as `type(exc).__name__`, which
-/// some records include (state.json's error is "<name>: <message>").
+/// some records include (state.json's error is "<name>: <message>"); `Error::type_name` adds the OSError subclass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Exc {
     Value,
     Os,
     Key,
+    Index,
     Type,
+    Attribute,
+    Runtime,
+    Recursion,
+    Memory,
+    Overflow,
+    /// `decimal.Overflow`, an ArithmeticError (not a ValueError).
+    DecimalOverflow,
+    UnicodeDecode,
+    UnicodeEncode,
+    JsonDecode,
+    Syntax,
+    Indentation,
+    Tab,
+    StopIteration,
+    /// Not an Exception: only a BaseException handler sees it.
+    KeyboardInterrupt,
     Context,
     Judge,
     Call,
@@ -31,15 +51,39 @@ pub enum Exc {
     Budget,
     Admission,
     NeedVerdicts,
+    /// Any other class a Python subprocess reported by name (`Exc::from_name`).
+    Other(&'static str),
 }
 
 impl Exc {
+    const KNOWN: [Exc; 27] = [
+        Exc::Value, Exc::Os, Exc::Key, Exc::Index, Exc::Type, Exc::Attribute, Exc::Runtime, Exc::Recursion,
+        Exc::Memory, Exc::Overflow, Exc::DecimalOverflow, Exc::UnicodeDecode, Exc::UnicodeEncode, Exc::JsonDecode,
+        Exc::Syntax, Exc::Indentation, Exc::Tab, Exc::StopIteration, Exc::KeyboardInterrupt, Exc::Context,
+        Exc::Judge, Exc::Call, Exc::Stopped, Exc::Timeout, Exc::Budget, Exc::Admission, Exc::NeedVerdicts,
+    ];
+
     pub fn name(self) -> &'static str {
         match self {
             Exc::Value => "ValueError",
             Exc::Os => "OSError",
             Exc::Key => "KeyError",
+            Exc::Index => "IndexError",
             Exc::Type => "TypeError",
+            Exc::Attribute => "AttributeError",
+            Exc::Runtime => "RuntimeError",
+            Exc::Recursion => "RecursionError",
+            Exc::Memory => "MemoryError",
+            Exc::Overflow => "OverflowError",
+            Exc::DecimalOverflow => "Overflow",
+            Exc::UnicodeDecode => "UnicodeDecodeError",
+            Exc::UnicodeEncode => "UnicodeEncodeError",
+            Exc::JsonDecode => "JSONDecodeError",
+            Exc::Syntax => "SyntaxError",
+            Exc::Indentation => "IndentationError",
+            Exc::Tab => "TabError",
+            Exc::StopIteration => "StopIteration",
+            Exc::KeyboardInterrupt => "KeyboardInterrupt",
             Exc::Context => "ContextError",
             Exc::Judge => "JudgeError",
             Exc::Call => "CallError",
@@ -48,18 +92,85 @@ impl Exc {
             Exc::Budget => "BudgetExceeded",
             Exc::Admission => "AdmissionRefused",
             Exc::NeedVerdicts => "NeedVerdicts",
+            Exc::Other(name) => name,
         }
     }
 
-    /// Python's `except X` also catches subclasses: ContextError is a ValueError, CallError a JudgeError,
-    /// AdmissionRefused a BudgetExceeded, Stopped a TimeoutExpired.
-    pub fn is(self, base: Exc) -> bool {
-        self == base
-            || matches!(
-                (self, base),
-                (Exc::Context, Exc::Value) | (Exc::Call, Exc::Judge) | (Exc::Admission, Exc::Budget) | (Exc::Stopped, Exc::Timeout)
-            )
+    /// The class it directly derives from, where that is a class `Exc` names.
+    fn parent(self) -> Option<Exc> {
+        Some(match self {
+            Exc::Context | Exc::UnicodeDecode | Exc::UnicodeEncode | Exc::JsonDecode => Exc::Value,
+            Exc::Recursion => Exc::Runtime,
+            Exc::Indentation => Exc::Syntax,
+            Exc::Tab => Exc::Indentation,
+            Exc::Call => Exc::Judge,
+            Exc::Stopped => Exc::Timeout,
+            Exc::Admission => Exc::Budget,
+            _ => return None,
+        })
     }
+
+    /// Python's `except base` also catches subclasses: ContextError, the Unicode errors and JSONDecodeError are
+    /// ValueErrors, RecursionError a RuntimeError, TabError an IndentationError a SyntaxError, CallError a
+    /// JudgeError, AdmissionRefused a BudgetExceeded, Stopped a TimeoutExpired.
+    pub fn is(self, base: Exc) -> bool {
+        let mut exc = Some(self);
+        while let Some(e) = exc {
+            if e == base {
+                return true;
+            }
+            exc = e.parent();
+        }
+        false
+    }
+
+    /// The class Python names `name` (an OSError subclass is `Os`: its errno names it again).
+    pub fn from_name(name: &str) -> Exc {
+        if let Some(exc) = Exc::KNOWN.iter().find(|e| e.name() == name) {
+            return *exc;
+        }
+        if OS_SUBCLASSES.contains(&name) || name == "ConnectionError" {
+            return Exc::Os;
+        }
+        // a class no port raises itself, reported once by a Python subprocess as the run ends
+        Exc::Other(Box::leak(name.to_string().into_boxed_str()))
+    }
+}
+
+const OS_SUBCLASSES: [&str; 14] = [
+    "BlockingIOError", "ChildProcessError", "BrokenPipeError", "ConnectionAbortedError", "ConnectionRefusedError",
+    "ConnectionResetError", "FileExistsError", "FileNotFoundError", "IsADirectoryError", "NotADirectoryError",
+    "InterruptedError", "PermissionError", "ProcessLookupError", "TimeoutError",
+];
+
+/// The OSError subclass Python raises for an errno (`OSError(errno, ...)` picks it), if any.
+#[cfg(unix)]
+pub fn os_subclass(errno: i32) -> Option<&'static str> {
+    use libc::*;
+    let i = match errno {
+        EAGAIN | EALREADY | EINPROGRESS => 0,
+        e if e == EWOULDBLOCK => 0,
+        ECHILD => 1,
+        EPIPE | ESHUTDOWN => 2,
+        ECONNABORTED => 3,
+        ECONNREFUSED => 4,
+        ECONNRESET => 5,
+        EEXIST => 6,
+        ENOENT => 7,
+        EISDIR => 8,
+        ENOTDIR => 9,
+        EINTR => 10,
+        EACCES | EPERM => 11,
+        ESRCH => 12,
+        ETIMEDOUT => 13,
+        _ => return None,
+    };
+    Some(OS_SUBCLASSES[i])
+}
+
+#[cfg(not(unix))]
+pub fn os_subclass(_errno: i32) -> Option<&'static str> {
+    None
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -80,12 +191,27 @@ impl Error {
     pub fn os(msg: impl Into<String>) -> Error {
         Error::new(Exc::Os, msg)
     }
+    /// An OSError from an io::Error, with Python's text (`py::os_error`) and so its errno.
+    pub fn io(e: &std::io::Error, filename: Option<&str>) -> Error {
+        Error::os(py::os_error(e, filename))
+    }
     pub fn with_data(mut self, data: serde_json::Value) -> Error {
         self.data = Some(data);
         self
     }
     pub fn is(&self, base: Exc) -> bool {
         self.exc.is(base)
+    }
+
+    /// `type(exc).__name__`, as records and messages print it: an OSError is named by the errno its text shows,
+    /// as Python names the subclass it raises (FileNotFoundError, PermissionError, ...).
+    pub fn type_name(&self) -> &'static str {
+        if self.exc == Exc::Os
+            && let Some(name) = self.msg.strip_prefix("[Errno ").and_then(|m| m.split(']').next()?.parse().ok()).and_then(os_subclass)
+        {
+            return name;
+        }
+        self.exc.name()
     }
 }
 
@@ -99,7 +225,7 @@ impl std::error::Error for Error {}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Error {
-        Error::os(py::os_error(&e, None))
+        Error::io(&e, None)
     }
 }
 
@@ -137,8 +263,8 @@ pub fn select(home: &std::path::Path) -> Result<Selection> {
     if root.is_symlink() {
         return Err(Error::value("release state cannot be a symlink"));
     }
-    let resolved = resolve(&root);
-    let here = resolve(home);
+    let resolved = py::realpath(&root)?;
+    let here = py::realpath(home)?;
     if resolved == here || resolved.starts_with(&here) {
         return Err(Error::value("release state must be outside the source repository"));
     }
@@ -180,7 +306,7 @@ fn verify_pinned(meta: &serde_json::Value, exe: &std::path::Path, binary_sha256:
     if !hex64(id) {
         return Err(refuse("no release id"));
     }
-    let state = resolve(&crate::state_root());
+    let state = py::realpath(&crate::state_root())?;
     let bundle = state.join("bundles").join(id);
     let real = bundle.canonicalize().map_err(|_| refuse("its release is not staged here"))?;
     // releases.py passes the bundle's resolved path itself; anything else, a symlink to it included, is refused
@@ -233,27 +359,4 @@ pub fn canonical(value: &serde_json::Value) -> String {
 pub fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// pathlib's resolve(strict=False): the longest existing prefix canonicalised, the rest appended.
-pub fn resolve(path: &std::path::Path) -> std::path::PathBuf {
-    let absolute = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().unwrap_or_default().join(path) };
-    let mut rest = Vec::new();
-    let mut probe = absolute.as_path();
-    loop {
-        if let Ok(real) = probe.canonicalize() {
-            let mut out = real;
-            for part in rest.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        match (probe.parent(), probe.file_name()) {
-            (Some(parent), Some(name)) => {
-                rest.push(name.to_os_string());
-                probe = parent;
-            }
-            _ => return absolute,
-        }
-    }
 }
