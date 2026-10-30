@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// `JUDGE_PRESETS`: preset name and command line, in the Python dict's order.
-pub const JUDGE_PRESETS: [(&str, &str); 3] = [
+pub const JUDGE_PRESETS: [(&str, &str); 4] = [
     (
         "claude",
         "claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools \"\" \
@@ -46,6 +46,20 @@ pub const JUDGE_PRESETS: [(&str, &str); 3] = [
          -c include_collaboration_mode_instructions=false \
          -c 'project_doc_max_bytes=0' -c 'forced_login_method=\"chatgpt\"' \
          -c 'model_provider=\"openai\"' -c 'web_search=\"disabled\"' \
+         --skip-git-repo-check --ephemeral -s read-only --color never --json -",
+    ),
+    (
+        "codex-search",
+        // research's gather call (research.py): the codex-chatgpt restrictions with live web search on
+        "codex --search exec --ignore-user-config --ignore-rules --disable apps --disable plugins \
+         --disable hooks --disable shell_tool --disable unified_exec --disable skill_search \
+         --enable skip_host_skill_discovery --disable unbounded_connection_retries \
+         --disable sleep_tool --disable goals --disable view_image --disable image_generation \
+         --disable default_mode_request_user_input -c include_environment_context=false \
+         -c include_permissions_instructions=false -c skills.include_instructions=false \
+         -c include_collaboration_mode_instructions=false \
+         -c 'project_doc_max_bytes=0' -c 'forced_login_method=\"chatgpt\"' \
+         -c 'model_provider=\"openai\"' -c 'web_search=\"live\"' \
          --skip-git-repo-check --ephemeral -s read-only --color never --json -",
     ),
 ];

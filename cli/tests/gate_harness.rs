@@ -1436,7 +1436,7 @@ fn small_helpers_match_python() {
             cases.push(json!(["limit_for", [v(x), v(floor)]]));
         }
     }
-    for name in ["claude", "codex", "codex-chatgpt", "ollama:", "ollama:qwen3", "claude:x", "codex:x", "", "Claude"] {
+    for name in ["claude", "codex", "codex-chatgpt", "codex-search", "ollama:", "ollama:qwen3", "claude:x", "codex:x", "", "Claude"] {
         cases.push(json!(["tool_access", [name]]));
     }
     let plans = [

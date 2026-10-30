@@ -1228,7 +1228,7 @@ fn backend_of(v: &Value) -> Backend {
 #[test]
 fn role_backend_matches_python() {
     let mut cases = Vec::new();
-    for name in ["codex-chatgpt", "codex", "claude", "claude:foo --model=a --model b", "codex:codex exec --json", "fake", "ollama:x"] {
+    for name in ["codex-chatgpt", "codex-search", "codex", "claude", "claude:foo --model=a --model b", "codex:codex exec --json", "fake", "ollama:x"] {
         for opts in [json!(null), json!({}), json!({"model": "gpt-6-luna", "effort": "low"}), json!({"model": "opus"}), json!({"effort": "high"}),
                      json!({"model": ""}), json!({"effort": ""})] {
             cases.push(json!([name, opts]));

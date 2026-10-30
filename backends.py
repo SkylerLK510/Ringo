@@ -24,23 +24,27 @@ except ImportError:  # Windows: file_lock uses msvcrt instead
     fcntl = None
     import msvcrt
 
+# The codex-chatgpt flags, shared with codex-search: subscription login, no shell or other tools, no agent scaffolding.
+_CHATGPT_FLAGS = ('--ignore-user-config --ignore-rules --disable apps --disable plugins '
+                  '--disable hooks --disable shell_tool --disable unified_exec --disable skill_search '
+                  '--enable skip_host_skill_discovery --disable unbounded_connection_retries '
+                  # Ringo's calls are single tool-free turns: drop the agent scaffolding Codex adds to each one
+                  '--disable sleep_tool --disable goals --disable view_image --disable image_generation '
+                  '--disable default_mode_request_user_input -c include_environment_context=false '
+                  '-c include_permissions_instructions=false -c skills.include_instructions=false '
+                  '-c include_collaboration_mode_instructions=false '
+                  '''-c 'project_doc_max_bytes=0' -c 'forced_login_method="chatgpt"' '''
+                  '''-c 'model_provider="openai"' ''')
+_CHATGPT_TAIL = '--skip-git-repo-check --ephemeral -s read-only --color never --json -'
 JUDGE_PRESETS = {
     'claude': ('claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" '
                '--no-session-persistence --model sonnet'),
     'codex': ('codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins '
               '''-c 'web_search="disabled"' -c 'model_reasoning_effort="high"' --skip-git-repo-check --ephemeral '''
               '-s read-only --color never --json -'),
-    'codex-chatgpt': ('codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins '
-                     '--disable hooks --disable shell_tool --disable unified_exec --disable skill_search '
-                     '--enable skip_host_skill_discovery --disable unbounded_connection_retries '
-                     # Ringo's calls are single tool-free turns: drop the agent scaffolding Codex adds to each one
-                     '--disable sleep_tool --disable goals --disable view_image --disable image_generation '
-                     '--disable default_mode_request_user_input -c include_environment_context=false '
-                     '-c include_permissions_instructions=false -c skills.include_instructions=false '
-                     '-c include_collaboration_mode_instructions=false '
-                     '''-c 'project_doc_max_bytes=0' -c 'forced_login_method="chatgpt"' '''
-                     '''-c 'model_provider="openai"' -c 'web_search="disabled"' '''
-                     '--skip-git-repo-check --ephemeral -s read-only --color never --json -'),
+    'codex-chatgpt': 'codex exec ' + _CHATGPT_FLAGS + '''-c 'web_search="disabled"' ''' + _CHATGPT_TAIL,
+    # research's gather call: the same restrictions with live web search on (`--search` is a top-level option)
+    'codex-search': 'codex --search exec ' + _CHATGPT_FLAGS + '''-c 'web_search="live"' ''' + _CHATGPT_TAIL,
 }
 RAW_PEEK = 1_000_000  # bytes of a running call's output read for its soft-limit checks
 # Replaces Codex's agent prompt (about 22 KB) for lean calls; Ringo's own instructions travel in the message.
@@ -434,6 +438,19 @@ def _peek(f):
         return own.read(RAW_PEEK)
 
 
+def child_env(subscription_auth=False):
+    """The environment a backend command gets: the caller's without the TypeSafe key; with subscription_auth also
+    without every *API_KEY variable and the endpoint and token overrides, so the CLI's own login is used."""
+    env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+    if subscription_auth:
+        env = {k: v for k, v in env.items() if not k.endswith('API_KEY') and k not in {
+            'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ACCESS_TOKEN', 'ANTHROPIC_AUTH_TOKEN',
+            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID',
+            # Claude's endpoint override and its cloud-provider switches would also move a call off the login
+            'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'}}
+    return env
+
+
 def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False, watch=None):
     """stdout of one run. The working folder is empty, so no project instructions or files
     load from it; it is not a file-system boundary. The command gets the caller's
@@ -445,13 +462,7 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
     (see _wait); the call is never killed at it. A failure (JudgeError), a stop (Stopped) or a timeout
     (TimeoutExpired, .limit True) carries the stdout written so far as .stdout."""
     # ceiling: stdout is read whole; a command that floods it fills disk and memory
-    env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
-    if subscription_auth:
-        env = {k: v for k, v in env.items() if not k.endswith('API_KEY') and k not in {
-            'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ACCESS_TOKEN', 'ANTHROPIC_AUTH_TOKEN',
-            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID',
-            # Claude's endpoint override and its cloud-provider switches would also move a call off the login
-            'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'}}
+    env = child_env(subscription_auth)
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
     # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.

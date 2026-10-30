@@ -10,7 +10,8 @@ commands have unknown capabilities. Local files read by tools can reach the prov
 get a private CODEX_HOME and HOME per call, so the owner's global Codex instructions, skills and memories do not
 load. No conversation history is replayed.
 
-Backends: `claude`, `codex` and `codex-chatgpt` (the built-in presets), `ollama:MODEL`, `claude:<command>` for any
+Backends: `claude`, `codex`, `codex-chatgpt` and `codex-search` (the built-in presets; research.py's gather call
+uses codex-search), `ollama:MODEL`, `claude:<command>` for any
 command that behaves like the Claude CLI (another model, other flags), `codex:<command>` for any command that
 prints Codex `exec --json` events, or any other command line, which is run plain. `--checker-backend` sends the
 plan's verdicts pass (and its repair) to a second backend, so a different model or provider checks the findings;
@@ -118,18 +119,19 @@ def backend(spec):
     (Codex `exec --json` events, private CODEX_HOME and HOME) or 'plain'. A codex backend also declares
     'subscription_auth' (strip API keys and endpoint overrides), 'lean' (the codex-chatgpt preset: Codex's agent
     prompt and tool modes are removed, see backends._lean_codex) and 'tools', the tool item types its turns may
-    contain: the `codex` preset keeps its shell, a `codex:` command may search the web only when its own argv
-    passes --search, and every other tool item fails the turn."""
+    contain: the `codex` preset keeps its shell, `codex-search` (research's gather call: the codex-chatgpt
+    restrictions with live web search) may search the web, a `codex:` command may search the web only when its own
+    argv passes --search, and every other tool item fails the turn."""
     extra = {}
     if spec == 'claude':  # the preset uses the subscription login: API keys and endpoint overrides are removed
         argv, style = split_command(backends.JUDGE_PRESETS['claude']), 'claude'
         extra = {'subscription_auth': True}
     elif spec.startswith('claude:'):
         argv, style = split_command(spec[7:]), 'claude'
-    elif spec in ('codex', 'codex-chatgpt'):
+    elif spec in ('codex', 'codex-chatgpt', 'codex-search'):
         argv, style = split_command(backends.JUDGE_PRESETS[spec]), 'codex'
-        extra = {'subscription_auth': spec == 'codex-chatgpt', 'lean': spec == 'codex-chatgpt',
-                 'tools': ['command_execution'] if spec == 'codex' else []}
+        extra = {'subscription_auth': spec != 'codex', 'lean': spec != 'codex',
+                 'tools': {'codex': ['command_execution'], 'codex-search': ['web_search']}.get(spec, [])}
     elif spec.startswith('codex:'):
         argv, style = split_command(spec[6:]), 'codex'
         if argv and '--json' not in argv:
@@ -609,7 +611,9 @@ def tool_access(name):
     """What tools a preset's child may use: preset declarations, not an attestation of arbitrary commands or CLI
     installations. 'none' is about tools, not instructions: a CLI can still load instructions on its own, which is
     why Codex children also get a private CODEX_HOME and HOME (backends.run_isolated)."""
-    return 'none' if name in ('claude', 'codex-chatgpt') or name.startswith('ollama:') else 'disk' if name == 'codex' else 'unknown'
+    if name in ('claude', 'codex-chatgpt') or name.startswith('ollama:'):
+        return 'none'
+    return {'codex': 'disk', 'codex-search': 'web'}.get(name, 'unknown')
 
 
 def check_backends(names, allow_tools=False):

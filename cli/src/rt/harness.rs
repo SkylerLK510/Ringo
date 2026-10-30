@@ -627,6 +627,8 @@ pub fn tool_access(name: &str) -> &'static str {
         "none"
     } else if name == "codex" {
         "disk"
+    } else if name == "codex-search" {
+        "web"
     } else {
         "unknown"
     }
@@ -1236,8 +1238,9 @@ impl backends::Watch for Leash {
 /// `backend(spec)`: the backend a spec names. The style says how a call is made, declared by the spec and never
 /// guessed from the executable's name: 'claude' (system-prompt file, JSON reply with usage), 'codex' (Codex `exec
 /// --json` events, private CODEX_HOME and HOME) or 'plain'. A codex backend also declares `subscription_auth`,
-/// `lean` (the codex-chatgpt preset) and `tools`, the tool item types its turns may contain: the `codex` preset
-/// keeps its shell, a `codex:` command may search the web only when its own argv passes --search.
+/// `lean` (the codex-chatgpt and codex-search presets) and `tools`, the tool item types its turns may contain: the
+/// `codex` preset keeps its shell, `codex-search` may search the web, a `codex:` command may search the web only
+/// when its own argv passes --search.
 pub fn backend(spec: &str) -> Result<Backend> {
     let preset = |name: &str| split_command(backends::judge_preset(name).expect("a preset"));
     let (mut subscription_auth, mut lean, mut tools) = (None, None, None);
@@ -1246,10 +1249,14 @@ pub fn backend(spec: &str) -> Result<Backend> {
         (preset("claude")?, "claude")
     } else if let Some(rest) = spec.strip_prefix("claude:") {
         (split_command(rest)?, "claude")
-    } else if spec == "codex" || spec == "codex-chatgpt" {
-        let chatgpt = spec == "codex-chatgpt";
-        (subscription_auth, lean) = (Some(chatgpt), Some(chatgpt));
-        tools = Some(if chatgpt { vec![] } else { vec!["command_execution".to_string()] });
+    } else if spec == "codex" || spec == "codex-chatgpt" || spec == "codex-search" {
+        let login = spec != "codex"; // codex-chatgpt and codex-search use the subscription login, lean
+        (subscription_auth, lean) = (Some(login), Some(login));
+        tools = Some(match spec {
+            "codex" => vec!["command_execution".to_string()],
+            "codex-search" => vec!["web_search".to_string()],
+            _ => vec![],
+        });
         (preset(spec)?, "codex")
     } else if let Some(rest) = spec.strip_prefix("codex:") {
         let argv = split_command(rest)?;
