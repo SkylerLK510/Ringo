@@ -30,7 +30,7 @@ fn locate(name: &str) -> Option<PathBuf> {
         .map(|p| fs::canonicalize(&p).unwrap_or(p))
 }
 
-/// Where to ask for the newest release, the JSON field holding it, and the command that updates this install.
+/// Where to ask for the newest release and the command that updates this install, from where the program lives.
 fn source(agent: Agent, path: &Path) -> Option<(String, String)> {
     let package = match agent {
         Agent::Codex => "@openai/codex",
@@ -38,13 +38,20 @@ fn source(agent: Agent, path: &Path) -> Option<(String, String)> {
         Agent::Grok => return None, // no public release feed to ask
     };
     let real = path.to_string_lossy().replace('\\', "/");
-    let name = agent.name();
-    Some(if real.contains("/Caskroom/") {
-        (format!("https://formulae.brew.sh/api/cask/{name}.json"), format!("brew upgrade --cask {name}"))
-    } else if agent == Agent::Claude && !real.contains("node_modules") {
-        (format!("https://registry.npmjs.org/{package}/latest"), "claude update".into())
+    let brew = |dir: &str| real.split(dir).nth(1).and_then(|rest| rest.split('/').next()).map(str::to_string);
+    let npm = (format!("https://registry.npmjs.org/{package}/latest"), format!("npm install -g {package}@latest"));
+    Some(if let Some(cask) = brew("/Caskroom/") {
+        (format!("https://formulae.brew.sh/api/cask/{cask}.json"), format!("brew upgrade --cask {cask}"))
+    } else if let Some(formula) = brew("/Cellar/") {
+        (format!("https://formulae.brew.sh/api/formula/{formula}.json"), format!("brew upgrade {formula}"))
+    } else if real.contains("/node_modules/") || real.ends_with(".cmd") {
+        npm // a .cmd is npm's Windows shim
+    } else if agent == Agent::Claude {
+        (npm.0, "claude update".into())
+    } else if cfg!(windows) {
+        (npm.0, r#"powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex""#.into())
     } else {
-        (format!("https://registry.npmjs.org/{package}/latest"), format!("npm install -g {package}@latest"))
+        (npm.0, "curl -fsSL https://chatgpt.com/codex/install.sh | sh".into())
     })
 }
 
@@ -52,7 +59,7 @@ fn fetch_version(url: &str) -> Option<String> {
     let out = Command::new("curl").args(["-fsSL", "-m", "5", url]).stdin(Stdio::null()).stderr(Stdio::null())
         .output().ok().filter(|o| o.status.success())?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    v.get("version")?.as_str().and_then(version)
+    v.get("version").or_else(|| v.get("versions")?.get("stable"))?.as_str().and_then(version)
 }
 
 fn installed_version(path: &Path) -> Option<String> {
@@ -73,6 +80,7 @@ pub fn notices(agents: &[Agent], state: &Path) -> Vec<String> {
     }
     let releases = std::env::var_os("RINGO_NO_UPDATE_CHECK").is_none();
     let lookup = releases && memo["checked"].as_u64().is_none_or(|t| now.saturating_sub(t) >= DAY_S);
+    let mut missed = false;
     let mut lines = Vec::new();
     for &agent in agents {
         let name = agent.name();
@@ -87,14 +95,17 @@ pub fn notices(agents: &[Agent], state: &Path) -> Vec<String> {
         if lookup {
             match fetch_version(&url) {
                 Some(out) => memo["latest"][&url] = out.into(),
-                None => continue, // offline or the feed moved: say nothing, look again next time
+                None => {
+                    missed = true; // offline or the feed moved: say nothing, look again next time
+                    continue;
+                }
             }
         }
         if let Some(out) = memo["latest"][&url].as_str().filter(|out| newer(out, &have)) {
             lines.push(format!("  {name} {out} is out (you have {have}); update with: {update}"));
         }
     }
-    if lookup {
+    if lookup && !missed {
         memo["checked"] = now.into();
     }
     if let Ok(text) = serde_json::to_vec_pretty(&memo) {
@@ -120,12 +131,19 @@ mod tests {
 
     #[test]
     fn picks_the_install_method() {
-        let cask = source(Agent::Codex, Path::new("/opt/homebrew/Caskroom/codex/0.165.0/bin/codex")).unwrap();
-        assert_eq!(cask, ("https://formulae.brew.sh/api/cask/codex.json".into(), "brew upgrade --cask codex".into()));
-        let npm = source(Agent::Codex, Path::new("/usr/local/lib/node_modules/@openai/codex/bin/codex.js")).unwrap();
-        assert_eq!(npm.1, "npm install -g @openai/codex@latest");
-        let native = source(Agent::Claude, Path::new("/Users/u/.local/share/claude/versions/2.1.314")).unwrap();
-        assert_eq!(native.1, "claude update");
+        let at = |agent, path: &str| source(agent, Path::new(path)).unwrap();
+        assert_eq!(at(Agent::Codex, "/opt/homebrew/Caskroom/codex/0.165.0/bin/codex"),
+                   ("https://formulae.brew.sh/api/cask/codex.json".into(), "brew upgrade --cask codex".into()));
+        let cask = at(Agent::Claude, "/opt/homebrew/Caskroom/claude-code/2.1.314/claude");
+        assert_eq!(cask.0, "https://formulae.brew.sh/api/cask/claude-code.json");
+        assert_eq!(cask.1, "brew upgrade --cask claude-code");
+        assert_eq!(at(Agent::Codex, "/opt/homebrew/Cellar/codex/0.165.0/bin/codex").1, "brew upgrade codex");
+        assert_eq!(at(Agent::Codex, "/usr/local/lib/node_modules/@openai/codex/bin/codex.js").1,
+                   "npm install -g @openai/codex@latest");
+        assert_eq!(at(Agent::Claude, "/Users/u/.local/share/claude/versions/2.1.314").1, "claude update");
+        assert!(at(Agent::Codex, "/Users/u/.local/bin/codex").1.contains("chatgpt.com/codex/install"));
+        let shim = at(Agent::Codex, r"C:\Users\u\AppData\Roaming\npm\codex.cmd");
+        assert_eq!(shim.1, "npm install -g @openai/codex@latest");
         assert!(source(Agent::Grok, Path::new("/usr/local/bin/grok")).is_none());
     }
 
