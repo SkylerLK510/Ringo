@@ -884,6 +884,11 @@ pub fn mkstemp(prefix: &str, dir: &Path) -> Result<(std::fs::File, PathBuf)> {
     Err(Error::os("[Errno 17] No usable temporary file name found"))
 }
 
+#[cfg(not(unix))]
+pub fn rmtree(_path: &Path) -> Result<()> {
+    Err(Error::os(crate::rt::NATIVE_ONLY))
+}
+
 /// `TemporaryDirectory` cleanup: everything under path removed, permissions and (macOS) file flags that block the
 /// removal reset first, as tempfile's error handler does; a folder already gone is no error.
 #[cfg(unix)]

@@ -354,7 +354,11 @@ def _sync_codex_auth(owner, snapshot, copy):
     if snapshot is None:
         return
     # Only a regular file the child left in its copy's place: never through a symlink (that would hand the owner
-    # another file), and never a FIFO or device (opened non-blocking, so one cannot hang the write-back).
+    # another file), and never a FIFO or device (opened non-blocking, so one cannot hang the write-back). Windows has
+    # no O_NOFOLLOW, so the link is also refused by name; nothing can swap it in between, because the child and
+    # everything it started were killed before this runs.
+    if copy.is_symlink():
+        return
     try:
         fd = os.open(copy, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
         with os.fdopen(fd, 'rb') as f:

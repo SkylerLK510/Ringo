@@ -323,6 +323,10 @@ impl Session {
     /// One agent turn. Read turns run in the repository with the agent's read-only setting and continue that
     /// agent's conversation; write turns start fresh in a private worktree from HEAD.
     pub fn launch_agent(&mut self, agent: Agent, write: bool, prompt: &str) -> Result<usize, String> {
+        if write && !self.git {
+            return Err(format!("@{}! edits in a private git worktree, so it needs a git project: start ringo inside one \
+                                (or run git init here). @{} without ! works in any folder", agent.name(), agent.name()));
+        }
         if !self.installed(agent) {
             return Err(format!("{} is not installed (no `{}` on PATH)", agent.name(), self.programs[&agent].display()));
         }
@@ -331,10 +335,6 @@ impl Session {
         }
         if !write && let Some(busy) = self.jobs.iter().find(|j| j.running() && j.kind == (Kind::Agent { agent, write: false })) {
             return Err(format!("{} is busy with #{}; its conversation takes one turn at a time", agent.name(), busy.id));
-        }
-        if write && !self.git {
-            return Err(format!("@{}! edits in a private git worktree, so it needs a git project: start ringo inside one \
-                                (or run git init here). @{} without ! works in any folder", agent.name(), agent.name()));
         }
         let base = if write { Some(git(&self.repo, &["rev-parse", "HEAD"])?) } else { None };
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
