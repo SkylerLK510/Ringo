@@ -68,6 +68,8 @@ pub struct Job {
     pub id: usize,
     pub kind: Kind,
     pub title: String,
+    /// The task as given, uncut.
+    pub title_full: String,
     pub status: Status,
     pub started: Instant,
     pub elapsed: Option<Duration>,
@@ -311,7 +313,7 @@ impl Session {
         let id = self.jobs.len() + 1;
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
-        self.jobs.push(Job { id, kind, title: parse::short(title, 60), status: Status::Running, started: Instant::now(),
+        self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), dir, worktree: None, base: None, applied: false,
                              touched: BTreeSet::new(), pid: None, cancel: Arc::new(AtomicBool::new(false)) });
@@ -407,7 +409,11 @@ impl Session {
     /// and environment are passed unchanged.
     pub fn launch_ringo(&mut self, title: &str, args: Vec<OsString>, trace: PathBuf) -> Result<usize, String> {
         let command = args.first().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
-        let id = self.new_job(Kind::Ringo { command }, title)?;
+        self.launch_ringo_as(&command, title, args, trace)
+    }
+
+    fn launch_ringo_as(&mut self, command: &str, title: &str, args: Vec<OsString>, trace: PathBuf) -> Result<usize, String> {
+        let id = self.new_job(Kind::Ringo { command: command.into() }, title)?;
         let prefix = self.pipeline.clone().unwrap_or_else(|| vec![python(), self.ringo_home.join("ringo.py").into()]);
         let mut cmd = Command::new(&prefix[0]);
         cmd.args(&prefix[1..]).args(args).current_dir(&self.repo);
@@ -472,6 +478,41 @@ impl Session {
         args.extend(["--backend", &self.backend, "--timeout", "180"].map(Into::into));
         args.extend(["--trace".into(), dir.join("trace").into(), "--out".into(), dir.join("reply.md").into()]);
         self.launch_ringo(brief, args, dir.join("trace"))
+    }
+
+    /// A plain line: one tool-free model call through Ringo's design pipeline with the ask plan (plans/ask.json),
+    /// the cheapest way to ask anything. The material is the last few questions and answers of this conversation,
+    /// then the question: no agent scaffolding, no tools, no files, so a question costs a few thousand tokens where
+    /// an agent turn costs 17,000 before it starts. Questions that need the repository go to @codex or @claude.
+    pub fn ask(&mut self, question: &str) -> Result<usize, String> {
+        const KEEP: usize = 4; // earlier exchanges carried as context
+        const ROOM: usize = 12_000; // characters of them at most, the newest kept first
+        let mut earlier: Vec<String> = Vec::new();
+        let mut used = 0;
+        for job in self.jobs.iter().rev().filter(|j| j.kind == (Kind::Ringo { command: "ask".into() }) && j.status == Status::Done) {
+            let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, job.reply().trim());
+            if earlier.len() == KEEP || used + text.len() > ROOM {
+                break;
+            }
+            used += text.len();
+            earlier.push(text);
+        }
+        earlier.reverse();
+        let mut material = String::new();
+        if !earlier.is_empty() {
+            material.push_str("Earlier in this conversation:\n\n");
+            material.push_str(&earlier.join("\n"));
+            material.push_str("\n---\n\n");
+        }
+        material.push_str(&format!("Question: {question}\n"));
+        let dir = self.next_dir()?;
+        fs::write(dir.join("ask.md"), &material).map_err(|e| e.to_string())?;
+        let mut args: Vec<OsString> = vec!["design".into(), "--pipeline".into(), self.ringo_home.join("plans/ask.json").into(),
+                                           "--input".into(), dir.join("ask.md").into()];
+        args.extend(["--backend", &self.backend, "--timeout", "180"].map(Into::into));
+        args.extend(["--trace".into(), dir.join("trace").into(), "--out".into(), dir.join("reply.md").into()]);
+        let id = self.launch_ringo_as("ask", question, args, dir.join("trace"))?;
+        Ok(id)
     }
 
     /// `/work SPEC`: Ringo's checked work loop on a task spec.

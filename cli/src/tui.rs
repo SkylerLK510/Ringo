@@ -15,18 +15,20 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 const HELP: &str = "\
-Cheap by default: Ringo's pipelines run the models as tool-free workers with executable checks and one review.
+Cheap by default. A line without / or @ is a question: one tool-free call, with your last few questions and
+answers as context. It costs a few thousand tokens, and it cannot see your files (pipelines backend: {backend}).
+Ringo's pipelines run the models as tool-free workers with executable checks and one review:
   /review #N           Ringo reviews job N's change (task text as the change description)
   /review BASE [HEAD]  Ringo reviews BASE...HEAD of this repository
   /design TEXT         Ringo's one-call design pipeline on TEXT
   /work SPEC.json      Ringo's checked work loop on a task spec
   /backend SPEC        backend for those pipelines (now: {backend})
-Agents (full agent turns: far more tokens per task; the panel shows each one's count):
+Agents (full agent turns: about 17,000 tokens before they start, far more when they search your files; the panel
+counts every one), for questions about your code and for changes:
   @codex TASK          ask an agent; it can read the repository but not change it (conversation continues)
   @codex! TASK         let it edit, in a private worktree from HEAD; nothing lands until you /apply
   @codex @claude TASK  the same task to several agents at once; @all means codex and claude
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
-  /use NAME            default agent for lines without @ (now: {default})
   /setup               add another agent and sign in to it
   /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono (now: {theme})
 Jobs: /show N  /diff N  /apply N  /drop N (remove its worktree)  /kill N  /quit
@@ -35,7 +37,7 @@ Keys: Tab / Shift-Tab select a job, PgUp / PgDn scroll, Up / Down history, Esc c
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     Agents(Vec<(Agent, bool)>, String),
-    Use(Agent),
+    Ask(String),
     Backend(String),
     Show(usize),
     Kill(usize),
@@ -56,8 +58,9 @@ fn job_number(word: Option<&str>) -> Result<usize, String> {
     word.map(|w| w.trim_start_matches('#')).and_then(|w| w.parse().ok()).ok_or("give a job number, e.g. 3".into())
 }
 
-/// One input line as a command. Lines without `/` or `@` go to the default agent; @all means every set-up agent.
-pub fn parse(line: &str, default: Agent, all: &[Agent]) -> Result<Cmd, String> {
+/// One input line as a command. A line without `/` or `@` is a question (one tool-free call); @all means every
+/// set-up agent that can read.
+pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
     let line = line.trim();
     if let Some(rest) = line.strip_prefix('/') {
         let mut words = rest.split_whitespace();
@@ -68,8 +71,6 @@ pub fn parse(line: &str, default: Agent, all: &[Agent]) -> Result<Cmd, String> {
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "setup" => Ok(Cmd::Setup),
             "theme" => Ok(Cmd::Theme(words.next().map(str::to_string))),
-            "use" => tail.parse::<String>().ok().and_then(|n| Agent::from_name(&n)).map(Cmd::Use)
-                .ok_or("/use codex, claude or grok".into()),
             "backend" if !tail.is_empty() => Ok(Cmd::Backend(tail.into())),
             "show" => job_number(words.next()).map(Cmd::Show),
             "kill" => job_number(words.next()).map(Cmd::Kill),
@@ -100,7 +101,7 @@ pub fn parse(line: &str, default: Agent, all: &[Agent]) -> Result<Cmd, String> {
         rest = rest.trim_start()[word.len()..].trim_start();
     }
     if agents.is_empty() {
-        agents.push((default, false));
+        return if rest.is_empty() { Err("type a question, or /help".into()) } else { Ok(Cmd::Ask(rest.to_string())) };
     }
     if rest.is_empty() {
         return Err("say what the agent should do".into());
@@ -139,7 +140,6 @@ struct App {
     selected: usize, // 0 is the console, otherwise a job id
     scroll: usize,   // lines up from the bottom of the log
     log_height: usize,
-    default: Agent,
     console: VecDeque<String>,
     quit_armed: bool,
     quit: bool,
@@ -165,7 +165,7 @@ impl App {
     }
 
     fn help_text(&self) -> String {
-        HELP.replace("{backend}", &self.s.backend).replace("{default}", self.default.name()).replace("{theme}", self.theme.name)
+        HELP.replace("{backend}", &self.s.backend).replace("{theme}", self.theme.name)
     }
 
     fn help(&mut self) {
@@ -195,7 +195,7 @@ impl App {
         self.history.push(line.clone());
         self.hist = self.history.len();
         self.say(format!("› {line}"));
-        match parse(&line, self.default, &self.agents.clone()).and_then(|cmd| self.run(cmd)) {
+        match parse(&line, &self.agents.clone()).and_then(|cmd| self.run(cmd)) {
             Ok(Some(text)) => {
                 self.say(text);
                 self.selected = 0;
@@ -240,10 +240,6 @@ impl App {
                 self.setup = true;
                 None
             }
-            Cmd::Use(agent) => {
-                self.default = agent;
-                Some(format!("  lines without @ now go to {}", agent.name()))
-            }
             Cmd::Backend(spec) => {
                 self.s.backend = spec;
                 Some(format!("  Ringo pipelines now use --backend {}", self.s.backend))
@@ -276,6 +272,11 @@ impl App {
             Cmd::Design(text) => {
                 let brief = self.s.expand(&text)?;
                 let id = self.s.design(&brief)?;
+                started(id, self)
+            }
+            Cmd::Ask(question) => {
+                let question = self.s.expand(&question)?;
+                let id = self.s.ask(&question)?;
                 started(id, self)
             }
             Cmd::Work(spec) => {
@@ -543,7 +544,7 @@ impl App {
         let title = if title.chars().count() > width { ringo_cli::parse::short(&title, width.saturating_sub(2)) } else { title };
         f.render_widget(Paragraph::new(visible).block(block(title, self.selected > 0)), log);
 
-        let hint = format!(" {} · Enter sends · Tab jobs · /help ", if self.default == Agent::Codex { "@codex" } else { self.default.name() });
+        let hint = " ask anything · @codex or @claude for an agent · Tab jobs · /help ".to_string();
         let room = input.width.saturating_sub(2).max(1) as usize;
         let start = self.cursor.saturating_sub(room - 1);
         let shown: String = self.input.iter().skip(start).take(room).collect();
@@ -593,7 +594,7 @@ pub fn run() -> ExitCode {
     let name = session.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let label = match branch { Some(b) => format!("{name} ({b})"), None => name };
     let mut app = App { s: session, input: Vec::new(), cursor: 0, history: Vec::new(), hist: 0, selected: 0, scroll: 0,
-                        log_height: 0, default: agents[0], console: VecDeque::new(), quit_armed: false, quit: false,
+                        log_height: 0, console: VecDeque::new(), quit_armed: false, quit: false,
                         setup: false, label, agents, theme: Theme::load(), started: Instant::now() };
     let found: Vec<&str> = app.agents.iter().map(|a| a.name()).collect();
     app.say(format!("Ringo shell in {}. Agents: {} (/setup adds another).", app.s.repo.display(), found.join(", ")));
@@ -648,8 +649,10 @@ mod tests {
     fn parses_routes_and_commands() {
         use Agent::*;
         let all = [Codex, Claude, Grok];
-        let parse = |line: &str, default| super::parse(line, default, &all);
-        assert_eq!(parse("why is it slow?", Codex), Ok(Cmd::Agents(vec![(Codex, false)], "why is it slow?".into())));
+        let parse = |line: &str, _: Agent| super::parse(line, &all);
+        assert_eq!(parse("why is it slow?", Codex), Ok(Cmd::Ask("why is it slow?".into())));
+        assert!(parse("   ", Codex).is_err());
+        assert_eq!(parse("@codex why is it slow?", Codex), Ok(Cmd::Agents(vec![(Codex, false)], "why is it slow?".into())));
         assert_eq!(parse("@claude! fix it", Codex), Ok(Cmd::Agents(vec![(Claude, true)], "fix it".into())));
         assert_eq!(parse("@codex @claude! do x", Grok), Ok(Cmd::Agents(vec![(Codex, false), (Claude, true)], "do x".into())));
         assert_eq!(parse("@all compare", Codex), Ok(Cmd::Agents(vec![(Codex, false), (Claude, false)], "compare".into())));
@@ -659,7 +662,6 @@ mod tests {
         assert_eq!(parse("/review main", Codex), Ok(Cmd::ReviewRepo("main".into(), "HEAD".into())));
         assert_eq!(parse("/apply 2", Codex), Ok(Cmd::Apply(2)));
         assert_eq!(parse("/design a cache for X", Codex), Ok(Cmd::Design("a cache for X".into())));
-        assert_eq!(parse("/use claude", Codex), Ok(Cmd::Use(Claude)));
         assert!(parse("/frobnicate", Codex).is_err());
     }
 

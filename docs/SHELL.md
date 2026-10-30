@@ -77,6 +77,7 @@ panel moves above the chat, one row per job.
 
 | You type | What happens |
 |---|---|
+| `TEXT` (no `/` or `@`) | a question: one tool-free call with your last few questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn |
 | `/review #N` | Ringo reviews job N's change, with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
@@ -93,7 +94,8 @@ Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git proj
 home folder (a dotfiles repository) included, they read and answer, and Ringo says why an edit needs a project.
 Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
 
-A line without `/` or `@` goes to the default agent (the first one you set up). Tab and Shift-Tab select a job,
+Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 17,000 tokens before it
+starts, and a vague question can send it searching (one such follow-up cost about 450,000). Tab and Shift-Tab select a job,
 PgUp and PgDn scroll its log, Up and Down recall earlier lines, and Ctrl-C twice quits, stopping running jobs.
 
 The panel shows each job's state, time, tokens, Ringo model calls and what it is doing now, with one row per

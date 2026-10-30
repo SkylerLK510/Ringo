@@ -247,6 +247,38 @@ fn a_repository_holding_the_home_folder_is_not_a_project() {
 }
 
 #[test]
+fn a_plain_question_is_one_tool_free_call_that_remembers_the_last_answers() {
+    // A stand-in ringo.py: records its argv and the material it was given, then answers through its trace and --out.
+    let r = repo("ask");
+    let home = root().join("fake-ask-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("ringo.py"), "import json, sys, pathlib\n\
+        a = sys.argv[1:]\n\
+        val = lambda k: a[a.index(k) + 1]\n\
+        material = pathlib.Path(val('--input')).read_text()\n\
+        n = len(list(pathlib.Path(sys.argv[0]).parent.glob('seen-*.json'))) + 1\n\
+        pathlib.Path(sys.argv[0]).with_name(f'seen-{n}.json').write_text(json.dumps({'argv': a, 'material': material}))\n\
+        t = pathlib.Path(val('--trace')); t.mkdir(parents=True, exist_ok=True)\n\
+        (t / 'trace.jsonl').write_text(json.dumps({'step': 'answer', 'backend': 'b', 'status': 'started'}) + '\\n' +\n\
+            json.dumps({'step': 'answer', 'status': 'ok', 'usage': {'input': 900, 'cache_write': 0, 'cache_read': 0, 'output': 40}}) + '\\n')\n\
+        pathlib.Path(val('--out')).write_text(f'answer {n}\\n')\n").unwrap();
+    let mut s = Session::new(&r).unwrap();
+    s.ringo_home = home.clone();
+    let first = s.ask("what is a dotfiles repository?").unwrap();
+    assert_eq!(wait(&mut s, first), Status::Done);
+    let second = s.ask("and why does it matter here?").unwrap();
+    assert_eq!(wait(&mut s, second), Status::Done);
+    let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join("seen-2.json")).unwrap()).unwrap();
+    let argv: Vec<&str> = seen["argv"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    assert_eq!(&argv[..3], &["design", "--pipeline", home.join("plans/ask.json").to_str().unwrap()]);
+    let material = seen["material"].as_str().unwrap();
+    assert!(material.contains("Question: what is a dotfiles repository?\n\nAnswer:\nanswer 1"), "{material}");
+    assert!(material.ends_with("Question: and why does it matter here?\n"), "{material}");
+    assert_eq!(s.jobs[second - 1].tokens.total(), 940);
+    assert!(s.jobs[second - 1].log.iter().any(|l| l == "answer 2"));
+}
+
+#[test]
 fn killing_a_pipeline_stops_its_model_calls_too() {
     // Ringo's model calls run in sessions of their own; the interrupt lets Python's cleanup end them.
     let r = repo("pipeline");
