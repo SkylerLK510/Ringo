@@ -410,13 +410,12 @@ const NESTS: [(&str, &str, &str); 7] = [
 /// Rust's is fixed. Away from the limit both agree exactly; at it they agree within 64 levels.
 #[test]
 fn strict_json_nesting_limits_match_python() {
-    // CPython's limit is its C stack, so it differs by platform; the port uses the one measured on macOS. Elsewhere
-    // only depths far from every platform's limit are compared.
-    let near_limit = cfg!(target_os = "macos");
-    let depths: &[usize] = if near_limit { &[1000, 115_000, 117_500, 200_000] } else { &[1000, 200_000] };
+    // CPython's limit is its C stack, so it differs by machine (116,128 on CI's macOS, 116,223 here, lower on Linux);
+    // the port uses a fixed one. Depths far from every limit are compared here; the boundary is measured by
+    // `strict_json_nesting_boundary_is_near_python`, run by hand with --ignored.
     let mut cases = Vec::new();
     for (open, inner, close) in NESTS {
-        for &n in depths {
+        for n in [1000, 200_000] {
             cases.push(json!([nest(open, inner, close, n)]));
         }
     }
@@ -428,6 +427,11 @@ fn strict_json_nesting_limits_match_python() {
             json!("ok")
         }))
     });
+}
+
+#[test]
+#[ignore = "measures this machine's CPython stack limit; run by hand"]
+fn strict_json_nesting_boundary_is_near_python() {
     let deep = |text: &str| match wf::strict_json(text) {
         Ok(v) => {
             pyjson::dispose(v); // a recursive drop of a value this deep would overflow the stack
@@ -435,9 +439,6 @@ fn strict_json_nesting_limits_match_python() {
         }
         Err(e) => e.msg == "JSON nesting exceeds the parser limit",
     };
-    if !near_limit {
-        return;
-    }
     let cases: Vec<Value> = NESTS.iter().map(|(o, i, c)| json!([o, i, c])).collect();
     let want = python("json_boundary", &cases);
     for ((open, inner, close), want) in NESTS.iter().zip(want) {

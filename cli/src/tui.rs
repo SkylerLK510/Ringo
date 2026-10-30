@@ -30,6 +30,8 @@ counts every one), for questions about your code and for changes:
   @codex @claude TASK  the same task to several agents at once; @all means codex and claude
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
   /setup               add another agent and sign in to it
+  /route on|off        suggest a command for a line that reads like a design, review or edit task, for you to
+                       send (Enter), change, or ask as a plain question (Esc); no model call (now: {route})
   /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono (now: {theme})
 Jobs: /show N  /diff N  /apply N  /drop N (remove its worktree)  /kill N  /quit
 Keys: Tab / Shift-Tab select a job, PgUp / PgDn scroll, Up / Down history, Esc clear, Ctrl-C twice quits.";
@@ -51,6 +53,7 @@ pub enum Cmd {
     Help,
     Setup,
     Theme(Option<String>),
+    Route(bool),
     Quit,
 }
 
@@ -71,6 +74,11 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "setup" => Ok(Cmd::Setup),
             "theme" => Ok(Cmd::Theme(words.next().map(str::to_string))),
+            "route" => match words.next() {
+                Some("on") => Ok(Cmd::Route(true)),
+                Some("off") => Ok(Cmd::Route(false)),
+                _ => Err("/route on or /route off".into()),
+            },
             "backend" if !tail.is_empty() => Ok(Cmd::Backend(tail.into())),
             "show" => job_number(words.next()).map(Cmd::Show),
             "kill" => job_number(words.next()).map(Cmd::Kill),
@@ -148,6 +156,9 @@ struct App {
     agents: Vec<Agent>,
     theme: Theme,
     started: Instant,
+    /// Route suggestions on (/route on), and the plain line a suggestion is standing in for.
+    route: bool,
+    suggested: Option<String>,
 }
 
 /// The running mark: a braille spinner, one frame per SPIN_MS while anything runs (the only redraws then).
@@ -166,6 +177,7 @@ impl App {
 
     fn help_text(&self) -> String {
         HELP.replace("{backend}", &self.s.backend).replace("{theme}", self.theme.name)
+            .replace("{route}", if self.route { "on" } else { "off" })
     }
 
     fn help(&mut self) {
@@ -192,6 +204,21 @@ impl App {
         if line.trim().is_empty() {
             return;
         }
+        let was_suggested = self.suggested.take().is_some();
+        let plain = !line.trim_start().starts_with(['/', '@']);
+        if self.route && plain && !was_suggested {
+            let agent = self.agents.iter().find(|a| **a != Agent::Grok).copied().unwrap_or(self.agents[0]);
+            let route = crate::route::classify(&line, self.s.git);
+            if let Some((cmd, cost)) = crate::route::suggestion(&route, line.trim(), agent.name()) {
+                self.say(format!("  → suggested: {cmd}\n    ({cost}). Enter sends it; change it if you like; Esc asks it \
+                                  as a plain question instead (about 1-2k tokens)."));
+                self.input = cmd.chars().collect();
+                self.cursor = self.input.len();
+                self.suggested = Some(line);
+                self.selected = 0;
+                return;
+            }
+        }
         self.history.push(line.clone());
         self.hist = self.history.len();
         self.say(format!("› {line}"));
@@ -217,6 +244,12 @@ impl App {
         };
         Ok(match cmd {
             Cmd::Help => Some(self.help_text()),
+            Cmd::Route(on) => {
+                self.route = on;
+                let saved = crate::theme::set_setting("route", serde_json::json!(on)).err()
+                    .map_or(" (saved for next time)".to_string(), |e| format!(" (not saved: {e})"));
+                Some(format!("  route suggestions {}{saved}", if on { "on" } else { "off" }))
+            }
             Cmd::Theme(None) => Some(format!("  theme: {} (also: {})", self.theme.name,
                 crate::theme::NAMES.iter().filter(|n| **n != self.theme.name).copied().collect::<Vec<_>>().join(", "))),
             Cmd::Theme(Some(name)) => {
@@ -361,6 +394,13 @@ impl App {
             }
             KeyCode::PageUp => self.scroll += self.log_height.max(1),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(self.log_height.max(1)),
+            KeyCode::Esc if self.suggested.is_some() => {
+                // a suggestion declined: ask the original line as a plain question instead
+                let line = self.suggested.take().unwrap_or_default();
+                self.input = line.chars().collect();
+                self.suggested = Some(String::new()); // so this submit is not routed again
+                self.submit();
+            }
             KeyCode::Esc => {
                 if self.input.is_empty() {
                     self.selected = 0;
@@ -595,7 +635,8 @@ pub fn run() -> ExitCode {
     let label = match branch { Some(b) => format!("{name} ({b})"), None => name };
     let mut app = App { s: session, input: Vec::new(), cursor: 0, history: Vec::new(), hist: 0, selected: 0, scroll: 0,
                         log_height: 0, console: VecDeque::new(), quit_armed: false, quit: false,
-                        setup: false, label, agents, theme: Theme::load(), started: Instant::now() };
+                        setup: false, label, agents, theme: Theme::load(), started: Instant::now(),
+                        route: crate::theme::setting("route").and_then(|v| v.as_bool()).unwrap_or(false), suggested: None };
     let found: Vec<&str> = app.agents.iter().map(|a| a.name()).collect();
     app.say(format!("Ringo shell in {}. Agents: {} (/setup adds another).", app.s.repo.display(), found.join(", ")));
     app.say(format!("Private state: {}", app.s.dir.display()));

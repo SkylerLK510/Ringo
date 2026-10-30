@@ -198,17 +198,31 @@ fn settings() -> std::path::PathBuf {
     ringo_cli::state_root().join("shell-settings.json")
 }
 
-fn saved() -> Option<String> {
+/// A remembered shell setting (shell-settings.json in Ringo's state folder).
+pub fn setting(key: &str) -> Option<serde_json::Value> {
     let text = std::fs::read_to_string(settings()).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value.get("theme")?.as_str().map(str::to_string)
+    value.get(key).cloned()
+}
+
+/// Remembers a shell setting for the next start, keeping the others.
+pub fn set_setting(key: &str, value: serde_json::Value) -> Result<(), String> {
+    let path = settings();
+    let mut all = std::fs::read_to_string(&path).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
+    all[key] = value;
+    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{all}\n")).map_err(|e| e.to_string())
+}
+
+fn saved() -> Option<String> {
+    setting("theme")?.as_str().map(str::to_string)
 }
 
 /// Remembers the theme for the next start.
 pub fn save(name: &str) -> Result<(), String> {
-    let path = settings();
-    std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(&path, format!("{}\n", serde_json::json!({ "theme": name }))).map_err(|e| e.to_string())
+    set_setting("theme", serde_json::json!(name))
 }
 
 #[cfg(test)]
