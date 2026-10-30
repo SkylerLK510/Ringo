@@ -1003,7 +1003,8 @@ fn history_subset_is_identical() {
         }
         if parents.len() > 1 { merges += 1 } else { plain += 1 }
     }
-    assert!(merges == 1 && plain == 3, "{merges} merge(s), {plain} commit(s)");
+    assert!(merges == 1 && plain == 3, "{merges} merge(s), {plain} commit(s): this test needs the repository's \
+             history (a full clone, or fetch-depth: 0 in CI)");
     same_builds(&cases);
 }
 
