@@ -87,6 +87,7 @@ panel moves above the chat, one row per job.
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once |
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
+| `/route on` | route suggestions: a line that reads like a design, review or edit task is not sent; the matching command (`/design ...`, `/review ...`, `@codex! ...`) appears in the input line with what it costs, for you to send with Enter, change, or ask as a plain question with Esc. Word rules only, no model call; an agent turn is only ever suggested. `/route off` turns it off |
 | `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | select a job, stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
