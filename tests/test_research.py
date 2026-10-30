@@ -549,6 +549,8 @@ class VerifierTest(Fixture):
             research.html_page('<p>' + 'x' * (3 * research.FEED), 'http://x.org/', time.monotonic() - 1)
         passages, _ = research.html_page('<!--' + 'x' * (2 * research.FEED), 'http://x.org/')  # unterminated: no text
         self.assertEqual(passages, [])
+        passages, _ = research.html_page(f'<p>{QUOTE}</p><!-- ok --><p>after a closed comment</p><!--{QUOTE}', 'http://x.org/')
+        self.assertEqual([t for t, _ in passages], [QUOTE, 'after a closed comment'])  # nothing after an open one
 
     def test_no_cookies_credentials_referrer_or_proxy_are_used(self):
         self.page('/login', b'', status=302, headers=[('Location', '/p'), ('Set-Cookie', 'session=abc; Path=/')])

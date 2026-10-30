@@ -714,13 +714,6 @@ class _Page(HTMLParser):
         self.skip, self.in_title, self.title, self.meta, self.canonical = 0, False, [], {}, None
         self.open, self.hidden = [], 0  # open elements as (tag, hides), and how many of them hide
 
-    def close(self):
-        # An unterminated comment hides the rest of the page in a browser; some Pythons' html.parser (3.11) would
-        # hand it over as text at close, so it is dropped here on every version.
-        if self.rawdata.lstrip().startswith('<!--'):
-            self.rawdata = ''
-        super().close()
-
     def handle_starttag(self, tag, attrs):
         self._open(tag, attrs, False)
 
@@ -847,9 +840,23 @@ def decode(body, headers):
 FEED = 256 * 1024  # characters of HTML parsed between deadline checks; also bounds how often a construct is rescanned
 
 
+def before_unterminated_comment(text):
+    """text up to its first <!-- that has no closing -->: a browser hides everything after it, and html.parser
+    versions differ on what they hand over as text there (3.11.9 the whole rest, newer ones nothing or a tail). A
+    <!-- inside a script can cut visible text after it, which can only make a quote fail to verify, never pass."""
+    i = text.find('<!--')
+    while i >= 0:
+        end = text.find('-->', i + 4)
+        if end < 0:
+            return text[:i]
+        i = text.find('<!--', end + 3)
+    return text
+
+
 def html_page(text, final_url, at=math.inf):
     """(passages, page facts: title, published, canonical, scholarly) of an HTML text, parsed in FEED-sized pieces
     with the deadline `at` (time.monotonic()) checked between them."""
+    text = before_unterminated_comment(text)
     parser = _Page()
     try:
         for k in range(0, len(text), FEED):
