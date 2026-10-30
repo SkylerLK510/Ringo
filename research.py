@@ -714,6 +714,13 @@ class _Page(HTMLParser):
         self.skip, self.in_title, self.title, self.meta, self.canonical = 0, False, [], {}, None
         self.open, self.hidden = [], 0  # open elements as (tag, hides), and how many of them hide
 
+    def close(self):
+        # An unterminated comment hides the rest of the page in a browser; some Pythons' html.parser (3.11) would
+        # hand it over as text at close, so it is dropped here on every version.
+        if self.rawdata.lstrip().startswith('<!--'):
+            self.rawdata = ''
+        super().close()
+
     def handle_starttag(self, tag, attrs):
         self._open(tag, attrs, False)
 
