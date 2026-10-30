@@ -6,6 +6,7 @@ mod route;
 mod setup;
 mod theme;
 mod tui;
+mod updates;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;

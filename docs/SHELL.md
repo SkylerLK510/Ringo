@@ -105,6 +105,16 @@ subagent: Claude Code's Task subagents and Codex's spawned agents. When two unap
 file, both rows say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs no tokens: it
 compares the agents' own edit events as they arrive.
 
+### Agent updates
+
+When the shell opens it says, in the background, which agents changed version since the last session and which have
+a newer release out, with the command that updates that install (`brew upgrade --cask codex`, `claude update`, or
+`npm install -g ...@latest`). Ringo never updates an agent itself: a new version of the engine can change answers and
+token use, so it is your call when to take one. The release lookup asks the Homebrew or npm registry at most once a
+day (no model call, no account); `RINGO_NO_UPDATE_CHECK=1` turns it off. Versions are kept in
+`engine-versions.json` in Ringo's state folder. Grok is only reported when its version changes: it has no public
+release feed.
+
 ## Colours
 
 The default theme, `siamese`, takes its palette from a seal-point Siamese: cream and fawn for text and frames, seal

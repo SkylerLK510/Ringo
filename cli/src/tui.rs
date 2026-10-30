@@ -651,6 +651,13 @@ pub fn run() -> ExitCode {
     app.say(format!("Ringo shell in {}. Agents: {} (/setup adds another).", app.s.repo.display(), found.join(", ")));
     app.say(format!("Private state: {}", app.s.dir.display()));
     app.help();
+    let (notes, news) = std::sync::mpsc::channel();
+    let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
+    std::thread::spawn(move || {
+        for note in crate::updates::notices(&agents, &state) {
+            let _ = notes.send(note);
+        }
+    });
 
     let mut terminal = ratatui::init();
     let (mut dirty, mut tick) = (true, Instant::now());
@@ -682,6 +689,10 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
+        while let Ok(note) = news.try_recv() {
+            app.say(note);
+            dirty = true;
+        }
         if app.s.running() > 0 && tick.elapsed() >= Duration::from_millis(SPIN_MS as u64) {
             dirty = true; // the spinner and the running clocks
             tick = Instant::now();
