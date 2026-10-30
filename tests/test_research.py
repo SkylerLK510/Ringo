@@ -256,6 +256,22 @@ class ParseTest(unittest.TestCase):
         s.update(over)
         return json.dumps(s)
 
+    def test_a_deeply_nested_reply_is_judged_not_crashed(self):
+        deep = '[' * 50_000 + ']' * 50_000
+        obj = research.strict_json('{"a": ' + deep + ', "b": 1}')
+        self.assertFalse(research.repeats_a_key(obj))
+        with self.assertRaises(research.Rejected):
+            research.parse_sources(json.dumps({'url': 'https://example.org/a', 'title': 'T', 'claims': [], 'x': 1})[:-1]
+                                   + ', "deep": ' + '[' * 900 + ']' * 900 + '}')
+
+    def test_only_fetched_http_addresses_become_links(self):
+        self.assertEqual(research.link('https://example.org/a'), '<https://example.org/a>')
+        for bad in ('javascript:alert(1)', 'data:text/html,x', 'https://a b', 'ftp://x/y'):
+            self.assertFalse(research.link(bad).startswith('<'), bad)
+        lines = research.unused_lines([{'source': 1, 'url': 'javascript:alert(1)', 'level': 'dropped',
+                                        'reason': 'not an http(s) address', 'claims': []}])
+        self.assertNotIn('<javascript', ''.join(lines))
+
     def test_gather_format_is_parsed_fail_closed(self):
         good = self.line()
         self.assertEqual(len(research.parse_sources(good)), 1)
@@ -422,6 +438,17 @@ class VerifierTest(Fixture):
                               self.source('/inline', cid='c'))['records']
         self.assertEqual([r['level'] for r in records], ['dropped', 'dropped', 'verified'])
         self.assertIn('not found', records[0]['claims'][0]['reason'])
+
+    def test_text_hidden_by_its_own_attributes_is_not_evidence(self):
+        for path, body in (('/hidden', f'<p hidden>{QUOTE}</p>'), ('/none', f'<div style="color:red; display: none">{QUOTE}</div>'),
+                           ('/vis', f'<section style="visibility:hidden"><p>{QUOTE}</p></section>'),
+                           ('/aria', f'<p aria-hidden="true">{QUOTE}</p>'),
+                           ('/nested', f'<div hidden><ul><li>{QUOTE}</li></ul></div>')):
+            self.page(path, html('Visible padding text long enough to count.', body))
+        self.page('/after', html(f'<div hidden>hidden words</div><p>{QUOTE}</p>'))  # visible text after a hidden block
+        records = self.verify(*[self.source(p, cid=c) for p, c in (('/hidden', 'a'), ('/none', 'b'), ('/vis', 'c'),
+                                                                     ('/aria', 'd'), ('/nested', 'e'), ('/after', 'f'))])['records']
+        self.assertEqual([r['level'] for r in records], ['dropped'] * 5 + ['verified'])
 
     def test_pdfs_paywalls_and_script_pages_are_not_checkable(self):
         self.page('/paper.pdf', b'%PDF-1.7 ' + QUOTE.encode(), ctype='application/pdf')
@@ -650,7 +677,7 @@ class PipelineTest(Fixture):
         self.assertIn(f'**[1]** Retry rules (title as the search call gave it). <{self.url("/spec")}>', report)
         self.assertIn(f'E1: “{QUOTE}”', report)
         self.assertIn('Retrieved ', report)
-        self.assertIn('S2 <' + self.url('/blog') + '>: dropped', report)
+        self.assertIn('S2 ' + self.url('/blog') + ': dropped', report)  # an unverified address is never a link
         self.assertIn('What “verified” means', report)
         self.assertEqual((out.state['status'], out.state['outcome'], out.state['calls']), ('done', 'report', 2))
         self.assertEqual((out.summary['verified'], out.summary['dropped'], out.summary['cited'], out.summary['searches']),

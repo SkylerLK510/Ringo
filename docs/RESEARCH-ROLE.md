@@ -97,7 +97,10 @@ Fetching (`research.fetch`):
 
 Extraction and matching (`research.Document`):
 - HTML is parsed with `html.parser`, in 256 KiB pieces with the deadline checked between them; text inside
-  `script`, `style`, `template`, `svg`, `noscript` and similar elements is skipped; block elements (paragraphs, list items, table cells, headings and the like) end a passage;
+  `script`, `style`, `template`, `svg`, `noscript` and similar elements is skipped, and so is text inside any
+  element hidden by its own attributes (`hidden`, `aria-hidden="true"`, an inline `display:none` or
+  `visibility:hidden`), so a page cannot pass off text its readers never see; hiding through stylesheets or classes
+  cannot be seen without running the page's CSS, so such text still counts as visible; block elements (paragraphs, list items, table cells, headings and the like) end a passage;
   plain text is split at blank lines; markup is parsed, never followed or run;
 - normalisation is conservative: runs of whitespace become one space, typographic quotes and dashes become ASCII,
   the ellipsis character becomes three dots, invisible formatting characters are removed; case, accents, digits and
@@ -179,6 +182,9 @@ characters, is refused before any call unless `--allow-private-search` is given;
 material and its line, not the material. This is a heuristic: it can miss private material and flag public text.
 Web addresses are ignored when looking for file paths. Fetched pages, the brief and both replies stay in the trace,
 which must be outside the repository and is created with mode 0700.
+
+In the report, only an address that was fetched over http(s) is a link; an address that was dropped or never
+fetched, whatever its scheme, is shown as plain text.
 
 ## Trace
 

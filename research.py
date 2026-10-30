@@ -216,9 +216,18 @@ def strict_json(text):
 
 
 def repeats_a_key(value):
-    if isinstance(value, dict):
-        return getattr(value, 'repeats_a_key', False) or any(repeats_a_key(v) for v in value.values())
-    return isinstance(value, list) and any(repeats_a_key(v) for v in value)
+    """Whether any object in value repeats a key. A loop, not recursion, so a deeply nested reply that parsed is
+    still judged instead of exhausting the stack."""
+    pending = [value]
+    while pending:
+        v = pending.pop()
+        if isinstance(v, dict):
+            if getattr(v, 'repeats_a_key', False):
+                return True
+            pending.extend(v.values())
+        elif isinstance(v, list):
+            pending.extend(v)
+    return False
 
 
 def unfence(text):
@@ -681,14 +690,29 @@ def fold(text):
     return low if len(low) == len(text) else ''.join(c.lower() if len(c.lower()) == 1 else c for c in text)
 
 
+# Elements that never have content, so never get an end tag to close a hidden subtree.
+VOID_TAGS = frozenset('area base br col embed hr img input link meta param source track wbr'.split())
+HIDING_STYLE = re.compile(r'(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*(?:hidden|collapse))\s*(?:!important\s*)?(?:;|$)', re.I)
+
+
+def hides(attrs):
+    """Whether an element's own attributes hide it and everything inside it: the hidden attribute, aria-hidden,
+    or an inline display:none / visibility:hidden. Hiding through stylesheets and classes cannot be seen without
+    running the page's CSS, so such text still counts as visible (docs/RESEARCH-ROLE.md says so)."""
+    return ('hidden' in attrs or attrs.get('aria-hidden', '').strip().lower() == 'true'
+            or bool(HIDING_STYLE.search(attrs.get('style', ''))))
+
+
 class _Page(HTMLParser):
-    """Passages of visible text (block elements end a passage; script, style and similar are skipped), the title,
-    a few metadata tags and the canonical link. Markup is parsed, never followed or run."""
+    """Passages of visible text (block elements end a passage; script, style and similar are skipped, and so is
+    anything inside an element hidden by its own attributes), the title, a few metadata tags and the canonical link.
+    Markup is parsed, never followed or run."""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
         self.passages, self.parts, self.line = [], [], 1
         self.skip, self.in_title, self.title, self.meta, self.canonical = 0, False, [], {}, None
+        self.open, self.hidden = [], 0  # open elements as (tag, hides), and how many of them hide
 
     def handle_starttag(self, tag, attrs):
         self._open(tag, attrs, False)
@@ -703,6 +727,14 @@ class _Page(HTMLParser):
         if self.skip:
             return
         a = {k: v or '' for k, v in attrs}
+        if not closed and tag not in VOID_TAGS:
+            hidden = hides(a)
+            self.open.append((tag, hidden))
+            self.hidden += hidden
+        if self.hidden and tag != 'meta' and tag != 'link':
+            if tag in BLOCK_TAGS:
+                self._flush()
+            return
         if tag == 'title' and not closed:
             self.in_title = True
         elif tag == 'meta':
@@ -720,15 +752,22 @@ class _Page(HTMLParser):
     def handle_endtag(self, tag):
         if tag in SKIP_TAGS:
             self.skip = max(0, self.skip - 1)
-        elif self.skip:
             return
-        elif tag == 'title':
+        if self.skip:
+            return
+        if any(t == tag for t, _ in self.open):  # close it and anything left open inside it
+            while self.open:
+                t, hidden = self.open.pop()
+                self.hidden -= hidden
+                if t == tag:
+                    break
+        if tag == 'title':
             self.in_title = False
         elif tag in BLOCK_TAGS:
             self._flush()
 
     def handle_data(self, data):
-        if self.skip:
+        if self.skip or (self.hidden and not self.in_title):
             return
         if self.in_title:
             if sum(map(len, self.title)) < 4 * TITLE_MAX:
@@ -1208,7 +1247,11 @@ def md(text):
 
 
 def link(url):
-    return '<' + url.replace('<', '%3C').replace('>', '%3E') + '>'
+    """A clickable link only for an http(s) address with nothing that could break out of it; anything else,
+    such as a javascript: address a gather reply supplied, is shown as inert text."""
+    if isinstance(url, str) and url.lower().startswith(('http://', 'https://')) and not any(c.isspace() for c in url):
+        return '<' + url.replace('<', '%3C').replace('>', '%3E') + '>'
+    return md(url)
 
 
 def evidence_lines(result):
@@ -1249,7 +1292,7 @@ def unused_lines(records, cited=frozenset()):
                 if c['level'] != 'verified':
                     lines.append(f'- S{r["source"]} claim {md(c["id"])}: {c["level"]}: {md(c["reason"])}.')
             continue
-        lines.append(f'- S{r["source"]} {link(r["url"])}: {r["level"]}: {md(r["reason"])}.')
+        lines.append(f'- S{r["source"]} {md(r["url"])}: {r["level"]}: {md(r["reason"])}.')  # never a link: unverified
         lines += [f'  - claim {md(c["id"])}: {md(c["reason"])}' for c in r['claims'] if c['reason'] != r['reason']]
     return lines
 
