@@ -33,6 +33,9 @@ _CHATGPT_FLAGS = ('--ignore-user-config --ignore-rules --disable apps --disable 
                   '--disable default_mode_request_user_input -c include_environment_context=false '
                   '-c include_permissions_instructions=false -c skills.include_instructions=false '
                   '-c include_collaboration_mode_instructions=false '
+                  # Codex flushes usage analytics before it exits, about 0.35 s after the reply is in; nothing
+                  # Ringo reads depends on them
+                  '-c analytics.enabled=false '
                   '''-c 'project_doc_max_bytes=0' -c 'forced_login_method="chatgpt"' '''
                   '''-c 'model_provider="openai"' ''')
 _CHATGPT_TAIL = '--skip-git-repo-check --ephemeral -s read-only --color never --json -'
