@@ -110,7 +110,8 @@ panel moves above the chat, one row per job.
 
 | You type | What happens |
 |---|---|
-| `TEXT` (no `/` or `@`) | a question: one tool-free call with your last few questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn |
+| `TEXT` (no `/` or `@`) | a question: one tool-free call with your last few questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell starts the task: an agent turn (claude, or codex when claude is not set up) or `/research`; a review is put in the input line for you to say what to review. Live: "fix the off-by-one in counter.py and add a test for it" came back `ROUTE: edit` in 3.2 s for 892 tokens |
+| `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` toggles auto and ask, Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/review #N` | Ringo reviews job N's change, with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
@@ -130,13 +131,76 @@ home folder (a dotfiles repository) included, they read and answer, and Ringo sa
 Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
 
 Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 17,000 tokens before it
-starts, and a vague question can send it searching (one such follow-up cost about 450,000). Tab and Shift-Tab select a job,
+starts, and a vague question can send it searching (one such follow-up cost about 450,000). Tab selects a job, Shift-Tab changes the mode,
 PgUp and PgDn scroll its log, Up and Down recall earlier lines, and Ctrl-C twice quits, stopping running jobs.
 
 The panel shows each job's state, time, tokens, Ringo model calls and what it is doing now, with one row per
 subagent: Claude Code's Task subagents and Codex's spawned agents. When two unapplied write jobs edit the same
 file, both rows say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs no tokens: it
 compares the agents' own edit events as they arrive.
+
+## Modes and permissions
+
+One switch sets how far every agent may act without asking; it applies to the turns started after it changes.
+
+| Mode | Claude | Codex |
+|---|---|---|
+| `ask` (the default) | reads, and edits its worktree, freely (Claude Code's own rules: plain file commands such as `mkdir` in the worktree run without asking); every other action waits for you: a command such as `curl`, `gh` or `npm` in a write turn, a connector call, a file outside its folder. Read turns (`@claude`) run in your own tree, so they never run commands; give a task that needs them to `@claude!` | works inside its sandbox (read-only for read turns, its worktree for write turns, no network); it cannot stop to ask, so what the sandbox refuses fails |
+| `auto` | Claude Code's auto mode: it acts on its own and its safety review blocks what is dangerous; what that review blocks repeatedly, and what an always-ask rule names, waits for you | write turns run with `--approve-for-me` (Codex's own reviewer answers its approval requests) and the network on in the sandbox, for git, gh and installs |
+| `read` | no edits, no commands, no connectors; `@agent!` is refused | read-only sandbox; `@agent!` is refused |
+
+When an agent waits, a box above the input line shows the whole action, every line of a command included, and
+`y` allows it once, `a` allows it and the same rule for the rest of the session (in every later Claude turn too, as
+`--allowedTools`; an always-ask action is allowed once only, whichever key), `n` or Esc declines it and the agent
+carries on without it. A request longer than its box shows its first lines and how many more there are; all of it is
+also in the job's log (Tab to the job, PgUp). The keys answer only when the input
+line is empty and not in the first 0.3 s after the box appears, so a word you are typing never answers by accident.
+Tab, PgUp and PgDn still let you look at the job first. Every answer is kept in `actions.jsonl` in the session's
+state folder, with the job, agent, action, rule and mode.
+
+**Always ask.** In ask and auto mode alike, these wait for you whatever an allow rule or a safety review says (ask
+rules win over allow rules): `sudo`, `dd`, `mkfs`, `diskutil`, `git push --force` and `-f`, `gh release`,
+`gh repo create` and `delete`, `gh gist create`, and edits to `~/.claude`, `~/.codex` and `~/.gemini`. Claude's own
+auto-mode review blocks more by default: force pushes however written, destroying files that existed before the
+session, downloading and running code, sending data out, production deploys. Add your own rules, in Claude's
+permission-rule syntax, as `{"ask": ["Bash(terraform apply:*)"]}` in `permissions.json` in Ringo's state folder.
+These rules are Claude's: Codex has no per-run rule list Ringo can pass, so its guard is its sandbox (it writes only
+in its worktree) and, in auto mode, its own reviewer.
+
+**Connectors.** A Claude turn whose task names a service only your connectors reach (Jira, Confluence, ClickUp,
+Gmail, email, calendar, Google Drive or Docs, Slack, Linear, Notion, Figma, Datadog, Intercom) runs with your MCP
+servers and plugins loaded, but without your CLAUDE.md, memory, skills or main agent; any other turn runs in safe
+mode without them. Measured with Claude Code 2.1.316, one trivial turn each: 16,567 tokens in safe mode, 27,522 with
+the connectors, 57,799 with everything. Without your CLAUDE.md, an instruction in it to use Ringo cannot start Ringo
+again either. Your own hooks do run in these turns, as in your normal Claude Code. Checked live through the same
+flags: a read-only Jira question asked before each of its two Jira calls
+and answered correctly (5 model calls, 18.5 s, 167,291 tokens, most of them cache reads).
+
+**Checked live** (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0, one run each in a throwaway repository):
+
+| Check | Result | Tokens |
+|---|---|---|
+| ask mode, Claude: `curl -sI https://example.com \| head -1` | waited, allowed once, `HTTP/2 200` | 38,195 |
+| auto mode, Claude: `mkdir -p made && ls`, then `sudo -n true` | `mkdir` ran without asking; `sudo` waited, was declined, Claude carried on | 57,691 |
+| auto mode, Codex: the same `curl` | `HTTP/2 200` (in ask mode its sandbox has no network) | 35,326 |
+
+**What the modes cost.** One trivial Claude turn each, the shell's flags before and after (2026-10-31, Claude Code
+2.1.316, one run each):
+
+| Turn | Before | Ask mode | Auto mode |
+|---|---|---|---|
+| read turn (`@claude`) | 16,547 | 16,547 | 16,547 |
+| write turn (`@claude!`) | 17,139 | 17,133 | |
+
+The first version cost 18,113 for the read turn: with a permission host, Claude Code also offers `AskUserQuestion`,
+`EnterPlanMode` and `ExitPlanMode`, which Ringo does not serve, so the shell denies them. The always-ask rules add
+nothing. Times ranged from 1.4 s to 3.8 s across these single runs with no pattern by mode, so no latency change can be
+claimed either way. Claude Code does not report its auto-mode review's own calls, so whether they count against a
+plan's usage is not known.
+
+Not yet: Codex cannot stop to ask, so it does not take ask mode's prompts. Its app-server protocol has the same
+three answers (`accept`, `acceptForSession`, `decline` for command, file-change and permission approvals) and could
+bring them, but it is marked experimental. agy keeps the deny rules described under Safety model.
 
 ### Agent updates
 
@@ -200,7 +264,8 @@ that number as the turn's own. It now counts only what each turn adds. Claude re
 33,056 was the two turns added together.
 
 So the shell starts Claude in safe mode (your CLAUDE.md, skills, plugins, hooks and MCP servers are left out; sign-in,
-built-in tools and subagents work as usual) and appends the repository's own `CLAUDE.md` or `AGENTS.md`. A follow-up
+built-in tools and subagents work as usual), unless the task names a connector (see Modes and permissions), and
+appends the repository's own `CLAUDE.md` or `AGENTS.md`. A follow-up
 re-sends the conversation so far, so it costs a first turn plus that history. A short exchange adds little, but a
 long read conversation grows with every turn, so start a write job (`@codex!`) for an unrelated task. Nothing is
 shared between agents unless you write `{#N}`. (`--bare` would cut more, but it signs in with an API key only, so
@@ -216,8 +281,14 @@ or for the spinner while a job runs.
 
 ## Safety model
 
-- **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with `--permission-prompts none` and deny
-  rules for `Bash`, `Edit`, `Write` and `NotebookEdit`, which win over any allow rules in your own settings. agy runs
+- **Permission prompts:** Claude's prompt is one stream-json message on stdin, which stays open until the turn's
+  result: Claude Code sends each permission request to Ringo (`--permission-prompt-tool stdio`, the channel the
+  Agent SDK uses; `--permission-prompts host` alone denies them) and Ringo writes your answer back. A request Ringo
+  does not serve is refused at once, so a turn never waits on it. Codex and agy cannot ask.
+- **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
+  and `NotebookEdit`, which win over any allow rules in your own settings (it works in your own tree with no sandbox,
+  and a command could write files there); its connector calls go through the mode, and in read mode nothing may
+  prompt (`--permission-prompts none`). agy runs
   with session-only deny rules for `write_file(*)`, `command(*)`, `unsandboxed(*)`, `mcp(*)` and
   `execute_url(*)`, which win over its accept rules; asked to edit, it gets an error it can see and answers anyway
   (checked live with agy 1.4.11: no file appeared). Grok and agents you add have
@@ -225,8 +296,8 @@ or for the spinner while a job runs.
   file, both refused and no file appeared, but trying cost Claude 98k tokens and Codex 40k. Use `@agent!` when you
   want edits.
 - **Write turns** run in a worktree under Ringo's private state folder: Codex with `workspace-write` (its sandbox allows commands in
-  the worktree), Claude with `acceptEdits` and a deny rule for `Bash` (edits allowed, shell commands refused: Claude
-  has no sandbox here), agy with `--mode accept-edits` and the same deny rules minus `write_file` (edits allowed;
+  the worktree; in auto mode `--approve-for-me` and the network), Claude with `acceptEdits` in ask mode and auto mode
+  in auto mode (edits allowed; any other command waits for you, or for its review), agy with `--mode accept-edits` and the same deny rules minus `write_file` (edits allowed;
   commands, MCP tools and browser actions refused, as for Claude), Grok with `--always-approve` (every tool call approved, so
   it is not contained; its flags come from xAI's documentation and are untested here). A worktree keeps parallel
   edits apart; it is not a security boundary.

@@ -29,6 +29,21 @@ impl Tokens {
     }
 }
 
+/// An agent asking before it acts (Claude's `can_use_tool` control request; verified with Claude Code 2.1.316).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Permission {
+    /// The id the answer must carry.
+    pub id: String,
+    pub tool: String,
+    /// The tool's input exactly as sent: an allow answer returns it unchanged.
+    pub input: Value,
+    /// What it wants to do, for the prompt: the command, the file, the address, or the connector tool and input.
+    pub what: String,
+    /// The permission rule an "allow for this session" answer adds, as Claude writes rules: `Bash(git status)`, a
+    /// tool name.
+    pub rule: String,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Note {
     /// The id that resumes this conversation.
@@ -46,6 +61,10 @@ pub enum Note {
     Touched(String),
     /// The turn cannot succeed; the runner stops the job.
     Fail(String),
+    /// The agent waits for the owner's answer before it acts.
+    Permission(Permission),
+    /// A control request Ringo does not serve (its id): it is refused at once, so the turn never waits on it.
+    Unserved(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +119,11 @@ impl Parser {
     /// The final reply text so far.
     pub fn reply(&self) -> &str {
         &self.reply
+    }
+
+    /// Whether the turn's completion record has arrived (Claude: then nothing more will be asked).
+    pub fn completed(&self) -> bool {
+        self.completed > 0
     }
 
     pub fn line(&mut self, line: &str) -> Vec<Note> {
@@ -255,6 +279,31 @@ impl Parser {
                     notes.extend(self.fail(format!("claude ended with {subtype}: {}", short(&self.reply.clone(), 200))));
                 }
             }
+            ("control_request", _) => {
+                let (id, r) = (s(e, "request_id").to_string(), e.get("request").cloned().unwrap_or(Value::Null));
+                if s(&r, "subtype") != "can_use_tool" {
+                    return vec![Note::Unserved(id)];
+                }
+                let (tool, input) = (s(&r, "tool_name").to_string(), r.get("input").cloned().unwrap_or(Value::Null));
+                let target = ["command", "file_path", "url", "path", "pattern", "query"].iter()
+                    .map(|k| s(&input, k)).find(|v| !v.is_empty());
+                // The whole action, every line of it: a prompt must not hide the part after a first newline.
+                let name = match s(&r, "display_name") { "" => tool.as_str(), shown => shown };
+                let what = match target {
+                    Some(t) => format!("{name} {t}"),
+                    None => format!("{name} {input}"),
+                };
+                // Claude's own suggestion when it makes one (Bash: the exact command); otherwise the tool itself.
+                let rule = r.get("permission_suggestions").and_then(Value::as_array).into_iter().flatten()
+                    .filter(|p| s(p, "type") == "addRules" && s(p, "behavior") == "allow")
+                    .find_map(|p| p.pointer("/rules/0").cloned())
+                    .map(|x| match s(&x, "ruleContent") { "" => s(&x, "toolName").to_string(),
+                                                          content => format!("{}({content})", s(&x, "toolName")) })
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| match s(&input, "command") { "" => tool.clone(), c => format!("{tool}({c})") });
+                notes.push(Note::Activity { node: None, text: format!("waiting for you: {}", short(&what, 60)) });
+                notes.push(Note::Permission(Permission { id, tool, input, what, rule }));
+            }
             _ => {}
         }
         notes
@@ -390,6 +439,23 @@ mod tests {
         let mut p = Parser::new(style);
         let notes = lines.iter().flat_map(|l| p.line(l)).collect();
         (p, notes)
+    }
+
+    #[test]
+    fn claude_permission_requests() {
+        // Shapes from Claude Code 2.1.316 with --permission-prompt-tool stdio.
+        let bash = r#"{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"mkdir -p d && ls","description":"x"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"mkdir -p d && ls"}],"behavior":"allow","destination":"localSettings"},{"type":"setMode","mode":"acceptEdits","destination":"session"}]}}"#;
+        let mcp = r#"{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"mcp__plugin_design_atlassian__getVisibleJiraProjects","display_name":"GetVisibleJiraProjects","input":{"cloudId":"c"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"mcp__plugin_design_atlassian__getVisibleJiraProjects"}],"behavior":"allow","destination":"localSettings"}]}}"#;
+        let bare = r#"{"type":"control_request","request_id":"r3","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"make"}}}"#;
+        let other = r#"{"type":"control_request","request_id":"r4","request":{"subtype":"hook_callback"}}"#;
+        let (_, notes) = run(Style::Claude, &[bash, mcp, bare, other]);
+        let asked: Vec<&Permission> = notes.iter().filter_map(|n| match n { Note::Permission(p) => Some(p), _ => None }).collect();
+        assert_eq!((asked[0].id.as_str(), asked[0].what.as_str(), asked[0].rule.as_str()), ("r1", "Bash mkdir -p d && ls", "Bash(mkdir -p d && ls)"));
+        assert_eq!(asked[0].input["description"], "x", "the input goes back exactly as sent");
+        assert_eq!((asked[1].what.as_str(), asked[1].rule.as_str()),
+                   ("GetVisibleJiraProjects {\"cloudId\":\"c\"}", "mcp__plugin_design_atlassian__getVisibleJiraProjects"));
+        assert_eq!(asked[2].rule, "Bash(make)", "no suggestion: the exact command");
+        assert!(notes.contains(&Note::Unserved("r4".into())));
     }
 
     // Shapes taken from real codex-cli 0.164 `exec --json` output.

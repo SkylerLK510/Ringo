@@ -5,7 +5,7 @@
 pub mod parse;
 pub mod rt;
 
-use parse::{Note, Parser, Style, Tokens};
+use parse::{Note, Parser, Permission, Style, Tokens};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
@@ -147,6 +147,100 @@ impl Agent {
     }
 }
 
+/// How far agents act without asking: one switch for every agent (`/mode`, Shift-Tab in the shell).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mode {
+    /// Agents read, and edit their own worktree, freely; any other action (a command, a connector, the network, a
+    /// push or a PR) waits for the owner's yes. Codex cannot stop to ask: it stays inside its sandbox.
+    Ask,
+    /// Agents act on their own; what their safety review flags, or an always-ask rule names, waits for the owner.
+    Auto,
+    /// Agents look but do not touch: no edits, no commands, no connectors.
+    Read,
+}
+
+impl Mode {
+    pub const ALL: [Mode; 3] = [Mode::Ask, Mode::Auto, Mode::Read];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Mode::Ask => "ask",
+            Mode::Auto => "auto",
+            Mode::Read => "read",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Mode> {
+        Mode::ALL.into_iter().find(|m| m.name() == name)
+    }
+
+    /// The next mode in Shift-Tab's cycle: ask, auto, read.
+    pub fn next(self) -> Mode {
+        Mode::ALL[(Mode::ALL.iter().position(|m| *m == self).unwrap_or(0) + 1) % Mode::ALL.len()]
+    }
+}
+
+/// The owner's answer to an agent that asks before it acts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    Once,
+    /// Allow it and the same rule for the rest of this session, in every agent turn.
+    Session,
+    Deny,
+}
+
+/// Actions that wait for the owner in ask and auto mode alike, whatever an allow rule or a safety review says, as
+/// Claude permission rules (ask rules win over allow rules). Claude's auto-mode review blocks more on its own
+/// (force pushes, destroying files that existed before the session, downloading and running code, sending data
+/// out); these name what must reach a person. The owner's own list, `permissions.json` {"ask": [...]} in Ringo's
+/// state folder, is added to it.
+pub const ALWAYS_ASK: [&str; 16] = [
+    "Bash(sudo:*)", "Bash(dd:*)", "Bash(mkfs:*)", "Bash(diskutil:*)", "Bash(git push --force:*)", "Bash(git push -f:*)",
+    "Bash(gh release:*)", "Bash(gh repo create:*)", "Bash(gh repo delete:*)", "Bash(gh gist create:*)",
+    "Edit(~/.claude/**)", "Write(~/.claude/**)", "Edit(~/.codex/**)", "Write(~/.codex/**)", "Edit(~/.gemini/**)",
+    "Write(~/.gemini/**)",
+];
+
+/// Words that name a service reached through the owner's connectors (MCP servers). A Claude turn whose task names
+/// one runs with the owner's connectors loaded; any other runs without them (16.6k tokens a trivial turn instead of
+/// 27.5k, measured with Claude Code 2.1.316).
+const CONNECTOR_WORDS: [&str; 18] = ["jira", "confluence", "atlassian", "clickup", "gmail", "email", "emails", "inbox",
+    "calendar", "gdrive", "slack", "linear", "notion", "figma", "datadog", "intercom", "connector", "mcp"];
+const CONNECTOR_PHRASES: [&str; 4] = ["google drive", "my drive", "google doc", "google docs"];
+
+/// Whether a Claude permission rule (`Tool`, `Tool(exact)`, `Bash(prefix:*)`, `Edit(~/dir/**)`) covers an action.
+/// A `Bash(prefix:*)` rule matches the prefix as a command anywhere in the line (after `;`, `&&`, `|`, `$(`, a
+/// newline, or a space: `xargs sudo`), so a chained command cannot slip past it; a match too many only means the
+/// action is asked about once more.
+pub fn rule_covers(rule: &str, p: &Permission) -> bool {
+    let Some((tool, content)) = rule.strip_suffix(')').and_then(|r| r.split_once('(')) else { return rule == p.tool };
+    if tool != p.tool {
+        return false;
+    }
+    let field = ["command", "file_path", "notebook_path", "path"].iter()
+        .find_map(|k| p.input.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty())).unwrap_or("");
+    if let Some(prefix) = content.strip_suffix(":*") {
+        let boundary = |c: Option<char>| c.is_none_or(|c| c.is_whitespace() || ";&|()`$".contains(c));
+        return field.match_indices(prefix).any(|(i, _)| {
+            boundary(field[..i].chars().next_back()) && boundary(field[i + prefix.len()..].chars().next())
+        });
+    }
+    if let Some(dir) = content.strip_suffix("/**") {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let dir = dir.strip_prefix("~/").map_or_else(|| PathBuf::from(dir), |rest| home.join(rest));
+        return resolved(Path::new(field)).starts_with(resolved(&dir));
+    }
+    field == content
+}
+
+/// Whether a task names a service only the owner's connectors reach. An identifier (`email_parser`) is one word.
+pub fn names_connector(task: &str) -> bool {
+    let lower = task.to_lowercase();
+    let words: Vec<&str> = lower.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
+    words.iter().any(|w| CONNECTOR_WORDS.contains(w))
+        || CONNECTOR_PHRASES.iter().any(|p| words.windows(2).any(|w| w.join(" ") == *p))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
     Running,
@@ -188,6 +282,10 @@ pub struct Job {
     pub applied: bool,
     /// Files the job edited, relative to its working folder.
     pub touched: BTreeSet<String>,
+    /// What the agent waits for the owner to allow, oldest first.
+    pub asks: VecDeque<Permission>,
+    /// Lines for the agent's stdin while the turn runs (Claude's answers to its permission requests); None closes it.
+    input: Option<Sender<Option<String>>>,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
 }
@@ -237,6 +335,15 @@ pub struct Session {
     threads: HashMap<Agent, String>,
     /// The running total each resumable conversation last reported, by agent and conversation id.
     usage_so_far: HashMap<(Agent, String), Tokens>,
+    /// How far agents act without asking.
+    pub mode: Mode,
+    /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
+    pub always_ask: Vec<String>,
+    /// Rules the owner allowed for this session: answered at once, and given to every later Claude turn.
+    pub allowed: BTreeSet<String>,
+    /// Plain lines the ask call answered with `ROUTE: <route>` (a task, not a question): (ask job, route), for the
+    /// shell to start.
+    pub routed: VecDeque<(usize, String)>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
 }
@@ -394,9 +501,15 @@ impl Session {
         private_dir(&dir)?;
         let (tx, rx) = channel();
         let programs = Agent::all().into_iter().map(|a| (a, PathBuf::from(&a.spec().program))).collect();
+        let mut always_ask: Vec<String> = ALWAYS_ASK.iter().map(|r| r.to_string()).collect();
+        let own = fs::read_to_string(root.join("permissions.json")).ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        always_ask.extend(own.iter().filter_map(|v| v.get("ask")?.as_array()).flatten()
+            .filter_map(|r| r.as_str()).map(str::to_string).filter(|r| !always_ask.contains(r)).collect::<Vec<_>>());
         Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
-                     usage_so_far: HashMap::new(), tx, rx })
+                     usage_so_far: HashMap::new(), mode: Mode::Ask, always_ask, allowed: BTreeSet::new(),
+                     routed: VecDeque::new(), tx, rx })
     }
 
     pub fn running(&self) -> usize {
@@ -439,7 +552,8 @@ impl Session {
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), dir, worktree: None, base: None, applied: false,
-                             touched: BTreeSet::new(), pid: None, cancel: Arc::new(AtomicBool::new(false)) });
+                             touched: BTreeSet::new(), asks: VecDeque::new(), input: None, pid: None,
+                             cancel: Arc::new(AtomicBool::new(false)) });
         Ok(id)
     }
 
@@ -456,6 +570,9 @@ impl Session {
         }
         if !spec.read && !write {
             return Err(format!("{name} has no verified read-only mode; use @{name}! for a write job in its own worktree"));
+        }
+        if write && self.mode == Mode::Read {
+            return Err(format!("read mode: agents do not edit. /mode ask (or Shift-Tab) lets @{name}! edit in a worktree"));
         }
         if !write && let Some(busy) = self.busy(agent) {
             return Err(format!("{name} is busy with #{busy}; its conversation takes one turn at a time"));
@@ -489,6 +606,11 @@ impl Session {
                 cmd.args(["exec"]);
                 if let Some(thread) = &resume {
                     cmd.args(["resume", thread]).arg("-c").arg(format!("sandbox_mode=\"{sandbox}\""));
+                } else if write && self.mode == Mode::Auto {
+                    // Auto: Codex's own reviewer answers its approval requests (--approve-for-me implies the
+                    // workspace-write sandbox), and the sandbox has the network, for git, gh and package installs.
+                    // Verified with codex-cli 0.165.0: the sandbox alone has no network.
+                    cmd.args(["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]).arg(&cwd);
                 } else {
                     cmd.args(["-s", sandbox, "-C"]).arg(&cwd);
                 }
@@ -497,20 +619,58 @@ impl Session {
                 Style::Codex
             }
             Adapter::Claude => {
-                // --safe-mode drops the owner's CLAUDE.md, skills, plugins, hooks and MCP servers: one trivial turn
-                // measured 16.6k tokens instead of 50.2k, with the subscription login and built-in subagents kept.
-                // The repository's own instructions are appended instead.
-                cmd.args(["-p", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-prompts",
-                          "none", "--permission-mode", if write { "acceptEdits" } else { "default" }]);
-                // Safe mode keeps the owner's permission rules; deny rules win over them. Read turns cannot edit or
-                // run commands, write turns cannot run commands (they have no sandbox).
-                cmd.arg("--disallowed-tools").args(if write { &["Bash"][..] } else { &["Bash", "Edit", "Write", "NotebookEdit"][..] });
+                // The prompt goes in on stdin as one stream-json message, and stdin stays open until the result: a
+                // permission request comes out as a control_request and Ringo writes the owner's answer back.
+                cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
+                if self.mode != Mode::Read && names_connector(prompt) {
+                    // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
+                    // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
+                    // Without CLAUDE.md the owner's instruction to use Ringo cannot start Ringo again either.
+                    cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
+                    cmd.args(["--agent", "claude", "--disable-slash-commands"]);
+                } else {
+                    // --safe-mode drops the owner's CLAUDE.md, skills, plugins, hooks and MCP servers: one trivial
+                    // turn measured 16.6k tokens instead of 50.2k, with the subscription login and built-in subagents
+                    // kept. The repository's own instructions are appended instead.
+                    cmd.arg("--safe-mode");
+                }
+                // Ask: Claude's default permission checks, every prompt sent to Ringo (`--permission-prompt-tool
+                // stdio`, the Agent SDK's own channel; `--permission-prompts host` alone denies). Auto: Claude's
+                // auto mode, whose review sends what it blocks repeatedly to Ringo too. Read: nothing may prompt.
+                match self.mode {
+                    Mode::Read => cmd.args(["--permission-prompts", "none", "--permission-mode", "default"]),
+                    Mode::Ask => cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode",
+                                           if write { "acceptEdits" } else { "default" }]),
+                    Mode::Auto => cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode", "auto"]),
+                };
+                // Read turns run in the owner's own tree with no sandbox, so they never edit and never run commands (a
+                // command could write files); deny rules win in every mode. Commands run in write turns' worktrees.
+                // With a permission host, Claude Code also offers AskUserQuestion, EnterPlanMode and ExitPlanMode,
+                // which Ringo does not serve: they cost 1,566 tokens a trivial turn (18,113 against 16,547, Claude
+                // Code 2.1.316), and denying them puts every mode back at the old floor.
+                let mut deny: Vec<&str> = Vec::new();
+                if !write {
+                    deny.extend(["Bash", "Edit", "Write", "NotebookEdit"]);
+                }
+                if self.mode != Mode::Read {
+                    deny.extend(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
+                }
+                if !deny.is_empty() {
+                    cmd.arg("--disallowed-tools").args(deny);
+                }
+                if self.mode != Mode::Read {
+                    cmd.arg("--settings").arg(serde_json::json!({"permissions": {"ask": self.always_ask}}).to_string());
+                    if !self.allowed.is_empty() {
+                        cmd.arg("--allowedTools").args(&self.allowed);
+                    }
+                }
                 if let Some(session) = &resume {
                     cmd.args(["--resume", session]);
                 }
                 if let Some(doc) = ["CLAUDE.md", "AGENTS.md"].iter().map(|d| cwd.join(d)).find(|p| p.is_file()) {
                     cmd.arg("--append-system-prompt-file").arg(doc);
                 }
+                input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": prompt}})));
                 Style::Claude
             }
             Adapter::Agy => {
@@ -630,13 +790,15 @@ impl Session {
     /// A plain line: one tool-free model call through Ringo's design pipeline with the ask plan (plans/ask.json),
     /// the cheapest way to ask anything. The material is the last few questions and answers of this conversation,
     /// then the question: no agent scaffolding, no tools, no files, so a question costs a few thousand tokens where
-    /// an agent turn costs 17,000 before it starts. Questions that need the repository go to @codex or @claude.
+    /// an agent turn costs 17,000 before it starts. A line that is a task (files to change, review or read, or live
+    /// sources) is answered with one `ROUTE: <route>` line, which `pump` hands to the shell to start.
     pub fn ask(&mut self, question: &str) -> Result<usize, String> {
         const KEEP: usize = 4; // earlier exchanges carried as context
         const ROOM: usize = 12_000; // characters of them at most, the newest kept first
         let mut earlier: Vec<String> = Vec::new();
         let mut used = 0;
-        for job in self.jobs.iter().rev().filter(|j| j.kind == (Kind::Ringo { command: "ask".into() }) && j.status == Status::Done) {
+        for job in self.jobs.iter().rev().filter(|j| j.kind == (Kind::Ringo { command: "ask".into() }) && j.status == Status::Done
+                                                     && !j.reply().trim_start().starts_with("ROUTE:")) {
             let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, job.reply().trim());
             if earlier.len() == KEEP || used + text.len() > ROOM {
                 break;
@@ -700,9 +862,24 @@ impl Session {
             }
         };
         self.jobs[id - 1].pid = Some(child.id());
+        // The stdin text, then for Claude the owner's answers until the turn's result; None closes the pipe.
+        let (lines, queued) = channel::<Option<String>>();
+        let keep_open = style == Style::Claude;
+        let mut closer = None;
         if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            let _ = lines.send(Some(text));
+            if keep_open {
+                self.jobs[id - 1].input = Some(lines.clone());
+                closer = Some(lines);
+            } else {
+                let _ = lines.send(None);
+            }
             thread::spawn(move || {
-                let _ = pipe.write_all(text.as_bytes()); // dropping the pipe closes it
+                while let Ok(Some(line)) = queued.recv() {
+                    if pipe.write_all(line.as_bytes()).and_then(|_| pipe.flush()).is_err() {
+                        break;
+                    }
+                } // dropping the pipe closes it
             });
         }
         let (tx, cancel, pid) = (self.tx.clone(), self.jobs[id - 1].cancel.clone(), child.id());
@@ -719,6 +896,9 @@ impl Session {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
                     }
                     let _ = tx.send(Event::Note(id, note));
+                }
+                if parser.completed() && let Some(close) = closer.take() {
+                    let _ = close.send(None); // the result is in: nothing more will be asked, so the agent may exit
                 }
             };
             if let Some(out) = stdout {
@@ -785,6 +965,8 @@ impl Session {
         if let Status::Failed(reason) = &status {
             job.push_log(format!("failed: {reason}"));
         }
+        job.asks.clear(); // nobody is waiting for these answers any more
+        job.input = None;
         job.status = status;
         for sub in job.subs.iter_mut().filter(|s| s.ended.is_none()) {
             sub.ended = Some(false);
@@ -800,6 +982,12 @@ impl Session {
             match event {
                 Event::Ended(id, status) => {
                     let job = &mut self.jobs[id - 1];
+                    if job.kind == (Kind::Ringo { command: "ask".into() }) && status == Status::Done {
+                        // The ask prompt answers a task with one line, `ROUTE: edit|read|review|research`.
+                        if let Some(route) = job.reply().trim().strip_prefix("ROUTE:") {
+                            self.routed.push_back((id, route.trim().to_lowercase()));
+                        }
+                    }
                     if matches!(job.kind, Kind::Ringo { .. }) {
                         let report = job.dir.join("work").join("report.json");
                         let reply = job.reply();
@@ -816,6 +1004,22 @@ impl Session {
                 Event::Note(id, Note::Session(session)) => {
                     if let Kind::Agent { agent, write: false } = self.jobs[id - 1].kind {
                         self.threads.insert(agent, session);
+                    }
+                }
+                Event::Note(id, Note::Permission(p)) => {
+                    if self.allowed.contains(&p.rule) && !self.always_asks(&p) {
+                        self.answer(id, &p, true, "allowed (this session)");
+                    } else {
+                        // The whole request in the job's log too, where a long one can be read before answering.
+                        self.jobs[id - 1].push_log(format!("asks before it acts: {}", p.what));
+                        self.jobs[id - 1].asks.push_back(p);
+                    }
+                }
+                Event::Note(id, Note::Unserved(request)) => {
+                    let line = serde_json::json!({"type": "control_response", "response": {"subtype": "error",
+                        "request_id": request, "error": "Ringo does not serve this request"}});
+                    if let Some(input) = &self.jobs[id - 1].input {
+                        let _ = input.send(Some(format!("{line}\n")));
                     }
                 }
                 Event::Note(id, note) => {
@@ -867,11 +1071,79 @@ impl Session {
                             job.touched.insert(rel.to_string_lossy().into_owned());
                         }
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
+                        Note::Permission(_) | Note::Unserved(_) => {} // handled above
                     }
                 }
             }
         }
         changed
+    }
+
+    /// The oldest action an agent waits on the owner for, across every job: (job, what it asks).
+    pub fn pending(&self) -> Option<(usize, &Permission)> {
+        self.jobs.iter().find_map(|j| j.asks.front().map(|p| (j.id, p)))
+    }
+
+    /// How many actions wait on the owner, across every job.
+    pub fn waiting(&self) -> usize {
+        self.jobs.iter().map(|j| j.asks.len()).sum()
+    }
+
+    /// The owner's answer to job `id`'s oldest waiting action. "This session" adds its rule to the session's allowed
+    /// rules and answers every other waiting action with the same rule too.
+    pub fn decide(&mut self, id: usize, decision: Decision) -> Result<String, String> {
+        let p = self.jobs.get_mut(id.wrapping_sub(1)).and_then(|j| j.asks.pop_front())
+            .ok_or(format!("#{id} is not waiting for an answer"))?;
+        // An always-ask action is allowed one at a time: "this session" counts as once for it.
+        let decision = if decision == Decision::Session && self.always_asks(&p) { Decision::Once } else { decision };
+        let said = match decision {
+            Decision::Once => "you allowed",
+            Decision::Session => "you allowed for this session",
+            Decision::Deny => "you declined",
+        };
+        self.answer(id, &p, decision != Decision::Deny, said);
+        if decision == Decision::Session {
+            self.allowed.insert(p.rule.clone());
+            for job in 1..=self.jobs.len() {
+                let same: Vec<Permission> = self.jobs[job - 1].asks.iter()
+                    .filter(|q| q.rule == p.rule && !self.always_asks(q)).cloned().collect();
+                self.jobs[job - 1].asks.retain(|q| !same.contains(q));
+                for q in same {
+                    self.answer(job, &q, true, "allowed (this session)");
+                }
+            }
+        }
+        Ok(format!("{said}: {}", parse::short(&p.what, 120)))
+    }
+
+    /// Whether an always-ask rule covers this action: such an action reaches the owner every time.
+    pub fn always_asks(&self, p: &Permission) -> bool {
+        self.always_ask.iter().any(|rule| rule_covers(rule, p))
+    }
+
+    /// Writes an answer to the agent, logs it in the job, and keeps it in the session's action log.
+    fn answer(&mut self, id: usize, p: &Permission, allow: bool, said: &str) {
+        let response = if allow {
+            serde_json::json!({"behavior": "allow", "updatedInput": p.input})
+        } else {
+            serde_json::json!({"behavior": "deny", "message": "The owner declined this action."})
+        };
+        let line = serde_json::json!({"type": "control_response", "response": {"subtype": "success", "request_id": p.id,
+                                      "response": response}});
+        let job = &mut self.jobs[id - 1];
+        if let Some(input) = &job.input {
+            let _ = input.send(Some(format!("{line}\n")));
+        }
+        job.push_log(format!("{said}: {}", p.what));
+        if job.asks.is_empty() {
+            job.activity = if allow { "working".into() } else { "declined; carrying on".into() };
+        }
+        let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
+        let record = serde_json::json!({"job": id, "agent": who, "tool": p.tool, "action": p.what, "rule": p.rule,
+                                        "answer": said, "mode": self.mode.name()});
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.dir.join("actions.jsonl")) {
+            let _ = writeln!(f, "{record}");
+        }
     }
 
     /// Other unapplied write jobs that edit the same files as job `id`: (job, shared files). Zero tokens: it is
