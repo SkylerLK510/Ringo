@@ -45,7 +45,6 @@ import math
 import re
 import subprocess
 import sys
-import tempfile
 import unicodedata
 from pathlib import Path
 

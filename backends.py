@@ -10,7 +10,6 @@ import math
 import ntpath
 import os
 import re
-import secrets
 import shutil
 import signal
 import stat
@@ -280,6 +279,7 @@ def private_tempdir(prefix, dir=None, *, cleanup=True):
             yield tempfile.mkdtemp(prefix=prefix, dir=dir)
         return
     for _ in range(tempfile.TMP_MAX):
+        import secrets  # deferred: only Windows takes this path
         folder = Path(dir if dir is not None else tempfile.gettempdir()) / (prefix + secrets.token_hex(8))
         try:
             private_directory(folder, create=True)

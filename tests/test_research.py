@@ -422,6 +422,13 @@ class VerifierTest(Fixture):
         self.assertEqual(records[0]['claims'][0]['match']['text'],
                          'The \u201cretry\u201d rule \u2014 clients\nretry\u00a0at most three\n times')
 
+    def test_markdown_backticks_in_a_quote_are_ignored(self):
+        # A gather call writes code in a quote as `5m`; the page's <code>5m</code> extracts as plain 5m.
+        self.page('/b', html('Set <code>ttl</code> to <code>5m</code> for helper requests; the remaining text is long.'))
+        records = self.verify(self.source('/b', quote='Set `ttl` to `5m` for helper requests'))['records']
+        self.assertEqual(records[0]['claims'][0]['level'], 'verified')
+        self.assertEqual(records[0]['claims'][0]['match']['text'], 'Set ttl to 5m for helper requests')
+
     def test_case_insensitive_match_is_verified_but_flagged(self):
         self.page('/c', html(f'Rule: {QUOTE}', 'More words to make the page long enough.'))
         result = self.verify(self.source('/c', quote=QUOTE.upper()))

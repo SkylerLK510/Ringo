@@ -89,7 +89,7 @@ Fetching (`research.fetch`):
 - each redirect (at most 3) is a new hop with the same checks; no cookies, credentials, referrer or proxy are ever
   used;
 - the body is read only for HTTP 200 and 203, within 2 MiB transferred (a larger declared size is refused before
-  reading) and 2 MiB after gzip or deflate decoding;
+  reading) and 8 MiB after gzip or deflate decoding;
 - a fetch chain has 10 seconds, redirects included; at its deadline every socket it opened is shut down, so a server
   that trickles bytes cannot outlast it; all fetching and extraction share a 60-second deadline; two chains run at a
   time, on daemon threads, so a stuck name lookup cannot hold the run open. At these limits ten URLs take five waves,
@@ -103,8 +103,8 @@ Extraction and matching (`research.Document`):
   cannot be seen without running the page's CSS, so such text still counts as visible; block elements (paragraphs, list items, table cells, headings and the like) end a passage;
   plain text is split at blank lines; markup is parsed, never followed or run;
 - normalisation is conservative: runs of whitespace become one space, typographic quotes and dashes become ASCII,
-  the ellipsis character becomes three dots, invisible formatting characters are removed; case, accents, digits and
-  other punctuation are kept;
+  the ellipsis character becomes three dots, invisible formatting characters and Markdown backticks are removed;
+  case, accents, digits and other punctuation are kept;
 - a quote matches only inside one passage, never across two; an exact match is preferred; a match that differs
   only in case is accepted and flagged in the evidence and the report, because case can change technical meaning;
 - the trace keeps the page's own text for each match, its passage, source line, offset and length in the extracted

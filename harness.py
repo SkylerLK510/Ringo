@@ -53,7 +53,6 @@ from pathlib import Path
 
 import backends
 import context
-import findings
 import pipelines
 
 TIMEOUT_S = 900
@@ -815,6 +814,7 @@ def findings_pr(args):
 def write_findings(args, text, run):
     """Write the review's findings as ReviewBench contract JSON to --findings-json (and the trace); anchors are
     checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary."""
+    import findings  # deferred: only --findings-json uses it
     found = findings.parse(text)
     kept, dropped = findings.anchor(found, args.repo, args.head, args.base) if getattr(args, 'repo', None) else (found, [])
     data = json.dumps(findings.reviewbench(kept, args.findings_pr, args.agent), indent=1) + '\n'

@@ -20,7 +20,6 @@ The writer replies with complete files or with exact search/replace edits. Edits
 before anything else, so the digest, checks, mutation check and judges always see full text.
 """
 import argparse
-import concurrent.futures
 import contextlib
 import decimal
 import hashlib
@@ -782,6 +781,7 @@ def run(spec_path, out, call_fn=harness.call):
                 def ask(i):
                     return call(f'writer-{n}.{i}', spec['writer'], writer_prompt, message, role=role)
                 if spec.get('max_cost') is None:
+                    import concurrent.futures  # deferred: only candidates > 1 uses it (about 10 ms of imports)
                     with concurrent.futures.ThreadPoolExecutor(k) as pool:
                         texts = list(pool.map(ask, range(1, k + 1)))
                 else:  # under a cost cap, calls run one at a time

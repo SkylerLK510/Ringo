@@ -294,7 +294,7 @@ class PrivateDirectoryTest(unittest.TestCase):
     def test_windows_tempdirs_retry_collisions_without_adopting_or_removing_them(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.object(backends, 'os', wraps=os) as win, \
                 mock.patch.object(backends, 'private_directory', side_effect=[FileExistsError(), None]) as create, \
-                mock.patch.object(backends.secrets, 'token_hex', side_effect=['collision', 'new']), \
+                mock.patch('secrets.token_hex', side_effect=['collision', 'new']), \
                 mock.patch.object(backends.shutil, 'rmtree') as cleanup, \
                 mock.patch.object(backends.tempfile, 'mkdtemp') as plain:
             win.name = 'nt'

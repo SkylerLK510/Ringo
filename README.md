@@ -305,7 +305,7 @@ or to an agent turn.
 The fetcher accepts only http and https, refuses URLs with credentials, resolves each host and refuses loopback,
 private, link-local, multicast, reserved and cloud-metadata addresses (IPv4 addresses inside IPv6 forms too), checks
 again on every redirect, and connects only to addresses it checked. It sends no cookies, credentials or referrer and
-uses no proxy. Each job fetches at most 10 URLs, with 3 redirects each, 2 MiB transferred and 2 MiB decompressed per
+uses no proxy. Each job fetches at most 10 URLs, with 3 redirects each, 2 MiB transferred and 8 MiB decompressed per
 page, 10 seconds per fetch and 60 seconds in all, two at a time. A source is **verified** (a quote was found on its
 page), **not checkable** (a PDF, a paywall or login, a page with no extractable text, a redirect loop; listed as a
 limitation, never cited) or **dropped** (unreachable, blocked, oversized, or no quote found on that page; a quote
