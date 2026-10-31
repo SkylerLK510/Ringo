@@ -54,7 +54,10 @@ Ringo's pipelines have no history to compact: each call is rebuilt from git obje
 
 ### 1. Agent turns in the shell
 
-A resumed turn re-sends the conversation: Codex grows from 16.8k to 34.8k tokens, Claude Code from 16.5k to 33.1k.
+A resumed turn re-sends the conversation so far. After a one-word exchange, the follow-up cost Codex 18.0k tokens
+against 16.8k for the first turn, and Claude Code 16.6k against 16.5k. (This section first said 34.8k and 33.1k; those
+were running totals for the conversation, not the follow-ups.) The cost grows with the conversation, so rebuilding
+matters for long read conversations, not short ones.
 
 The alternative is to rebuild instead of resume, with no model call. Start a fresh turn whose context comes from the
 repository (the diff, the touched files, the current failing check output), and carry only the task and the model's
