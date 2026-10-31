@@ -92,21 +92,29 @@ conversation busy, the suggestion names Codex, then any other agent that can tak
 ## Using it
 
 ```
- ringo  my-repo (main)  ·  2 running  ·  48.1k tokens this session  ·  pipelines: codex-chatgpt
-╭ agents ─────────────────────────────╮╭ #2 where else do we retry HTTP calls? ─────────────────╮
-│#1 codex!              ✓ 0:41 34.8k  ││ ...the selected job's live log, or the console...       │
-│   [change ready] Created the retry… ││                                                         │
-│#2 claude              ⠼ 0:12 13.3k  ││                                                         │
-│   Grep fn retry                     ││                                                         │
-│   └ ⠼ Explore: find callers: Read … ││                                                         │
-│#3 ringo review        ⠼ 0:05 0 1c   │╰─────────────────────────────────────────────────────────╯
-│   review: calling codex-chatgpt     │╭ @codex · Enter sends · Tab jobs · /help ────────────────╮
-│                                     ││ /review #1                                              │
-╰─────────────────────────────────────╯╰─────────────────────────────────────────────────────────╯
+ ringo  my-repo (main) · agents: claude, codex (/setup adds another) · mode: ask
+Ask anything, or @claude / @codex for an agent turn. /usrman shows the manual.
+
+› @claude! add a retry to the HTTP client
+#1 claude!
+  worktree ... from HEAD 3f2a91c; uncommitted changes in your tree are not in it
+  I'll add the retry in client.rs and a test for it.
+✓ #1 claude! done · 0:41 · 34.8k tokens · change ready: /diff 1, /apply 1
+
+› /review #1
+ ⠼ #2 ringo review  0:05 0 1c  review: calling codex-chatgpt
+╭ @claude or @codex for an agent · Ctrl-J new line · /usrman ───────────────╮
+│                                                                           │
+╰───────────────────────────────────────────────────────────────────────────╯
+ ringo  my-repo (main) · mode: ask · 1 running · 34.8k tokens
 ```
 
-From 90 columns wide, the agents sit in a column on the left and the chat beside them. On a narrower terminal the
-panel moves above the chat, one row per job.
+The conversation prints into the terminal's own scrollback, as Claude Code's and Codex's do: your lines, every
+reply, and what each agent does (its commands, edits and messages, under its job number), then one line when a
+job ends with its time, tokens and Ringo model calls. Scroll it with the mouse wheel and select from it as in any
+other program; the shell never captures the mouse. Below it, a live area holds one row per running job and
+subagent, any permission request, the input box and a status line. The manual is not on screen until you ask for
+it: `/usrman` (or `/instructions`, `/help`) prints it into the conversation.
 
 | You type | What happens |
 |---|---|
@@ -123,7 +131,7 @@ panel moves above the chat, one row per job.
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
 | `/route on` | route suggestions: a line that reads like a research, design, review or edit task, or a question about this folder's files, is not sent; the matching command (`/research ...`, `/design ...`, `/review ...`, `@claude! ...`, or `@claude ...` for a read-only look at the files; see "Who takes which turn") appears in the input line with what it costs, for you to send with Enter, change, or ask as a plain question with Esc. Word rules only, no model call; an agent turn is only ever suggested. On 100 held-out lines the suggestions were acceptable 35 times in 38 and covered about half of the tasks; the rest are asked as plain questions. `/route off` turns it off |
-| `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | select a job, stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
+| `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's log (its last 2,000 lines; the whole stream is in its folder), stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
 (`@agent!`, in a worktree) and `/review BASE` reviews its commits; in any other folder, a repository that holds your
@@ -131,12 +139,16 @@ home folder (a dotfiles repository) included, they read and answer, and Ringo sa
 Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
 
 Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 17,000 tokens before it
-starts, and a vague question can send it searching (one such follow-up cost about 450,000). Tab selects a job, Shift-Tab changes the mode,
-PgUp and PgDn scroll its log, Up and Down recall earlier lines, and Ctrl-C twice quits, stopping running jobs.
+starts, and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends; Ctrl-J,
+Alt-Enter or `\` then Enter starts a new line. A paste goes into the input box with its lines kept, and nothing is
+sent until you press Enter (in a terminal without bracketed paste, keys that arrive together, as a paste's do, are kept the
+same way, its last newline too). Up and Down move between the lines of a message, then through earlier messages; Shift-Tab changes the mode,
+Esc clears the input, and Ctrl-C twice quits, stopping running jobs.
 
-The panel shows each job's state, time, tokens, Ringo model calls and what it is doing now, with one row per
+The live area shows each running job's time, tokens, Ringo model calls and what it is doing now, with one row per
 subagent: Claude Code's Task subagents and Codex's spawned agents. When two unapplied write jobs edit the same
-file, both rows say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs no tokens: it
+file, the running job's row and the line it ends with say so (`⚠ same files as #2 client.rs`) before you apply
+either. That check costs no tokens: it
 compares the agents' own edit events as they arrive.
 
 ## Modes and permissions
@@ -152,10 +164,10 @@ One switch sets how far every agent may act without asking; it applies to the tu
 When an agent waits, a box above the input line shows the whole action, every line of a command included, and
 `y` allows it once, `a` allows it and the same rule for the rest of the session (in every later Claude turn too, as
 `--allowedTools`; an always-ask action is allowed once only, whichever key), `n` or Esc declines it and the agent
-carries on without it. A request longer than its box shows its first lines and how many more there are; all of it is
-also in the job's log (Tab to the job, PgUp). The keys answer only when the input
-line is empty and not in the first 0.3 s after the box appears, so a word you are typing never answers by accident.
-Tab, PgUp and PgDn still let you look at the job first. Every answer is kept in `actions.jsonl` in the session's
+carries on without it. A request longer than its box shows its first lines and how many more there are; all of it
+is also in the conversation above, where it printed when it arrived. The keys answer only when the input line is
+empty and not in the first 0.3 s after the box appears, so a word you are typing never answers by accident.
+Every answer is kept in `actions.jsonl` in the session's
 state folder, with the job, agent, action, rule and mode.
 
 **Always ask.** In ask and auto mode alike, these wait for you whatever an allow rule or a safety review says (ask
