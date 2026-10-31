@@ -145,13 +145,15 @@ One switch sets how far every agent may act without asking; it applies to the tu
 
 | Mode | Claude | Codex |
 |---|---|---|
-| `ask` (the default) | reads, and edits its worktree, freely (Claude Code's own rules: plain file commands such as `mkdir` in the worktree run without asking); every other action waits for you: a command such as `curl`, `gh` or `npm`, a connector call, a file outside its folder | works inside its sandbox (read-only for read turns, its worktree for write turns, no network); it cannot stop to ask, so what the sandbox refuses fails |
+| `ask` (the default) | reads, and edits its worktree, freely (Claude Code's own rules: plain file commands such as `mkdir` in the worktree run without asking); every other action waits for you: a command such as `curl`, `gh` or `npm` in a write turn, a connector call, a file outside its folder. Read turns (`@claude`) run in your own tree, so they never run commands; give a task that needs them to `@claude!` | works inside its sandbox (read-only for read turns, its worktree for write turns, no network); it cannot stop to ask, so what the sandbox refuses fails |
 | `auto` | Claude Code's auto mode: it acts on its own and its safety review blocks what is dangerous; what that review blocks repeatedly, and what an always-ask rule names, waits for you | write turns run with `--approve-for-me` (Codex's own reviewer answers its approval requests) and the network on in the sandbox, for git, gh and installs |
 | `read` | no edits, no commands, no connectors; `@agent!` is refused | read-only sandbox; `@agent!` is refused |
 
 When an agent waits, a box above the input line shows the whole action, every line of a command included, and
 `y` allows it once, `a` allows it and the same rule for the rest of the session (in every later Claude turn too, as
-`--allowedTools`), `n` or Esc declines it and the agent carries on without it. The keys answer only when the input
+`--allowedTools`; an always-ask action is allowed once only, whichever key), `n` or Esc declines it and the agent
+carries on without it. A request longer than its box shows its first lines and how many more there are; all of it is
+also in the job's log (Tab to the job, PgUp). The keys answer only when the input
 line is empty and not in the first 0.3 s after the box appears, so a word you are typing never answers by accident.
 Tab, PgUp and PgDn still let you look at the job first. Every answer is kept in `actions.jsonl` in the session's
 state folder, with the job, agent, action, rule and mode.
@@ -170,7 +172,8 @@ Gmail, email, calendar, Google Drive or Docs, Slack, Linear, Notion, Figma, Data
 servers and plugins loaded, but without your CLAUDE.md, memory, skills or main agent; any other turn runs in safe
 mode without them. Measured with Claude Code 2.1.316, one trivial turn each: 16,567 tokens in safe mode, 27,522 with
 the connectors, 57,799 with everything. Without your CLAUDE.md, an instruction in it to use Ringo cannot start Ringo
-again either. Checked live through the same flags: a read-only Jira question asked before each of its two Jira calls
+again either. Your own hooks do run in these turns, as in your normal Claude Code. Checked live through the same
+flags: a read-only Jira question asked before each of its two Jira calls
 and answered correctly (5 model calls, 18.5 s, 167,291 tokens, most of them cache reads).
 
 **Checked live** (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0, one run each in a throwaway repository):
@@ -271,9 +274,10 @@ or for the spinner while a job runs.
   result: Claude Code sends each permission request to Ringo (`--permission-prompt-tool stdio`, the channel the
   Agent SDK uses; `--permission-prompts host` alone denies them) and Ringo writes your answer back. A request Ringo
   does not serve is refused at once, so a turn never waits on it. Codex and agy cannot ask.
-- **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Edit`, `Write` and
-  `NotebookEdit` (and, in read mode, `Bash`, with `--permission-prompts none`), which win over any allow rules in
-  your own settings; in ask and auto mode its commands and connector calls go through the mode. agy runs
+- **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
+  and `NotebookEdit`, which win over any allow rules in your own settings (it works in your own tree with no sandbox,
+  and a command could write files there); its connector calls go through the mode, and in read mode nothing may
+  prompt (`--permission-prompts none`). agy runs
   with session-only deny rules for `write_file(*)`, `command(*)`, `unsandboxed(*)`, `mcp(*)` and
   `execute_url(*)`, which win over its accept rules; asked to edit, it gets an error it can see and answers anyway
   (checked live with agy 1.4.11: no file appeared). Grok and agents you add have

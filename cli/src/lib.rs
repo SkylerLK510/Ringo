@@ -208,6 +208,31 @@ const CONNECTOR_WORDS: [&str; 18] = ["jira", "confluence", "atlassian", "clickup
     "calendar", "gdrive", "slack", "linear", "notion", "figma", "datadog", "intercom", "connector", "mcp"];
 const CONNECTOR_PHRASES: [&str; 4] = ["google drive", "my drive", "google doc", "google docs"];
 
+/// Whether a Claude permission rule (`Tool`, `Tool(exact)`, `Bash(prefix:*)`, `Edit(~/dir/**)`) covers an action.
+/// A `Bash(prefix:*)` rule matches the prefix as a command anywhere in the line (after `;`, `&&`, `|`, `$(`, a
+/// newline, or a space: `xargs sudo`), so a chained command cannot slip past it; a match too many only means the
+/// action is asked about once more.
+pub fn rule_covers(rule: &str, p: &Permission) -> bool {
+    let Some((tool, content)) = rule.strip_suffix(')').and_then(|r| r.split_once('(')) else { return rule == p.tool };
+    if tool != p.tool {
+        return false;
+    }
+    let field = ["command", "file_path", "notebook_path", "path"].iter()
+        .find_map(|k| p.input.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty())).unwrap_or("");
+    if let Some(prefix) = content.strip_suffix(":*") {
+        let boundary = |c: Option<char>| c.is_none_or(|c| c.is_whitespace() || ";&|()`$".contains(c));
+        return field.match_indices(prefix).any(|(i, _)| {
+            boundary(field[..i].chars().next_back()) && boundary(field[i + prefix.len()..].chars().next())
+        });
+    }
+    if let Some(dir) = content.strip_suffix("/**") {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let dir = dir.strip_prefix("~/").map_or_else(|| PathBuf::from(dir), |rest| home.join(rest));
+        return resolved(Path::new(field)).starts_with(resolved(&dir));
+    }
+    field == content
+}
+
 /// Whether a task names a service only the owner's connectors reach. An identifier (`email_parser`) is one word.
 pub fn names_connector(task: &str) -> bool {
     let lower = task.to_lowercase();
@@ -618,10 +643,10 @@ impl Session {
                                            if write { "acceptEdits" } else { "default" }]),
                     Mode::Auto => cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode", "auto"]),
                 };
-                // Read turns never edit files, and in read mode run no commands; deny rules win in every mode.
+                // Read turns run in the owner's own tree with no sandbox, so they never edit and never run commands (a
+                // command could write files); deny rules win in every mode. Commands run in write turns' worktrees.
                 if !write {
-                    cmd.arg("--disallowed-tools").args(if self.mode == Mode::Read { &["Bash", "Edit", "Write", "NotebookEdit"][..] }
-                                                       else { &["Edit", "Write", "NotebookEdit"][..] });
+                    cmd.arg("--disallowed-tools").args(["Bash", "Edit", "Write", "NotebookEdit"]);
                 }
                 if self.mode != Mode::Read {
                     cmd.arg("--settings").arg(serde_json::json!({"permissions": {"ask": self.always_ask}}).to_string());
@@ -972,9 +997,11 @@ impl Session {
                     }
                 }
                 Event::Note(id, Note::Permission(p)) => {
-                    if self.allowed.contains(&p.rule) {
+                    if self.allowed.contains(&p.rule) && !self.always_asks(&p) {
                         self.answer(id, &p, true, "allowed (this session)");
                     } else {
+                        // The whole request in the job's log too, where a long one can be read before answering.
+                        self.jobs[id - 1].push_log(format!("asks before it acts: {}", p.what));
                         self.jobs[id - 1].asks.push_back(p);
                     }
                 }
@@ -1057,6 +1084,8 @@ impl Session {
     pub fn decide(&mut self, id: usize, decision: Decision) -> Result<String, String> {
         let p = self.jobs.get_mut(id.wrapping_sub(1)).and_then(|j| j.asks.pop_front())
             .ok_or(format!("#{id} is not waiting for an answer"))?;
+        // An always-ask action is allowed one at a time: "this session" counts as once for it.
+        let decision = if decision == Decision::Session && self.always_asks(&p) { Decision::Once } else { decision };
         let said = match decision {
             Decision::Once => "you allowed",
             Decision::Session => "you allowed for this session",
@@ -1066,14 +1095,20 @@ impl Session {
         if decision == Decision::Session {
             self.allowed.insert(p.rule.clone());
             for job in 1..=self.jobs.len() {
-                let same: Vec<Permission> = self.jobs[job - 1].asks.iter().filter(|q| q.rule == p.rule).cloned().collect();
-                self.jobs[job - 1].asks.retain(|q| q.rule != p.rule);
+                let same: Vec<Permission> = self.jobs[job - 1].asks.iter()
+                    .filter(|q| q.rule == p.rule && !self.always_asks(q)).cloned().collect();
+                self.jobs[job - 1].asks.retain(|q| !same.contains(q));
                 for q in same {
                     self.answer(job, &q, true, "allowed (this session)");
                 }
             }
         }
         Ok(format!("{said}: {}", parse::short(&p.what, 120)))
+    }
+
+    /// Whether an always-ask rule covers this action: such an action reaches the owner every time.
+    pub fn always_asks(&self, p: &Permission) -> bool {
+        self.always_ask.iter().any(|rule| rule_covers(rule, p))
     }
 
     /// Writes an answer to the agent, logs it in the job, and keeps it in the session's action log.

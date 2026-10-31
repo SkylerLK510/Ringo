@@ -367,11 +367,11 @@ fn agent_commands_are_pinned() {
                (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"read-only\""], &tail), "the task".into()));
     assert_eq!(turn(agent("codex"), true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
     // Ask mode (the default): every permission prompt comes to Ringo, the always-ask rules ride along, read turns
-    // cannot edit files; the prompt is one stream-json message on stdin, which stays open for the answers.
+    // neither edit nor run commands; the prompt is one stream-json message on stdin, which stays open for the answers.
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
-    let read = ["default", "--disallowed-tools", "Edit", "Write", "NotebookEdit", "--settings", &rules];
+    let read = ["default", "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit", "--settings", &rules];
     let message = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the task\"}}\n".to_string();
     assert_eq!(turn(agent("claude"), false, &claude),
                (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
@@ -501,6 +501,9 @@ fn ask_mode_sends_each_permission_request_to_the_owner() {
     assert_eq!(p.what, "Bash gh pr create --fill\nrm -rf build", "every line of the command is shown");
     assert_eq!(p.rule, "Bash(gh pr create:*)");
     assert_eq!(s.job(id).unwrap().activity, "waiting for you: Bash gh pr create --fill");
+    let log: Vec<&String> = s.job(id).unwrap().log.iter().collect();
+    assert!(log.windows(2).any(|w| w[0] == "asks before it acts: Bash gh pr create --fill" && w[1] == "rm -rf build"),
+            "the whole request is in the job's log: {log:?}");
     assert!(s.decide(id, Decision::Session).unwrap().starts_with("you allowed for this session"));
     assert_eq!(wait(&mut s, id), Status::Done);
     let a = answers(&claude);
@@ -567,7 +570,8 @@ fn modes_change_what_each_agent_may_do() {
     turn(&mut s, "claude", false, "what is in my Jira sprint?");
     let (argv, env) = (read(&claude, "argv"), read(&claude, "env"));
     assert!(has(&argv, &["--agent", "claude", "--disable-slash-commands"]) && !argv.contains("--safe-mode"), "{argv}");
-    assert!(has(&argv, &["--disallowed-tools", "Edit", "Write", "NotebookEdit"]), "a read turn never edits: {argv}");
+    assert!(has(&argv, &["--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit"]),
+            "a read turn, in the owner's own tree, neither edits nor runs commands: {argv}");
     for var in ["CLAUDE_CODE_DISABLE_CLAUDE_MDS=1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1", "RINGO_CHILD=1"] {
         assert!(env.lines().any(|l| l == var), "{var}");
     }
@@ -609,4 +613,39 @@ fn a_task_typed_as_a_plain_line_comes_back_routed() {
     assert!(s.routed.is_empty());
     let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join("seen-2.json")).unwrap()).unwrap();
     assert_eq!(seen["material"], "Question: why do retries back off?\n", "a routed line is not an earlier answer");
+}
+
+#[test]
+fn always_ask_actions_reach_the_owner_every_time() {
+    let r = repo("always-ask");
+    let sudo = CLAUDE_ASKS.replace("gh pr create --fill\\nrm -rf build", "make && sudo -n true")
+        .replace("gh pr create --draft", "make && sudo -n true").replace("gh pr create:*", "make && sudo -n true");
+    let claude = fake(&root(), "claude-sudo", &sudo);
+    let mut s = session(&r, agent("claude"), &claude);
+    let id = s.launch_agent(agent("claude"), true, "build it").unwrap();
+    wait_for_ask(&mut s);
+    let (_, p) = s.pending().unwrap();
+    assert!(s.always_asks(p), "`sudo` after `&&` is still sudo");
+    assert_eq!(s.decide(id, Decision::Session).unwrap(), "you allowed: Bash make && sudo -n true", "allowed once only");
+    assert!(s.allowed.is_empty());
+    wait_for_ask(&mut s); // the same request asks again
+    s.decide(id, Decision::Deny).unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let a = answers(&claude);
+    assert_eq!((a[0]["response"]["response"]["behavior"].as_str(), a[1]["response"]["response"]["behavior"].as_str()),
+               (Some("allow"), Some("deny")));
+
+    let ask = |tool: &str, input: serde_json::Value| ringo_cli::parse::Permission {
+        id: "r".into(), tool: tool.into(), input, what: String::new(), rule: String::new() };
+    let covers = |rule: &str, p: &ringo_cli::parse::Permission| ringo_cli::rule_covers(rule, p);
+    let bash = |c: &str| ask("Bash", serde_json::json!({"command": c}));
+    assert!(covers("Bash(sudo:*)", &bash("sudo rm x")) && covers("Bash(sudo:*)", &bash("ls; sudo rm x")));
+    assert!(covers("Bash(sudo:*)", &bash("echo $(sudo cat f)")) && covers("Bash(sudo:*)", &bash("ls\nsudo rm x")));
+    assert!(!covers("Bash(sudo:*)", &bash("pseudocode.py")) && !covers("Bash(dd:*)", &bash("git add .")));
+    assert!(covers("Bash(git push --force:*)", &bash("git push --force origin main")));
+    assert!(!covers("Bash(sudo:*)", &ask("Edit", serde_json::json!({"file_path": "/x/sudo"}))));
+    let home = std::env::var("HOME").unwrap();
+    assert!(covers("Edit(~/.claude/**)", &ask("Edit", serde_json::json!({"file_path": format!("{home}/.claude/settings.json")}))));
+    assert!(!covers("Edit(~/.claude/**)", &ask("Edit", serde_json::json!({"file_path": format!("{home}/.claudex/a")}))));
+    assert!(covers("WebFetch", &ask("WebFetch", serde_json::json!({}))) && covers("Bash(make)", &bash("make")));
 }

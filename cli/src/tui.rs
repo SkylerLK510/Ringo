@@ -20,8 +20,9 @@ answers as context. It costs a few thousand tokens, and it cannot see your files
 When that call reads the line as a task (files to change, read or review, or live sources), Ringo starts it:
 claude takes code turns (codex when claude is not set up), /research takes sources.
 Mode (now: {mode}), one switch for every agent: Shift-Tab cycles it, /mode ask|auto|read sets it, /auto toggles auto.
-  ask    agents read, and edit their own worktree, freely; anything else (a command, a connector such as Jira, the
-         network, a push or a PR) waits for you: y allow, a allow for this session, n decline
+  ask    agents read, and edit their own worktree, freely; anything else (a command in a write turn, a connector
+         such as Jira, the network, a push or a PR) waits for you: y allow, a allow for this session, n decline.
+         Read turns (@claude) never run commands: they work in your own tree
   auto   agents act on their own; only what their safety review flags, or an always-ask rule names (sudo, disk
          tools, force pushes, publishing, agent settings), waits for you. Codex works in its sandbox with the network
          and its own reviewer; it cannot stop to ask
@@ -757,12 +758,20 @@ impl App {
         let title = if title.chars().count() > width { ringo_cli::parse::short(&title, width.saturating_sub(2)) } else { title };
         f.render_widget(Paragraph::new(visible).block(block(title, self.selected > 0)), log);
 
-        let input = if let Some((title, lines)) = ask {
-            // The whole request, wrapped, above the input line; when it is taller than its box, its end (and the
-            // keys) stay visible.
+        let input = if let Some((title, mut lines)) = ask {
+            // The request, wrapped, above the input line, from its first line: a long one shows how much more there
+            // is, all of it is in the job's log (Tab, PgUp), and the keys stay on the last line.
             let [asked, input] = Layout::vertical([Constraint::Length(ask_h), Constraint::Length(3)]).areas(input);
             let room = asked.height.saturating_sub(2) as usize;
-            let shown: Vec<Line> = lines[lines.len().saturating_sub(room)..].to_vec();
+            let keys = lines.pop().unwrap_or_default();
+            let mut shown: Vec<Line> = lines.clone();
+            if shown.len() + 1 > room {
+                shown.truncate(room.saturating_sub(2));
+                let more = lines.len() - shown.len();
+                let job = self.s.pending().map_or(0, |(id, _)| id);
+                shown.push(Line::styled(format!("… {more} more lines: Tab to #{job} and PgUp to read all of it before you answer"), t.warn));
+            }
+            shown.push(keys);
             f.render_widget(Paragraph::new(shown).block(block(title, true).border_style(t.warn)), asked);
             input
         } else {
@@ -789,11 +798,13 @@ impl App {
         let more = self.s.waiting() - 1;
         let title = format!(" {who} #{id} asks before it acts{} ", if more > 0 { format!(" · {more} more waiting") } else { String::new() });
         let mut lines: Vec<Line<'static>> = p.what.lines().flat_map(|l| wrap(l, width)).map(Line::raw).collect();
-        let keys = if self.input.is_empty() {
+        let keys = if !self.input.is_empty() {
+            "send or clear (Esc) your line to answer: y allow · a allow for this session · n decline".to_string()
+        } else if self.s.always_asks(p) {
+            "y allow this once (an always-ask rule: it asks every time) · n decline · Tab to look first".to_string()
+        } else {
             format!("y allow · a allow `{}` for this session · n decline · Tab to look first",
                     ringo_cli::parse::short(&p.rule, 60))
-        } else {
-            "send or clear (Esc) your line to answer: y allow · a allow for this session · n decline".to_string()
         };
         lines.push(Line::styled(keys, self.theme.dim));
         Some((title, lines))
