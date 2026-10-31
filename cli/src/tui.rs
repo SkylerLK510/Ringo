@@ -314,7 +314,9 @@ fn inline(height: u16) -> std::io::Result<DefaultTerminal> {
 
 fn open(height: u16) -> std::io::Result<DefaultTerminal> {
     enable_raw_mode()?;
-    execute!(stdout(), EnableBracketedPaste)?; // a paste arrives as one event, not as keys (its newlines as Enter)
+    // A paste arrives as one event, not as keys (its newlines as Enter). Not fatal: the legacy Windows console has no
+    // bracketed paste, and there a paste's keys are told apart by their timing (see BURST).
+    let _ = execute!(stdout(), EnableBracketedPaste);
     inline(height)
 }
 
