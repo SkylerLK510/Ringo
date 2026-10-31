@@ -968,20 +968,12 @@ fn read_agents_file(root: &Path) -> serde_json::Value {
 }
 
 /// Runs a read-modify-write of agents.json holding an exclusive lock, so two shells saving at once cannot drop each
-/// other's change.
-// ceiling: Unix only (flock); on Windows two setups saving in the same instant can still lose one change.
+/// other's change (std's File::lock: flock on Unix, LockFileEx on Windows).
 fn with_agents_lock<T>(root: &Path, change: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     private_dir(root)?;
     let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join("agents.json.lock"))
         .map_err(|e| format!("agents.json.lock: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: flock on a descriptor this function owns; it is released when `lock` closes.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!("agents.json.lock: {}", std::io::Error::last_os_error()));
-        }
-    }
+    lock.lock().map_err(|e| format!("agents.json.lock: {e}"))?; // released when `lock` closes
     let result = change();
     drop(lock);
     result
