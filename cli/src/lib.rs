@@ -235,8 +235,8 @@ pub struct Session {
     /// Why no job may start now (an agent update is replacing a program), if one may not.
     pub hold: Option<String>,
     threads: HashMap<Agent, String>,
-    /// The usage each resumable conversation last reported, by its id.
-    usage_so_far: HashMap<String, Tokens>,
+    /// The running total each resumable conversation last reported, by agent and conversation id.
+    usage_so_far: HashMap<(Agent, String), Tokens>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
 }
@@ -841,13 +841,18 @@ impl Session {
                         Note::Tokens(t) => {
                             // A resumed Codex or agy turn reports its conversation's usage so far (Codex 16,829
                             // then 34,835 input tokens for a one-word follow-up; agy 6,981 then 14,260), so only
-                            // what this turn added is counted. Claude reports each run on its own.
+                            // what this turn added is counted. Claude reports each run on its own. A running total
+                            // never falls, so a result without usage (zero) keeps the last one.
                             let t = match job.kind {
                                 Kind::Agent { agent, write: false }
                                     if matches!(agent.spec().adapter, Adapter::Codex | Adapter::Agy) =>
                                 {
-                                    let thread = self.threads.get(&agent).cloned().unwrap_or_default();
-                                    t.since(self.usage_so_far.insert(thread, t).unwrap_or_default())
+                                    let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
+                                    let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
+                                    if t.total() >= before.total() {
+                                        self.usage_so_far.insert(key, t);
+                                    }
+                                    t.since(before)
                                 }
                                 _ => t,
                             };

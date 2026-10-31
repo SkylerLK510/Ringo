@@ -391,7 +391,8 @@ fn agy_turns_and_their_permissions() {
     const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
     let agy = fake(&root(), "agy", &format!("#!/bin/sh\n{RECORD}\
         echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
-        case \" $* \" in *' --conversation '*) k=2 ;; *) k=1 ;; esac\n\
+        if [ -e \"$0.fail\" ]; then rm \"$0.fail\"; echo '{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"response\":\"quota\",\"usage\":{{}}}}}}'; exit 0; fi\n\
+        case \" $* \" in *' --mode '*) k=1 ;; *' --conversation '*) k=$(($(cat \"$0.k\") + 1)); echo $k > \"$0.k\" ;; *) k=1; echo 1 > \"$0.k\" ;; esac\n\
         echo \"{{\\\"event\\\":\\\"result\\\",\\\"result\\\":{{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"done\\\",\\\"usage\\\":{{\\\"input_tokens\\\":$((7*k)),\\\"output_tokens\\\":$((2*k))}}}}}}\"\n"));
     let mut s = session(&r, agent("agy"), &agy);
     let mut turn = |write: bool| -> Vec<String> {
@@ -408,6 +409,14 @@ fn agy_turns_and_their_permissions() {
     assert_eq!(turn(false), [&head[..], &[read, "--conversation", "c-1"]].concat());
     let write = r#"{"permissions":{"deny":["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
     assert_eq!(turn(true), [&head[..], &[write, "--mode", "accept-edits"]].concat());
+    // A failed resumed turn reports no usage; the running total it leaves is still the last one reported.
+    fs::write(format!("{}.fail", agy.display()), "").unwrap();
+    let failed = s.launch_agent(agent("agy"), false, "again").unwrap();
+    assert!(matches!(wait(&mut s, failed), Status::Failed(_)));
+    assert_eq!(s.job(failed).unwrap().tokens.total(), 0);
+    let next = s.launch_agent(agent("agy"), false, "and now?").unwrap();
+    assert_eq!(wait(&mut s, next), Status::Done);
+    assert_eq!(s.job(next).unwrap().tokens.total(), 9, "27 so far, 18 at the last report");
 }
 
 /// An agent the owner adds: kept in agents.json beside the set-up list, run with its own command line (the prompt
