@@ -1,0 +1,1561 @@
+{
+ "version": 1,
+ "reports": [
+  {
+   "version": 1,
+   "status": "negligible",
+   "reason": "all upper confidence bounds fit the declared budgets on this workload",
+   "measurement": {
+    "version": 1,
+    "baseline": "backends.py:3db9ec6ef66f3e7a96e6314fe4f157acb5a8751c0c529d967c6ba705efbc73a9",
+    "candidate": "backends.py:aa5a55ca31c67dbcc27ff571254447bb2a5fe37a10c8369cb8e773623ae78106",
+    "planned_pairs": 100,
+    "pairs": [
+     {
+      "id": "0",
+      "baseline_s": 0.222832667,
+      "candidate_s": 0.007842416,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "1",
+      "baseline_s": 0.22406825,
+      "candidate_s": 0.008131292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "2",
+      "baseline_s": 0.231350042,
+      "candidate_s": 0.007928125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "3",
+      "baseline_s": 0.226633708,
+      "candidate_s": 0.008172084,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "4",
+      "baseline_s": 0.227095042,
+      "candidate_s": 0.008324792,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "5",
+      "baseline_s": 0.228295416,
+      "candidate_s": 0.008238875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "6",
+      "baseline_s": 0.226483458,
+      "candidate_s": 0.008122875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "7",
+      "baseline_s": 0.22712425,
+      "candidate_s": 0.008180208,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "8",
+      "baseline_s": 0.227060958,
+      "candidate_s": 0.008527042,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "9",
+      "baseline_s": 0.2276545,
+      "candidate_s": 0.008108708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "10",
+      "baseline_s": 0.224647334,
+      "candidate_s": 0.008041125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "11",
+      "baseline_s": 0.225778292,
+      "candidate_s": 0.00827025,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "12",
+      "baseline_s": 0.235072375,
+      "candidate_s": 0.008350125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "13",
+      "baseline_s": 0.222973917,
+      "candidate_s": 0.008201708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "14",
+      "baseline_s": 0.22600475,
+      "candidate_s": 0.008205958,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "15",
+      "baseline_s": 0.224295292,
+      "candidate_s": 0.007770667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "16",
+      "baseline_s": 0.225868209,
+      "candidate_s": 0.008356291,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "17",
+      "baseline_s": 0.2248085,
+      "candidate_s": 0.008398375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "18",
+      "baseline_s": 0.225733334,
+      "candidate_s": 0.008220584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "19",
+      "baseline_s": 0.225799625,
+      "candidate_s": 0.008130125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "20",
+      "baseline_s": 0.2248665,
+      "candidate_s": 0.008366458,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "21",
+      "baseline_s": 0.226084125,
+      "candidate_s": 0.008106584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "22",
+      "baseline_s": 0.22313675,
+      "candidate_s": 0.008062333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "23",
+      "baseline_s": 0.224647708,
+      "candidate_s": 0.0082895,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "24",
+      "baseline_s": 0.224286375,
+      "candidate_s": 0.008196875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "25",
+      "baseline_s": 0.223710791,
+      "candidate_s": 0.008058583,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "26",
+      "baseline_s": 0.223965167,
+      "candidate_s": 0.008304375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "27",
+      "baseline_s": 0.2278495,
+      "candidate_s": 0.008117917,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "28",
+      "baseline_s": 0.225043375,
+      "candidate_s": 0.00800175,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "29",
+      "baseline_s": 0.229069833,
+      "candidate_s": 0.008019792,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "30",
+      "baseline_s": 0.23385575,
+      "candidate_s": 0.00820725,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "31",
+      "baseline_s": 0.227934917,
+      "candidate_s": 0.008170292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "32",
+      "baseline_s": 0.225846708,
+      "candidate_s": 0.008280875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "33",
+      "baseline_s": 0.229891417,
+      "candidate_s": 0.008426667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "34",
+      "baseline_s": 0.231795459,
+      "candidate_s": 0.008469833,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "35",
+      "baseline_s": 0.230881958,
+      "candidate_s": 0.008411459,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "36",
+      "baseline_s": 0.228080375,
+      "candidate_s": 0.008349291,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "37",
+      "baseline_s": 0.227364875,
+      "candidate_s": 0.008385291,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "38",
+      "baseline_s": 0.226932584,
+      "candidate_s": 0.008392417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "39",
+      "baseline_s": 0.227986416,
+      "candidate_s": 0.008375458,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "40",
+      "baseline_s": 0.226817333,
+      "candidate_s": 0.008074917,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "41",
+      "baseline_s": 0.225472917,
+      "candidate_s": 0.008231167,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "42",
+      "baseline_s": 0.225212334,
+      "candidate_s": 0.008224334,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "43",
+      "baseline_s": 0.227251417,
+      "candidate_s": 0.008278375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "44",
+      "baseline_s": 0.227978042,
+      "candidate_s": 0.008360625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "45",
+      "baseline_s": 0.225978416,
+      "candidate_s": 0.008483667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "46",
+      "baseline_s": 0.227765458,
+      "candidate_s": 0.008308333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "47",
+      "baseline_s": 0.22514825,
+      "candidate_s": 0.008129583,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "48",
+      "baseline_s": 0.225902584,
+      "candidate_s": 0.007796417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "49",
+      "baseline_s": 0.225532125,
+      "candidate_s": 0.008067,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "50",
+      "baseline_s": 0.226439583,
+      "candidate_s": 0.008301125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "51",
+      "baseline_s": 0.225160083,
+      "candidate_s": 0.008380875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "52",
+      "baseline_s": 0.225144583,
+      "candidate_s": 0.008303084,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "53",
+      "baseline_s": 0.2254745,
+      "candidate_s": 0.008020458,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "54",
+      "baseline_s": 0.224824958,
+      "candidate_s": 0.008272166,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "55",
+      "baseline_s": 0.226217333,
+      "candidate_s": 0.008245541,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "56",
+      "baseline_s": 0.226935042,
+      "candidate_s": 0.008174334,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "57",
+      "baseline_s": 0.22567225,
+      "candidate_s": 0.008267958,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "58",
+      "baseline_s": 0.224821917,
+      "candidate_s": 0.008356583,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "59",
+      "baseline_s": 0.226048667,
+      "candidate_s": 0.008271542,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "60",
+      "baseline_s": 0.225159709,
+      "candidate_s": 0.008209667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "61",
+      "baseline_s": 0.226889834,
+      "candidate_s": 0.008237083,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "62",
+      "baseline_s": 0.226427125,
+      "candidate_s": 0.008279166,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "63",
+      "baseline_s": 0.225489584,
+      "candidate_s": 0.008245458,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "64",
+      "baseline_s": 0.226924875,
+      "candidate_s": 0.008266083,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "65",
+      "baseline_s": 0.227372,
+      "candidate_s": 0.008046958,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "66",
+      "baseline_s": 0.226863875,
+      "candidate_s": 0.008306083,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "67",
+      "baseline_s": 0.226402542,
+      "candidate_s": 0.007933709,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "68",
+      "baseline_s": 0.227368583,
+      "candidate_s": 0.008240959,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "69",
+      "baseline_s": 0.227967417,
+      "candidate_s": 0.008788334,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "70",
+      "baseline_s": 0.225756375,
+      "candidate_s": 0.007998875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "71",
+      "baseline_s": 0.2276355,
+      "candidate_s": 0.008337834,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "72",
+      "baseline_s": 0.226863292,
+      "candidate_s": 0.008322,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "73",
+      "baseline_s": 0.22747775,
+      "candidate_s": 0.007981292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "74",
+      "baseline_s": 0.226608875,
+      "candidate_s": 0.008320625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "75",
+      "baseline_s": 0.227411458,
+      "candidate_s": 0.00824325,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "76",
+      "baseline_s": 0.227844209,
+      "candidate_s": 0.008246958,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "77",
+      "baseline_s": 0.2287285,
+      "candidate_s": 0.008311416,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "78",
+      "baseline_s": 0.227797667,
+      "candidate_s": 0.008556417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "79",
+      "baseline_s": 0.228596125,
+      "candidate_s": 0.007908625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "80",
+      "baseline_s": 0.23633675,
+      "candidate_s": 0.008148,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "81",
+      "baseline_s": 0.224949417,
+      "candidate_s": 0.008221667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "82",
+      "baseline_s": 0.225626083,
+      "candidate_s": 0.008202875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "83",
+      "baseline_s": 0.228095083,
+      "candidate_s": 0.008401667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "84",
+      "baseline_s": 0.227209791,
+      "candidate_s": 0.008301625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "85",
+      "baseline_s": 0.22522475,
+      "candidate_s": 0.008075583,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "86",
+      "baseline_s": 0.227634667,
+      "candidate_s": 0.008345375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "87",
+      "baseline_s": 0.22685225,
+      "candidate_s": 0.008304084,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "88",
+      "baseline_s": 0.227524291,
+      "candidate_s": 0.008276542,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "89",
+      "baseline_s": 0.22946575,
+      "candidate_s": 0.008327625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "90",
+      "baseline_s": 0.228252625,
+      "candidate_s": 0.008359167,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "91",
+      "baseline_s": 0.227419292,
+      "candidate_s": 0.008340166,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "92",
+      "baseline_s": 0.228064416,
+      "candidate_s": 0.008313,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "93",
+      "baseline_s": 0.229041459,
+      "candidate_s": 0.008168708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "94",
+      "baseline_s": 0.227803917,
+      "candidate_s": 0.008226084,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "95",
+      "baseline_s": 0.227675083,
+      "candidate_s": 0.008287292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "96",
+      "baseline_s": 0.229647083,
+      "candidate_s": 0.008376959,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "97",
+      "baseline_s": 0.2269365,
+      "candidate_s": 0.008298417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "98",
+      "baseline_s": 0.22760125,
+      "candidate_s": 0.008368584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "99",
+      "baseline_s": 0.22708475,
+      "candidate_s": 0.00824875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     }
+    ],
+    "protocol": {
+     "workload": "hostile-nesting-20KB",
+     "kind": "simulated",
+     "order": "randomized",
+     "warmups": 3,
+     "clock": "perf_counter_ns",
+     "baseline_config": "top_level_objects as on main: every brace tried",
+     "candidate_config": "top_level_objects with the start filter and failure bounds",
+     "environment": "macOS-27.0.1-arm64-arm-64bit-Mach-O Python 3.14.7; in-process, same text (19800 characters) for both arms; both arms find the same objects"
+    }
+   },
+   "policy": {
+    "absolute_ms": 5.0,
+    "relative": 0.05,
+    "min_pairs": 100,
+    "resamples": 2000,
+    "seed": 7
+   },
+   "measurement_sha256": "3acd94d210f558440d83962862aad90d2477eeca34d8814ccc708618bd713c08",
+   "policy_sha256": "3ff214b8ed91c29144fe1289ca42f356b9aecb5a9f422dda7a3217a8a6d4d4d9",
+   "assessor_sha256": "f87d09a2e94f553e8167e7fd77dab746dca32cd1a5f54cab9b51f0e205b91b44",
+   "metrics": {
+    "mean_delta_ms": {
+     "estimate": -218.69203125,
+     "interval": [
+      -219.2674287915,
+      -218.1953672764375
+     ]
+    },
+    "mean_relative": {
+     "estimate": -0.9637135337850111,
+     "interval": [
+      -0.9638953419733195,
+      -0.963540182002531
+     ]
+    },
+    "p95_delta_ms": {
+     "estimate": -222.47653689999999,
+     "interval": [
+      -226.6601556,
+      -219.9432081965625
+     ]
+    },
+    "p95_relative": {
+     "estimate": -0.9634966238129224,
+     "interval": [
+      -0.9642143429231104,
+      -0.9626802635126634
+     ]
+    }
+   },
+   "baseline_ms": {
+    "p50": 226.8768545,
+    "p95": 230.90536219999998,
+    "p99": 235.08501875000002
+   },
+   "candidate_ms": {
+    "p50": 8.2574165,
+    "p95": 8.4288253,
+    "p99": 8.558736170000001
+   },
+   "failures": {
+    "baseline": 0,
+    "candidate": 0
+   },
+   "limits": "Self-reported paired measurements; simultaneous bootstrap bounds, one workload. Simulated backends do not establish live provider latency. No RRSI quality claim."
+  },
+  {
+   "version": 1,
+   "status": "negligible",
+   "reason": "all upper confidence bounds fit the declared budgets on this workload",
+   "measurement": {
+    "version": 1,
+    "baseline": "backends.py:3db9ec6ef66f3e7a96e6314fe4f157acb5a8751c0c529d967c6ba705efbc73a9",
+    "candidate": "backends.py:aa5a55ca31c67dbcc27ff571254447bb2a5fe37a10c8369cb8e773623ae78106",
+    "planned_pairs": 100,
+    "pairs": [
+     {
+      "id": "0",
+      "baseline_s": 0.002244583,
+      "candidate_s": 0.001169458,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "1",
+      "baseline_s": 0.002246375,
+      "candidate_s": 0.001149292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "2",
+      "baseline_s": 0.00226875,
+      "candidate_s": 0.001147709,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "3",
+      "baseline_s": 0.002246417,
+      "candidate_s": 0.00114425,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "4",
+      "baseline_s": 0.002183708,
+      "candidate_s": 0.001149417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "5",
+      "baseline_s": 0.0021305,
+      "candidate_s": 0.001098709,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "6",
+      "baseline_s": 0.002151958,
+      "candidate_s": 0.001124875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "7",
+      "baseline_s": 0.002199084,
+      "candidate_s": 0.001142709,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "8",
+      "baseline_s": 0.002215042,
+      "candidate_s": 0.001132833,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "9",
+      "baseline_s": 0.002204333,
+      "candidate_s": 0.001137125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "10",
+      "baseline_s": 0.0022285,
+      "candidate_s": 0.00114,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "11",
+      "baseline_s": 0.002208666,
+      "candidate_s": 0.001136459,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "12",
+      "baseline_s": 0.002212542,
+      "candidate_s": 0.001156417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "13",
+      "baseline_s": 0.002222958,
+      "candidate_s": 0.001146416,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "14",
+      "baseline_s": 0.002215375,
+      "candidate_s": 0.001136667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "15",
+      "baseline_s": 0.002230333,
+      "candidate_s": 0.001141083,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "16",
+      "baseline_s": 0.002219375,
+      "candidate_s": 0.00115575,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "17",
+      "baseline_s": 0.00223975,
+      "candidate_s": 0.001134375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "18",
+      "baseline_s": 0.002224833,
+      "candidate_s": 0.001151625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "19",
+      "baseline_s": 0.002215666,
+      "candidate_s": 0.001158042,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "20",
+      "baseline_s": 0.002224458,
+      "candidate_s": 0.001155459,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "21",
+      "baseline_s": 0.002243792,
+      "candidate_s": 0.001144125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "22",
+      "baseline_s": 0.002218333,
+      "candidate_s": 0.001153917,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "23",
+      "baseline_s": 0.002246208,
+      "candidate_s": 0.001173333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "24",
+      "baseline_s": 0.002240667,
+      "candidate_s": 0.001156917,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "25",
+      "baseline_s": 0.002216542,
+      "candidate_s": 0.001148833,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "26",
+      "baseline_s": 0.002226,
+      "candidate_s": 0.00115925,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "27",
+      "baseline_s": 0.002230334,
+      "candidate_s": 0.001137625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "28",
+      "baseline_s": 0.002229541,
+      "candidate_s": 0.001158125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "29",
+      "baseline_s": 0.00222825,
+      "candidate_s": 0.001161041,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "30",
+      "baseline_s": 0.002255625,
+      "candidate_s": 0.001158125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "31",
+      "baseline_s": 0.002310375,
+      "candidate_s": 0.001147292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "32",
+      "baseline_s": 0.002209792,
+      "candidate_s": 0.0012325,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "33",
+      "baseline_s": 0.002180375,
+      "candidate_s": 0.001188875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "34",
+      "baseline_s": 0.002161125,
+      "candidate_s": 0.001175459,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "35",
+      "baseline_s": 0.002181209,
+      "candidate_s": 0.001125792,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "36",
+      "baseline_s": 0.002171333,
+      "candidate_s": 0.001174459,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "37",
+      "baseline_s": 0.002201666,
+      "candidate_s": 0.001136458,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "38",
+      "baseline_s": 0.002209209,
+      "candidate_s": 0.001125417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "39",
+      "baseline_s": 0.00219175,
+      "candidate_s": 0.001120792,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "40",
+      "baseline_s": 0.00219675,
+      "candidate_s": 0.001130666,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "41",
+      "baseline_s": 0.002191459,
+      "candidate_s": 0.001152625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "42",
+      "baseline_s": 0.002190583,
+      "candidate_s": 0.001141084,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "43",
+      "baseline_s": 0.00223575,
+      "candidate_s": 0.001133166,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "44",
+      "baseline_s": 0.002201875,
+      "candidate_s": 0.001141667,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "45",
+      "baseline_s": 0.00220625,
+      "candidate_s": 0.001149083,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "46",
+      "baseline_s": 0.00222925,
+      "candidate_s": 0.001132333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "47",
+      "baseline_s": 0.002209,
+      "candidate_s": 0.0011385,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "48",
+      "baseline_s": 0.002241625,
+      "candidate_s": 0.001158042,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "49",
+      "baseline_s": 0.00223325,
+      "candidate_s": 0.001143208,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "50",
+      "baseline_s": 0.002237458,
+      "candidate_s": 0.001160708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "51",
+      "baseline_s": 0.002241125,
+      "candidate_s": 0.001131333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "52",
+      "baseline_s": 0.002213792,
+      "candidate_s": 0.001133209,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "53",
+      "baseline_s": 0.002270541,
+      "candidate_s": 0.001135167,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "54",
+      "baseline_s": 0.002234292,
+      "candidate_s": 0.001138208,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "55",
+      "baseline_s": 0.00225375,
+      "candidate_s": 0.001139708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "56",
+      "baseline_s": 0.002216084,
+      "candidate_s": 0.001139584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "57",
+      "baseline_s": 0.002230417,
+      "candidate_s": 0.001146542,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "58",
+      "baseline_s": 0.002221542,
+      "candidate_s": 0.001155625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "59",
+      "baseline_s": 0.00221875,
+      "candidate_s": 0.001134209,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "60",
+      "baseline_s": 0.002246166,
+      "candidate_s": 0.001137417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "61",
+      "baseline_s": 0.002228625,
+      "candidate_s": 0.00114125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "62",
+      "baseline_s": 0.002246958,
+      "candidate_s": 0.001143042,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "63",
+      "baseline_s": 0.002247459,
+      "candidate_s": 0.001151291,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "64",
+      "baseline_s": 0.00221125,
+      "candidate_s": 0.001158708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "65",
+      "baseline_s": 0.002247875,
+      "candidate_s": 0.001145333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "66",
+      "baseline_s": 0.002234625,
+      "candidate_s": 0.001144042,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "67",
+      "baseline_s": 0.00224775,
+      "candidate_s": 0.001146666,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "68",
+      "baseline_s": 0.002203625,
+      "candidate_s": 0.001138375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "69",
+      "baseline_s": 0.002124875,
+      "candidate_s": 0.001097042,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "70",
+      "baseline_s": 0.002134208,
+      "candidate_s": 0.001088292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "71",
+      "baseline_s": 0.002126209,
+      "candidate_s": 0.001092583,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "72",
+      "baseline_s": 0.002172917,
+      "candidate_s": 0.001104125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "73",
+      "baseline_s": 0.002182708,
+      "candidate_s": 0.001151875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "74",
+      "baseline_s": 0.002169917,
+      "candidate_s": 0.001128875,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "75",
+      "baseline_s": 0.002219791,
+      "candidate_s": 0.001126292,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "76",
+      "baseline_s": 0.002201041,
+      "candidate_s": 0.001152083,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "77",
+      "baseline_s": 0.002200917,
+      "candidate_s": 0.001132333,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "78",
+      "baseline_s": 0.002219375,
+      "candidate_s": 0.00114275,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "79",
+      "baseline_s": 0.002205708,
+      "candidate_s": 0.001138208,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "80",
+      "baseline_s": 0.002206458,
+      "candidate_s": 0.001141958,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "81",
+      "baseline_s": 0.002144833,
+      "candidate_s": 0.001101416,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "82",
+      "baseline_s": 0.002131833,
+      "candidate_s": 0.001104584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "83",
+      "baseline_s": 0.002207334,
+      "candidate_s": 0.001113584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "84",
+      "baseline_s": 0.0021915,
+      "candidate_s": 0.00114125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "85",
+      "baseline_s": 0.002208333,
+      "candidate_s": 0.001121625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "86",
+      "baseline_s": 0.002220292,
+      "candidate_s": 0.001135375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "87",
+      "baseline_s": 0.0022385,
+      "candidate_s": 0.001141417,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "88",
+      "baseline_s": 0.002208125,
+      "candidate_s": 0.001160958,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "89",
+      "baseline_s": 0.002245833,
+      "candidate_s": 0.001203,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "90",
+      "baseline_s": 0.002259,
+      "candidate_s": 0.001142959,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "91",
+      "baseline_s": 0.002222917,
+      "candidate_s": 0.001155708,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "92",
+      "baseline_s": 0.002252167,
+      "candidate_s": 0.001157,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "93",
+      "baseline_s": 0.00223275,
+      "candidate_s": 0.001167375,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "94",
+      "baseline_s": 0.00223375,
+      "candidate_s": 0.001164125,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "95",
+      "baseline_s": 0.002257125,
+      "candidate_s": 0.0011435,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "96",
+      "baseline_s": 0.002249667,
+      "candidate_s": 0.001161625,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "97",
+      "baseline_s": 0.002252375,
+      "candidate_s": 0.001146209,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "98",
+      "baseline_s": 0.002249,
+      "candidate_s": 0.001147584,
+      "baseline_ok": true,
+      "candidate_ok": true
+     },
+     {
+      "id": "99",
+      "baseline_s": 0.002256333,
+      "candidate_s": 0.00115225,
+      "baseline_ok": true,
+      "candidate_ok": true
+     }
+    ],
+    "protocol": {
+     "workload": "typical-reply-20KB",
+     "kind": "simulated",
+     "order": "randomized",
+     "warmups": 3,
+     "clock": "perf_counter_ns",
+     "baseline_config": "top_level_objects as on main: every brace tried",
+     "candidate_config": "top_level_objects with the start filter and failure bounds",
+     "environment": "macOS-27.0.1-arm64-arm-64bit-Mach-O Python 3.14.7; in-process, same text (12645 characters) for both arms; both arms find the same objects"
+    }
+   },
+   "policy": {
+    "absolute_ms": 5.0,
+    "relative": 0.05,
+    "min_pairs": 100,
+    "resamples": 2000,
+    "seed": 7
+   },
+   "measurement_sha256": "b10a0723f500f74702e937a8ce78940a04b9998be592b35d05ac76c86bac77e4",
+   "policy_sha256": "3ff214b8ed91c29144fe1289ca42f356b9aecb5a9f422dda7a3217a8a6d4d4d9",
+   "assessor_sha256": "f87d09a2e94f553e8167e7fd77dab746dca32cd1a5f54cab9b51f0e205b91b44",
+   "metrics": {
+    "mean_delta_ms": {
+     "estimate": -1.0731324299999998,
+     "interval": [
+      -1.0799268601874998,
+      -1.0654453909375001
+     ]
+    },
+    "mean_relative": {
+     "estimate": -0.4840492897308931,
+     "interval": [
+      -0.4860169814534867,
+      -0.4817544917024901
+     ]
+    },
+    "p95_delta_ms": {
+     "estimate": -1.0829833000000004,
+     "interval": [
+      -1.1075695703125,
+      -1.05111625
+     ]
+    },
+    "p95_relative": {
+     "estimate": -0.47996651794123024,
+     "interval": [
+      -0.4881754217598094,
+      -0.4662339243531623
+     ]
+    }
+   },
+   "baseline_ms": {
+    "p50": 2.2200415000000002,
+    "p95": 2.2563726,
+    "p99": 2.2709393400000004
+   },
+   "candidate_ms": {
+    "p50": 1.143125,
+    "p95": 1.1733892999999997,
+    "p99": 1.2032950000000002
+   },
+   "failures": {
+    "baseline": 0,
+    "candidate": 0
+   },
+   "limits": "Self-reported paired measurements; simultaneous bootstrap bounds, one workload. Simulated backends do not establish live provider latency. No RRSI quality claim."
+  }
+ ]
+}

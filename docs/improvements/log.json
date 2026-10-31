@@ -51,5 +51,57 @@
    "writer",
    "judge"
   ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Calls end when the backend exits",
+  "kind": "latency",
+  "change": [
+   9
+  ],
+  "scope": "Ringo used to notice that a backend process had exited only at Popen's next poll, whose sleeps grow to fifty milliseconds. A blocking wait in a helper thread now wakes the call at once, within the new soft time limits. Fresh-process commands with simulated backends against the release active at the time, equal private fixture approvals, no provider calls. Local machine overhead, not live-provider latency.",
+  "evidence": {
+   "2026-10-26-event-wait/suite.json": "5ec6a7cab92105bc3b7eab3ca1393c4dc74aa11837d03dbac63795c265df106d"
+  },
+  "claim": [
+   "review",
+   "review-trace",
+   "review-large",
+   "design",
+   "work",
+   "review-delay",
+   "review-override"
+  ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Faster review context on large repositories",
+  "kind": "latency",
+  "change": [
+   10
+  ],
+  "scope": "Building the review material for a change ran one git process per file read and per changed file, and its reference search made git scan every line once per changed symbol. It now reads every object through one cat-file process, takes the changed lines from one diff, and searches with one compiled alternation. The material is byte-identical to before on every measured commit. Real git on a public repository, each commit built against its parent; no provider calls.",
+  "evidence": {
+   "2026-10-26-context-git/django-context.json": "0fbf96447d5aa15861528c5330d426443c8c75ced0623990ffb7687bae7a21ce"
+  },
+  "claim": [
+   "django-recent-commits"
+  ]
+ },
+ {
+  "date": "2026-10-26",
+  "title": "Reply scanning that cannot be stalled",
+  "kind": "latency",
+  "change": [
+   11
+  ],
+  "scope": "Finding the JSON answer in a model's reply tried a parse at every brace. Each failed attempt built an error message that counts lines from the start of the reply, and an unterminated nested reply made every attempt run to the end, so hostile or garbled replies cost time quadratic in their length, and very deep nesting crashed the run. Braces that cannot start an object under the JSON grammar are now skipped without parsing, deep nesting is a failed attempt, and failed attempts are bounded in total. Both arms find the same objects. In process, no provider calls.",
+  "evidence": {
+   "2026-10-26-json-scan/scan-suite.json": "d66bb9f80073522b3976ab2f52aa0c7fabae8f5056954c13972dd2e49605ea02"
+  },
+  "claim": [
+   "hostile-nesting-20KB",
+   "typical-reply-20KB"
+  ]
  }
 ]

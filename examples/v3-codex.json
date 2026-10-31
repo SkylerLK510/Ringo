@@ -1,0 +1,41 @@
+{
+ "version": 1,
+ "brief": "Implement slugify(text) in slug.py, standard library only.\n\n- Lowercase the text.\n- Replace every run of characters that are not ASCII letters or digits with a single hyphen.\n- Remove leading and trailing hyphens.\n- Truncate to at most 40 characters, then remove a trailing hyphen the cut leaves.\n- Return \"n-a\" when the result is empty.\n- Raise TypeError(\"text must be a str\") when text is not a str.\n",
+ "files": {
+  "slug.py": "def slugify(text):\n    raise NotImplementedError\n"
+ },
+ "fixtures": {
+  "check.py": "from slug import slugify\n\nassert slugify(\"Hello, World!\") == \"hello-world\"\nassert slugify(\"  --Already--Slugged--  \") == \"already-slugged\"\nassert slugify(\"\\u00dcn\\u00efc\\u00f6d\\u00e9\") == \"n-c-d\"\nassert slugify(\"a\" * 50) == \"a\" * 40\nassert slugify(\"x\" * 39 + \" y\") == \"x\" * 39\nassert slugify(\"!!!\") == \"n-a\"\ntry:\n    slugify(5)\nexcept TypeError as exc:\n    assert str(exc) == \"text must be a str\"\nelse:\n    raise AssertionError(\"slugify(5) did not raise TypeError\")\nprint(\"all checks pass\")\n"
+ },
+ "checks": [
+  {
+   "name": "examples",
+   "argv": [
+    "{python}",
+    "-B",
+    "check.py"
+   ],
+   "timeout_s": 60
+  }
+ ],
+ "allow_execution": true,
+ "writer": "codex-chatgpt",
+ "judge": "codex-chatgpt",
+ "protocol": "text",
+ "protocol_repair": true,
+ "no_regression": true,
+ "max_rounds": 3,
+ "max_seconds": 1200,
+ "timeout_s": 300,
+ "roles": {
+  "writer": {
+   "effort": "low"
+  },
+  "revision": {
+   "effort": "low"
+  },
+  "review": {
+   "effort": "low"
+  }
+ }
+}

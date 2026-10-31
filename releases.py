@@ -13,7 +13,10 @@ from latency import canonical, read_json, sha
 
 HERE = Path(__file__).resolve().parent
 RUNTIME = ('ringo.py', 'harness.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
-           'workflow.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
+           'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
+# Files that joined the runtime after releases already existed. New bundles always include them; a bundle staged
+# before one joined still verifies without it, since that bundle has no feature that runs it.
+LATER_RUNTIME = {'spec_runner.py'}
 IDENT = re.compile(r'[0-9a-f]{64}')
 LATENCY_WORKLOADS = {'startup', 'review', 'review-trace', 'review-large', 'design', 'work'}
 
@@ -82,26 +85,39 @@ def state_root(path=None):
 
 
 def private_root(path=None):
+    import backends
     root = state_root(path)
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backends.private_directory(root, create=True, mode=0o700, parents=True, exist_ok=True)
     root.chmod(0o700)
     for name in ('bundles', 'approvals'):
         target = root / name
         if target.is_symlink():
             raise ValueError('release state directories cannot be symlinks')
-        target.mkdir(mode=0o700, exist_ok=True)
+        # not mkdir(mode=0o700): on Windows, Python 3.13+ gives that its own DACL (SYSTEM, administrators, owner)
+        backends.private_directory(target, create=True, mode=0o700, exist_ok=True)
     return root
 
 
 @contextlib.contextmanager
 def locked(root):
-    import fcntl
+    import backends
     lock = root / '.lock'
     if lock.is_symlink():
         raise ValueError('release lock cannot be a symlink')
-    with lock.open('a') as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    with lock.open('a') as f, backends.file_lock(f):
         yield
+
+
+def fsync_dir(path):
+    """Make a rename inside the folder path durable. Windows cannot open a folder for os.fsync; NTFS records the
+    rename in its metadata journal instead."""
+    if os.name == 'nt':
+        return
+    directory = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def atomic_json(path, value):
@@ -113,11 +129,7 @@ def atomic_json(path, value):
             f.flush()
             os.fsync(f.fileno())
         os.replace(name, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        fsync_dir(path.parent)
     finally:
         if os.path.exists(name):
             os.unlink(name)
@@ -167,8 +179,8 @@ def quality(store, digest, plan, runtime_root=None, *, verify_bytecode=False):
         # while retaining evaluated sources and their source-hash header.
         import importlib.util
         import py_compile
-        import tempfile
-        with tempfile.TemporaryDirectory(prefix='ringo-proof-') as folder:
+        import backends
+        with backends.private_tempdir(prefix='ringo-proof-') as folder:
             for name in evaluate.CODE:
                 if not name.endswith('.py'):
                     continue
@@ -188,9 +200,9 @@ def quality(store, digest, plan, runtime_root=None, *, verify_bytecode=False):
 
 
 def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None):
+    import backends
     import pipelines
     import py_compile
-    import tempfile
     source, root = Path(source).resolve(), private_root(root)
     if candidate_plan and (not evaluation_store or not digest):
         raise ValueError('candidate staging needs --evaluation-store and --digest')
@@ -199,7 +211,7 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
     files = inventory(source)
     plan = pipelines.load_plan(candidate_plan, 'review') if candidate_plan else default_plan(source)
     evidence = quality(evaluation_store, digest, plan, source) if candidate_plan else {'kind': 'deployment', 'claim': None}
-    with locked(root), tempfile.TemporaryDirectory(prefix='.stage-', dir=root) as folder:
+    with locked(root), backends.private_tempdir(prefix='.stage-', dir=root) as folder:
         tmp = Path(folder)
         for name, expected in files.items():
             data = (source / name).read_bytes()
@@ -246,17 +258,13 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
         # The bundle is owner-readonly against accidents, not a same-user security boundary.
         for path in tmp.rglob('*'):
             if path.is_file():
-                with path.open('rb') as f:
+                with path.open('r+b' if os.name == 'nt' else 'rb') as f:  # Windows flushes only a writable handle
                     os.fsync(f.fileno())
             path.chmod(0o555 if path.is_dir() else 0o444)
         os.rename(tmp, target)
         target.chmod(0o555)
-        directory = os.open(target.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-        # TemporaryDirectory's cleanup tolerates the moved-away path.
+        fsync_dir(target.parent)
+        # private_tempdir's cleanup tolerates the moved-away path.
         return rid
 
 
@@ -272,7 +280,7 @@ def verify(root, rid):
             or not isinstance(manifest['files'], dict) or not isinstance(manifest['quality'], dict) \
             or not isinstance(manifest['default_review_sha256'], str) \
             or not IDENT.fullmatch(manifest['default_review_sha256']) \
-            or not set(RUNTIME).issubset(manifest['files']):
+            or not (set(RUNTIME) - LATER_RUNTIME).issubset(manifest['files']):
         raise ValueError('release manifest integrity failure')
     # Validate every manifest path before opening inventory members. Keep paths
     # canonical so one physical file cannot satisfy two differently spelled keys.

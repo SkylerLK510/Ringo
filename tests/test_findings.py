@@ -188,6 +188,7 @@ ENTRYPOINT = Path(__file__).resolve().parent.parent / 'adapters' / 'reviewbench'
 
 
 @unittest.skipUnless(shutil.which('bash'), 'needs bash')
+@unittest.skipIf(os.name == 'nt', 'the ReviewBench entrypoint is a bash script for its Linux container image')
 class AdapterTest(unittest.TestCase):
     """The ReviewBench entrypoint, run outside a container against a fake `claude` CLI, with a private HOME and
     git config so its `git config --global` never touches the real ones."""

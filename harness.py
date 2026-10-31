@@ -37,6 +37,7 @@ that fails or replies in the wrong shape is tried once more; a missing verdict a
 no call cap: the built-in plans make exactly one call when it succeeds, at most two.
 """
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -45,7 +46,6 @@ import os
 import shlex
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
@@ -56,6 +56,10 @@ import findings
 import pipelines
 
 TIMEOUT_S = 900
+HARD_FLOOR_S = 900  # the limiter never stops a call sooner than this, however short its soft limit
+PROBE_MESSAGE = 'Reply with the single word OK.'
+PROBE_TIMEOUT_S = 120
+STALL_FACTOR = 3  # past this multiple of the slowest finished comparable call, a running call looks stalled
 RAW_LIMIT = 1_000_000  # bytes of a failed call's stdout kept in the trace
 
 
@@ -96,6 +100,17 @@ def claude_usage(reply):
             'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
 
 
+def split_command(command):
+    """A command string's argv, split as a POSIX shell splits words without expanding anything. On Windows a
+    backslash is the path separator, not an escape, so C:\\tools\\cli.exe needs no quoting there; quote a word
+    that holds spaces with '...' or "...", as shlex.join does."""
+    if os.name != 'nt':
+        return shlex.split(command)
+    lexer = shlex.shlex(command, posix=True)
+    lexer.whitespace_split, lexer.commenters, lexer.escape = True, '', ''
+    return list(lexer)
+
+
 def backend(spec):
     """{'name', 'argv', 'style'} for a backend spec. The style says how a call is made, declared by the spec and
     never guessed from the executable's name: 'claude' (system-prompt file, JSON reply with usage), 'codex'
@@ -106,24 +121,24 @@ def backend(spec):
     passes --search, and every other tool item fails the turn."""
     extra = {}
     if spec == 'claude':
-        argv, style = shlex.split(backends.JUDGE_PRESETS['claude']), 'claude'
+        argv, style = split_command(backends.JUDGE_PRESETS['claude']), 'claude'
     elif spec.startswith('claude:'):
-        argv, style = shlex.split(spec[7:]), 'claude'
+        argv, style = split_command(spec[7:]), 'claude'
     elif spec in ('codex', 'codex-chatgpt'):
-        argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'codex'
+        argv, style = split_command(backends.JUDGE_PRESETS[spec]), 'codex'
         extra = {'subscription_auth': spec == 'codex-chatgpt', 'lean': spec == 'codex-chatgpt',
                  'tools': ['command_execution'] if spec == 'codex' else []}
     elif spec.startswith('codex:'):
-        argv, style = shlex.split(spec[6:]), 'codex'
+        argv, style = split_command(spec[6:]), 'codex'
         if argv and '--json' not in argv:
             raise ValueError(f'backend {spec!r}: a codex: command must pass --json so its events can be parsed')
         extra = {'subscription_auth': False, 'tools': ['web_search'] if '--search' in argv else []}
     elif spec in backends.JUDGE_PRESETS:
-        argv, style = shlex.split(backends.JUDGE_PRESETS[spec]), 'plain'
+        argv, style = split_command(backends.JUDGE_PRESETS[spec]), 'plain'
     elif spec.startswith('ollama:'):
         argv, style = (['ollama', 'run', spec[7:]] if spec[7:] else []), 'plain'
     else:
-        argv, style = shlex.split(spec), 'plain'
+        argv, style = split_command(spec), 'plain'
     if not argv:
         raise ValueError(f'backend {spec!r} has no command')
     return {'name': spec, 'argv': argv, 'style': style, **extra}
@@ -233,10 +248,11 @@ def codex_reply(output, name='codex-chatgpt', tools=()):
     return messages[-1], usage
 
 
-def call(backend, system, message, timeout_s, model=None):
+def call(backend, system, message, timeout_s, model=None, watch=None):
     """(reply text, usage) of one isolated, single-turn call through backends.run_isolated (empty folder, no
     TypeSafe key, the whole process session killed on exit). usage is None when the backend does not report it.
-    model overrides the backend's model for this call; only claude-style backends take one."""
+    model overrides the backend's model for this call; only claude-style backends take one. watch: timeout_s is
+    a soft limit (see Watch)."""
     argv = backend['argv']
     if model:
         if backend['style'] != 'claude':
@@ -247,7 +263,7 @@ def call(backend, system, message, timeout_s, model=None):
         try:
             output = backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, codex_home=True,
                                            subscription_auth=backend.get('subscription_auth', True),
-                                           lean=backend.get('lean', False))
+                                           lean=backend.get('lean', False), watch=watch)
         except (backends.JudgeError, subprocess.TimeoutExpired) as exc:
             stdout = getattr(exc, 'stdout', '') or ''
             try:
@@ -260,13 +276,13 @@ def call(backend, system, message, timeout_s, model=None):
             raise CallError(str(exc), usage, stdout) from None
         return codex_reply(output, backend['name'], tools)
     if backend['style'] == 'plain':
-        return backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s), None
-    with tempfile.TemporaryDirectory(prefix='ringo-system-') as d:  # created 0700; removed after the call
+        return backends.run_isolated(argv, f'{system}\n\n{message}', timeout_s, watch=watch), None
+    with backends.private_tempdir(prefix='ringo-system-') as d:
         path = Path(d) / 'system.txt'
-        path.write_text(system, encoding='utf-8')
+        path.write_text(system, encoding='utf-8', newline='')  # the exact text: no CRLF on Windows
         try:
             out = backends.run_isolated([*argv, '--system-prompt-file', str(path), '--output-format', 'json'],
-                                       message, timeout_s)
+                                       message, timeout_s, watch=watch)
         except backends.JudgeError as exc:  # a failed call may still have reported its cost
             try:
                 reply = json.loads(getattr(exc, 'stdout', '') or 'null')
@@ -286,6 +302,175 @@ def call(backend, system, message, timeout_s, model=None):
     return reply['result'], claude_usage(reply)
 
 
+def limit_for(soft_s):
+    """The hard limit for a soft limit: twice it, never under HARD_FLOOR_S."""
+    return max(2 * soft_s, HARD_FLOOR_S)
+
+
+def accepts_watch(fn):
+    """True when a call function takes watch=; stand-in call functions without it keep a hard timeout. Reads the
+    code object instead of importing inspect, which would add about 3 ms to every launch."""
+    code = getattr(fn, '__code__', None)
+    return code is not None and 'watch' in code.co_varnames[:code.co_argcount + code.co_kwonlyargcount]
+
+
+RECONNECT = re.compile(r'reconnect|disconnect|stream error|retrying', re.I)
+
+
+class Watch:
+    """One attempt's soft time limit. Past soft_s the call keeps running and soft() (run by backends._wait in a
+    thread) checks it for free, probes the backend with one tiny recorded call, writes an incident file and asks
+    the person only when the evidence suggests a stall. Writing `stop` to the decision file stops the call (it is
+    then retried once); `wait` keeps it. Nothing answers for the person: without a decision the call runs on until
+    limit_s, where it is stopped and not retried."""
+
+    def __init__(self, run, label, attempt, backend, soft_s, limit_s, kind, probe_fn=None):
+        self.run, self.label, self.attempt, self.backend = run, label, attempt, backend
+        self.soft_s, self.limit_s, self.kind, self.probe_fn = soft_s, limit_s, kind, probe_fn
+        self.stop, self.done = threading.Event(), threading.Event()
+        self.incident = None
+
+    def soft(self, elapsed, snapshot):
+        try:
+            self._soft(elapsed, snapshot)
+        except Exception as exc:  # the call itself must never fail because its watch did
+            print(f'ringo: {self.label}: soft-limit check failed: {type(exc).__name__}: {exc}', file=sys.stderr)
+
+    def _soft(self, elapsed, snapshot):
+        call_started = time.monotonic() - elapsed
+        folder = self.run.incident_folder()
+        name = f'{self.label}.{self.attempt}'
+        path, decision = folder / f'{name}.json', folder / f'{name}.decision'
+        stdout, stderr = snapshot()
+        lines = [line for line in stdout.splitlines() if line.strip()]
+        events = []
+        for line in lines:
+            try:
+                events.append(json.loads(line).get('type'))
+            except (ValueError, AttributeError):
+                events.append(None)
+        comparable = self.run.comparable(self.kind)
+        incident = {'step': self.label, 'attempt': self.attempt, 'backend': self.backend['name'],
+                    'soft_s': self.soft_s, 'limit_s': self.limit_s, 'elapsed_s': round(elapsed, 1),
+                    'checks': {'running': True, 'stdout_bytes': len(stdout.encode()), 'stdout_lines': len(lines),
+                               'last_event': events[-1] if events else None,
+                               'turn_started': 'turn.started' in events,
+                               'reconnect_lines': sum(bool(RECONNECT.search(x)) for x in (stdout + stderr).splitlines()),
+                               'comparable_seconds': [c['seconds'] for c in comparable]},
+                    'probe': None, 'diagnosis': None, 'decision': None, 'decision_file': str(decision)}
+        self.incident = incident
+        self.run.note_incident()
+        self._write(path)
+        incident['probe'] = self.probe_fn(self.done) if self.probe_fn else {'status': 'skipped', 'reason': 'not available here'}
+        if self.done.is_set():  # the call finished while the probe ran: nothing left to decide
+            incident.update(diagnosis='the call finished during the probe', recommendation=None)
+            self._write(path)
+            return
+        slowest = max(incident['checks']['comparable_seconds'], default=None)
+        status = incident['probe']['status']
+        evidence = incident['checks']['reconnect_lines'] > 0 or (slowest is not None and elapsed > STALL_FACTOR * slowest)
+        seen = ('comparable calls finished in at most %.0fs' % slowest if slowest is not None and
+                elapsed > STALL_FACTOR * slowest else 'the output shows reconnects')
+        stalled = evidence and status == 'ok'  # only an answered probe shows the backend is up
+        if status == 'error':
+            diagnosis = 'the backend did not answer a fresh call either, so a retry now would likely fail too'
+        elif stalled:
+            diagnosis = seen + ' and the backend still answers, so this call may be stalled'
+        elif evidence:
+            diagnosis = seen + ', but the backend was not probed, so a retry may not help'
+        else:
+            diagnosis = 'no sign of a stall; a harder task can take longer'
+        tokens = [c['tokens'] for c in comparable if c['tokens'] is not None]
+        incident.update(diagnosis=diagnosis, recommendation='stop' if stalled else 'wait', options={
+            'wait': f'no new tokens; the call continues and is stopped at {self.limit_s:.0f}s',
+            'stop': 'this attempt\'s tokens are spent and usually unreported; one retry then runs'
+                    + (f', about {round(sum(tokens) / len(tokens)):,} tokens like comparable calls' if tokens else '')})
+        self._write(path)
+        ask = 'consider stopping it' if stalled else 'Ringo keeps waiting'
+        print(f'ringo: {self.label} attempt {self.attempt} passed its {self.soft_s:.0f}s soft limit and is still '
+              f'running: {diagnosis}; {ask}. To stop and retry it: echo stop > {decision}  (details: {path}). '
+              f'It is stopped at {self.limit_s:.0f}s regardless.', file=sys.stderr)
+        while not self.done.wait(1):
+            try:
+                answer = decision.read_text(encoding='utf-8').strip().lower()
+            except OSError:
+                continue
+            if answer in ('stop', 'wait'):
+                incident.update(decision=answer, decided_after_s=round(time.monotonic() - call_started, 1))
+                self._write(path)
+                if answer == 'stop':
+                    self.stop.set()
+                return
+
+    def _write(self, path):
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self.incident, indent=1), encoding='utf-8')
+        os.replace(tmp, path)
+
+
+class Leash:
+    """A watch for a probe: a hard limit, and a stop when the watched call ends, so a probe never outlives it."""
+
+    def __init__(self, stop, limit_s):
+        self.stop, self.limit_s, self.done = stop, limit_s, threading.Event()
+
+    def soft(self, elapsed, snapshot):
+        pass
+
+
+def probe(run, backend, label, call_fn=None, stop=None):
+    """One tiny recorded call to the same backend, so a running call's silence can be told apart from a backend
+    that answers nothing. It is stopped when stop (the watched call's end) is set. Skipped under a cost cap: those
+    calls run one at a time and an unpriced probe would stop every later call."""
+    if run.max_cost is not None:
+        return {'status': 'skipped', 'reason': 'a cost cap is set'}
+    fn = call_fn or call
+    step = f'{label}.probe'
+    run.reserve()
+    rec = {'step': step, 'attempt': 1, 'backend': backend['name'], 'started': time.time()}
+    run.record({**rec, 'status': 'started'})  # so an interrupted probe is visible, and its cost unknown
+    t0 = time.monotonic()
+    try:
+        leash = {'watch': Leash(stop or threading.Event(), PROBE_TIMEOUT_S)} if accepts_watch(fn) else {}
+        text, usage = fn(backend, '', PROBE_MESSAGE, PROBE_TIMEOUT_S, **leash)
+    except Exception as exc:
+        seconds = round(time.monotonic() - t0, 1)
+        run.record({**rec, 'status': 'error', 'error': f'{type(exc).__name__}: {exc}'[:500],
+                    'usage': getattr(exc, 'usage', None), 'seconds': seconds})
+        return {'status': 'error', 'seconds': seconds, 'error': f'{type(exc).__name__}: {exc}'[:300]}
+    seconds = round(time.monotonic() - t0, 1)
+    run.record({**rec, 'status': 'ok', 'usage': usage, 'seconds': seconds}, text)
+    return {'status': 'ok', 'seconds': seconds, 'tokens': total_tokens(usage)}
+
+
+def stop_reason(exc, watch):
+    """'person' for a call the person stopped, 'limit' for one stopped at its hard limit, else None."""
+    if isinstance(exc, backends.Stopped):
+        return 'person'
+    if watch is not None and isinstance(exc, subprocess.TimeoutExpired) and getattr(exc, 'limit', False):
+        return 'limit'
+    return None
+
+
+def total_tokens(usage):
+    return sum(usage[k] for k in TOKEN_KEYS) if isinstance(usage, dict) and all(k in usage for k in TOKEN_KEYS) else None
+
+def write_state(folder, state):
+    """Atomically replace folder/state.json: the small run state an agent waits on (`ringo.py wait`) and reads
+    instead of the trace or logs."""
+    path = Path(folder) / 'state.json'
+    tmp = path.with_name(f'.state.{os.getpid()}.{threading.get_ident()}.tmp')
+    tmp.write_text(json.dumps(state, separators=(',', ':')) + '\n', encoding='utf-8')
+    for attempt in range(100):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:  # Windows: a waiter has state.json open for its read, for a moment
+            if os.name != 'nt' or attempt == 99:
+                raise
+            time.sleep(0.01)
+
+
 class Run:
     """Cost budget, totals and trace of one pipeline run; shared by the parallel steps, so it holds a lock. It
     counts calls but never caps them: the plan's structure (passes, batches, one retry, one repair) or the
@@ -299,14 +484,21 @@ class Run:
         self.trace = Path(trace_dir) if trace_dir else None
         self.max_cost, self.unpriced_call_usd = max_cost, unpriced_call_usd
         self.calls, self.cost, self.unpriced, self.untokened = 0, 0.0, 0, 0
-        self.admission_refusals = 0
+        self.admission_refusals, self.incidents = 0, 0
         self.tokens = dict.fromkeys(TOKEN_KEYS, 0)
+        self.finished = {}  # kind -> [{'seconds', 'tokens'}] of successful calls, for soft-limit comparisons
+        self.incident_dir = None
         self.lock = threading.Lock()
         if self.trace:
             if self.trace.exists() and any(self.trace.iterdir()):
                 raise ValueError('the trace folder must be new or empty')
-            (self.trace / 'steps').mkdir(parents=True)  # exclusive creation also refuses concurrent trace writers
-            os.chmod(self.trace, 0o700)  # it holds the material
+            if os.name == 'nt':  # protect the root before creating children that inherit its ACL
+                backends.private_directory(self.trace, create=True, parents=True, exist_ok=True)
+            # Exclusive steps creation also refuses concurrent trace writers.
+            (self.trace / 'steps').mkdir(parents=True)
+            os.chmod(self.trace, 0o700)
+        self.started, self.last = time.time(), None
+        self.state('running')
 
     def reserve(self):
         """Count a call about to start, or raise BudgetExceeded under a cost cap. A cost cap needs every earlier
@@ -349,15 +541,54 @@ class Run:
             if self.trace:
                 with open(self.trace / 'trace.jsonl', 'a', encoding='utf-8') as f:
                     f.write(json.dumps(rec) + '\n')
+                self.last = {k: rec[k] for k in ('step', 'attempt', 'status') if k in rec}
+                self._state('running')
                 if reply is not None:
                     (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.txt").write_text(reply, encoding='utf-8')
                 if raw:
                     (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt").write_bytes(
                         raw.encode('utf-8', 'replace')[:RAW_LIMIT])
 
+    def finish(self, kind, seconds, usage):
+        with self.lock:
+            self.finished.setdefault(kind, []).append({'seconds': seconds, 'tokens': total_tokens(usage)})
+
+    def comparable(self, kind):
+        with self.lock:
+            return list(self.finished.get(kind, ()))
+
+    def note_incident(self):
+        with self.lock:
+            self.incidents += 1
+
+    def incident_folder(self):
+        """trace/incidents, or a private temporary folder for a run without a trace (its path is printed)."""
+        with self.lock:
+            if self.incident_dir is None:
+                if self.trace:
+                    folder = self.trace / 'incidents'
+                    backends.private_directory(folder, create=True, mode=0o700, exist_ok=True)
+                else:
+                    with backends.private_tempdir(prefix='ringo-incidents-', cleanup=False) as tmp:
+                        folder = Path(tmp)
+                self.incident_dir = folder  # cache only after protection and verification succeeded
+            return self.incident_dir
+
+    def state(self, status, **extra):
+        """Write state.json with status ('running', 'done', 'failed' or a work report status) and artifact paths."""
+        with self.lock:
+            self._state(status, **extra)
+
+    def _state(self, status, **extra):
+        if self.trace:
+            write_state(self.trace, {'version': 1, 'status': status, 'pid': os.getpid(), 'started': round(self.started, 3),
+                                     'updated': round(time.time(), 3), 'last': self.last, **self.summary(),
+                                     **{k: v for k, v in extra.items() if v is not None}})
+
     def summary(self):
         return {'calls': self.calls, 'cost_usd': round(self.cost, 6), 'unpriced_calls': self.unpriced,
-                'untokened_calls': self.untokened, 'admission_refusals': self.admission_refusals, **self.tokens}
+                'untokened_calls': self.untokened, 'admission_refusals': self.admission_refusals,
+                'incidents': self.incidents, **self.tokens}
 
 
 def outside_repo(path, what):
@@ -464,13 +695,20 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                     raise
                 raise type(exc)(f'{exc}; retry not started after attempt {attempt - 1} failed: '
                                 f'{type(last).__name__}: {last}') from last
-            rec = {'step': label, 'attempt': attempt, 'pass': p['id'], 'backend': spec_for(p)['name'],
+            backend = spec_for(p)
+            rec = {'step': label, 'attempt': attempt, 'pass': p['id'], 'backend': backend['name'],
                    'system_sha256': sha(system),
                    'message_sha256': sha(message), 'started': time.time()}
+            watch = None
+            if accepts_watch(call_fn):  # timeout_s is soft: probe and ask past it, stop at the limit
+                watch = Watch(run, label, attempt, backend, timeout_s, limit_for(timeout_s), p['id'],
+                              lambda done, a=attempt, b=backend: probe(run, b, f'{label}.{a}', call_fn, done))
+                rec.update(soft_s=timeout_s, limit_s=watch.limit_s)
             run.record({**rec, 'status': 'started'})  # so an interrupted attempt is visible, and its cost unknown
             t0 = time.monotonic()
             try:
-                text, usage = call_fn(spec_for(p), system, message, timeout_s, p.get('model'))
+                text, usage = call_fn(backend, system, message, timeout_s, p.get('model'),
+                                      **({'watch': watch} if watch else {}))
             except AdmissionRefused as exc:
                 run.refuse_reservation()
                 run.record({**rec, 'status': 'admission_refused', 'error': str(exc),
@@ -481,11 +719,14 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                             'seconds': round(time.monotonic() - t0, 3)})
                 raise
             except Exception as exc:  # no usable reply; the attempt is settled either way, its cost unknown if unreported
+                stopped = stop_reason(exc, watch)
                 run.record({**rec, 'status': 'error', 'error': f'{type(exc).__name__}: {exc}'[:500],
-                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3)},
+                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3),
+                            **({'stopped': stopped} if stopped else {})},
                            raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
-                if attempt == 2 or not isinstance(exc, (backends.JudgeError, ValueError, subprocess.TimeoutExpired)):
-                    raise
+                if attempt == 2 or stopped == 'limit' or \
+                        not isinstance(exc, (backends.JudgeError, ValueError, subprocess.TimeoutExpired)):
+                    raise  # a call stopped at its hard limit already had its whole window: no retry
                 last = exc
                 continue
             except BaseException as exc:
@@ -501,7 +742,9 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                     raise
                 last = exc
                 continue
-            run.record({**rec, 'status': 'ok', 'usage': usage, 'seconds': round(time.monotonic() - t0, 3)}, text)
+            seconds = round(time.monotonic() - t0, 3)
+            run.record({**rec, 'status': 'ok', 'usage': usage, 'seconds': seconds}, text)
+            run.finish(p['id'], seconds, usage)
             return text
 
     def step(p):
@@ -569,6 +812,7 @@ def write_findings(args, text, run):
 
 
 def task(args, kind):
+    run = None
     try:
         import releases
         started = time.perf_counter_ns()
@@ -598,20 +842,27 @@ def task(args, kind):
             args.findings_pr = findings_pr(args)
         run = Run(args.trace, args.max_cost, args.unpriced_call_usd)
         if run.trace:
-            (run.trace / 'material.txt').write_text(material, encoding='utf-8')
+            (run.trace / 'material.txt').write_text(material, encoding='utf-8', newline='')  # as sent, on every OS
             (run.trace / 'plan.json').write_text(json.dumps(plan, indent=1), encoding='utf-8')
             (run.trace / 'backends.json').write_text(json.dumps({k: names[k] for k in
                 ('backend', 'checker_backend')}, indent=1), encoding='utf-8')
             (run.trace / 'implementation.json').write_text(json.dumps(names['implementation'], indent=1), encoding='utf-8')
     except (ValueError, OSError) as exc:
         print(f'harness: {kind} cannot start: {exc}', file=sys.stderr)
+        if run is not None:  # its state already says running; a waiter must learn the run is over
+            with contextlib.suppress(OSError):
+                run.state('failed', error=f'cannot start: {exc}'[:500])
         return 2
     try:
         text, stats = run_plan(plan, material, b, run, timeout_s=args.timeout, checker_spec=c)
     except (backends.JudgeError, ValueError, OSError, subprocess.TimeoutExpired, BudgetExceeded, pipelines.NeedVerdicts) as exc:
         print(f'harness: {kind} failed: {exc}', file=sys.stderr)
         print(f'harness: {json.dumps({**run.summary(), **names})}', file=sys.stderr)
+        run.state('failed', error=f'{type(exc).__name__}: {exc}'[:500])
         return 2
+    except BaseException:
+        run.state('interrupted')
+        raise
     summary = {**run.summary(), **stats, **names}
     summary['elapsed_s'] = (time.perf_counter_ns() - started) / 1_000_000_000
     try:
@@ -628,8 +879,12 @@ def task(args, kind):
         print(text)
         print(f'harness: {kind} cannot write the result: {exc}', file=sys.stderr)
         print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+        run.state('failed', error=f'cannot write the result: {exc}'[:500])
         return 2
     print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+    if run.trace:
+        run.state('done', result=str(Path(args.out).resolve()) if args.out else str(run.trace / 'result.md'),
+                  summary=str(run.trace / 'summary.json'))
     return 0
 
 
@@ -670,7 +925,9 @@ def main(argv=None, *, prog='harness.py'):
         p.add_argument('--max-cost', type=float, help='stop starting calls once the cost reaches this many USD')
         p.add_argument('--unpriced-call-usd', type=float,
                        help='fallback cost for any attempt reporting no price; required with --max-cost')
-        p.add_argument('--timeout', type=float, default=TIMEOUT_S, help=f'seconds per call (default {TIMEOUT_S})')
+        p.add_argument('--timeout', type=float, default=TIMEOUT_S,
+                       help=f'soft seconds per call (default {TIMEOUT_S}): a call past it is checked and probed, '
+                            f'not killed, and stopped at twice it, never under {HARD_FLOOR_S}s')
         p.add_argument('--max-calls', help=argparse.SUPPRESS)  # removed; kept only to explain why it fails
     args = parser.parse_args(argv)
     if args.command == 'review':

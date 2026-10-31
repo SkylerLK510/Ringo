@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import backends  # noqa: E402
 import harness  # noqa: E402
 import pipelines as pl  # noqa: E402
+from tests.support import POSIX_MODES, python_cli  # noqa: E402
 
 REVIEW = 'What this change does: x.\n\n### 1. Bug one (`a.py:1`)\n- Code: `a`\n- Problem: p1. Side claim here.\n\n' \
          '### 2. Bug two (`a.py:2`)\n- Code: `b`\n- Problem: p2.\n\n### Not checked\n- runtime'
@@ -48,11 +49,7 @@ def scripted(replies):
 
 class CallTest(unittest.TestCase):
     def fake_claude(self, body):
-        d = tempfile.mkdtemp()
-        exe = Path(d, 'claude')
-        exe.write_text(f'#!{sys.executable}\n{body}', encoding='utf-8')
-        exe.chmod(exe.stat().st_mode | stat.S_IEXEC)
-        return str(exe)
+        return python_cli(Path(tempfile.mkdtemp(), 'claude'), body)
 
     def test_claude_gets_material_in_a_system_prompt_file_and_reports_usage(self):
         exe = self.fake_claude(
@@ -60,20 +57,20 @@ class CallTest(unittest.TestCase):
             'assert a[a.index("--output-format") + 1] == "json"\n'
             'print(json.dumps({"result": open(f).read() + "|" + sys.stdin.read(), "total_cost_usd": 0.02,\n'
             '  "usage": {"input_tokens": 3, "cache_creation_input_tokens": 7, "cache_read_input_tokens": 90, "output_tokens": 4}}))\n')
-        text, usage = harness.call({'name': 'c', 'argv': [exe, '-p'], 'style': 'claude'}, 'SYSTEM+MATERIAL', 'INSTRUCTION', 30)
+        text, usage = harness.call({'name': 'c', 'argv': [*exe, '-p'], 'style': 'claude'}, 'SYSTEM+MATERIAL', 'INSTRUCTION', 30)
         self.assertEqual(text, 'SYSTEM+MATERIAL|INSTRUCTION')
         self.assertEqual(usage, {'input': 3, 'cache_write': 7, 'cache_read': 90, 'output': 4, 'cost_usd': 0.02, 'models': []})
 
     def test_claude_errors_and_non_json_raise(self):
         bad = self.fake_claude('import json\nprint(json.dumps({"is_error": True, "result": "limit reached"}))\n')
         with self.assertRaisesRegex(backends.JudgeError, 'limit reached'):
-            harness.call({'name': 'c', 'argv': [bad], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': bad, 'style': 'claude'}, 's', 'm', 30)
         junk = self.fake_claude('print("not json")\n')
         with self.assertRaisesRegex(backends.JudgeError, 'did not return JSON') as caught:
-            harness.call({'name': 'c', 'argv': [junk], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': junk, 'style': 'claude'}, 's', 'm', 30)
         self.assertEqual(caught.exception.raw.strip(), 'not json')  # kept for the trace
         with self.assertRaises(harness.CallError) as caught:
-            harness.call({'name': 'c', 'argv': [bad], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': bad, 'style': 'claude'}, 's', 'm', 30)
         self.assertIn('limit reached', caught.exception.raw)
 
     def test_other_backends_get_system_then_message_on_stdin(self):
@@ -82,6 +79,16 @@ class CallTest(unittest.TestCase):
         self.assertEqual((text.strip(), usage), ('SYS\n\nMSG', None))
         with self.assertRaisesRegex(ValueError, 'claude-style'):
             harness.call({'name': 'py', 'argv': argv, 'style': 'plain'}, 'SYS', 'MSG', 30, model='haiku')
+
+    def test_windows_command_strings_keep_backslashes_and_split_like_posix(self):
+        cases = {r'C:\Tools\cli.exe -p': [r'C:\Tools\cli.exe', '-p'],
+                 r'"C:\Program Files\cli.exe" --x "a b" c#d': [r'C:\Program Files\cli.exe', '--x', 'a b', 'c#d'],
+                 shlex.join([r'C:\py\python.exe', '-c', "print('a # b')"]): [r'C:\py\python.exe', '-c', "print('a # b')"]}
+        with mock.patch.object(harness.os, 'name', 'nt'):
+            for command, argv in cases.items():
+                self.assertEqual(harness.split_command(command), argv)
+            for preset in backends.JUDGE_PRESETS.values():  # POSIX-quoted, without backslashes: split alike
+                self.assertEqual(harness.split_command(preset), shlex.split(preset))
 
     def test_backend_styles_are_declared_not_guessed(self):
         self.assertEqual(harness.backend('claude'), {'name': 'claude', 'argv': shlex.split(backends.JUDGE_PRESETS['claude']),
@@ -152,7 +159,7 @@ class CallTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             text, usage = harness.call(backend, 'SYS', 'MSG', 30)
         invoke.assert_called_once_with(backend['argv'], 'SYS\n\nMSG', 30, codex_home=True, subscription_auth=True,
-                                       lean=True)
+                                       lean=True, watch=None)
         self.assertEqual(text, 'No defects found.')
         self.assertEqual(usage, {'input': 30, 'cache_read': 70, 'cache_write': 0, 'output': 12, 'cost_usd': None,
                                  'items': {'agent_message': 1}, 'warnings': []})
@@ -212,7 +219,7 @@ class CallTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', return_value=events) as invoke:
             text, usage = harness.call(searching, 'S', 'M', 30)
         invoke.assert_called_once_with(searching['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=False,
-                                       lean=False)
+                                       lean=False, watch=None)
         self.assertEqual((text, usage['input'], usage['cache_read'], usage['output']), ('No defects found.', 30, 70, 12))
         for spec in ('codex:codex exec --json -', 'codex-chatgpt'):
             with self.subTest(spec=spec), mock.patch.object(backends, 'run_isolated', return_value=events), \
@@ -229,7 +236,7 @@ class CallTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', return_value=self.codex_events()) as invoke:
             harness.call(b, 'S', 'M', 30)
         invoke.assert_called_once_with(b['argv'], 'S\n\nM', 30, codex_home=True, subscription_auth=True,
-                                       lean=False)
+                                       lean=False, watch=None)
 
     def test_native_turn_failures_preserve_reported_tokens_without_becoming_success(self):
         for tail in ('not JSON', json.dumps({'type': 'turn.failed'}),
@@ -255,14 +262,17 @@ class CallTest(unittest.TestCase):
         child = f'import sys, time; sys.stdout.write({events!r} + "\\n"); sys.stdout.flush(); time.sleep(10)'
         backend = {**harness.backend('codex-chatgpt'), 'argv': [sys.executable, '-c', child]}
         with tempfile.TemporaryDirectory() as d, \
-                mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'codex'))}):  # no real login
+                mock.patch.dict(os.environ, {'HOME': d, 'CODEX_HOME': str(Path(d, 'codex'))}), \
+                mock.patch.object(harness, 'HARD_FLOOR_S', 0), mock.patch('sys.stderr', new_callable=io.StringIO):
             run = harness.Run(Path(d, 't'))
-            with self.assertRaises(subprocess.TimeoutExpired):  # the type the retry rule sees is unchanged
+            with self.assertRaises(subprocess.TimeoutExpired) as caught:  # soft at 1s, stopped at 2s
                 harness.run_plan(pl.load_plan(None, 'review'), 'M', backend, run, timeout_s=1,
                                  call_fn=harness.call)
+            self.assertTrue(caught.exception.limit)
             rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
-            errors = [r for r in rows if r['status'] == 'error']
-            self.assertEqual(len(errors), 2)  # one retry, as before
+            errors = [r for r in rows if r['status'] == 'error' and r['step'] == 'review']
+            self.assertEqual(len(errors), 1)  # the whole window was used: no retry after the hard limit
+            self.assertEqual((errors[0]['stopped'], errors[0]['soft_s'], errors[0]['limit_s']), ('limit', 1, 2))
             self.assertEqual(errors[0]['usage']['input'], 30)
             raw = Path(d, 't', 'steps', f"{errors[0]['step']}.1.raw.txt").read_text()
             self.assertIn('No defects found.', raw)
@@ -508,12 +518,10 @@ class RunTest(unittest.TestCase):
             unpriced.reserve()
 
     def test_failed_calls_keep_their_reported_cost_and_bad_prices_count_as_unknown(self):
-        exe = Path(tempfile.mkdtemp(), 'claude')
-        exe.write_text(f'#!{sys.executable}\nimport json, sys\nprint(json.dumps({{"is_error": True, "result": "boom", '
-                       f'"total_cost_usd": 0.02, "usage": {{"input_tokens": 50}}}}))\nsys.exit(1)\n')
-        exe.chmod(0o755)
+        exe = python_cli(Path(tempfile.mkdtemp(), 'claude'), 'import json, sys\nprint(json.dumps({"is_error": True, '
+                         '"result": "boom", "total_cost_usd": 0.02, "usage": {"input_tokens": 50}}))\nsys.exit(1)\n')
         with self.assertRaises(harness.CallError) as cm:
-            harness.call({'name': 'c', 'argv': [str(exe)], 'style': 'claude'}, 's', 'm', 30)
+            harness.call({'name': 'c', 'argv': exe, 'style': 'claude'}, 's', 'm', 30)
         self.assertEqual((cm.exception.usage['cost_usd'], cm.exception.usage['input']), (0.02, 50))
         for bad in (-0.01, float('nan'), True, '0.01'):
             self.assertIsNone(harness.valid_price(bad))
@@ -564,12 +572,17 @@ class RunTest(unittest.TestCase):
         harness.run_plan(p, 'M', B, harness.Run(max_cost=10.0), call_fn=fn)
         self.assertEqual(peak[0], 1)
 
-    def test_trace_folder_is_private_and_complete(self):
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_trace_folder_is_private(self):
+        d = Path(tempfile.mkdtemp()) / 'trace'
+        harness.Run(d)
+        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
+
+    def test_trace_folder_is_complete(self):
         d = Path(tempfile.mkdtemp()) / 'trace'
         fn, _ = scripted({'Review the change': REVIEW})
         run = harness.Run(d)
         harness.run_plan(pl.load_plan(None, 'review'), 'M', B, run, call_fn=fn)
-        self.assertEqual(stat.S_IMODE(os.stat(d).st_mode), 0o700)
         recs = [json.loads(line) for line in (d / 'trace.jsonl').read_text().splitlines()]
         self.assertEqual([r['status'] for r in recs], ['started', 'ok'])  # an interrupted call would stay 'started'
         self.assertEqual(recs[1]['usage']['cache_write'], 100)
@@ -810,6 +823,7 @@ class CheckerBackendTest(unittest.TestCase):
             {'type': 'turn.completed', 'usage': {'input_tokens': 10, 'output_tokens': 2}}])
         calls = []
         def isolated(argv, stdin, timeout, **kw):
+            assert isinstance(kw.pop('watch'), harness.Watch)  # every pass gets a soft limit
             calls.append((argv[0], kw))
             return events if kw.get('codex_home') else REVIEW
         trace = Path(tempfile.mkdtemp()) / 'trace'

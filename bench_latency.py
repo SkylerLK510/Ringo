@@ -18,6 +18,7 @@ import sys
 import time
 
 import latency
+import backends
 import releases
 
 
@@ -91,7 +92,7 @@ def run(baseline, out, pairs=100, warmups=5, absolute_ms=5, relative=.05, worklo
     known = releases.LATENCY_WORKLOADS | {'review-delay', 'review-override', 'review-failure'}
     if len(set(workloads)) != len(workloads) or set(workloads) - known:
         raise ValueError('select unique known workloads')
-    out.mkdir(mode=0o700, parents=True, exist_ok=False)
+    backends.private_directory(out, create=True, mode=0o700, parents=True, exist_ok=False)
     fake = out / 'backend.py'
     fake.write_text('''import json, os, sys, time
 text = sys.stdin.read()

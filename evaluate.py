@@ -52,7 +52,6 @@ usage:
 import argparse
 import concurrent.futures
 import contextlib
-import fcntl
 import functools
 import hashlib
 import json
@@ -131,9 +130,9 @@ def _ledger(store):
 
 
 def private_store(store):
-    """Create the store private from the first instant; tighten an existing root before opening files."""
+    """Create/tighten the private root before opening files."""
     path = outside_repo(store, 'store')
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backends.private_directory(path, create=True, mode=0o700, parents=True, exist_ok=True)
     path.chmod(0o700)
     return path
 
@@ -143,8 +142,8 @@ _lock, _held = threading.RLock(), threading.local()
 
 @contextlib.contextmanager
 def locked(store):
-    """An exclusive lock on the store, across processes (POSIX flock on store/.lock) and threads; re-entrant
-    within a thread, so a locked step can call record()."""
+    """An exclusive lock on the store, across processes (backends.file_lock on store/.lock) and threads;
+    re-entrant within a thread, so a locked step can call record()."""
     store = private_store(store)
     with _lock:
         if getattr(_held, 'depth', 0):
@@ -154,14 +153,12 @@ def locked(store):
             finally:
                 _held.depth -= 1
             return
-        with open(Path(store) / '.lock', 'a', encoding='utf-8') as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
+        with open(Path(store) / '.lock', 'a', encoding='utf-8') as f, backends.file_lock(f):
             _held.depth = 1
             try:
                 yield
             finally:
                 _held.depth = 0
-                fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def record(store, kind, **fields):
@@ -188,15 +185,12 @@ def prereg(store, digest):
 def exclusive(path, what):
     """A non-blocking exclusive lock on path, held across processes; EvalError if someone else holds it."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, 'a', encoding='utf-8') as f:
+    with open(path, 'a', encoding='utf-8') as f, contextlib.ExitStack() as held:
         try:
-            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held.enter_context(backends.file_lock(f, blocking=False))
         except BlockingIOError:
             raise EvalError(f'another {what} of this experiment is in progress') from None
-        try:
-            yield
-        finally:
-            fcntl.flock(f, fcntl.LOCK_UN)
+        yield
 
 
 # ---------- cases and splits ----------
@@ -1023,7 +1017,7 @@ def _score(store, d):
     if (keyfile.exists() and not key_seals) or (key_seals and (
             not keyfile.exists() or key_seals[-1]['artifact'] != file_sha(keyfile))):
         integrity.append('blind key is unsealed or changed since grading')
-    if set(key.values()) != {str(p.parent.relative_to(out_dir)) for p in out_dir.glob('*/*/result.md')}:
+    if set(key.values()) != {p.parent.relative_to(out_dir).as_posix() for p in out_dir.glob('*/*/result.md')}:
         integrity.append('blind key does not cover exactly the outputs')
     slot_seals = outcomes(store, d, 'slot')
     for c, arm, r in slots(store, spec):
@@ -1227,8 +1221,8 @@ def import_reviewbench(store, corpus, clones, max_chars=140_000, languages=None)
         gold += [format_gold(i, x) for i, x in enumerate(tps, 1)]
         d = component(store / 'cases', cid)
         d.mkdir(parents=True, exist_ok=True)
-        (d / 'material.txt').write_text(material, encoding='utf-8')
-        (d / 'gold.md').write_text('\n'.join(gold) + '\n', encoding='utf-8')
+        (d / 'material.txt').write_text(material, encoding='utf-8', newline='')  # the same bytes on every OS
+        (d / 'gold.md').write_text('\n'.join(gold) + '\n', encoding='utf-8', newline='')
         created = git(repo, 'show', '-s', '--format=%cI', t['head']).strip()
         pool[cid] = {'group': t['nwo'], 'source': 'reviewbench', 'language': t['language'], 'created': created,
                      'gold': len(tps)}

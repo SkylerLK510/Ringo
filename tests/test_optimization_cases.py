@@ -18,6 +18,7 @@ from unittest import mock
 import bench_latency
 import releases
 from tests import test_releases as fixtures
+from tests.support import SYMLINKS
 
 
 class OptimizationCases(unittest.TestCase):
@@ -36,6 +37,7 @@ class OptimizationCases(unittest.TestCase):
         elif kind == 'missing-prompt':
             path = case.bundle / 'prompts/work.md'
             path.parent.chmod(0o755)
+            path.chmod(0o644)  # Windows refuses to delete a read-only file
             path.unlink()
         elif kind == 'unexpected-file':
             case.bundle.chmod(0o755)
@@ -50,6 +52,7 @@ class OptimizationCases(unittest.TestCase):
             path = case.bundle / 'release.json'
             target = case.root / 'manifest-copy.json'
             target.write_bytes(path.read_bytes())
+            path.chmod(0o644)
             path.unlink()
             path.symlink_to(target)
         elif kind == 'fifo':
@@ -65,8 +68,9 @@ class OptimizationCases(unittest.TestCase):
             raise AssertionError(kind)
 
     def test_corrupt_release_cases_fail_before_inference_or_trace_creation(self):
-        kinds = ['source', 'bytecode', 'missing-prompt', 'unexpected-file',
-                 'dangling-symlink', 'manifest-symlink', 'approval']
+        kinds = ['source', 'bytecode', 'missing-prompt', 'unexpected-file', 'approval']
+        if SYMLINKS:  # NO_SYMLINKS otherwise
+            kinds += ['dangling-symlink', 'manifest-symlink']
         if hasattr(os, 'mkfifo'):
             kinds.append('fifo')
         for kind in kinds:
