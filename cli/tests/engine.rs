@@ -77,7 +77,11 @@ fn session(repo: &Path, agent: Agent, program: &Path) -> Session {
 #[test]
 fn read_turns_continue_one_conversation_one_at_a_time() {
     let r = repo("read");
-    let codex = fake(&root(), "codex-read", &CODEX_OK.replace("cat >", "sleep 0.3; cat >"));
+    // A resumed thread reports its usage so far, as the real Codex does.
+    let so_far = r#"case "$*" in *resume*) echo '{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":4}}'; exit ;; esac
+echo '{"type":"turn.completed""#;
+    let codex = fake(&root(), "codex-read", &CODEX_OK.replace("cat >", "sleep 0.3; cat >")
+        .replace(r#"echo '{"type":"turn.completed""#, so_far));
     let mut s = session(&r, agent("codex"), &codex);
     assert!(!s.dir.starts_with(&r), "state is outside the repository");
     assert_eq!(fs::metadata(&s.dir).unwrap().permissions().mode() & 0o777, 0o700);
@@ -90,6 +94,7 @@ fn read_turns_continue_one_conversation_one_at_a_time() {
     assert_eq!(fs::read_to_string(codex.with_extension("stdin")).unwrap(), "what is a.txt?");
     let second = s.launch_agent(agent("codex"), false, "and then?").unwrap();
     assert_eq!(wait(&mut s, second), Status::Done);
+    assert_eq!(s.job(second).unwrap().tokens.total(), 12, "only what the resumed turn added (24 so far)");
     let args = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
     let lines: Vec<&str> = args.lines().collect();
     assert!(lines[0].contains("-s read-only") && lines[0].contains("forced_login_method"));
@@ -376,28 +381,42 @@ fn agent_commands_are_pinned() {
                 String::new()));
 }
 
-/// agy (measured with 1.4.11): the prompt as one `--print=` argument, stream-json out, session-only deny rules
-/// (read turns cannot write files; no turn runs commands, MCP tools or browser actions), resume by conversation id.
+/// agy (verified with 1.4.12): the prompt on stdin as one stream-json message, stream-json out, session-only deny
+/// rules (read turns cannot write files; no turn runs commands, MCP tools or browser actions), resume by
+/// conversation id, where agy reports the conversation's usage so far and only the turn's own is counted. The prompt
+/// is never an argument, so a leading `-` or a quote cannot change the command line.
 #[test]
 fn agy_turns_and_their_permissions() {
     let r = repo("agy");
-    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n";
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
     let agy = fake(&root(), "agy", &format!("#!/bin/sh\n{RECORD}\
         echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
-        echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{{\"input_tokens\":7,\"output_tokens\":2}}}}}}'\n"));
+        if [ -e \"$0.fail\" ]; then rm \"$0.fail\"; echo '{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"response\":\"quota\",\"usage\":{{}}}}}}'; exit 0; fi\n\
+        case \" $* \" in *' --mode '*) k=1 ;; *' --conversation '*) k=$(($(cat \"$0.k\") + 1)); echo $k > \"$0.k\" ;; *) k=1; echo 1 > \"$0.k\" ;; esac\n\
+        echo \"{{\\\"event\\\":\\\"result\\\",\\\"result\\\":{{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"done\\\",\\\"usage\\\":{{\\\"input_tokens\\\":$((7*k)),\\\"output_tokens\\\":$((2*k))}}}}}}\"\n"));
     let mut s = session(&r, agent("agy"), &agy);
     let mut turn = |write: bool| -> Vec<String> {
-        let id = s.launch_agent(agent("agy"), write, "-x the task").unwrap();
+        let id = s.launch_agent(agent("agy"), write, r#"-x the "task""#).unwrap();
         assert_eq!(wait(&mut s, id), Status::Done);
         assert_eq!(s.job(id).unwrap().tokens.total(), 9);
+        assert_eq!(fs::read_to_string(format!("{}.stdin", agy.display())).unwrap(),
+                   "{\"event\":\"user\",\"message\":{\"content\":\"-x the \\\"task\\\"\"}}\n");
         fs::read_to_string(format!("{}.argv", agy.display())).unwrap().lines().map(str::to_string).collect()
     };
     let read = r#"{"permissions":{"deny":["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
-    let head = ["--print=-x the task", "--output-format", "stream-json", "--settings"];
+    let head = ["--input-format", "stream-json", "--output-format", "stream-json", "--settings"];
     assert_eq!(turn(false), [&head[..], &[read]].concat());
     assert_eq!(turn(false), [&head[..], &[read, "--conversation", "c-1"]].concat());
     let write = r#"{"permissions":{"deny":["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
     assert_eq!(turn(true), [&head[..], &[write, "--mode", "accept-edits"]].concat());
+    // A failed resumed turn reports no usage; the running total it leaves is still the last one reported.
+    fs::write(format!("{}.fail", agy.display()), "").unwrap();
+    let failed = s.launch_agent(agent("agy"), false, "again").unwrap();
+    assert!(matches!(wait(&mut s, failed), Status::Failed(_)));
+    assert_eq!(s.job(failed).unwrap().tokens.total(), 0);
+    let next = s.launch_agent(agent("agy"), false, "and now?").unwrap();
+    assert_eq!(wait(&mut s, next), Status::Done);
+    assert_eq!(s.job(next).unwrap().tokens.total(), 9, "27 so far, 18 at the last report");
 }
 
 /// An agent the owner adds: kept in agents.json beside the set-up list, run with its own command line (the prompt

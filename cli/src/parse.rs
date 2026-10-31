@@ -22,6 +22,11 @@ impl Tokens {
         self.cache_read += other.cache_read;
         self.output += other.output;
     }
+    /// What was added since `before`, a total the same conversation reported earlier.
+    pub fn since(self, before: Tokens) -> Tokens {
+        Tokens { input: self.input.saturating_sub(before.input), cache_write: self.cache_write.saturating_sub(before.cache_write),
+                 cache_read: self.cache_read.saturating_sub(before.cache_read), output: self.output.saturating_sub(before.output) }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,7 +54,7 @@ pub enum Style {
     Codex,
     /// `claude -p --output-format stream-json --verbose` events.
     Claude,
-    /// `agy --print=… --output-format stream-json` events.
+    /// `agy --input-format stream-json --output-format stream-json` events.
     Agy,
     /// Plain text: every line is reply text.
     Plain,

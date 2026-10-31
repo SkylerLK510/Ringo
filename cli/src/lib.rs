@@ -28,7 +28,7 @@ pub enum Adapter {
     Codex,
     /// `claude -p --output-format stream-json`.
     Claude,
-    /// `agy --print=… --output-format stream-json`.
+    /// `agy --input-format stream-json --output-format stream-json`, the prompt on stdin.
     Agy,
     /// Any other program: its own command line, the reply as plain text, write turns only.
     Plain,
@@ -235,6 +235,8 @@ pub struct Session {
     /// Why no job may start now (an agent update is replacing a program), if one may not.
     pub hold: Option<String>,
     threads: HashMap<Agent, String>,
+    /// The running total each resumable conversation last reported, by agent and conversation id.
+    usage_so_far: HashMap<(Agent, String), Tokens>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
 }
@@ -393,7 +395,8 @@ impl Session {
         let (tx, rx) = channel();
         let programs = Agent::all().into_iter().map(|a| (a, PathBuf::from(&a.spec().program))).collect();
         Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), tx, rx })
+                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
+                     usage_so_far: HashMap::new(), tx, rx })
     }
 
     pub fn running(&self) -> usize {
@@ -480,7 +483,7 @@ impl Session {
         let mut cmd = Command::new(self.program(agent));
         let resume = if write { None } else { self.threads.get(&agent).cloned() };
         let sandbox = if write { "workspace-write" } else { "read-only" };
-        let mut stdin_prompt = true;
+        let mut input = Some(prompt.to_string());
         let style = match spec.adapter {
             Adapter::Codex => {
                 cmd.args(["exec"]);
@@ -515,10 +518,11 @@ impl Session {
                 // turn with no reply; a deny rule instead returns an error the model sees and works around. Write turns
                 // edit (accept-edits) but run no commands, MCP tools or browser actions, as claude's write turns run no
                 // Bash; read turns cannot write files either. The rules last for this session only.
-                // ceiling: the prompt is one argument (about 1 MB on macOS); stdin needs agy's stream-json input.
+                // The prompt goes in on stdin as one stream-json message (verified with agy 1.4.12, which drops a
+                // flag's prompt in this mode): no argument-length limit, and the process table never shows it.
                 let deny = if write { r#"["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# }
                            else { r#"["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# };
-                cmd.arg(format!("--print={prompt}")).args(["--output-format", "stream-json", "--settings"])
+                cmd.args(["--input-format", "stream-json", "--output-format", "stream-json", "--settings"])
                     .arg(format!(r#"{{"permissions":{{"deny":{deny}}}}}"#));
                 if write {
                     cmd.args(["--mode", "accept-edits"]);
@@ -526,7 +530,7 @@ impl Session {
                 if let Some(conversation) = &resume {
                     cmd.args(["--conversation", conversation]);
                 }
-                stdin_prompt = false;
+                input = Some(format!("{}\n", serde_json::json!({"event": "user", "message": {"content": prompt}})));
                 Style::Agy
             }
             Adapter::Plain => {
@@ -536,13 +540,15 @@ impl Session {
                 for arg in &spec.args { // the prompt goes in last, so its own text is never filled in
                     cmd.arg(arg.replace("{cwd}", &cwd.to_string_lossy()).replace("{prompt}", prompt));
                 }
-                stdin_prompt = !spec.args.iter().any(|a| a.contains("{prompt}"));
+                if spec.args.iter().any(|a| a.contains("{prompt}")) {
+                    input = None;
+                }
                 Style::Plain
             }
         };
         cmd.current_dir(&cwd);
         agent_env(&mut cmd);
-        self.spawn(id, cmd, style, if stdin_prompt { Some(prompt.to_string()) } else { None }, None)?;
+        self.spawn(id, cmd, style, input, None)?;
         Ok(id)
     }
 
@@ -832,7 +838,26 @@ impl Session {
                                 s.ended = Some(ok);
                             }
                         }
-                        Note::Tokens(t) => job.tokens.add(t),
+                        Note::Tokens(t) => {
+                            // A resumed Codex or agy turn reports its conversation's usage so far (Codex 16,829
+                            // then 34,835 input tokens for a one-word follow-up; agy 6,981 then 14,260), so only
+                            // what this turn added is counted. Claude reports each run on its own. A running total
+                            // never falls, so a result without usage (zero) keeps the last one.
+                            let t = match job.kind {
+                                Kind::Agent { agent, write: false }
+                                    if matches!(agent.spec().adapter, Adapter::Codex | Adapter::Agy) =>
+                                {
+                                    let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
+                                    let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
+                                    if t.total() >= before.total() {
+                                        self.usage_so_far.insert(key, t);
+                                    }
+                                    t.since(before)
+                                }
+                                _ => t,
+                            };
+                            job.tokens.add(t)
+                        }
                         Note::Call => job.calls += 1,
                         Note::Touched(path) => {
                             let cwd = job.worktree.clone().unwrap_or_else(|| self.repo.clone());
@@ -968,20 +993,12 @@ fn read_agents_file(root: &Path) -> serde_json::Value {
 }
 
 /// Runs a read-modify-write of agents.json holding an exclusive lock, so two shells saving at once cannot drop each
-/// other's change.
-// ceiling: Unix only (flock); on Windows two setups saving in the same instant can still lose one change.
+/// other's change (std's File::lock: flock on Unix, LockFileEx on Windows).
 fn with_agents_lock<T>(root: &Path, change: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     private_dir(root)?;
     let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join("agents.json.lock"))
         .map_err(|e| format!("agents.json.lock: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        // SAFETY: flock on a descriptor this function owns; it is released when `lock` closes.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(format!("agents.json.lock: {}", std::io::Error::last_os_error()));
-        }
-    }
+    lock.lock().map_err(|e| format!("agents.json.lock: {e}"))?; // released when `lock` closes
     let result = change();
     drop(lock);
     result

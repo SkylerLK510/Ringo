@@ -190,14 +190,24 @@ Measured while building the shell (2026-10-29, one run each, trivial prompts):
 |---|---|
 | Claude Code turn with the owner's normal setup (138 tools, 21 MCP servers, CLAUDE.md, plugins) | 50,201 |
 | the same turn with `--safe-mode`, which the shell uses | 16,567 |
-| a Codex agent turn, first / resumed | 16,834 / 34,845 |
-| a Claude agent turn, first / resumed | 16,501 / 33,056 |
+| a Codex agent turn, first / one-word follow-up | 16,834 / 18,011 |
+| a Claude agent turn, first / one-word follow-up | 16,501 / 16,555 |
+| an agy turn, first / one-word follow-up (2026-10-31, agy 1.4.12) | 7,064 / 7,314 |
+
+This table first listed the follow-ups as 34,845 and 33,056 tokens, which were running totals, not what the
+follow-ups used. A resumed Codex or agy turn reports its whole conversation's usage so far, and the shell had shown
+that number as the turn's own. It now counts only what each turn adds. Claude reports each run on its own; its
+33,056 was the two turns added together.
 
 So the shell starts Claude in safe mode (your CLAUDE.md, skills, plugins, hooks and MCP servers are left out; sign-in,
-built-in tools and subagents work as usual) and appends the repository's own `CLAUDE.md` or `AGENTS.md`. A resumed
-turn re-sends the conversation, so a follow-up costs about twice a first turn; start a write job (`@codex!`) for an
-unrelated task instead of continuing a long read conversation. Nothing is shared between agents unless you write
-`{#N}`. (`--bare` would cut more, but it signs in with an API key only, so the shell does not use it.)
+built-in tools and subagents work as usual) and appends the repository's own `CLAUDE.md` or `AGENTS.md`. A follow-up
+re-sends the conversation so far, so it costs a first turn plus that history. A short exchange adds little, but a
+long read conversation grows with every turn, so start a write job (`@codex!`) for an unrelated task. Nothing is
+shared between agents unless you write `{#N}`. (`--bare` would cut more, but it signs in with an API key only, so
+the shell does not use it.)
+
+agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
+sandbox. Its startup event lists them, and no setting Ringo can pass removes them.
 
 The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
 memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
