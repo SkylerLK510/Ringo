@@ -627,11 +627,19 @@ def run(spec_path, out, call_fn=harness.call):
     def review(files, rationale, observed):
         import pipelines
 
-        def bounded(backend, system, message, _timeout, _model=None):  # each attempt gets the time still left
-            timeout = min(spec['timeout_s'], remaining())
+        # Each attempt gets the time still left (run_plan caps its limits by it). timeout_s is soft here too: a
+        # call function that takes a watch gets it, so a slow review is probed, not killed and sent again.
+        def guard(timeout):
             if timeout <= 0:  # refused before any provider call, so run_plan releases the reservation
                 raise harness.AdmissionRefused('workflow wall-clock limit reached')
-            return call_fn(backend, system, message, timeout)
+        if harness.accepts_watch(call_fn):
+            def bounded(backend, system, message, timeout, _model=None, watch=None):
+                guard(timeout)
+                return call_fn(backend, system, message, timeout, watch=watch)
+        else:
+            def bounded(backend, system, message, timeout, _model=None):
+                guard(timeout)
+                return call_fn(backend, system, message, timeout)
         plan = pipelines.load_plan(HERE / 'plans' / 'review-doc.json' if kind == 'doc' else None, 'review')
         material = review_material(spec, files, rationale, observed)
         if spec_suite:
@@ -640,7 +648,7 @@ def run(spec_path, out, call_fn=harness.call):
             material += (f"\n\n=== the writer's script ({last_script['status']}) ===\n{last_script['source']}"
                          f"\n=== its output ===\n{(last_script['stdout'] + last_script['stderr'])[-6000:]}")
         text, _ = harness.run_plan(plan, material, role_backend(harness.backend(spec['judge']), spec['roles'].get('review')),
-                                   accounting, call_fn=bounded, timeout_s=spec['timeout_s'])
+                                   accounting, call_fn=bounded, timeout_s=spec['timeout_s'], left=remaining)
         return text
 
     # Spec tests: one call that sees the brief and the starting files (the interface) but never a candidate,

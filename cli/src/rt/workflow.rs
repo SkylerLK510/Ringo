@@ -2039,15 +2039,16 @@ impl Work<'_> {
     }
 
     fn review(&self, files: &Files, rationale: &Value, observed: &[Value]) -> Result<String> {
-        // each attempt gets the time still left; with none left the call is refused before any provider call, so
-        // run_plan releases the reservation
-        let (call_fn, clock, max_seconds, timeout_s) = (self.call_fn.clone(), self.clock, self.max_seconds, self.timeout_s);
-        let bounded = CallFn::new(false, move |b: &Backend, system: &str, message: &str, _timeout: HNum, _model: Option<&str>, _watch| {
-            let timeout = min_num(timeout_s, HNum::Float(max_seconds - clock.elapsed().as_secs_f64()));
+        // Each attempt gets the time still left (run_plan caps its limits by it); with none left the call is refused
+        // before any provider call, so run_plan releases the reservation. timeout_s is soft here too: a call function
+        // that takes a watch gets it, so a slow review is probed, not killed and sent again.
+        let (call_fn, clock, max_seconds) = (self.call_fn.clone(), self.clock, self.max_seconds);
+        let left = move || max_seconds - clock.elapsed().as_secs_f64();
+        let bounded = CallFn::new(call_fn.accepts_watch, move |b: &Backend, system: &str, message: &str, timeout: HNum, _model: Option<&str>, watch| {
             if non_positive(timeout) {
                 return Err(harness::admission_refused("workflow wall-clock limit reached"));
             }
-            call_fn.call(b, system, message, timeout, None, None)
+            call_fn.call(b, system, message, timeout, None, watch)
         });
         let path = (self.kind == "doc").then(|| self.here.join("plans").join("review-doc.json"));
         let plan = pipelines::load_plan(&self.here, path.as_deref(), "review")?;
@@ -2067,7 +2068,7 @@ impl Work<'_> {
         }
         let roles = getitem(&self.spec, "roles")?;
         let judge = role_backend(&harness::backend(str_of(getitem(&self.spec, "judge")?)?)?, get(roles, "review")?)?;
-        let (text, _) = harness::run_plan(&plan, &material, &judge, &self.accounting, &bounded, self.timeout_s, None, None)?;
+        let (text, _) = harness::run_plan(&plan, &material, &judge, &self.accounting, &bounded, self.timeout_s, None, None, Some(&left))?;
         Ok(text)
     }
 

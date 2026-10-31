@@ -24,10 +24,6 @@ pub fn lstrip(s: &str) -> &str {
     s.trim_start_matches(isspace)
 }
 
-pub fn rstrip(s: &str) -> &str {
-    s.trim_end_matches(isspace)
-}
-
 /// `str.split()` with no arguments: runs of whitespace separate, and none are empty.
 pub fn split(s: &str) -> Vec<&str> {
     s.split(isspace).filter(|p| !p.is_empty()).collect()
@@ -405,6 +401,11 @@ impl Num {
     /// `max(self, other)`: other only when it is greater, as Python's max keeps the first of equals.
     pub fn max(self, other: Num) -> Num {
         if other.gt(self) { other } else { self }
+    }
+
+    /// Python's `min(self, other)`: other only when it is smaller, so an int stays an int.
+    pub fn min(self, other: Num) -> Num {
+        if other.py_cmp(self) == Some(Ordering::Less) { other } else { self }
     }
 
     /// `k * self` (an int past 128 bits saturates).

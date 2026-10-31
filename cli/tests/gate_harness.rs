@@ -1805,7 +1805,7 @@ fn rust_plan(case: &Value, sink: &Arc<Mutex<String>>) -> String {
         run = Some(Arc::clone(&r));
         let checker = case.get("checker").filter(|c| !c.is_null()).map(backend_of);
         let (text, stats) = h::run_plan(&plan, case["material"].as_str().unwrap(), &backend_of(&case["backend"]), &r, &call_fn,
-                                        num(&case["timeout"]), case.get("scope").and_then(Value::as_str), checker.as_ref())?;
+                                        num(&case["timeout"]), case.get("scope").and_then(Value::as_str), checker.as_ref(), None)?;
         Ok(json!([text, stats]))
     })();
     let res = ok_or_err(result);
