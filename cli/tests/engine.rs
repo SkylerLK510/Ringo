@@ -319,3 +319,55 @@ fn killing_a_pipeline_stops_its_model_calls_too() {
     // SAFETY: signal 0 only checks that the process exists.
     assert_eq!(unsafe { libc::kill(child, 0) }, -1, "the model call in its own session is gone");
 }
+
+/// Every argument and the stdin each built-in adapter sends, pinned: the registry must reproduce them exactly.
+#[test]
+fn agent_commands_are_pinned() {
+    let r = repo("golden");
+    fs::write(r.join("AGENTS.md"), "rules\n").unwrap();
+    git(&r, &["add", "."]);
+    git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rules"]);
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n";
+    let codex = fake(&root(), "codex-golden", &format!("#!/bin/sh\n{RECORD}cat > \"$0.stdin\"\n\
+        echo '{{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}}'\n\
+        echo '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n\
+        echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n"));
+    let claude = fake(&root(), "claude-golden", &format!("#!/bin/sh\n{RECORD}cat > \"$0.stdin\"\n\
+        echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\",\"apiKeySource\":\"none\"}}'\n\
+        echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
+    let grok = fake(&root(), "grok-golden", &format!("#!/bin/sh\n{RECORD}echo done\n"));
+    let mut s = session(&r, Agent::Codex, &codex);
+    s.programs.insert(Agent::Claude, claude.clone());
+    s.programs.insert(Agent::Grok, grok.clone());
+    let repo = s.repo.to_string_lossy().into_owned();
+    let mut turn = |agent: Agent, write: bool, program: &Path| -> (Vec<String>, String) {
+        let id = s.launch_agent(agent, write, "the task").unwrap();
+        assert_eq!(wait(&mut s, id), Status::Done);
+        let wt = s.job(id).unwrap().worktree.clone().map(|w| w.to_string_lossy().into_owned());
+        let argv = fs::read_to_string(format!("{}.argv", program.display())).unwrap_or_default();
+        let stdin = fs::read_to_string(format!("{}.stdin", program.display())).unwrap_or_default();
+        let _ = fs::remove_file(format!("{}.stdin", program.display()));
+        let argv = argv.lines().map(|a| match &wt { Some(w) => a.replace(w.as_str(), "WT"), None => a.to_string() })
+            .map(|a| a.replace(&repo, "REPO")).collect();
+        (argv, stdin)
+    };
+    let tail = ["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"", "-"];
+    let want = |head: &[&str], rest: &[&str]| -> Vec<String> { head.iter().chain(rest).map(|a| a.to_string()).collect() };
+    assert_eq!(turn(Agent::Codex, false, &codex), (want(&["exec", "-s", "read-only", "-C", "REPO"], &tail), "the task".into()));
+    assert_eq!(turn(Agent::Codex, false, &codex),
+               (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"read-only\""], &tail), "the task".into()));
+    assert_eq!(turn(Agent::Codex, true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
+    let head = ["-p", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-prompts", "none", "--permission-mode"];
+    let read = ["default", "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit"];
+    assert_eq!(turn(Agent::Claude, false, &claude),
+               (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), "the task".into()));
+    assert_eq!(turn(Agent::Claude, false, &claude),
+               (want(&head, &[&read[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
+                "the task".into()));
+    assert_eq!(turn(Agent::Claude, true, &claude),
+               (want(&head, &["acceptEdits", "--disallowed-tools", "Bash", "--append-system-prompt-file", "WT/AGENTS.md"]),
+                "the task".into()));
+    assert_eq!(turn(Agent::Grok, true, &grok),
+               (want(&["-p", "the task", "--output-format", "plain", "--no-auto-update", "--always-approve", "--cwd", "WT"], &[]),
+                String::new()));
+}
