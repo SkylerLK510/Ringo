@@ -131,7 +131,8 @@ class Objects:
         if not header.endswith(b'\n'):
             raise ContextError(f'git cat-file --batch stopped while reading {rev}:{path}')
         fields = header[:-1].split(b' ')
-        if fields[-1] in (b'missing', b'ambiguous'):  # a gitlink's commit is not in this repository either
+        # missing/ambiguous: a gitlink's commit is not in this repository either; newer git answers 'submodule'
+        if fields[-1] in (b'missing', b'ambiguous', b'submodule'):
             e = tree_entry(self.repo, rev, path)
             return (e[1], b'') if e and e[1] != 'blob' else None
         kind, size = fields[1].decode(), int(fields[2])

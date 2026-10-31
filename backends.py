@@ -13,6 +13,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -26,23 +27,30 @@ except ImportError:  # Windows: file_lock uses msvcrt instead
     fcntl = None
     import msvcrt
 
+# The codex-chatgpt flags, shared with codex-search: subscription login, no shell or other tools, no agent scaffolding.
+_CHATGPT_FLAGS = ('--ignore-user-config --ignore-rules --disable apps --disable plugins '
+                  '--disable hooks --disable shell_tool --disable unified_exec --disable skill_search '
+                  '--enable skip_host_skill_discovery --disable unbounded_connection_retries '
+                  # Ringo's calls are single tool-free turns: drop the agent scaffolding Codex adds to each one
+                  '--disable sleep_tool --disable goals --disable view_image --disable image_generation '
+                  '--disable default_mode_request_user_input -c include_environment_context=false '
+                  '-c include_permissions_instructions=false -c skills.include_instructions=false '
+                  '-c include_collaboration_mode_instructions=false '
+                  # Codex flushes usage analytics before it exits, about 0.35 s after the reply is in; nothing
+                  # Ringo reads depends on them
+                  '-c analytics.enabled=false '
+                  '''-c 'project_doc_max_bytes=0' -c 'forced_login_method="chatgpt"' '''
+                  '''-c 'model_provider="openai"' ''')
+_CHATGPT_TAIL = '--skip-git-repo-check --ephemeral -s read-only --color never --json -'
 JUDGE_PRESETS = {
     'claude': ('claude -p --setting-sources project --strict-mcp-config --disable-slash-commands --tools "" '
                '--no-session-persistence --model sonnet'),
     'codex': ('codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins '
               '''-c 'web_search="disabled"' -c 'model_reasoning_effort="high"' --skip-git-repo-check --ephemeral '''
               '-s read-only --color never --json -'),
-    'codex-chatgpt': ('codex exec --ignore-user-config --ignore-rules --disable apps --disable plugins '
-                     '--disable hooks --disable shell_tool --disable unified_exec --disable skill_search '
-                     '--enable skip_host_skill_discovery --disable unbounded_connection_retries '
-                     # Ringo's calls are single tool-free turns: drop the agent scaffolding Codex adds to each one
-                     '--disable sleep_tool --disable goals --disable view_image --disable image_generation '
-                     '--disable default_mode_request_user_input -c include_environment_context=false '
-                     '-c include_permissions_instructions=false -c skills.include_instructions=false '
-                     '-c include_collaboration_mode_instructions=false '
-                     '''-c 'project_doc_max_bytes=0' -c 'forced_login_method="chatgpt"' '''
-                     '''-c 'model_provider="openai"' -c 'web_search="disabled"' '''
-                     '--skip-git-repo-check --ephemeral -s read-only --color never --json -'),
+    'codex-chatgpt': 'codex exec ' + _CHATGPT_FLAGS + '''-c 'web_search="disabled"' ''' + _CHATGPT_TAIL,
+    # research's gather call: the same restrictions with live web search on (`--search` is a top-level option)
+    'codex-search': 'codex --search exec ' + _CHATGPT_FLAGS + '''-c 'web_search="live"' ''' + _CHATGPT_TAIL,
 }
 RAW_PEEK = 1_000_000  # bytes of a running call's output read for its soft-limit checks
 # Replaces Codex's agent prompt (about 22 KB) for lean calls; Ringo's own instructions travel in the message.
@@ -487,6 +495,16 @@ def _codex_home(root, env):
         fd = os.open(copy, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
         with os.fdopen(fd, 'wb') as f:
             f.write(snapshot)
+    # The owner's model catalog cache: without it every call's `codex debug models` (see _lean_codex) fetches the
+    # same catalog over the network, about 0.5-1 s; with it, about 15 ms. It holds no instructions. Not copied back.
+    try:
+        catalog = (owner.parent / 'models_cache.json').read_bytes()
+    except OSError:
+        catalog = None
+    if catalog is not None:
+        fd = os.open(private / 'models_cache.json', os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+        with os.fdopen(fd, 'wb') as f:
+            f.write(catalog)
     env.update(HOME=str(home), CODEX_HOME=str(private))
     if os.name == 'nt':  # Windows programs find the home folder in USERPROFILE, not HOME
         env['USERPROFILE'] = str(home)
@@ -503,8 +521,22 @@ def _lean_codex(argv, private, env, timeout_s=15):
     extra = ['-c', f'model_instructions_file={json.dumps(str(instructions))}']
     _check_windows_program(argv)  # this direct subprocess must obey the same rule as spawn
     try:
-        listed = subprocess.run([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=timeout_s, check=True).stdout
+        # In a process tree of its own (see spawn), killed whole on timeout or Ctrl-C, like the call itself.
+        with tempfile.TemporaryFile() as out:
+            proc = spawn([argv[0], 'debug', 'models'], env=env, cwd=private, stdin=subprocess.DEVNULL, stdout=out,
+                         stderr=subprocess.DEVNULL)
+            try:
+                proc.wait(timeout=timeout_s)
+            finally:
+                try:
+                    kill_tree(proc)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                proc.wait()
+            if proc.returncode:
+                raise subprocess.CalledProcessError(proc.returncode, proc.args)
+            out.seek(0)
+            listed = out.read()
         catalog = json.loads(listed)
         for model in catalog['models']:
             for field in CATALOG_TOOL_FIELDS:
@@ -539,8 +571,18 @@ def _sync_codex_auth(owner, snapshot, copy):
     file in the same folder, then os.replace), mode 0600, and never goes through a symlink."""
     if snapshot is None:
         return
+    # Only a regular file the child left in its copy's place: never through a symlink (that would hand the owner
+    # another file), and never a FIFO or device (opened non-blocking, so one cannot hang the write-back). Windows has
+    # no O_NOFOLLOW, so the link is also refused by name; nothing can swap it in between, because the child and
+    # everything it started were killed before this runs.
+    if copy.is_symlink():
+        return
     try:
-        new = copy.read_bytes()
+        fd = os.open(copy, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as f:
+            if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                return
+            new = f.read()
     except OSError:
         return
     if new == snapshot:
@@ -614,6 +656,19 @@ def _peek(f):
         return own.read(RAW_PEEK)
 
 
+def child_env(subscription_auth=False):
+    """The environment a backend command gets: the caller's without the TypeSafe key; with subscription_auth also
+    without every *API_KEY variable and the endpoint and token overrides, so the CLI's own login is used."""
+    env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+    if subscription_auth:
+        env = {k: v for k, v in env.items() if not k.endswith('API_KEY') and k not in {
+            'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ACCESS_TOKEN', 'ANTHROPIC_AUTH_TOKEN',
+            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID',
+            # Claude's endpoint override and its cloud-provider switches would also move a call off the login
+            'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX'}}
+    return env
+
+
 def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home=False, lean=False, watch=None):
     """stdout of one run. The working folder is empty, so no project instructions or files
     load from it; it is not a file-system boundary. The command gets the caller's
@@ -625,11 +680,7 @@ def run_isolated(argv, prompt, timeout_s, *, subscription_auth=False, codex_home
     (see _wait); the call is never killed at it. A failure (JudgeError), a stop (Stopped) or a timeout
     (TimeoutExpired, .limit True) carries the stdout written so far as .stdout."""
     # ceiling: stdout is read whole; a command that floods it fills disk and memory
-    env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
-    if subscription_auth:
-        env = {k: v for k, v in env.items() if not k.endswith('API_KEY') and k not in {
-            'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ACCESS_TOKEN', 'ANTHROPIC_AUTH_TOKEN',
-            'OPENAI_IDENTITY_TOKEN_FILE', 'OPENAI_WORKLOAD_IDENTITY_PROVIDER_ID'}}
+    env = child_env(subscription_auth)
     # Output goes to files, not pipes, so the wait ends when the command exits, even if something it
     # started still holds stdout open; whatever it started is then killed with its session.
     # stdin is a file too, so a long wait is plain slices of proc.wait() with nothing left to write.

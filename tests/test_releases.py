@@ -488,6 +488,64 @@ else:
                 self.activate()
             self.assertFalse((self.state / 'active.json').exists())
 
+    def native_fixture(self, **changes):
+        """A stand-in `ringo` binary (a script that records how it was started) and a passing gate report for it."""
+        binary = self.root / 'ringo-native'
+        binary.write_text('#!/bin/sh\nprintf "%s\\n" "$RINGO_PINNED" "$0" "$@" > "$(dirname "$0")/../../../native-ran"\n')
+        binary.chmod(0o755)
+        report = {'version': 1, 'binary_sha256': rel.file_hash(binary),
+                  'reference_sha256': latency.sha(rel.inventory(self.source)),
+                  'tasks': ['review-fixture'], 'mismatches': [], **changes}
+        gate = self.root / 'gate.json'
+        gate.write_text(json.dumps(report))
+        return binary, gate
+
+    @unittest.skipIf(os.name == 'nt', 'the native runtime runs on macOS and Linux')
+    def test_a_native_release_binds_the_binary_and_its_gate_report(self):
+        binary, gate = self.native_fixture()
+        rid = rel.stage(self.source, self.state, native=binary, gate=gate)
+        bundle, manifest = rel.verify(self.state, rid)
+        self.assertNotEqual(rid, self.rid)
+        self.assertEqual(manifest['native'], rel.NATIVE)
+        self.assertEqual(manifest['files']['bin/ringo'], rel.file_hash(binary))
+        self.assertTrue(os.access(bundle / 'bin/ringo', os.X_OK))
+        self.assertEqual(rel.stage(self.source, self.state, native=binary, gate=gate), rid)
+        os.chmod(bundle / 'bin', 0o755)
+        os.chmod(bundle / 'bin/ringo', 0o755)
+        (bundle / 'bin/ringo').write_text('#!/bin/sh\necho swapped\n')
+        with self.assertRaisesRegex(ValueError, 'integrity'):
+            rel.verify(self.state, rid)
+
+    @unittest.skipIf(os.name == 'nt', 'the native runtime runs on macOS and Linux')
+    def test_a_native_release_is_refused_without_a_matching_passing_gate(self):
+        binary, gate = self.native_fixture()
+        for kw in ({'native': binary}, {'gate': gate}):
+            with self.subTest(kw=kw), self.assertRaisesRegex(ValueError, 'gate report'):
+                rel.stage(self.source, self.state, **kw)
+        for changes, message in (({'binary_sha256': '0' * 64}, 'this binary'),
+                                 ({'reference_sha256': '0' * 64}, 'another Python runtime'),
+                                 ({'mismatches': ['review-fixture: message bytes differ']}, 'no mismatch'),
+                                 ({'tasks': []}, 'no mismatch')):
+            binary, gate = self.native_fixture(**changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                rel.stage(self.source, self.state, native=binary, gate=gate)
+
+    @unittest.skipIf(os.name == 'nt', 'the native runtime runs on macOS and Linux')
+    def test_a_native_release_runs_its_bundled_binary_for_pipelines_only(self):
+        binary, gate = self.native_fixture()
+        rid = rel.stage(self.source, self.state, native=binary, gate=gate)
+        proc = self.cli(['release', 'preview', '--release', rid, '--', 'review', '--input', 'x'])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pinned, program, *args = (self.state / 'native-ran').read_text().splitlines()
+        self.assertEqual(json.loads(pinned)['id'], rid)
+        self.assertEqual(json.loads(pinned)['runtime'], 'native')
+        self.assertEqual(Path(program), self.state / 'bundles' / rid / 'bin/ringo')
+        self.assertEqual(args, ['review', '--input', 'x'])
+        (self.state / 'native-ran').unlink()
+        proc = self.cli(['release', 'preview', '--release', rid, '--', '--help'])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.state / 'native-ran').exists())
+
     def test_preview_runs_bundled_modules_without_approval_and_one_backend_call(self):
         trace = self.root / 'trace'
         proc = self.cli(['release', 'preview', '--release', self.rid, '--', *self.review_args(trace)])

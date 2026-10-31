@@ -25,3 +25,22 @@ jobs:
       - run: python -m unittest discover -s tests -q
         env:
           RINGO_RELEASE_HOME: ${{ runner.temp }}/ringo-ci-state
+
+  cli:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the context gate replays this repository's own history
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.14'
+      - run: cargo test --locked --no-fail-fast  # report every failing test file, not just the first
+        working-directory: cli
+        env:
+          RINGO_RELEASE_HOME: ${{ runner.temp }}/ringo-cli-state

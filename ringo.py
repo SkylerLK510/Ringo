@@ -1,4 +1,4 @@
-"""Ringo CLI: review, design and bounded council-guided work."""
+"""Ringo CLI: review, design, research and bounded council-guided work."""
 import argparse
 import sys
 
@@ -77,6 +77,10 @@ def wait(argv):
 
 
 def main(argv=None):
+    import os
+    if os.environ.get('RINGO_CHILD'):  # set by the ringo shell for the agents it launches
+        print('ringo: refusing to start inside an agent that ringo launched (RINGO_CHILD is set)', file=sys.stderr)
+        return 2
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ['wait']:
         return wait(argv[1:])
@@ -95,6 +99,7 @@ def main(argv=None):
         commands = parser.add_subparsers(dest='command')
         for name, help_text in [('review', 'review code'), ('design', 'propose a design'),
                                 ('work', 'revise artifacts with checks and one review'),
+                                ('research', 'search the web once, verify quotes in code, write one cited report'),
                                 ('wait', 'block until a traced run finishes and print its state'),
                                 ('release', 'stage, activate, inspect or roll back local releases')]:
             commands.add_parser(name, help=help_text)
@@ -103,6 +108,9 @@ def main(argv=None):
     if argv[:1] == ['work']:
         import workflow
         return workflow.main(argv[1:])
+    if argv[:1] == ['research']:
+        import research
+        return research.main(argv[1:])
     import harness
     return harness.main(argv, prog='ringo.py')
 

@@ -20,6 +20,9 @@ proposals and unmeasured areas.
 | [Harness guide](HARNESS.md) | Runtime/evaluation architecture, provenance and guardrails | Implementation and tests included |
 | [ReviewBench adapter](../adapters/reviewbench/README.md) | Container/contract integration and scoring procedure | Adapter source and offline tests included; no official result claimed |
 | [Council workflow](COUNCIL-WORKFLOW.md) | Executable checks and separate Design Council assessment | Implementation and tests included |
+| [Engineering objectives](ENGINEERING-OBJECTIVES.md) | Coding ability, design judgment, architectural insight and quality-conditioned token efficiency | Requirements and proposed pilot; no campaign or measured gain |
+| [Research role](RESEARCH-ROLE.md) | `ringo.py research`: one search call, a deterministic quote verifier with a guarded fetcher, one tool-free write call | Implementation and offline tests; unmeasured, no quality or token claim |
+| [Audit-Gated Continual Learning](AGCL.md) | Learning when to stop spending tokens, with labels collected at no added token cost and changes only through releases | `stop_on_checks`, shadow labels and the HumanEval+ studies implemented; study results pending |
 
 ## Publication boundary
 

@@ -13,11 +13,15 @@ from latency import canonical, read_json, sha
 
 HERE = Path(__file__).resolve().parent
 RUNTIME = ('ringo.py', 'harness.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
-           'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py')
+           'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py', 'research.py')
 # Files that joined the runtime after releases already existed. New bundles always include them; a bundle staged
 # before one joined still verifies without it, since that bundle has no feature that runs it.
-LATER_RUNTIME = {'spec_runner.py'}
+LATER_RUNTIME = {'spec_runner.py', 'research.py'}
 IDENT = re.compile(r'[0-9a-f]{64}')
+# A release may also carry the Rust runtime (the `ringo` binary built from cli/), with the differential gate report
+# that proved it sends the same requests as this Python runtime. Then review, design and work run the bundled binary.
+NATIVE = {'binary': 'bin/ringo', 'gate': 'native-gate.json'}
+GATE_KEYS = {'version', 'binary_sha256', 'reference_sha256', 'tasks', 'mismatches'}
 LATENCY_WORKLOADS = {'startup', 'review', 'review-trace', 'review-large', 'design', 'work'}
 
 
@@ -199,7 +203,18 @@ def quality(store, digest, plan, runtime_root=None, *, verify_bytecode=False):
             'comparators': list(spec['comparators'])}
 
 
-def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None):
+def native_gate(report, binary_sha256, reference):
+    """The gate report must name this binary and this Python runtime, and show tasks compared and no mismatch."""
+    if not isinstance(report, dict) or set(report) != GATE_KEYS or report['version'] != 1 \
+            or report['binary_sha256'] != binary_sha256:
+        raise ValueError('the native gate report does not describe this binary')
+    if report['reference_sha256'] != sha(reference):
+        raise ValueError('the native gate report compared another Python runtime')
+    if not isinstance(report['tasks'], list) or not report['tasks'] or report['mismatches'] != []:
+        raise ValueError('the native gate report needs compared tasks and no mismatch')
+
+
+def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None, native=None, gate=None):
     import backends
     import pipelines
     import py_compile
@@ -208,7 +223,15 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
         raise ValueError('candidate staging needs --evaluation-store and --digest')
     if not candidate_plan and (evaluation_store or digest):
         raise ValueError('quality evidence requires a candidate plan')
+    if (native is None) != (gate is None):
+        raise ValueError('a native binary needs its gate report, and a gate report its binary (--native, --native-gate)')
+    if native is not None and os.name == 'nt':
+        raise ValueError('the native runtime runs on macOS and Linux')
     files = inventory(source)
+    if native is not None:
+        binary = Path(native).read_bytes()
+        report = read_json(gate)
+        native_gate(report, hashlib.sha256(binary).hexdigest(), files)
     plan = pipelines.load_plan(candidate_plan, 'review') if candidate_plan else default_plan(source)
     evidence = quality(evaluation_store, digest, plan, source) if candidate_plan else {'kind': 'deployment', 'claim': None}
     with locked(root), backends.private_tempdir(prefix='.stage-', dir=root) as folder:
@@ -240,6 +263,12 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
             if not base.is_relative_to(tmp.resolve()):
                 raise ValueError('bundled plans cannot load external prompt directories')
             pipelines.validate(raw, base)
+        if native is not None:
+            (tmp / 'bin').mkdir()
+            (tmp / NATIVE['binary']).write_bytes(binary)
+            (tmp / NATIVE['gate']).write_bytes(canonical(report) + b'\n')
+            for name in NATIVE.values():
+                files[name] = file_hash(tmp / name)
         # Precompile at staging time. Readonly releases must not reparse every module
         # on every invocation. Hash-checked bytecode is also covered by the inventory.
         for name in RUNTIME:
@@ -249,6 +278,8 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
         manifest = {'version': 1, 'files': files, 'quality': evidence,
                     'python_cache_tag': sys.implementation.cache_tag,
                     'default_review_sha256': config_hash(default_plan(tmp))}
+        if native is not None:
+            manifest['native'] = dict(NATIVE)
         rid = sha(manifest)
         target = root / 'bundles' / rid
         if target.exists():
@@ -260,7 +291,7 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None)
             if path.is_file():
                 with path.open('r+b' if os.name == 'nt' else 'rb') as f:  # Windows flushes only a writable handle
                     os.fsync(f.fileno())
-            path.chmod(0o555 if path.is_dir() else 0o444)
+            path.chmod(0o555 if path.is_dir() or path == tmp / NATIVE['binary'] else 0o444)
         os.rename(tmp, target)
         target.chmod(0o555)
         fsync_dir(target.parent)
@@ -275,12 +306,15 @@ def verify(root, rid):
     if (root / 'bundles').is_symlink() or bundle.is_symlink() or not bundle.is_dir() or (bundle / 'release.json').is_symlink():
         raise ValueError('missing bundle or symlink')
     manifest = metadata_json(bundle / 'release.json')
-    if not isinstance(manifest, dict) or set(manifest) != {'version', 'files', 'quality', 'default_review_sha256', 'python_cache_tag'} \
+    if not isinstance(manifest, dict) \
+            or set(manifest) - {'native'} != {'version', 'files', 'quality', 'default_review_sha256', 'python_cache_tag'} \
             or type(manifest['version']) is not int or manifest['version'] != 1 or sha(manifest) != rid \
             or not isinstance(manifest['files'], dict) or not isinstance(manifest['quality'], dict) \
             or not isinstance(manifest['default_review_sha256'], str) \
             or not IDENT.fullmatch(manifest['default_review_sha256']) \
             or not (set(RUNTIME) - LATER_RUNTIME).issubset(manifest['files']):
+        raise ValueError('release manifest integrity failure')
+    if 'native' in manifest and (manifest['native'] != NATIVE or not set(NATIVE.values()).issubset(manifest['files'])):
         raise ValueError('release manifest integrity failure')
     # Validate every manifest path before opening inventory members. Keep paths
     # canonical so one physical file cannot satisfy two differently spelled keys.
@@ -420,7 +454,8 @@ def dispatch(argv):
     approved(root, entry)
     return execute(bundle, {'mode': 'release', 'id': entry['release'], 'root': str(bundle),
                            'approval': entry['approval'], 'quality_claim':
-                               manifest['quality'] if manifest['quality']['kind'] == 'rrsi' else None}, argv)
+                               manifest['quality'] if manifest['quality']['kind'] == 'rrsi' else None,
+                           **({'runtime': 'native'} if 'native' in manifest else {})}, argv)
 
 
 def execute(bundle, metadata, argv):
@@ -434,18 +469,31 @@ def execute(bundle, metadata, argv):
         raise ValueError('runtime modules were imported before release selection; start a fresh CLI process')
     sys._ringo_release = {**metadata, 'checkout_root': str(HERE), 'bootstrap_sha256': sha({name: file_hash(HERE / name)
         for name in ('ringo.py', 'releases.py', 'latency.py')})}
+    if metadata.get('runtime') == 'native' and argv[:1] in (['review'], ['design'], ['work']):
+        # The bundled binary runs the pipeline. It refuses RINGO_PINNED unless it is that bundle's own binary.
+        binary = bundle / NATIVE['binary']
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.execve(binary, [str(binary), *argv], {**os.environ, 'RINGO_PINNED': json.dumps(sys._ringo_release)})
     sys.path[:] = [str(bundle), *[p for p in sys.path if Path(p or os.getcwd()).resolve() != HERE]]
     sys.dont_write_bytecode = True
     sys.argv = [str(bundle / 'ringo.py'), *argv]
     if argv in ([], ['--help'], ['-h']):
-        parser = argparse.ArgumentParser(prog='ringo.py', description='Pinned Ringo runtime: review, design, work.')
-        for name in ('review', 'design', 'work'):
+        parser = argparse.ArgumentParser(prog='ringo.py', description='Pinned Ringo runtime: review, design, work, research.')
+        for name in ('review', 'design', 'work', 'research'):
             parser.add_argument_group(name)
         parser.print_help()
         return 0 if argv else 2
     if argv[:1] == ['work']:
         import workflow
         return workflow.main(argv[1:])
+    if argv[:1] == ['research']:  # Python only, also under a native bundle; a bundle staged before it has no research
+        if not (bundle / 'research.py').is_file():
+            print('ringo: the active release predates research; stage a new release or roll back to run it',
+                  file=sys.stderr)
+            return 2
+        import research
+        return research.main(argv[1:])
     import harness
     return harness.main(argv, prog='ringo.py')
 
@@ -459,6 +507,9 @@ def main(argv=None):
     staging.add_argument('--candidate-plan', type=Path)
     staging.add_argument('--evaluation-store', type=Path)
     staging.add_argument('--digest')
+    staging.add_argument('--native', type=Path, help='also bundle this Rust `ringo` binary to run review/design/work')
+    staging.add_argument('--native-gate', type=Path, help="with --native: the differential gate's report for it "
+                                                          '(tests/native_gate.py)')
     activation = commands.add_parser('activate')
     activation.add_argument('--release', required=True)
     activation.add_argument('--latency-report', type=Path, required=True)
@@ -475,17 +526,19 @@ def main(argv=None):
     try:
         root = state_root(args.state)
         if args.command == 'stage':
-            result = {'release': stage(args.source, root, args.candidate_plan, args.evaluation_store, args.digest)}
+            result = {'release': stage(args.source, root, args.candidate_plan, args.evaluation_store, args.digest,
+                                       args.native, args.native_gate)}
         elif args.command == 'activate':
             result = activate(root, args.release, read_json(args.latency_report), args.approved_by,
                               args.expected_current, args.accept_uncertain)
         elif args.command == 'rollback':
             result = rollback(root, args.expected_current)
         elif args.command == 'preview':
-            bundle, _ = verify(root, args.release)
+            bundle, manifest = verify(root, args.release)
             rest = args.args[1:] if args.args[:1] == ['--'] else args.args
             return execute(bundle, {'mode': 'preview', 'id': args.release, 'root': str(bundle),
-                                    'approval': None, 'quality_claim': None}, rest)
+                                    'approval': None, 'quality_claim': None,
+                                    **({'runtime': 'native'} if 'native' in manifest else {})}, rest)
         else:
             result = pointer(root)
             for entry in (result['active'], result['previous']):

@@ -137,6 +137,12 @@ class CodexHomeTest(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.owner.iterdir()),
                          ['.ringo-auth.lock', 'AGENTS.md', 'auth.json', 'memories_1.sqlite'])  # no temp file left
 
+    def test_the_owners_model_catalog_cache_is_copied_and_nothing_else(self):
+        (self.owner / 'models_cache.json').write_text('{"models": []}')
+        seen = self.run_child('r2')
+        self.assertEqual(seen['codex_files'], ['auth.json', 'models_cache.json'])  # still no AGENTS.md or memories
+        self.assertEqual((self.owner / 'models_cache.json').read_text(), '{"models": []}')
+
     @unittest.skipIf(os.name == 'nt', POSIX_MODES)
     def test_private_login_and_folders_are_owner_only_and_the_refresh_keeps_mode_0600(self):
         seen = self.run_child('r2')
@@ -187,6 +193,25 @@ class CodexHomeTest(unittest.TestCase):
         self.assertTrue(self.auth.is_symlink())
         self.assertEqual(json.loads(target.read_text())['tokens']['refresh_token'], 'r1')
         self.assertIn('could not be saved', ''.join(c.args[0] for c in err.write.call_args_list))
+
+
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
+    def test_a_symlink_the_child_puts_in_place_of_its_copy_is_not_followed(self):
+        other = self.tmp / 'other.json'
+        other.write_text('{"not": "a login"}')
+        child = ('import os, pathlib\np = pathlib.Path(os.environ["CODEX_HOME"]) / "auth.json"\n'
+                 f'p.unlink()\np.symlink_to({str(other)!r})\nprint("{{}}")\n')
+        backends.run_isolated([sys.executable, '-c', child], '', 10, codex_home=True)
+        self.assertEqual(self.token(), 'r1')
+
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_a_fifo_the_child_puts_in_place_of_its_copy_cannot_hang_the_write_back(self):
+        child = ('import os, pathlib\np = pathlib.Path(os.environ["CODEX_HOME"]) / "auth.json"\n'
+                 'p.unlink()\nos.mkfifo(p)\nprint("{}")\n')
+        started = time.monotonic()
+        backends.run_isolated([sys.executable, '-c', child], '', 10, codex_home=True)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(self.token(), 'r1')
 
 
 # A stand-in Codex CLI: `debug models` prints a two-model catalog (or fails with FAKE_CATALOG=fail);

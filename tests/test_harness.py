@@ -61,6 +61,17 @@ class CallTest(unittest.TestCase):
         self.assertEqual(text, 'SYSTEM+MATERIAL|INSTRUCTION')
         self.assertEqual(usage, {'input': 3, 'cache_write': 7, 'cache_read': 90, 'output': 4, 'cost_usd': 0.02, 'models': []})
 
+    def test_the_claude_preset_runs_on_the_login_not_an_api_key(self):
+        exe = self.fake_claude('import json, os, sys\nsys.stdin.read()\nkeys = [k for k in ("ANTHROPIC_API_KEY", '
+                               '"ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "KEEP") if k in os.environ]\n'
+                               'print(json.dumps({"result": " ".join(keys)}))\n')
+        env = {'ANTHROPIC_API_KEY': 'x', 'ANTHROPIC_BASE_URL': 'http://x', 'CLAUDE_CODE_USE_BEDROCK': '1', 'KEEP': '1'}
+        with mock.patch.dict(os.environ, env):
+            preset = {**harness.backend('claude'), 'argv': [exe, '-p']}
+            self.assertEqual(harness.call(preset, 's', 'm', 30)[0], 'KEEP')
+            custom = {**harness.backend('claude:claude -p'), 'argv': [exe, '-p']}
+            self.assertEqual(harness.call(custom, 's', 'm', 30)[0], 'ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK KEEP')
+
     def test_claude_errors_and_non_json_raise(self):
         bad = self.fake_claude('import json\nprint(json.dumps({"is_error": True, "result": "limit reached"}))\n')
         with self.assertRaisesRegex(backends.JudgeError, 'limit reached'):
@@ -92,7 +103,8 @@ class CallTest(unittest.TestCase):
 
     def test_backend_styles_are_declared_not_guessed(self):
         self.assertEqual(harness.backend('claude'), {'name': 'claude', 'argv': shlex.split(backends.JUDGE_PRESETS['claude']),
-                                                     'style': 'claude'})
+                                                     'style': 'claude', 'subscription_auth': True})
+        self.assertNotIn('subscription_auth', harness.backend('claude:claude -p'))  # a command you wrote is yours
         self.assertEqual(harness.backend('codex')['style'], 'codex')
         self.assertEqual(harness.backend('codex --search exec --json -')['style'], 'plain')  # no name sniffing
         self.assertEqual(harness.backend('codex-chatgpt')['style'], 'codex')
