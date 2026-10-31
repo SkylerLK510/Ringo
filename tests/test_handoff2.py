@@ -23,6 +23,7 @@ import pipelines as pl
 from tests.test_harness import plan, REVIEW, B, USAGE
 from tests.test_evaluate import Store, fake_call
 from tests.test_improve import World, BASE_PROMPT, edit
+from tests.support import POSIX_MODES
 
 
 class PipelineRegressions(unittest.TestCase):
@@ -225,6 +226,7 @@ class EvaluatorRegressions(unittest.TestCase):
         self.assertEqual(ev.cost_ratio(1, 0), float('inf'))
         self.assertIsNone(ev.cost_ratio(None, 0))
 
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
     def test_store_is_private_even_with_permissive_umask(self):
         with tempfile.TemporaryDirectory() as d:
             store = Path(d, 'new-store')

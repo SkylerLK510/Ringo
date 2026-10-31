@@ -1,0 +1,918 @@
+{
+ "version": 1,
+ "status": "negligible",
+ "reason": "all upper confidence bounds fit the declared budgets on this workload",
+ "measurement": {
+  "version": 1,
+  "baseline": "context.py:a3c1f44250d59f18ad8b58218bd33cf92a840fbc9cd17d82d564de8e2e3938a3",
+  "candidate": "context.py:142fa5c1bd22e4a33c33ef6c97175a264a2ac57c36fa15308f68a3af6de3e075",
+  "planned_pairs": 120,
+  "pairs": [
+   {
+    "id": "0-e9414948e966",
+    "baseline_s": 0.11249125,
+    "candidate_s": 0.082950333,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-5c13b5a19864",
+    "baseline_s": 8.043945042,
+    "candidate_s": 0.476967375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-45fe4636d8d1",
+    "baseline_s": 0.282166875,
+    "candidate_s": 0.157166375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-a2a0b4f2764f",
+    "baseline_s": 0.268395625,
+    "candidate_s": 0.166211041,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-36920bb47666",
+    "baseline_s": 0.095552042,
+    "candidate_s": 0.083384334,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-0e128d524d0a",
+    "baseline_s": 0.180740375,
+    "candidate_s": 0.149840791,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-1b40abab06d2",
+    "baseline_s": 0.145807083,
+    "candidate_s": 0.082967209,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-512b92a493f8",
+    "baseline_s": 1.2434065,
+    "candidate_s": 0.251929625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-816ea69cb8d2",
+    "baseline_s": 10.814022542,
+    "candidate_s": 0.741893416,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-32a46625c24c",
+    "baseline_s": 0.212901167,
+    "candidate_s": 0.1518335,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-a26ceb090318",
+    "baseline_s": 0.499128084,
+    "candidate_s": 0.157038833,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-8e4e95da9b5b",
+    "baseline_s": 0.117925459,
+    "candidate_s": 0.081629084,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-fa214ea7b217",
+    "baseline_s": 0.220227625,
+    "candidate_s": 0.157275959,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-549605de8c78",
+    "baseline_s": 0.293250709,
+    "candidate_s": 0.15440375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-4b09d8c2c84b",
+    "baseline_s": 1.17178025,
+    "candidate_s": 0.224715458,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-210c7ca0c101",
+    "baseline_s": 0.093617959,
+    "candidate_s": 0.07865825,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-5190bbc3b70a",
+    "baseline_s": 1.362525375,
+    "candidate_s": 0.206099375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-7d89d63c899e",
+    "baseline_s": 0.49282675,
+    "candidate_s": 0.1967635,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-79502d08405d",
+    "baseline_s": 0.096558333,
+    "candidate_s": 0.081407042,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-3c85ea391e27",
+    "baseline_s": 0.177302042,
+    "candidate_s": 0.14953125,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-0b4aaa7cdb86",
+    "baseline_s": 0.188044875,
+    "candidate_s": 0.152234166,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-3d3d943b7442",
+    "baseline_s": 1.680446833,
+    "candidate_s": 0.241351042,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-4e7c04fdfa76",
+    "baseline_s": 0.204402125,
+    "candidate_s": 0.149624375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-6de4b35a79b8",
+    "baseline_s": 0.519854916,
+    "candidate_s": 0.170505042,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-2fff3e9f493a",
+    "baseline_s": 0.6823655,
+    "candidate_s": 0.182133958,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-45ce894a3b33",
+    "baseline_s": 0.280418625,
+    "candidate_s": 0.149907958,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-9b83f7513c06",
+    "baseline_s": 1.278112167,
+    "candidate_s": 0.227822083,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-2a7992385f91",
+    "baseline_s": 1.201516417,
+    "candidate_s": 0.2247925,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-c6ebf51871fa",
+    "baseline_s": 0.503626416,
+    "candidate_s": 0.150038625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "0-11af25c0ae06",
+    "baseline_s": 0.10001725,
+    "candidate_s": 0.080394834,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-e9414948e966",
+    "baseline_s": 0.110305708,
+    "candidate_s": 0.081748958,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-5c13b5a19864",
+    "baseline_s": 8.046138042,
+    "candidate_s": 0.477698625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-45fe4636d8d1",
+    "baseline_s": 0.27588125,
+    "candidate_s": 0.157328083,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-a2a0b4f2764f",
+    "baseline_s": 0.26705825,
+    "candidate_s": 0.167075167,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-36920bb47666",
+    "baseline_s": 0.102140459,
+    "candidate_s": 0.080032416,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-0e128d524d0a",
+    "baseline_s": 0.181284875,
+    "candidate_s": 0.148188833,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-1b40abab06d2",
+    "baseline_s": 0.144712708,
+    "candidate_s": 0.084813625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-512b92a493f8",
+    "baseline_s": 1.242254334,
+    "candidate_s": 0.255779833,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-816ea69cb8d2",
+    "baseline_s": 10.853903125,
+    "candidate_s": 0.758614167,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-32a46625c24c",
+    "baseline_s": 0.209291,
+    "candidate_s": 0.147824292,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-a26ceb090318",
+    "baseline_s": 0.511545125,
+    "candidate_s": 0.163976875,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-8e4e95da9b5b",
+    "baseline_s": 0.108414542,
+    "candidate_s": 0.078367666,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-fa214ea7b217",
+    "baseline_s": 0.221724666,
+    "candidate_s": 0.152988042,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-549605de8c78",
+    "baseline_s": 0.296866792,
+    "candidate_s": 0.157470625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-4b09d8c2c84b",
+    "baseline_s": 1.17926525,
+    "candidate_s": 0.221451959,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-210c7ca0c101",
+    "baseline_s": 0.102398792,
+    "candidate_s": 0.080008167,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-5190bbc3b70a",
+    "baseline_s": 1.36650175,
+    "candidate_s": 0.2079505,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-7d89d63c899e",
+    "baseline_s": 0.491007417,
+    "candidate_s": 0.196792542,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-79502d08405d",
+    "baseline_s": 0.097689458,
+    "candidate_s": 0.08477125,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-3c85ea391e27",
+    "baseline_s": 0.183751875,
+    "candidate_s": 0.161001667,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-0b4aaa7cdb86",
+    "baseline_s": 0.197158292,
+    "candidate_s": 0.153650667,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-3d3d943b7442",
+    "baseline_s": 1.687716,
+    "candidate_s": 0.2461685,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-4e7c04fdfa76",
+    "baseline_s": 0.205108916,
+    "candidate_s": 0.149994584,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-6de4b35a79b8",
+    "baseline_s": 0.5273165,
+    "candidate_s": 0.167321125,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-2fff3e9f493a",
+    "baseline_s": 0.71234425,
+    "candidate_s": 0.191342542,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-45ce894a3b33",
+    "baseline_s": 0.281013208,
+    "candidate_s": 0.151573125,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-9b83f7513c06",
+    "baseline_s": 1.274773667,
+    "candidate_s": 0.234103792,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-2a7992385f91",
+    "baseline_s": 1.20626525,
+    "candidate_s": 0.217714958,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-c6ebf51871fa",
+    "baseline_s": 0.516348875,
+    "candidate_s": 0.155084,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "1-11af25c0ae06",
+    "baseline_s": 0.101598291,
+    "candidate_s": 0.083038375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-e9414948e966",
+    "baseline_s": 0.110980667,
+    "candidate_s": 0.080862667,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-5c13b5a19864",
+    "baseline_s": 8.127820792,
+    "candidate_s": 0.476621916,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-45fe4636d8d1",
+    "baseline_s": 0.2728355,
+    "candidate_s": 0.160808292,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-a2a0b4f2764f",
+    "baseline_s": 0.26994975,
+    "candidate_s": 0.170439708,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-36920bb47666",
+    "baseline_s": 0.098160375,
+    "candidate_s": 0.081988542,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-0e128d524d0a",
+    "baseline_s": 0.182231042,
+    "candidate_s": 0.148948333,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-1b40abab06d2",
+    "baseline_s": 0.149577042,
+    "candidate_s": 0.082414292,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-512b92a493f8",
+    "baseline_s": 1.25420525,
+    "candidate_s": 0.252532167,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-816ea69cb8d2",
+    "baseline_s": 10.930391584,
+    "candidate_s": 0.753704333,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-32a46625c24c",
+    "baseline_s": 0.215754959,
+    "candidate_s": 0.15157825,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-a26ceb090318",
+    "baseline_s": 0.5134675,
+    "candidate_s": 0.157567625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-8e4e95da9b5b",
+    "baseline_s": 0.118021959,
+    "candidate_s": 0.08695175,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-fa214ea7b217",
+    "baseline_s": 0.230782458,
+    "candidate_s": 0.160795917,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-549605de8c78",
+    "baseline_s": 0.303494417,
+    "candidate_s": 0.15843675,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-4b09d8c2c84b",
+    "baseline_s": 1.211646791,
+    "candidate_s": 0.224663875,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-210c7ca0c101",
+    "baseline_s": 0.096466125,
+    "candidate_s": 0.086363083,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-5190bbc3b70a",
+    "baseline_s": 1.392341958,
+    "candidate_s": 0.210320375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-7d89d63c899e",
+    "baseline_s": 0.515082667,
+    "candidate_s": 0.20222625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-79502d08405d",
+    "baseline_s": 0.097199708,
+    "candidate_s": 0.092256,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-3c85ea391e27",
+    "baseline_s": 0.18138075,
+    "candidate_s": 0.159574209,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-0b4aaa7cdb86",
+    "baseline_s": 0.189439334,
+    "candidate_s": 0.154052958,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-3d3d943b7442",
+    "baseline_s": 1.695129292,
+    "candidate_s": 0.252356916,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-4e7c04fdfa76",
+    "baseline_s": 0.202340167,
+    "candidate_s": 0.150244792,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-6de4b35a79b8",
+    "baseline_s": 0.545799875,
+    "candidate_s": 0.169524583,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-2fff3e9f493a",
+    "baseline_s": 0.735554375,
+    "candidate_s": 0.191269959,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-45ce894a3b33",
+    "baseline_s": 0.284978958,
+    "candidate_s": 0.152185917,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-9b83f7513c06",
+    "baseline_s": 1.299474042,
+    "candidate_s": 0.232666166,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-2a7992385f91",
+    "baseline_s": 1.218531584,
+    "candidate_s": 0.221656209,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-c6ebf51871fa",
+    "baseline_s": 0.512153625,
+    "candidate_s": 0.158582625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "2-11af25c0ae06",
+    "baseline_s": 0.103396708,
+    "candidate_s": 0.079831167,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-e9414948e966",
+    "baseline_s": 0.110576667,
+    "candidate_s": 0.085726,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-5c13b5a19864",
+    "baseline_s": 8.159074458,
+    "candidate_s": 0.487077709,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-45fe4636d8d1",
+    "baseline_s": 0.290901375,
+    "candidate_s": 0.160914333,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-a2a0b4f2764f",
+    "baseline_s": 0.269142833,
+    "candidate_s": 0.1717855,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-36920bb47666",
+    "baseline_s": 0.102784959,
+    "candidate_s": 0.082276,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-0e128d524d0a",
+    "baseline_s": 0.188831708,
+    "candidate_s": 0.16347425,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-1b40abab06d2",
+    "baseline_s": 0.181009375,
+    "candidate_s": 0.094361334,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-512b92a493f8",
+    "baseline_s": 1.32783975,
+    "candidate_s": 0.269232042,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-816ea69cb8d2",
+    "baseline_s": 11.194909959,
+    "candidate_s": 0.757480666,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-32a46625c24c",
+    "baseline_s": 0.215306583,
+    "candidate_s": 0.154034625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-a26ceb090318",
+    "baseline_s": 0.531185459,
+    "candidate_s": 0.170746292,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-8e4e95da9b5b",
+    "baseline_s": 0.117186625,
+    "candidate_s": 0.089140792,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-fa214ea7b217",
+    "baseline_s": 0.228080833,
+    "candidate_s": 0.160211083,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-549605de8c78",
+    "baseline_s": 0.315869459,
+    "candidate_s": 0.156905833,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-4b09d8c2c84b",
+    "baseline_s": 1.248017083,
+    "candidate_s": 0.220692625,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-210c7ca0c101",
+    "baseline_s": 0.105705292,
+    "candidate_s": 0.084945416,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-5190bbc3b70a",
+    "baseline_s": 1.423316833,
+    "candidate_s": 0.215164459,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-7d89d63c899e",
+    "baseline_s": 0.515939292,
+    "candidate_s": 0.205632333,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-79502d08405d",
+    "baseline_s": 0.102137625,
+    "candidate_s": 0.092122,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-3c85ea391e27",
+    "baseline_s": 0.184437167,
+    "candidate_s": 0.155105334,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-0b4aaa7cdb86",
+    "baseline_s": 0.191067542,
+    "candidate_s": 0.153789958,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-3d3d943b7442",
+    "baseline_s": 1.715331917,
+    "candidate_s": 0.247024917,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-4e7c04fdfa76",
+    "baseline_s": 0.2099915,
+    "candidate_s": 0.156063417,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-6de4b35a79b8",
+    "baseline_s": 0.549832208,
+    "candidate_s": 0.174308291,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-2fff3e9f493a",
+    "baseline_s": 0.724642375,
+    "candidate_s": 0.191012375,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-45ce894a3b33",
+    "baseline_s": 0.290483625,
+    "candidate_s": 0.160380666,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-9b83f7513c06",
+    "baseline_s": 1.30127025,
+    "candidate_s": 0.237717084,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-2a7992385f91",
+    "baseline_s": 1.244613625,
+    "candidate_s": 0.222455458,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-c6ebf51871fa",
+    "baseline_s": 0.522165583,
+    "candidate_s": 0.160680458,
+    "baseline_ok": true,
+    "candidate_ok": true
+   },
+   {
+    "id": "3-11af25c0ae06",
+    "baseline_s": 0.106588375,
+    "candidate_s": 0.08513125,
+    "baseline_ok": true,
+    "candidate_ok": true
+   }
+  ],
+  "protocol": {
+   "workload": "django-recent-commits",
+   "kind": "live",
+   "order": "randomized",
+   "warmups": 1,
+   "clock": "perf_counter_ns",
+   "baseline_config": "context.build(repo, head~1, head), default budget",
+   "candidate_config": "context.build(repo, head~1, head), default budget",
+   "environment": "macOS-27.0.1-arm64-arm-64bit-Mach-O Python 3.14.7 git version 2.54.0 (Apple Git-157); 30 commits 11af25c0ae06..e9414948e966 of django/django (each against its parent); material byte-identical on all 30"
+  }
+ },
+ "policy": {
+  "absolute_ms": 5.0,
+  "relative": 0.05,
+  "min_pairs": 100,
+  "resamples": 2000,
+  "seed": 7
+ },
+ "measurement_sha256": "da78d323f56fac98e5fed7581e3f73b85f8cd352ec5862db6753652f0e8c220e",
+ "policy_sha256": "3ff214b8ed91c29144fe1289ca42f356b9aecb5a9f422dda7a3217a8a6d4d4d9",
+ "assessor_sha256": "f87d09a2e94f553e8167e7fd77dab746dca32cd1a5f54cab9b51f0e205b91b44",
+ "metrics": {
+  "mean_delta_ms": {
+   "estimate": -911.5801691500001,
+   "interval": [
+    -1460.5287200745834,
+    -471.7054537113006
+   ]
+  },
+  "mean_relative": {
+   "estimate": -0.8287595700582036,
+   "interval": [
+    -0.8699080829596566,
+    -0.7448723825445397
+   ]
+  },
+  "p95_delta_ms": {
+   "estimate": -7573.218242,
+   "interval": [
+    -10104.02321495,
+    -1113.5468674140625
+   ]
+  },
+  "p95_relative": {
+   "estimate": -0.9407464878777263,
+   "interval": [
+    -0.9413591996923546,
+    -0.8137726314758994
+   ]
+  }
+ },
+ "baseline_ms": {
+  "p50": 281.5900415,
+  "p95": 8050.2221795000005,
+  "p99": 10915.85877679
+ },
+ "candidate_ms": {
+  "p50": 158.50968749999998,
+  "p95": 477.0039375,
+  "p99": 756.76316273
+ },
+ "failures": {
+  "baseline": 0,
+  "candidate": 0
+ },
+ "limits": "Self-reported paired measurements; simultaneous bootstrap bounds, one workload. Simulated backends do not establish live provider latency. No RRSI quality claim."
+}

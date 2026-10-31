@@ -1,4 +1,5 @@
 """Offline checks of improve.py: a fake case pool, fake reviewers, graders and proposer; no model calls."""
+import contextlib
 import json
 import re
 import sys
@@ -196,15 +197,16 @@ class ScreenTest(unittest.TestCase):
                 im.load_campaign(self.w.campaign)
 
     def test_an_invalid_plan_does_not_leave_a_screen_directory_behind(self):
-        real_mkdtemp, created = tempfile.mkdtemp, []
+        real, created = im.backends.private_tempdir, []
 
-        def track(*args, **kwargs):
-            path = real_mkdtemp(*args, **kwargs)
-            created.append(Path(path))
-            return path
+        @contextlib.contextmanager
+        def track(*args, **kwargs):  # the private temporary folder, on every platform
+            with real(*args, **kwargs) as path:
+                created.append(Path(path))
+                yield path
         plan, _ = im.plan_files(self.camp['incumbent'])
         plan['passes'][0]['id'] = 'invalid id'
-        with mock.patch.object(im.tempfile, 'mkdtemp', side_effect=track):
+        with mock.patch.object(im.backends, 'private_tempdir', track):
             self.assertIn('invalid', self.problems({'hypothesis': 'h', 'plan': plan}))
         self.assertTrue(created)
         self.assertFalse(any(p.exists() for p in created))

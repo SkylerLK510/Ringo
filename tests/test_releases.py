@@ -17,6 +17,7 @@ from unittest import mock
 import latency
 import pipelines
 import releases as rel
+from tests.support import NO_SYMLINKS, POSIX_MODES, SYMLINKS
 from tests.test_latency import data, POLICY
 
 
@@ -82,11 +83,14 @@ print('No defects found.')
         return ['review', '--input', str(material), '--backend', shlex.join([sys.executable, str(self.backend)]),
                 '--trace', str(trace), '--out', str(trace.parent / (trace.name + '.md'))]
 
-    def test_stage_is_reproducible_readonly_private_and_does_not_activate(self):
+    def test_stage_is_reproducible_readonly_and_does_not_activate(self):
         self.assertEqual(rel.stage(self.source, self.state), self.rid)
         self.assertFalse((self.state / 'active.json').exists())
+        self.assertEqual((self.bundle / 'ringo.py').stat().st_mode & 0o222, 0)  # Windows: the read-only attribute
+
+    @unittest.skipIf(os.name == 'nt', POSIX_MODES)
+    def test_release_state_is_private(self):
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
-        self.assertEqual((self.bundle / 'ringo.py').stat().st_mode & 0o222, 0)
 
     def test_source_prompt_changes_change_identity_and_actual_default_plan_hash(self):
         next_id = self.next_release()
@@ -99,6 +103,15 @@ print('No defects found.')
         with self.assertRaises(ValueError):
             rel.stage(self.source, self.state)
 
+    def test_a_bundle_staged_before_a_later_runtime_file_still_verifies(self):
+        older = tuple(name for name in rel.RUNTIME if name not in rel.LATER_RUNTIME)
+        with mock.patch.object(rel, 'RUNTIME', older):
+            rid = rel.stage(self.source, self.state)
+        _, manifest = rel.verify(self.state, rid)
+        self.assertNotIn('spec_runner.py', manifest['files'])
+        self.assertIn('spec_runner.py', self.manifest['files'])  # a new bundle carries it
+
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
     def test_symlink_source_and_bundle_are_refused(self):
         p = self.source / 'context.py'
         p.unlink()
@@ -107,6 +120,7 @@ print('No defects found.')
             rel.stage(self.source, self.state)
         q = self.bundle / 'context.py'
         self.bundle.chmod(0o755)
+        q.chmod(0o644)  # Windows refuses to delete a read-only file
         q.unlink()
         q.symlink_to(rel.HERE / 'context.py')
         with self.assertRaises(ValueError):
@@ -139,7 +153,8 @@ print('No defects found.')
 
     def test_verification_accepts_registered_nested_unicode_and_whitespace_names(self):
         self.bundle.chmod(0o755)
-        name = 'fixtures/nested folder/café\tvalue.txt'
+        # Windows file names cannot hold control characters such as a tab, so whitespace there is a space.
+        name = 'fixtures/nested folder/café' + (' ' if os.name == 'nt' else '\t') + 'value.txt'
         path = self.bundle / name
         path.parent.mkdir(parents=True)
         path.write_bytes(b'complete fixture content\n')
@@ -153,6 +168,7 @@ print('No defects found.')
     def test_missing_non_runtime_inventory_file_is_rejected(self):
         parent = self.bundle / 'prompts'
         parent.chmod(0o755)
+        (parent / 'work.md').chmod(0o644)  # Windows refuses to delete a read-only file
         (parent / 'work.md').unlink()
         with self.assertRaises(ValueError):
             rel.verify(self.state, self.rid)
@@ -170,6 +186,7 @@ print('No defects found.')
         (self.bundle / 'empty' / 'nested').mkdir(parents=True)
         self.assertEqual(rel.verify(self.state, self.rid)[1], self.manifest)
 
+    @unittest.skipUnless(SYMLINKS, NO_SYMLINKS)
     def test_directory_and_dangling_symlinks_are_rejected(self):
         self.bundle.chmod(0o755)
         for destination in (self.root, self.root / 'does-not-exist'):
@@ -341,7 +358,7 @@ print('No defects found.')
             self.assertFalse(t.is_alive())
         self.assertCountEqual(outcomes, ['activated', 'stale'])
 
-    def test_preview_work_uses_exactly_one_writer_and_six_judges(self):
+    def test_preview_work_uses_one_writer_and_the_first_three_judges_when_they_recommend(self):
         from tests.test_workflow import FAKE_BRIDGE
         bridge = self.root / 'bridge.py'
         bridge.write_text(FAKE_BRIDGE)
@@ -365,9 +382,9 @@ else:
                            '--out',str(self.root/'work-run')])
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         report = json.loads((self.root/'work-run/report.json').read_text())
-        self.assertEqual(report['usage']['calls'], 7)
+        self.assertEqual(report['usage']['calls'], 4)
         self.assertEqual(report['implementation']['id'], self.rid)
-        self.assertEqual(len(Path(str(self.backend)+'.calls').read_text().splitlines()), 7)
+        self.assertEqual(len(Path(str(self.backend)+'.calls').read_text().splitlines()), 4)
 
     def test_quality_requires_test_pass_and_matching_candidate(self):
         import evaluate
@@ -470,6 +487,64 @@ else:
             with self.assertRaisesRegex(ValueError, 'bytecode differs'):
                 self.activate()
             self.assertFalse((self.state / 'active.json').exists())
+
+    def native_fixture(self, **changes):
+        """A stand-in `ringo` binary (a script that records how it was started) and a passing gate report for it."""
+        binary = self.root / 'ringo-native'
+        binary.write_text('#!/bin/sh\nprintf "%s\\n" "$RINGO_PINNED" "$0" "$@" > "$(dirname "$0")/../../../native-ran"\n')
+        binary.chmod(0o755)
+        report = {'version': 1, 'binary_sha256': rel.file_hash(binary),
+                  'reference_sha256': latency.sha(rel.inventory(self.source)),
+                  'tasks': ['review-fixture'], 'mismatches': [], **changes}
+        gate = self.root / 'gate.json'
+        gate.write_text(json.dumps(report))
+        return binary, gate
+
+    @unittest.skipIf(os.name == 'nt', 'the native runtime runs on macOS and Linux')
+    def test_a_native_release_binds_the_binary_and_its_gate_report(self):
+        binary, gate = self.native_fixture()
+        rid = rel.stage(self.source, self.state, native=binary, gate=gate)
+        bundle, manifest = rel.verify(self.state, rid)
+        self.assertNotEqual(rid, self.rid)
+        self.assertEqual(manifest['native'], rel.NATIVE)
+        self.assertEqual(manifest['files']['bin/ringo'], rel.file_hash(binary))
+        self.assertTrue(os.access(bundle / 'bin/ringo', os.X_OK))
+        self.assertEqual(rel.stage(self.source, self.state, native=binary, gate=gate), rid)
+        os.chmod(bundle / 'bin', 0o755)
+        os.chmod(bundle / 'bin/ringo', 0o755)
+        (bundle / 'bin/ringo').write_text('#!/bin/sh\necho swapped\n')
+        with self.assertRaisesRegex(ValueError, 'integrity'):
+            rel.verify(self.state, rid)
+
+    @unittest.skipIf(os.name == 'nt', 'the native runtime runs on macOS and Linux')
+    def test_a_native_release_is_refused_without_a_matching_passing_gate(self):
+        binary, gate = self.native_fixture()
+        for kw in ({'native': binary}, {'gate': gate}):
+            with self.subTest(kw=kw), self.assertRaisesRegex(ValueError, 'gate report'):
+                rel.stage(self.source, self.state, **kw)
+        for changes, message in (({'binary_sha256': '0' * 64}, 'this binary'),
+                                 ({'reference_sha256': '0' * 64}, 'another Python runtime'),
+                                 ({'mismatches': ['review-fixture: message bytes differ']}, 'no mismatch'),
+                                 ({'tasks': []}, 'no mismatch')):
+            binary, gate = self.native_fixture(**changes)
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                rel.stage(self.source, self.state, native=binary, gate=gate)
+
+    @unittest.skipIf(os.name == 'nt', 'the native runtime runs on macOS and Linux')
+    def test_a_native_release_runs_its_bundled_binary_for_pipelines_only(self):
+        binary, gate = self.native_fixture()
+        rid = rel.stage(self.source, self.state, native=binary, gate=gate)
+        proc = self.cli(['release', 'preview', '--release', rid, '--', 'review', '--input', 'x'])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        pinned, program, *args = (self.state / 'native-ran').read_text().splitlines()
+        self.assertEqual(json.loads(pinned)['id'], rid)
+        self.assertEqual(json.loads(pinned)['runtime'], 'native')
+        self.assertEqual(Path(program), self.state / 'bundles' / rid / 'bin/ringo')
+        self.assertEqual(args, ['review', '--input', 'x'])
+        (self.state / 'native-ran').unlink()
+        proc = self.cli(['release', 'preview', '--release', rid, '--', '--help'])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse((self.state / 'native-ran').exists())
 
     def test_preview_runs_bundled_modules_without_approval_and_one_backend_call(self):
         trace = self.root / 'trace'

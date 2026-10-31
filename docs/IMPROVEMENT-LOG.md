@@ -16,6 +16,9 @@ repository.
 |---|---|---|---|
 | 2026-10-26 | Shorter launch for one-call plans | [#7](https://github.com/SkylerLK510/Ringo/pull/7) | mean −2.64 to −3.00 ms on 5 workloads |
 | 2026-10-26 | Lean Codex calls | [#8](https://github.com/SkylerLK510/Ringo/pull/8) | writer input 12,617 → 2,479 (−80.4%); judge input 16,104 → 5,969 (−62.9%) |
+| 2026-10-26 | Calls end when the backend exits | [#9](https://github.com/SkylerLK510/Ringo/pull/9) | mean −2.78 to −37.60 ms on 7 workloads |
+| 2026-10-26 | Faster review context on large repositories | [#10](https://github.com/SkylerLK510/Ringo/pull/10) | mean −911.58 ms on 1 workload |
+| 2026-10-26 | Reply scanning that cannot be stalled | [#11](https://github.com/SkylerLK510/Ringo/pull/11) | mean −1.07 to −218.69 ms on 2 workloads |
 | 2026-10-25 | Faster release verification | [#2](https://github.com/SkylerLK510/Ringo/pull/2), [#4](https://github.com/SkylerLK510/Ringo/pull/4) | mean −0.46 to −2.42 ms on 2 workloads |
 
 ## 2026-10-26 · Shorter launch for one-call plans
@@ -47,6 +50,45 @@ Input tokens include cached input. Output varies between samples and is not clai
 Repeat check: the same judge input sent again reported 16,104 input tokens, the same as the first call.
 
 Evidence: [`2026-10-26-lean-codex/calls.json`](improvements/2026-10-26-lean-codex/calls.json) (sha256 `5174724dc49f`).
+
+## 2026-10-26 · Calls end when the backend exits
+
+Ringo used to notice that a backend process had exited only at Popen's next poll, whose sleeps grow to fifty milliseconds. A blocking wait in a helper thread now wakes the call at once, within the new soft time limits. Fresh-process commands with simulated backends against the release active at the time, equal private fixture approvals, no provider calls. Local machine overhead, not live-provider latency.
+
+| Workload | Pairs | Before p50 ms | After p50 ms | Mean change ms (simultaneous interval) |
+|---|---:|---:|---:|---|
+| review | 100 | 62.96 | 59.81 | −3.20 [−3.50, −2.88] |
+| review-trace | 100 | 64.62 | 61.43 | −2.99 [−3.37, −2.55] |
+| review-large | 100 | 65.26 | 62.47 | −2.78 [−3.50, −1.96] |
+| design | 100 | 63.23 | 60.18 | −2.97 [−3.46, −2.57] |
+| work | 100 | 275.30 | 249.03 | −37.60 [−45.33, −31.18] |
+| review-delay | 100 | 123.63 | 120.21 | −10.22 [−14.59, −6.32] |
+| review-override | 100 | 63.23 | 60.35 | −3.06 [−4.02, −2.32] |
+
+Measured in the same run but not claimed (interval includes no change, or the arm failed by design): startup +0.08 [−0.09, +0.30] ms; review-failure −10.04 [−13.09, −7.28] ms.
+
+Evidence: [`2026-10-26-event-wait/suite.json`](improvements/2026-10-26-event-wait/suite.json) (sha256 `5ec6a7cab921`).
+
+## 2026-10-26 · Faster review context on large repositories
+
+Building the review material for a change ran one git process per file read and per changed file, and its reference search made git scan every line once per changed symbol. It now reads every object through one cat-file process, takes the changed lines from one diff, and searches with one compiled alternation. The material is byte-identical to before on every measured commit. Real git on a public repository, each commit built against its parent; no provider calls.
+
+| Workload | Pairs | Before p50 ms | After p50 ms | Mean change ms (simultaneous interval) |
+|---|---:|---:|---:|---|
+| django-recent-commits | 120 | 281.59 | 158.51 | −911.58 [−1460.53, −471.71] |
+
+Evidence: [`2026-10-26-context-git/django-context.json`](improvements/2026-10-26-context-git/django-context.json) (sha256 `0fbf96447d5a`).
+
+## 2026-10-26 · Reply scanning that cannot be stalled
+
+Finding the JSON answer in a model's reply tried a parse at every brace. Each failed attempt built an error message that counts lines from the start of the reply, and an unterminated nested reply made every attempt run to the end, so hostile or garbled replies cost time quadratic in their length, and very deep nesting crashed the run. Braces that cannot start an object under the JSON grammar are now skipped without parsing, deep nesting is a failed attempt, and failed attempts are bounded in total. Both arms find the same objects. In process, no provider calls.
+
+| Workload | Pairs | Before p50 ms | After p50 ms | Mean change ms (simultaneous interval) |
+|---|---:|---:|---:|---|
+| hostile-nesting-20KB | 100 | 226.88 | 8.26 | −218.69 [−219.27, −218.20] |
+| typical-reply-20KB | 100 | 2.22 | 1.14 | −1.07 [−1.08, −1.07] |
+
+Evidence: [`2026-10-26-json-scan/scan-suite.json`](improvements/2026-10-26-json-scan/scan-suite.json) (sha256 `d66bb9f80073`).
 
 ## 2026-10-25 · Faster release verification
 

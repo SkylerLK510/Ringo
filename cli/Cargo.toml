@@ -1,0 +1,25 @@
+[package]
+name = "ringo-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+fancy-regex = { version = "0.11.0", default-features = false, features = ["perf"] }
+indexmap = "2.14.2"
+libc = "0.2.191"
+ratatui = "0.30.2"
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-gencat", "unicode-perl"] }
+serde_json = { version = "1.0.154", features = ["preserve_order", "arbitrary_precision"] }
+sha2 = "0.10.9"
+
+[lib]
+name = "ringo_cli"
+
+[[bin]]
+name = "ringo"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

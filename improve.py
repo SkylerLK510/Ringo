@@ -193,9 +193,9 @@ def candidate_parts(incumbent, proposal):
 
 def candidate_key(incumbent, proposal):
     _, _, plan, texts = candidate_parts(incumbent, proposal)
-    with tempfile.TemporaryDirectory(prefix='ringo-screen-') as d:
+    with backends.private_tempdir(prefix='ringo-screen-') as d:
         for n, t in texts.items():
-            (Path(d) / n).write_text(t)
+            (Path(d) / n).write_text(t, encoding='utf-8')
         normalized, used = bare(pipelines.validate(json.loads(json.dumps(plan)), d))
     return evaluate.sha(json.dumps([normalized, used], sort_keys=True))
 
@@ -210,7 +210,7 @@ def screen(store, proposal, incumbent, dev_ids, camp):
         plan, texts, raw, new_texts = candidate_parts(incumbent, proposal)
         if raw.get('kind') != 'review':
             return ['the improver may only propose a review plan']
-        with tempfile.TemporaryDirectory(prefix='ringo-screen-') as d:
+        with backends.private_tempdir(prefix='ringo-screen-') as d:
             for n, t in new_texts.items():
                 (Path(d) / n).write_text(t, encoding='utf-8')
             new_plan, normalized = bare(pipelines.validate(json.loads(json.dumps(raw)), d))
@@ -354,7 +354,8 @@ def campaign(store, campaign_path, ws, call_fn=harness.call):
         ids = evaluate.split_cases(store, part, selection)
         if len({pool[c]['group'] for c in ids}) < camp['min_groups']:
             raise ValueError(f'{part} needs at least {camp["min_groups"]} repository groups before a campaign can spend')
-    ws.mkdir(parents=True, exist_ok=True)
+    # The campaign workspace is caller-selected and may have a shared parent.
+    backends.private_directory(ws, create=True, parents=True, exist_ok=True)
     with evaluate.exclusive(ws / '.campaign.lock', 'campaign'):
         with evaluate.locked(store):
             if any(r['kind'] in ('campaign_start', 'campaign') and r['name'] == camp['name']

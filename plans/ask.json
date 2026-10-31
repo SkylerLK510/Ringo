@@ -1,0 +1,2 @@
+{"version": 1, "kind": "design", "role": "You answer the owner's questions. Reply in plain text.", "prompts_dir": "../prompts",
+ "passes": [{"id": "answer", "prompt": "ask.md", "reply": "proposal"}]}
