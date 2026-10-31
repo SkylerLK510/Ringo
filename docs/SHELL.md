@@ -131,7 +131,7 @@ it: `/usrman` (or `/instructions`, `/help`) prints it into the conversation.
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
 | `/route on` | route suggestions: a line that reads like a research, design, review or edit task, or a question about this folder's files, is not sent; the matching command (`/research ...`, `/design ...`, `/review ...`, `@claude! ...`, or `@claude ...` for a read-only look at the files; see "Who takes which turn") appears in the input line with what it costs, for you to send with Enter, change, or ask as a plain question with Esc. Word rules only, no model call; an agent turn is only ever suggested. On 100 held-out lines the suggestions were acceptable 35 times in 38 and covered about half of the tasks; the rest are asked as plain questions. `/route off` turns it off |
-| `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's whole log, stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
+| `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's log (its last 2,000 lines; the whole stream is in its folder), stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
 (`@agent!`, in a worktree) and `/review BASE` reviews its commits; in any other folder, a repository that holds your
@@ -141,8 +141,8 @@ Ringo's private state stays out of every repository; its folder carries a `.giti
 Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 17,000 tokens before it
 starts, and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends; Ctrl-J,
 Alt-Enter or `\` then Enter starts a new line. A paste goes into the input box with its lines kept, and nothing is
-sent until you press Enter (in a terminal without bracketed paste, keys that arrive in one burst are treated the same
-way). Up and Down move between the lines of a message, then through earlier messages; Shift-Tab changes the mode,
+sent until you press Enter (in a terminal without bracketed paste, keys that arrive together, as a paste's do, are kept the
+same way, its last newline too). Up and Down move between the lines of a message, then through earlier messages; Shift-Tab changes the mode,
 Esc clears the input, and Ctrl-C twice quits, stopping running jobs.
 
 The live area shows each running job's time, tokens, Ringo model calls and what it is doing now, with one row per

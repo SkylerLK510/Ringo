@@ -281,8 +281,9 @@ pub struct Job {
     pub calls: u32,
     pub subs: Vec<Sub>,
     pub log: VecDeque<String>,
-    /// Lines ever added to `log` (it keeps the last LOG_LINES), so the shell can print each new one once.
-    pub logged: usize,
+    /// Lines added to `log` that the shell has not printed yet; it takes them as it prints them (`log` keeps only
+    /// the last LOG_LINES, and a long reply arrives at once).
+    pub fresh: Vec<String>,
     pub dir: PathBuf,
     pub worktree: Option<PathBuf>,
     pub base: Option<String>,
@@ -313,7 +314,7 @@ impl Job {
                 self.log.pop_front();
             }
             self.log.push_back(l.to_string());
-            self.logged += 1;
+            self.fresh.push(l.to_string());
         }
     }
 }
@@ -559,7 +560,7 @@ impl Session {
         private_dir(&dir)?;
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), calls: 0,
-                             subs: Vec::new(), log: VecDeque::new(), logged: 0, dir, worktree: None, base: None, applied: false,
+                             subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false,
                              touched: BTreeSet::new(), asks: VecDeque::new(), input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)) });
         Ok(id)

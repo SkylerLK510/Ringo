@@ -83,7 +83,7 @@ your code and for changes:
   /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono
                        (now: {theme})
 
-Jobs: /show N (its whole log)  /diff N  /apply N  /drop N (remove its
+Jobs: /show N (its log)  /diff N  /apply N  /drop N (remove its
 worktree)  /kill N  /quit
 
 Keys: Enter sends; Ctrl-J, Alt-Enter or \\ then Enter starts a new line (a paste
@@ -394,8 +394,10 @@ struct App {
     out: Vec<Line<'static>>,
     recent: VecDeque<Line<'static>>,
     width: u16,
-    /// Per job (at its id - 1): how many of its log lines are printed, and whether its end is.
-    seen: Vec<(usize, bool)>,
+    /// Per job (at its id - 1): whether the line it ended with is printed.
+    ended: Vec<bool>,
+    /// When the last key arrived: an Enter right behind another key is part of a paste (see BURST).
+    last_key: Instant,
     /// The job whose line was printed last (0: none, or the shell's own), so a run of one job's lines is named once.
     last: usize,
     quit_armed: bool,
@@ -436,6 +438,9 @@ impl Live {
 /// The running mark: a braille spinner, one frame per SPIN_MS while anything runs (the only redraws then).
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPIN_MS: u128 = 120;
+/// An Enter this soon after the key before it came with it, as a paste's keys do in a terminal without bracketed
+/// paste (a person's keystrokes are tens of milliseconds apart): it starts a new line instead of sending.
+const BURST: Duration = Duration::from_millis(15);
 /// How long after a permission request appears its answer keys are ignored.
 const ANSWER_GRACE: Duration = Duration::from_millis(300);
 
@@ -482,29 +487,28 @@ impl App {
     /// line when a job ends.
     fn feed(&mut self) {
         for i in 0..self.s.jobs.len() {
-            if self.seen.len() == i {
-                self.seen.push((0, false));
+            if self.ended.len() == i {
+                self.ended.push(false);
             }
+            let fresh = std::mem::take(&mut self.s.jobs[i].fresh);
             let job = &self.s.jobs[i];
-            let (printed, ended_before) = self.seen[i];
-            let new = job.logged - printed;
             let mut lines = Vec::new();
-            if new > 0 {
+            if !fresh.is_empty() {
                 if self.last != job.id {
                     let (who, style) = self.who(job);
                     lines.push(Line::from(vec![Span::styled(format!("#{} ", job.id), self.theme.dim), Span::styled(who, style)]));
                 }
-                for line in job.log.iter().skip(job.log.len().saturating_sub(new)) {
+                for line in &fresh {
                     lines.extend(clean(line).lines().map(|l| Line::raw(format!("  {l}"))));
                 }
             }
-            let ends = !job.running() && !ended_before;
+            let ends = !job.running() && !self.ended[i];
             if ends {
                 lines.extend(self.job_end(job));
             }
-            let (id, logged) = (job.id, job.logged);
-            self.seen[i] = (logged, ended_before || ends);
-            if new > 0 {
+            let id = job.id;
+            self.ended[i] |= ends;
+            if !fresh.is_empty() {
                 self.last = id;
             }
             if ends {
@@ -705,7 +709,8 @@ impl App {
                 let job = self.s.job(id)?;
                 let (who, _) = self.who(job);
                 let log: Vec<String> = job.log.iter().map(|l| format!("  {l}")).collect();
-                Some(format!("#{id} {who} · {} (its whole stream: {})\n{}", job.title_full, job.dir.display(), log.join("\n")))
+                Some(format!("#{id} {who} · {}: its last {} log lines (the whole stream is in {})\n{}", job.title_full,
+                             log.len(), job.dir.display(), log.join("\n")))
             }
             Cmd::Kill(id) => {
                 self.s.kill(id)?;
@@ -784,6 +789,8 @@ impl App {
     fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let burst = self.last_key.elapsed() < BURST;
+        self.last_key = Instant::now();
         if !(ctrl && matches!(k.code, KeyCode::Char('c' | 'd'))) {
             self.quit_armed = false;
         }
@@ -832,9 +839,9 @@ impl App {
             KeyCode::Char(c) if !ctrl => self.insert(c.encode_utf8(&mut [0; 4])),
             KeyCode::Enter if alt => self.insert("\n"),
             KeyCode::Enter if self.cursor > 0 && self.input[self.cursor - 1] == '\\' => self.input[self.cursor - 1] = '\n',
-            // More keys already queued behind this Enter: a paste in a terminal without bracketed paste. Its lines stay
-            // in the input instead of each being sent (and each costing a model call).
-            KeyCode::Enter if event::poll(Duration::ZERO).unwrap_or(false) => self.insert("\n"),
+            // An Enter right behind another key, or with more keys queued behind it: a paste in a terminal without
+            // bracketed paste. Its lines stay in the input, its last one too, instead of being sent (each a model call).
+            KeyCode::Enter if burst || event::poll(Duration::ZERO).unwrap_or(false) => self.insert("\n"),
             KeyCode::Enter => self.submit(),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -1014,7 +1021,7 @@ pub fn run() -> ExitCode {
     let name = session.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let label = match branch { Some(b) => format!("{name} ({b})"), None => name };
     let mut app = App { s: session, input: Vec::new(), cursor: 0, history: Vec::new(), hist: 0, out: Vec::new(),
-                        recent: VecDeque::new(), width: 0, seen: Vec::new(), last: 0, quit_armed: false, quit: false, setup: false, label, agents,
+                        recent: VecDeque::new(), width: 0, ended: Vec::new(), last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents,
                         theme: Theme::load(), started: Instant::now(),
                         route: crate::theme::setting("route").and_then(|v| v.as_bool()).unwrap_or(false),
                         suggested: None, asked: None, pending: None, update: false };
