@@ -89,6 +89,9 @@ pub struct Parser {
     subagents: Vec<String>,
 }
 
+/// What a missing field reads as: borrowed, so no event payload is copied just to be read.
+static NULL: Value = Value::Null;
+
 fn u(v: &Value, key: &str) -> u64 {
     v.get(key).and_then(Value::as_u64).unwrap_or(0)
 }
@@ -155,21 +158,21 @@ impl Parser {
 
     fn codex(&mut self, e: &Value) -> Vec<Note> {
         let kind = s(e, "type");
-        let item = e.get("item").cloned().unwrap_or(Value::Null);
-        let item_type = s(&item, "type");
+        let item = e.get("item").unwrap_or(&NULL);
+        let item_type = s(item, "type");
         let done = kind == "item.completed";
         let mut notes = Vec::new();
         match kind {
             "thread.started" => notes.push(Note::Session(s(e, "thread_id").to_string())),
             "turn.completed" => {
                 self.completed += 1;
-                let usage = e.get("usage").cloned().unwrap_or(Value::Null);
-                let cached = u(&usage, "cached_input_tokens").min(u(&usage, "input_tokens"));
+                let usage = e.get("usage").unwrap_or(&NULL);
+                let cached = u(usage, "cached_input_tokens").min(u(usage, "input_tokens"));
                 notes.push(Note::Tokens(Tokens {
-                    input: u(&usage, "input_tokens") - cached,
+                    input: u(usage, "input_tokens") - cached,
                     cache_read: cached,
-                    cache_write: u(&usage, "cache_write_input_tokens"),
-                    output: u(&usage, "output_tokens"),
+                    cache_write: u(usage, "cache_write_input_tokens"),
+                    output: u(usage, "output_tokens"),
                 }));
             }
             "turn.failed" | "error" => {
@@ -182,12 +185,12 @@ impl Parser {
         let activity = |text: String| Note::Activity { node: None, text };
         match item_type {
             "agent_message" if done => {
-                self.reply = s(&item, "text").to_string();
+                self.reply = s(item, "text").to_string();
                 notes.push(Note::Log(self.reply.clone()));
             }
             "reasoning" => notes.push(activity("thinking".into())),
             "command_execution" if !done => {
-                let command = s(&item, "command");
+                let command = s(item, "command");
                 notes.push(activity(format!("$ {}", short(command, 80))));
                 notes.push(Note::Log(format!("$ {command}")));
             }
@@ -201,15 +204,15 @@ impl Parser {
                     notes.push(Note::Touched(s(c, "path").to_string()));
                 }
             }
-            "mcp_tool_call" if !done => notes.push(activity(format!("tool {}.{}", s(&item, "server"), s(&item, "tool")))),
-            "web_search" if !done => notes.push(activity(format!("search {}", short(s(&item, "query"), 60)))),
+            "mcp_tool_call" if !done => notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool")))),
+            "web_search" if !done => notes.push(activity(format!("search {}", short(s(item, "query"), 60)))),
             "todo_list" => {
                 let items = item.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
                 let finished = items.iter().filter(|i| i.get("completed") == Some(&Value::Bool(true))).count();
                 notes.push(activity(format!("plan {finished}/{} done", items.len())));
             }
-            "collab_tool_call" => notes.extend(self.codex_subagents(&item)),
-            "error" if done => notes.push(Note::Log(format!("warning: {}", short(s(&item, "message"), 200)))),
+            "collab_tool_call" => notes.extend(self.codex_subagents(item)),
+            "error" if done => notes.push(Note::Log(format!("warning: {}", short(s(item, "message"), 200)))),
             _ => {}
         }
         notes
@@ -280,15 +283,15 @@ impl Parser {
                 }
             }
             ("control_request", _) => {
-                let (id, r) = (s(e, "request_id").to_string(), e.get("request").cloned().unwrap_or(Value::Null));
-                if s(&r, "subtype") != "can_use_tool" {
+                let (id, r) = (s(e, "request_id").to_string(), e.get("request").unwrap_or(&NULL));
+                if s(r, "subtype") != "can_use_tool" {
                     return vec![Note::Unserved(id)];
                 }
-                let (tool, input) = (s(&r, "tool_name").to_string(), r.get("input").cloned().unwrap_or(Value::Null));
+                let (tool, input) = (s(r, "tool_name").to_string(), r.get("input").unwrap_or(&NULL));
                 let target = ["command", "file_path", "url", "path", "pattern", "query"].iter()
-                    .map(|k| s(&input, k)).find(|v| !v.is_empty());
+                    .map(|k| s(input, k)).find(|v| !v.is_empty());
                 // The whole action, every line of it: a prompt must not hide the part after a first newline.
-                let name = match s(&r, "display_name") { "" => tool.as_str(), shown => shown };
+                let name = match s(r, "display_name") { "" => tool.as_str(), shown => shown };
                 let what = match target {
                     Some(t) => format!("{name} {t}"),
                     None => format!("{name} {input}"),
@@ -300,9 +303,9 @@ impl Parser {
                     .map(|x| match s(&x, "ruleContent") { "" => s(&x, "toolName").to_string(),
                                                           content => format!("{}({content})", s(&x, "toolName")) })
                     .filter(|r| !r.is_empty())
-                    .unwrap_or_else(|| match s(&input, "command") { "" => tool.clone(), c => format!("{tool}({c})") });
+                    .unwrap_or_else(|| match s(input, "command") { "" => tool.clone(), c => format!("{tool}({c})") });
                 notes.push(Note::Activity { node: None, text: format!("waiting for you: {}", short(&what, 60)) });
-                notes.push(Note::Permission(Permission { id, tool, input, what, rule }));
+                notes.push(Note::Permission(Permission { id, tool, input: input.clone(), what, rule }));
             }
             _ => {}
         }
@@ -310,20 +313,20 @@ impl Parser {
     }
 
     fn claude_tool(&mut self, block: &Value, parent: &Option<String>) -> Vec<Note> {
-        let (name, input) = (s(block, "name"), block.get("input").cloned().unwrap_or(Value::Null));
+        let (name, input) = (s(block, "name"), block.get("input").unwrap_or(&NULL));
         if name == "Task" || name == "Agent" {
             let id = s(block, "id").to_string();
             self.subagents.push(id.clone());
-            let label = format!("{}: {}", s(&input, "subagent_type"), short(s(&input, "description"), 40));
+            let label = format!("{}: {}", s(input, "subagent_type"), short(s(input, "description"), 40));
             return vec![Note::Subagent { id, label }];
         }
         let target = ["command", "file_path", "pattern", "path", "url", "query"].iter()
-            .map(|k| s(&input, k)).find(|v| !v.is_empty()).unwrap_or("");
+            .map(|k| s(input, k)).find(|v| !v.is_empty()).unwrap_or("");
         let target = if input.get("file_path").is_some() { base_name(target) } else { target };
         let text = format!("{name} {}", short(target, 70));
         let mut notes = vec![Note::Activity { node: parent.clone(), text: text.clone() }];
         if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
-            notes.push(Note::Touched(s(&input, "file_path").to_string()));
+            notes.push(Note::Touched(s(input, "file_path").to_string()));
         }
         if parent.is_none() {
             notes.push(Note::Log(text));
@@ -338,12 +341,12 @@ impl Parser {
         match s(e, "event") {
             "init" => notes.push(Note::Session(s(e, "conversation_id").to_string())),
             "step_update" => {
-                let step = e.get("step_update").cloned().unwrap_or(Value::Null);
-                let (state, tool) = (s(&step, "state"), s(&step, "tool_name"));
-                let params = step.pointer("/tool_info/parameters").cloned().unwrap_or(Value::Null);
+                let step = e.get("step_update").unwrap_or(&NULL);
+                let (state, tool) = (s(step, "state"), s(step, "tool_name"));
+                let params = step.pointer("/tool_info/parameters").unwrap_or(&NULL);
                 let target = ["Path", "TargetFile", "AbsolutePath", "CommandLine", "Query", "Url"].iter()
-                    .map(|k| s(&params, k)).find(|v| !v.is_empty()).unwrap_or("");
-                match (s(&step, "step_type"), state) {
+                    .map(|k| s(params, k)).find(|v| !v.is_empty()).unwrap_or("");
+                match (s(step, "step_type"), state) {
                     ("tool", "ACTIVE") => {
                         let shown = if params.get("CommandLine").is_some() { target } else { base_name(target) };
                         let text = format!("{tool} {}", short(shown, 70));
@@ -364,18 +367,18 @@ impl Parser {
             }
             "result" => {
                 self.completed += 1;
-                let r = e.get("result").cloned().unwrap_or(Value::Null);
-                let usage = r.get("usage").cloned().unwrap_or(Value::Null);
+                let r = e.get("result").unwrap_or(&NULL);
+                let usage = r.get("usage").unwrap_or(&NULL);
                 // Thinking is part of output_tokens (input + output = total_tokens); cache reads are taken to be part
                 // of input_tokens, as Gemini counts them.
-                let cached = u(&usage, "cache_read_tokens").min(u(&usage, "input_tokens"));
-                notes.push(Note::Tokens(Tokens { input: u(&usage, "input_tokens") - cached, cache_read: cached,
-                                                 cache_write: 0, output: u(&usage, "output_tokens") }));
-                self.reply = s(&r, "response").to_string();
+                let cached = u(usage, "cache_read_tokens").min(u(usage, "input_tokens"));
+                notes.push(Note::Tokens(Tokens { input: u(usage, "input_tokens") - cached, cache_read: cached,
+                                                 cache_write: 0, output: u(usage, "output_tokens") }));
+                self.reply = s(r, "response").to_string();
                 let denied: Vec<&str> = r.get("denied_actions").and_then(Value::as_array).into_iter().flatten()
                     .map(|d| s(d, "action")).collect();
-                if s(&r, "status") != "SUCCESS" {
-                    let why = format!("agy ended with {}: {}", s(&r, "status"), short(&self.reply.clone(), 200));
+                if s(r, "status") != "SUCCESS" {
+                    let why = format!("agy ended with {}: {}", s(r, "status"), short(&self.reply.clone(), 200));
                     notes.extend(self.fail(why));
                 } else if self.reply.trim().is_empty() && !denied.is_empty() {
                     notes.extend(self.fail(format!("agy stopped: it needed permission for {}", denied.join(", "))));
@@ -393,9 +396,9 @@ impl Parser {
         match s(e, "status") {
             "started" | "reserved" => vec![Note::Activity { node: None, text: format!("{step}: calling {}", s(e, "backend")) }],
             status @ ("ok" | "malformed" | "error") => {
-                let usage = e.get("usage").cloned().unwrap_or(Value::Null);
-                let tokens = Tokens { input: u(&usage, "input"), cache_write: u(&usage, "cache_write"),
-                                      cache_read: u(&usage, "cache_read"), output: u(&usage, "output") };
+                let usage = e.get("usage").unwrap_or(&NULL);
+                let tokens = Tokens { input: u(usage, "input"), cache_write: u(usage, "cache_write"),
+                                      cache_read: u(usage, "cache_read"), output: u(usage, "output") };
                 vec![Note::Call, Note::Tokens(tokens), Note::Log(format!("{step}: {status}, {} tokens", tokens.total()))]
             }
             _ => Vec::new(),
@@ -426,9 +429,9 @@ fn claude_tokens(e: &Value) -> Tokens {
         }
         return t;
     }
-    let usage = e.get("usage").cloned().unwrap_or(Value::Null);
-    Tokens { input: u(&usage, "input_tokens"), cache_write: u(&usage, "cache_creation_input_tokens"),
-             cache_read: u(&usage, "cache_read_input_tokens"), output: u(&usage, "output_tokens") }
+    let usage = e.get("usage").unwrap_or(&NULL);
+    Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
+             cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") }
 }
 
 #[cfg(test)]

@@ -201,6 +201,11 @@ pub const ALWAYS_ASK: [&str; 16] = [
     "Write(~/.gemini/**)",
 ];
 
+/// Claude Code tools that act outside the agent's turn, denied in every Claude turn Ringo starts.
+pub const OUT_OF_TURN_TOOLS: [&str; 13] = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger",
+    "PushNotification", "SendToProject", "SendToProjectContext", "EnterWorktree", "ExitWorktree", "DesignSync",
+    "ReportFindings", "Workflow"];
+
 /// Words that name a service reached through the owner's connectors (MCP servers). A Claude turn whose task names
 /// one runs with the owner's connectors loaded; any other runs without them (16.6k tokens a trivial turn instead of
 /// 27.5k, measured with Claude Code 2.1.316).
@@ -615,7 +620,18 @@ impl Session {
                     cmd.args(["-s", sandbox, "-C"]).arg(&cwd);
                 }
                 cmd.args(["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"",
-                          "-c", "model_provider=\"openai\"", "-"]);
+                          "-c", "model_provider=\"openai\""]);
+                // Codex cannot stop to ask here, so the ask tool and its mode instructions go, and analytics (its
+                // upload delays the exit by about 0.33 s). Plugins and apps (documents, browser and computer-use
+                // skills, a computer-use tool that acts outside the sandbox) load only for a task that names a
+                // connector, as Claude's do. A trivial read turn: 17,133 tokens a call before, 14,350 after
+                // (codex-cli 0.165.0). The same settings work after `exec resume`.
+                cmd.args(["-c", "features.default_mode_request_user_input=false", "-c",
+                          "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false"]);
+                if !names_connector(prompt) {
+                    cmd.args(["-c", "features.plugins=false", "-c", "features.apps=false"]);
+                }
+                cmd.arg("-");
                 Style::Codex
             }
             Adapter::Claude => {
@@ -645,19 +661,20 @@ impl Session {
                 };
                 // Read turns run in the owner's own tree with no sandbox, so they never edit and never run commands (a
                 // command could write files); deny rules win in every mode. Commands run in write turns' worktrees.
-                // With a permission host, Claude Code also offers AskUserQuestion, EnterPlanMode and ExitPlanMode,
-                // which Ringo does not serve: they cost 1,566 tokens a trivial turn (18,113 against 16,547, Claude
-                // Code 2.1.316), and denying them puts every mode back at the old floor.
+                // Tools that act outside the turn go in every mode: scheduling, notifications, remote triggers, other
+                // projects, entering a worktree of the owner's repository, design sync, review reports and
+                // multi-agent workflows. With a permission host Claude Code also offers AskUserQuestion,
+                // EnterPlanMode and ExitPlanMode, which Ringo does not serve. A trivial turn (Claude Code 2.1.316):
+                // read 16,547 tokens before, 11,984 after; write 17,133 before, 12,570 after.
                 let mut deny: Vec<&str> = Vec::new();
                 if !write {
                     deny.extend(["Bash", "Edit", "Write", "NotebookEdit"]);
                 }
+                deny.extend(OUT_OF_TURN_TOOLS);
                 if self.mode != Mode::Read {
                     deny.extend(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
                 }
-                if !deny.is_empty() {
-                    cmd.arg("--disallowed-tools").args(deny);
-                }
+                cmd.arg("--disallowed-tools").args(deny);
                 if self.mode != Mode::Read {
                     cmd.arg("--settings").arg(serde_json::json!({"permissions": {"ask": self.always_ask}}).to_string());
                     if !self.allowed.is_empty() {
@@ -797,7 +814,7 @@ impl Session {
         const ROOM: usize = 12_000; // characters of them at most, the newest kept first
         let mut earlier: Vec<String> = Vec::new();
         let mut used = 0;
-        for job in self.jobs.iter().rev().filter(|j| j.kind == (Kind::Ringo { command: "ask".into() }) && j.status == Status::Done
+        for job in self.jobs.iter().rev().filter(|j| matches!(&j.kind, Kind::Ringo { command } if command == "ask") && j.status == Status::Done
                                                      && !j.reply().trim_start().starts_with("ROUTE:")) {
             let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, job.reply().trim());
             if earlier.len() == KEEP || used + text.len() > ROOM {
@@ -886,7 +903,9 @@ impl Session {
         let stdout = child.stdout.take();
         thread::spawn(move || {
             let mut parser = Parser::new(style);
-            let mut events = fs::OpenOptions::new().create(true).append(true).open(dir.join("events.jsonl")).ok();
+            // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
+            let mut events = (style != Style::Trace).then(|| fs::OpenOptions::new().create(true).append(true)
+                .open(dir.join("events.jsonl")).ok()).flatten();
             let mut handle = |line: &str, parser: &mut Parser| {
                 if let Some(f) = events.as_mut() {
                     let _ = writeln!(f, "{line}");
@@ -982,10 +1001,12 @@ impl Session {
             match event {
                 Event::Ended(id, status) => {
                     let job = &mut self.jobs[id - 1];
-                    if job.kind == (Kind::Ringo { command: "ask".into() }) && status == Status::Done {
+                    if matches!(&job.kind, Kind::Ringo { command } if command == "ask") && status == Status::Done {
                         // The ask prompt answers a task with one line, `ROUTE: edit|read|review|research`.
                         if let Some(route) = job.reply().trim().strip_prefix("ROUTE:") {
-                            self.routed.push_back((id, route.trim().to_lowercase()));
+                            // the route word alone: "ROUTE: edit." or a line of reasons after it still starts the task
+                            let word = route.split(|c: char| !c.is_ascii_alphabetic()).find(|w| !w.is_empty());
+                            self.routed.push_back((id, word.unwrap_or("").to_lowercase()));
                         }
                     }
                     if matches!(job.kind, Kind::Ringo { .. }) {
@@ -1220,19 +1241,30 @@ impl Session {
         let mut out = String::new();
         let mut rest = prompt;
         while let Some(start) = rest.find("{#") {
-            let Some(len) = rest[start + 2..].find('}') else { break };
-            let n: usize = rest[start + 2..start + 2 + len].parse().map_err(|_| "write {#N} with a job number")?;
+            // Only `{#` digits `}` is a handoff; anything else (a template comment `{# note #}`) stays as written.
+            let tail = &rest[start + 2..];
+            let digits = tail.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 || !tail[digits..].starts_with('}') {
+                out.push_str(&rest[..start + 2]);
+                rest = tail;
+                continue;
+            }
+            let n: usize = tail[..digits].parse().map_err(|_| "write {#N} with a job number")?;
             let job = self.job(n)?;
             if job.status != Status::Done {
                 return Err(format!("#{n} has not finished successfully, so it cannot be handed off"));
             }
             out.push_str(&rest[..start]);
             out.push_str(&format!("\n--- reply of job #{n} ---\n{}\n", job.reply().trim_end()));
-            if job.worktree.is_some() {
-                out.push_str(&format!("--- change made by job #{n} ---\n{}\n", self.diff(n)?));
+            if let (Some(wt), Some(base)) = (&job.worktree, &job.base) {
+                // The change as text: a binary file is one "Binary files ... differ" line, not base85 the agent
+                // cannot read (a 20 KB binary file was 19,546 tokens of it). /apply keeps the binary patch.
+                git(wt, &["add", "-A"])?;
+                let patch = git_raw(wt, &["diff", "--cached", base])?;
+                out.push_str(&format!("--- change made by job #{n} ---\n{}\n", String::from_utf8_lossy(&patch)));
             }
             out.push_str("---\n");
-            rest = &rest[start + 3 + len..];
+            rest = &tail[digits + 1..];
         }
         out.push_str(rest);
         Ok(out)
@@ -1246,8 +1278,19 @@ impl Session {
                 stop_group(pid, Duration::from_millis(1500), matches!(job.kind, Kind::Ringo { .. }));
             }
         }
-        if self.running() > 0 {
-            thread::sleep(Duration::from_millis(3100)); // let the last signal land before the process exits
+        // Let the last signal land before the process exits: on Unix only until every group is gone (most go within a
+        // millisecond of TERM), at most the 3.1 s the TERM, INT and KILL steps take.
+        let groups: Vec<u32> = self.jobs.iter().filter(|j| j.running()).filter_map(|j| j.pid).collect();
+        let deadline = Instant::now() + Duration::from_millis(3100);
+        while !groups.is_empty() && Instant::now() < deadline {
+            #[cfg(unix)]
+            {
+                // SAFETY: signal 0 only checks whether the group exists. EPERM: only zombies are left.
+                if groups.iter().all(|&g| unsafe { libc::killpg(g as libc::pid_t, 0) } != 0) {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(15));
         }
     }
 }
