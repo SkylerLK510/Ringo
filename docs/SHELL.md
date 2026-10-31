@@ -63,7 +63,7 @@ Ringo never runs a program to find out what it is. A name that is not a program 
 "`tle` is not an agent: nothing called tle is installed." An installed program Ringo has no entry for gets
 "`git` is a program, but not an agent Ringo knows.", then the offer to add it: you give the command that runs one
 prompt and prints the answer, with `{prompt}` where the prompt goes and `{cwd}` for the folder (without `{prompt}`,
-the prompt goes on stdin). An agent you add takes `@name!` write turns in its own worktree, with its reply read as
+the prompt goes on stdin; quotes group words, as in a shell, but no shell runs it). An agent you add takes `@name!` write turns in its own worktree, with its reply read as
 plain text; it has no read turns, because Ringo cannot verify a read-only mode for it.
 
 Your entries live in `agents.json` in Ringo's state folder, beside the list of agents you set up, and you can edit

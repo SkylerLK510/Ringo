@@ -967,6 +967,26 @@ fn read_agents_file(root: &Path) -> serde_json::Value {
         .filter(serde_json::Value::is_object).unwrap_or_else(|| serde_json::json!({}))
 }
 
+/// Runs a read-modify-write of agents.json holding an exclusive lock, so two shells saving at once cannot drop each
+/// other's change.
+// ceiling: Unix only (flock); on Windows two setups saving in the same instant can still lose one change.
+fn with_agents_lock<T>(root: &Path, change: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    private_dir(root)?;
+    let lock = fs::OpenOptions::new().create(true).truncate(false).write(true).open(root.join("agents.json.lock"))
+        .map_err(|e| format!("agents.json.lock: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: flock on a descriptor this function owns; it is released when `lock` closes.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!("agents.json.lock: {}", std::io::Error::last_os_error()));
+        }
+    }
+    let result = change();
+    drop(lock);
+    result
+}
+
 /// Written whole and renamed into place, so a crash or a second shell cannot leave half a file.
 fn write_agents_file(root: &Path, value: &serde_json::Value) -> Result<(), String> {
     private_dir(root)?;
@@ -995,14 +1015,19 @@ pub fn load_custom_agents(root: &Path) -> Vec<String> {
 
 /// Adds the owner's entry for an agent Ringo does not ship, kept in `root`/agents.json for next time.
 pub fn add_custom_agent(root: &Path, entry: serde_json::Value) -> Result<Agent, String> {
-    let agent = Agent::register(Spec::from_json(&entry, true)?)?;
-    let mut file = read_agents_file(root);
-    if !file["custom"].is_array() {
-        file["custom"] = serde_json::json!([]);
+    let spec = Spec::from_json(&entry, true)?;
+    if Agent::from_name(&spec.name).is_some() {
+        return Err(format!("Ringo already has an agent called {}", spec.name));
     }
-    file["custom"].as_array_mut().unwrap().push(entry);
-    write_agents_file(root, &file)?;
-    Ok(agent)
+    with_agents_lock(root, || {
+        let mut file = read_agents_file(root);
+        if !file["custom"].is_array() {
+            file["custom"] = serde_json::json!([]);
+        }
+        file["custom"].as_array_mut().unwrap().push(entry);
+        write_agents_file(root, &file)
+    })?;
+    Agent::register(spec)
 }
 
 /// The agents set up with `ringo setup` (state_root()/agents.json), the owner's own entries registered first;
@@ -1019,9 +1044,11 @@ pub fn configured_agents() -> Option<Vec<Agent>> {
 /// Saves which agents are set up; the owner's own entries are kept as they are.
 pub fn save_agents(agents: &[Agent]) -> Result<(), String> {
     let root = state_root();
-    let mut file = read_agents_file(&root);
-    file["agents"] = agents.iter().map(|a| a.name()).collect::<Vec<_>>().into();
-    write_agents_file(&root, &file)
+    with_agents_lock(&root, || {
+        let mut file = read_agents_file(&root);
+        file["agents"] = agents.iter().map(|a| a.name()).collect::<Vec<_>>().into();
+        write_agents_file(&root, &file)
+    })
 }
 
 #[derive(Debug, PartialEq)]

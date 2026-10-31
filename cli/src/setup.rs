@@ -42,7 +42,7 @@ fn connect(agent: Agent, t: &Theme) -> bool {
             SignIn::Unknown => {
                 println!("  {name}: installed {ok}  Ringo cannot read its sign-in status.");
                 if yes(&format!("  Open {name} now to sign in (sign in in the browser, then exit {name} to come back)? [y/n] ")) {
-                    let _ = Command::new(program).status();
+                    let _ = Command::new(program).args(&agent.spec().login).status(); // its own sign-in, if it has one
                 }
                 return true;
             }
@@ -59,6 +59,38 @@ fn connect(agent: Agent, t: &Theme) -> bool {
     false
 }
 
+/// A command line split into words the way a shell splits a simple one: quotes ('…' or "…") group words, a backslash
+/// outside single quotes keeps the next character as it is. No variables, globs or pipes: Ringo runs no shell.
+fn words(line: &str) -> Result<Vec<String>, String> {
+    let (mut out, mut word, mut quote, mut started) = (Vec::new(), String::new(), None, false);
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('\''), c) => word.push(c),
+            (_, '\\') => word.push(chars.next().ok_or("the command ends with a backslash")?),
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => quote = Some(c),
+            (None, c) if c.is_whitespace() => {
+                if started || !word.is_empty() {
+                    out.push(std::mem::take(&mut word));
+                }
+                started = false;
+                continue;
+            }
+            (None, c) => word.push(c),
+        }
+        started = true;
+    }
+    if quote.is_some() {
+        return Err("a quote in the command is not closed".into());
+    }
+    if started || !word.is_empty() {
+        out.push(word);
+    }
+    Ok(out)
+}
+
 /// A name Ringo has no entry for. Not a program on PATH: not an agent. A program: the owner may add it as a write-only
 /// agent, giving the command that runs one prompt without questions. Never runs the program to find out.
 fn unknown(typed: &str, answer: &str) -> Option<Agent> {
@@ -73,12 +105,18 @@ fn unknown(typed: &str, answer: &str) -> Option<Agent> {
     println!("  The command that runs one prompt and prints the answer, with {{prompt}} where the prompt goes and");
     println!("  {{cwd}} for the folder, e.g. `{typed} -p {{prompt}}` (without {{prompt}}, the prompt goes on stdin).");
     let line = ask("  command> ")?;
-    let mut words = line.split_whitespace();
-    if words.next() != Some(typed) {
+    let words = match words(&line) {
+        Ok(words) => words,
+        Err(e) => {
+            println!("  {e}; type {typed} again to retry.");
+            return None;
+        }
+    };
+    if words.first().map(String::as_str) != Some(typed) {
         println!("  The command has to start with `{typed}`; type {typed} again to retry.");
         return None;
     }
-    let args: Vec<&str> = words.collect();
+    let args = &words[1..];
     let entry = serde_json::json!({"name": typed, "adapter": "plain", "args": args});
     match ringo_cli::add_custom_agent(&ringo_cli::state_root(), entry) {
         Ok(agent) => {
@@ -128,4 +166,16 @@ pub fn run() -> Vec<Agent> {
         println!("Set up: {}. Next time just type ringo.", names.join(", "));
     }
     agents
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn splits_a_command_like_a_shell() {
+        let w = |l: &str| super::words(l).unwrap();
+        assert_eq!(w("mytool --prompt \"{prompt}\""), ["mytool", "--prompt", "{prompt}"]);
+        assert_eq!(w("mytool --model 'My Model' -p {prompt}"), ["mytool", "--model", "My Model", "-p", "{prompt}"]);
+        assert_eq!(w(r#"a "it's" b\ c ''"#), ["a", "it's", "b c", ""]);
+        assert!(super::words("a 'open").is_err());
+    }
 }
