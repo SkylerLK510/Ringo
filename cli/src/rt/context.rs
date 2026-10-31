@@ -667,28 +667,54 @@ pub fn is_test(path: &str) -> bool {
         || TEST_NAME.is_match(name)
 }
 
-struct KindRes([Fancy; 6]);
+/// The six kind() patterns of one symbol, each compiled when a line first needs it (a subclass pattern costs about
+/// 2 ms to compile; most symbols never need one).
+struct KindRes {
+    sym: String,
+    res: [std::cell::OnceCell<Fancy>; 6],
+}
+
+/// Literals every definition pattern needs (one of them).
+const DEFINING: [&str; 13] =
+    ["def", "class", "function", "fn", "func", "struct", "enum", "trait", "interface", "type", "const", "static", "protocol"];
 
 impl KindRes {
     fn new(sym: &str) -> KindRes {
-        let s = fancy_regex::escape(sym);
-        KindRes([
-            fancy(&format!(
+        KindRes { sym: sym.to_string(), res: Default::default() }
+    }
+
+    fn pattern(&self, i: usize) -> String {
+        let s = fancy_regex::escape(&self.sym);
+        match i {
+            0 => format!(
                 r"\b(?:def|class|function|fn|func|struct|enum|trait|interface|type|const|static|protocol)\s+(?:\([^)]*\)\s*)?{s}\b"
-            )),
-            fancy(&format!(r"^\s*(?:export\s+)?{s}\s*(?::[^=]*)?=(?!=)")),
-            fancy(&format!(r"\bclass\s+{IDENT}\s*(?:\[[^\]]*\])?\s*\([^)]*\b{s}\b")),
-            fancy(&format!(r"\b(?:extends|implements)\b[^{{]*\b{s}\b")),
-            fancy(&format!(r"\b(?:class|struct|object)\s+{IDENT}[^{{(]*:\s*[^{{]*\b{s}\b")),
-            fancy(&format!(r"\bimpl\b(?:<[^>]*>)?\s+(?:[\w:]+::)?{s}\b[^{{]*\bfor\b")),
-        ])
+            ),
+            1 => format!(r"^\s*(?:export\s+)?{s}\s*(?::[^=]*)?=(?!=)"),
+            2 => format!(r"\bclass\s+{IDENT}\s*(?:\[[^\]]*\])?\s*\([^)]*\b{s}\b"),
+            3 => format!(r"\b(?:extends|implements)\b[^{{]*\b{s}\b"),
+            4 => format!(r"\b(?:class|struct|object)\s+{IDENT}[^{{(]*:\s*[^{{]*\b{s}\b"),
+            _ => format!(r"\bimpl\b(?:<[^>]*>)?\s+(?:[\w:]+::)?{s}\b[^{{]*\bfor\b"),
+        }
+    }
+
+    /// Whether pattern i matches line; a line without the literals the pattern needs is not tried.
+    fn hit(&self, i: usize, line: &str) -> bool {
+        let has = |w: &str| line.contains(w);
+        let possible = match i {
+            0 => DEFINING.iter().any(|k| has(k)),
+            1 => has("=") && { let rest = py::lstrip(line); rest.starts_with("export") || rest.starts_with(self.sym.as_str()) },
+            2 => has("class") && has("("),
+            3 => has("extends") || has("implements"),
+            4 => (has("class") || has("struct") || has("object")) && has(":"),
+            _ => has("impl") && has("for"),
+        };
+        possible && found_any(self.res[i].get_or_init(|| fancy(&self.pattern(i))), line)
     }
 
     fn kind(&self, line: &str) -> &'static str {
-        let r = &self.0;
-        if found_any(&r[0], line) || found_any(&r[1], line) {
+        if self.hit(0, line) || self.hit(1, line) {
             "definition"
-        } else if r[2..].iter().any(|re| found_any(re, line)) {
+        } else if (2..6).any(|i| self.hit(i, line)) {
             "subclass"
         } else {
             "reference"
@@ -717,9 +743,25 @@ pub fn kind(line: &str, sym: &str) -> &'static str {
 pub fn grep(repo: &Path, head: &str, names: &[String]) -> Result<String> {
     let common = ["grep", "-n", "-I", "-z", "--no-color", "--no-column"];
     if names.iter().all(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')) {
-        let pattern = format!("(?<![A-Za-z0-9_])(?:{})(?![A-Za-z0-9_])", names.join("|"));
+        // git's PCRE refuses one alternation past about 31 KB; several -e patterns print the same lines once each
+        let mut patterns: Vec<String> = Vec::new();
+        let mut group: Vec<&str> = Vec::new();
+        let mut size = 0;
+        for n in names {
+            if !group.is_empty() && size + n.len() + 1 > GREP_CHUNK {
+                patterns.push(format!("(?<![A-Za-z0-9_])(?:{})(?![A-Za-z0-9_])", group.join("|")));
+                (group, size) = (Vec::new(), 0);
+            }
+            group.push(n);
+            size += n.len() + 1;
+        }
+        patterns.push(format!("(?<![A-Za-z0-9_])(?:{})(?![A-Za-z0-9_])", group.join("|")));
         let mut args = common.to_vec();
-        args.extend(["-P", "-e", &pattern, head, "--"]);
+        args.push("-P");
+        for p in &patterns {
+            args.extend(["-e", p.as_str()]);
+        }
+        args.extend([head, "--"]);
         match git_ok(repo, &args, &[0, 1]) {
             Ok(out) => return Ok(out),
             Err(e) if e.is(Exc::Context) => {} // git built without PCRE, or a pattern too large for it
@@ -734,6 +776,23 @@ pub fn grep(repo: &Path, head: &str, names: &[String]) -> Result<String> {
     args.extend([head, "--"]);
     git_ok(repo, &args, &[0, 1])
 }
+
+enum Word {
+    Plain(Regex),
+    Fancy(Fancy),
+}
+
+impl Word {
+    fn all(&self, text: &str) -> Vec<String> {
+        match self {
+            Word::Plain(re) => re.captures_iter(text).map(|c| c[1].to_string()).collect(),
+            Word::Fancy(re) => found_all(re, text),
+        }
+    }
+}
+
+/// Bytes of names per PCRE pattern (git refuses one of about 31 KB).
+const GREP_CHUNK: usize = 16_000;
 
 /// One candidate file: the matched line numbers and the reasons ((kind, sym)).
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -752,7 +811,14 @@ pub fn matches(repo: &Path, head: &str, syms: &[String], owners: &[String], excl
     let names: Vec<String> = syms.iter().chain(owners).cloned().collect();
     let out = grep(repo, head, &names)?;
     let alternation: Vec<String> = names.iter().map(|n| fancy_regex::escape(n).into_owned()).collect();
-    let word = fancy(&format!("(?<![A-Za-z0-9_])({})(?![A-Za-z0-9_])", alternation.join("|")));
+    // Names of ASCII word characters only (the PCRE case): an ASCII word boundary is the same test as the
+    // lookarounds, and the regex crate finds the same leftmost-first matches without a backtracking VM.
+    let ascii = names.iter().all(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'));
+    let word = if ascii {
+        Word::Plain(Regex::new(&format!(r"(?-u:\b)({})(?-u:\b)", alternation.join("|"))).expect("a valid pattern"))
+    } else {
+        Word::Fancy(fancy(&format!("(?<![A-Za-z0-9_])({})(?![A-Za-z0-9_])", alternation.join("|"))))
+    };
     let only_subclass: BTreeSet<&str> = owners.iter().map(String::as_str).collect();
     let prefix = format!("{head}:");
     for rec in out.split('\n') {
@@ -770,7 +836,7 @@ pub fn matches(repo: &Path, head: &str, syms: &[String], owners: &[String], excl
         }
         let test = is_test(path);
         let mut why = BTreeSet::new();
-        for sym in found_all(&word, &text) {
+        for sym in word.all(&text) {
             let k = kind(&text, &sym);
             if !only_subclass.contains(sym.as_str()) || k == "subclass" {
                 why.insert((if test { "test" } else { k }, sym));

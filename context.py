@@ -305,6 +305,9 @@ def kind(line, sym):
     return 'reference'
 
 
+GREP_CHUNK = 16_000  # bytes of names per PCRE pattern
+
+
 def grep(repo, head, names):
     """`git grep` lines with a word match of any name at head. One PCRE2 alternation is a single JIT-compiled pass;
     one -F -w pattern per name made git scan each line once per name (7.3 s against 0.27 s for 54 names over a
@@ -312,9 +315,16 @@ def grep(repo, head, names):
     patterns, whose word rule is the same."""
     common = ['grep', '-n', '-I', '-z', '--no-color', '--no-column']
     if all(re.fullmatch(r'[A-Za-z0-9_]+', n) for n in names):
-        pattern = rf'(?<![A-Za-z0-9_])(?:{"|".join(names)})(?![A-Za-z0-9_])'
+        groups, size = [[]], 0  # git's PCRE refuses one alternation past about 31 KB; -e patterns print a line once
+        for n in names:
+            if groups[-1] and size + len(n) + 1 > GREP_CHUNK:
+                groups.append([])
+                size = 0
+            groups[-1].append(n)
+            size += len(n) + 1
+        patterns = [x for g in groups for x in ('-e', rf'(?<![A-Za-z0-9_])(?:{"|".join(g)})(?![A-Za-z0-9_])')]
         try:
-            return git(repo, *common, '-P', '-e', pattern, head, '--', ok=(0, 1))  # 1: no match
+            return git(repo, *common, '-P', *patterns, head, '--', ok=(0, 1))  # 1: no match
         except ContextError:
             pass  # git built without PCRE, or a pattern too large for it
     return git(repo, *common, '-w', '-F', *[x for n in names for x in ('-e', n)], head, '--', ok=(0, 1))
