@@ -1,7 +1,7 @@
 //! The conductor against fake agents in throwaway git repositories (Unix: the fakes are shell scripts).
 #![cfg(unix)]
 
-use ringo_cli::{Agent, Session, Status};
+use ringo_cli::{Agent, Decision, Mode, Session, Status};
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -178,7 +178,7 @@ fn malformed_output_and_api_key_logins_fail_closed() {
     let mut s = session(&r, agent("codex"), &garbage);
     let id = s.launch_agent(agent("codex"), false, "x").unwrap();
     assert!(matches!(wait(&mut s, id), Status::Failed(_)));
-    let keyed = fake(&root(), "claude-keyed", "#!/bin/sh\ncat >/dev/null\n\
+    let keyed = fake(&root(), "claude-keyed", "#!/bin/sh\nhead -n 1 >/dev/null\n\
         echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"ANTHROPIC_API_KEY\"}'\nsleep 30\n");
     s.programs.insert(agent("claude"), keyed);
     let id = s.launch_agent(agent("claude"), false, "x").unwrap();
@@ -341,7 +341,7 @@ fn agent_commands_are_pinned() {
         echo '{{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}}'\n\
         echo '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n\
         echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n"));
-    let claude = fake(&root(), "claude-golden", &format!("#!/bin/sh\n{RECORD}cat > \"$0.stdin\"\n\
+    let claude = fake(&root(), "claude-golden", &format!("#!/bin/sh\n{RECORD}head -n 1 > \"$0.stdin\"\n\
         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\",\"apiKeySource\":\"none\"}}'\n\
         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
     let grok = fake(&root(), "grok-golden", &format!("#!/bin/sh\n{RECORD}echo done\n"));
@@ -366,16 +366,21 @@ fn agent_commands_are_pinned() {
     assert_eq!(turn(agent("codex"), false, &codex),
                (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"read-only\""], &tail), "the task".into()));
     assert_eq!(turn(agent("codex"), true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
-    let head = ["-p", "--output-format", "stream-json", "--verbose", "--safe-mode", "--permission-prompts", "none", "--permission-mode"];
-    let read = ["default", "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit"];
+    // Ask mode (the default): every permission prompt comes to Ringo, the always-ask rules ride along, read turns
+    // cannot edit files; the prompt is one stream-json message on stdin, which stays open for the answers.
+    let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
+                "--permission-prompt-tool", "stdio", "--permission-mode"];
+    let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
+    let read = ["default", "--disallowed-tools", "Edit", "Write", "NotebookEdit", "--settings", &rules];
+    let message = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the task\"}}\n".to_string();
     assert_eq!(turn(agent("claude"), false, &claude),
-               (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), "the task".into()));
+               (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
     assert_eq!(turn(agent("claude"), false, &claude),
                (want(&head, &[&read[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
-                "the task".into()));
+                message.clone()));
     assert_eq!(turn(agent("claude"), true, &claude),
-               (want(&head, &["acceptEdits", "--disallowed-tools", "Bash", "--append-system-prompt-file", "WT/AGENTS.md"]),
-                "the task".into()));
+               (want(&head, &["acceptEdits", "--settings", &rules, "--append-system-prompt-file", "WT/AGENTS.md"]),
+                message.clone()));
     assert_eq!(turn(agent("grok"), true, &grok),
                (want(&["-p", "the task", "--output-format", "plain", "--no-auto-update", "--always-approve", "--cwd", "WT"], &[]),
                 String::new()));
@@ -449,4 +454,159 @@ fn an_agent_the_owner_adds() {
     let argv = fs::read_to_string(format!("{}.argv", tool.display())).unwrap();
     assert_eq!(argv.lines().collect::<Vec<_>>(), ["run", "--in", &*wt.to_string_lossy()]);
     assert_eq!(fs::read_to_string(format!("{}.stdin", tool.display())).unwrap(), "fix {cwd} please");
+}
+
+/// Claude's permission requests, with Claude Code 2.1.316's shape (`control_request` / `can_use_tool` with
+/// suggested rules): two requests with the same rule, then one Ringo does not serve, then the result.
+const CLAUDE_ASKS: &str = r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+read -r line
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"s-p","apiKeySource":"none"}'
+printf '%s\n' '{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"Bash","display_name":"Bash","input":{"command":"gh pr create --fill\nrm -rf build"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"gh pr create:*"}],"behavior":"allow","destination":"localSettings"}]}}'
+read -r a; printf '%s\n' "$a" > "$0.answers"
+printf '%s\n' '{"type":"control_request","request_id":"r2","request":{"subtype":"can_use_tool","tool_name":"Bash","input":{"command":"gh pr create --draft"},"permission_suggestions":[{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"gh pr create:*"}],"behavior":"allow"}]}}'
+read -r a; printf '%s\n' "$a" >> "$0.answers"
+printf '%s\n' '{"type":"control_request","request_id":"r3","request":{"subtype":"hook_callback","callback_id":"h"}}'
+read -r a; printf '%s\n' "$a" >> "$0.answers"
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"opened"}'
+if read -r a; then echo "stdin was left open" >> "$0.answers"; fi
+"#;
+
+fn wait_for_ask(s: &mut Session) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        s.pump();
+        if let Some((id, _)) = s.pending() {
+            return id;
+        }
+        assert!(Instant::now() < deadline, "no permission request arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn answers(program: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(format!("{}.answers", program.display())).unwrap().lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|_| panic!("not an answer: {l}"))).collect()
+}
+
+#[test]
+fn ask_mode_sends_each_permission_request_to_the_owner() {
+    let r = repo("permissions");
+    let claude = fake(&root(), "claude-asks", CLAUDE_ASKS);
+    let mut s = session(&r, agent("claude"), &claude);
+    assert_eq!(s.mode, Mode::Ask);
+    let id = s.launch_agent(agent("claude"), true, "open a PR with the fix").unwrap();
+    assert_eq!(wait_for_ask(&mut s), id);
+    let (_, p) = s.pending().unwrap();
+    assert_eq!(p.what, "Bash gh pr create --fill\nrm -rf build", "every line of the command is shown");
+    assert_eq!(p.rule, "Bash(gh pr create:*)");
+    assert_eq!(s.job(id).unwrap().activity, "waiting for you: Bash gh pr create --fill");
+    assert!(s.decide(id, Decision::Session).unwrap().starts_with("you allowed for this session"));
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let a = answers(&claude);
+    assert_eq!(a.len(), 3, "the result closed stdin: {a:?}");
+    assert_eq!((a[0]["response"]["request_id"].as_str(), a[0]["response"]["response"]["behavior"].as_str()),
+               (Some("r1"), Some("allow")));
+    assert_eq!(a[0]["response"]["response"]["updatedInput"]["command"], "gh pr create --fill\nrm -rf build");
+    assert_eq!((a[1]["response"]["request_id"].as_str(), a[1]["response"]["response"]["behavior"].as_str()),
+               (Some("r2"), Some("allow")), "the same rule, allowed for the session, is not asked again");
+    assert_eq!((a[2]["response"]["request_id"].as_str(), a[2]["response"]["subtype"].as_str()), (Some("r3"), Some("error")));
+    let log = fs::read_to_string(s.dir.join("actions.jsonl")).unwrap();
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(log.lines().nth(1).unwrap().contains("\"answer\":\"allowed (this session)\""));
+    // A later turn starts with the rule allowed, so its same requests never reach the owner.
+    let next = s.launch_agent(agent("claude"), true, "and another").unwrap();
+    assert_eq!(wait(&mut s, next), Status::Done);
+    let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+    assert!(argv.contains("--allowedTools\nBash(gh pr create:*)\n"), "{argv}");
+    // Declined, the same rule is asked again; nothing is allowed for the session.
+    let mut s = session(&r, agent("claude"), &claude);
+    let id = s.launch_agent(agent("claude"), true, "open a PR").unwrap();
+    wait_for_ask(&mut s);
+    assert!(s.decide(id, Decision::Deny).unwrap().starts_with("you declined"));
+    wait_for_ask(&mut s);
+    s.decide(id, Decision::Once).unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let a = answers(&claude);
+    assert_eq!(a[0]["response"]["response"]["behavior"], "deny");
+    assert_eq!(a[1]["response"]["response"]["behavior"], "allow");
+    assert!(s.allowed.is_empty() && s.decide(id, Decision::Once).is_err());
+}
+
+#[test]
+fn modes_change_what_each_agent_may_do() {
+    let r = repo("modes");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\nenv > \"$0.env\"\n";
+    let claude = fake(&root(), "claude-modes", &format!("#!/bin/sh\n{RECORD}head -n 1 >/dev/null\n\
+        echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-m\",\"apiKeySource\":\"none\"}}'\n\
+        echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
+    let codex = fake(&root(), "codex-modes", &format!("#!/bin/sh\n{RECORD}cat >/dev/null\n\
+        echo '{{\"type\":\"thread.started\",\"thread_id\":\"t-m\"}}'\n\
+        echo '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n\
+        echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n"));
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    let read = |p: &Path, ext: &str| fs::read_to_string(format!("{}.{ext}", p.display())).unwrap();
+    let has = |argv: &str, run: &[&str]| argv.lines().collect::<Vec<_>>().windows(run.len()).any(|w| w == run);
+    let turn = |s: &mut Session, a: &str, write: bool, task: &str| {
+        let id = s.launch_agent(agent(a), write, task).unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+    };
+
+    s.mode = Mode::Auto;
+    turn(&mut s, "claude", true, "fix the retry loop");
+    let argv = read(&claude, "argv");
+    assert!(has(&argv, &["--safe-mode", "--permission-prompt-tool", "stdio", "--permission-mode", "auto"]), "{argv}");
+    assert!(!argv.contains("--disallowed-tools") && argv.contains("--settings"), "a write turn edits; the always-ask rules ride along");
+    turn(&mut s, "codex", true, "fix the retry loop");
+    let argv = read(&codex, "argv");
+    assert!(has(&argv, &["exec", "--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]), "{argv}");
+    assert!(!argv.lines().any(|a| a == "-s"), "--approve-for-me picks the sandbox itself: {argv}");
+
+    // A task naming a connector gets the owner's connectors, without their CLAUDE.md, memory, skills or main agent.
+    turn(&mut s, "claude", false, "what is in my Jira sprint?");
+    let (argv, env) = (read(&claude, "argv"), read(&claude, "env"));
+    assert!(has(&argv, &["--agent", "claude", "--disable-slash-commands"]) && !argv.contains("--safe-mode"), "{argv}");
+    assert!(has(&argv, &["--disallowed-tools", "Edit", "Write", "NotebookEdit"]), "a read turn never edits: {argv}");
+    for var in ["CLAUDE_CODE_DISABLE_CLAUDE_MDS=1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1", "RINGO_CHILD=1"] {
+        assert!(env.lines().any(|l| l == var), "{var}");
+    }
+    assert!(ringo_cli::names_connector("check the ClickUp board") && ringo_cli::names_connector("open my Google Drive"));
+    assert!(!ringo_cli::names_connector("fix the drive train module") && !ringo_cli::names_connector("refactor the email_parser"),
+            "words inside identifiers and other senses do not count");
+
+    s.mode = Mode::Read;
+    assert!(s.launch_agent(agent("claude"), true, "fix it").unwrap_err().contains("read mode"));
+    turn(&mut s, "claude", false, "what is in my Jira sprint?");
+    let argv = read(&claude, "argv");
+    assert!(has(&argv, &["--safe-mode", "--permission-prompts", "none", "--permission-mode", "default"]), "{argv}");
+    assert!(has(&argv, &["--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit"]) && !argv.contains("--settings"));
+    assert_eq!((Mode::Ask.next(), Mode::Auto.next(), Mode::Read.next()), (Mode::Auto, Mode::Read, Mode::Ask));
+}
+
+#[test]
+fn a_task_typed_as_a_plain_line_comes_back_routed() {
+    // The ask call answers a task with one `ROUTE:` line; the shell starts it, and later asks do not carry it.
+    let r = repo("routed");
+    let home = root().join("fake-route-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("ringo.py"), "import json, sys, pathlib\n\
+        a = sys.argv[1:]\n\
+        val = lambda k: a[a.index(k) + 1]\n\
+        material = pathlib.Path(val('--input')).read_text()\n\
+        n = len(list(pathlib.Path(sys.argv[0]).parent.glob('seen-*.json'))) + 1\n\
+        pathlib.Path(sys.argv[0]).with_name(f'seen-{n}.json').write_text(json.dumps({'material': material}))\n\
+        t = pathlib.Path(val('--trace')); t.mkdir(parents=True, exist_ok=True)\n\
+        (t / 'trace.jsonl').write_text(json.dumps({'step': 'answer', 'status': 'ok', 'usage': {'input': 900, 'output': 5}}) + '\\n')\n\
+        pathlib.Path(val('--out')).write_text('ROUTE: Edit\\n' if n == 1 else 'an answer\\n')\n").unwrap();
+    let mut s = Session::new(&r).unwrap();
+    s.ringo_home = home.clone();
+    let task = s.ask("fix the retry loop in client.rs").unwrap();
+    assert_eq!(wait(&mut s, task), Status::Done);
+    assert_eq!(s.routed.pop_front(), Some((task, "edit".to_string())));
+    let question = s.ask("why do retries back off?").unwrap();
+    assert_eq!(wait(&mut s, question), Status::Done);
+    assert!(s.routed.is_empty());
+    let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join("seen-2.json")).unwrap()).unwrap();
+    assert_eq!(seen["material"], "Question: why do retries back off?\n", "a routed line is not an earlier answer");
 }

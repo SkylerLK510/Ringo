@@ -8,7 +8,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph};
 use ratatui::Frame;
-use ringo_cli::{Agent, Kind, Session, Status};
+use ringo_cli::{Agent, Decision, Kind, Mode, Session, Status};
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::ExitCode;
@@ -17,6 +17,15 @@ use std::time::{Duration, Instant};
 const HELP: &str = "\
 Cheap by default. A line without / or @ is a question: one tool-free call, with your last few questions and
 answers as context. It costs a few thousand tokens, and it cannot see your files (pipelines backend: {backend}).
+When that call reads the line as a task (files to change, read or review, or live sources), Ringo starts it:
+claude takes code turns (codex when claude is not set up), /research takes sources.
+Mode (now: {mode}), one switch for every agent: Shift-Tab cycles it, /mode ask|auto|read sets it, /auto toggles auto.
+  ask    agents read, and edit their own worktree, freely; anything else (a command, a connector such as Jira, the
+         network, a push or a PR) waits for you: y allow, a allow for this session, n decline
+  auto   agents act on their own; only what their safety review flags, or an always-ask rule names (sudo, disk
+         tools, force pushes, publishing, agent settings), waits for you. Codex works in its sandbox with the network
+         and its own reviewer; it cannot stop to ask
+  read   agents look but do not touch: no edits, no commands, no connectors
 Ringo's pipelines run the models as tool-free workers with executable checks and one review:
   /review #N           Ringo reviews job N's change (task text as the change description)
   /review BASE [HEAD]  Ringo reviews BASE...HEAD of this repository
@@ -41,7 +50,7 @@ counts every one), for questions about your code and for changes:
                        question (Esc); no model call (now: {route})
   /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono (now: {theme})
 Jobs: /show N  /diff N  /apply N  /drop N (remove its worktree)  /kill N  /quit
-Keys: Tab / Shift-Tab select a job, PgUp / PgDn scroll, Up / Down history, Esc clear, Ctrl-C twice quits.";
+Keys: Tab selects a job, Shift-Tab the mode, PgUp / PgDn scroll, Up / Down history, Esc clear, Ctrl-C twice quits.";
 
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
@@ -64,6 +73,10 @@ pub enum Cmd {
     Route(bool),
     /// `/update` (None) or `/update auto on|off`.
     Update(Option<bool>),
+    /// `/mode` (None: show it) or `/mode ask|auto|read`.
+    Mode(Option<Mode>),
+    /// `/auto`: auto mode on, or back to ask mode.
+    Auto,
     Quit,
 }
 
@@ -83,6 +96,11 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "help" | "?" => Ok(Cmd::Help),
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "setup" => Ok(Cmd::Setup),
+            "auto" => Ok(Cmd::Auto),
+            "mode" => match words.next() {
+                None => Ok(Cmd::Mode(None)),
+                Some(m) => Mode::from_name(m).map(|m| Cmd::Mode(Some(m))).ok_or("/mode ask, /mode auto or /mode read".into()),
+            },
             "theme" => Ok(Cmd::Theme(words.next().map(str::to_string))),
             "route" => match words.next() {
                 Some("on") => Ok(Cmd::Route(true)),
@@ -179,6 +197,8 @@ struct App {
     /// Route suggestions on (/route on), and the plain line a suggestion is standing in for.
     route: bool,
     suggested: Option<String>,
+    /// The permission request on screen and when it appeared (answer keys wait ANSWER_GRACE after that).
+    asked: Option<(String, Instant)>,
     /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
     pending: Option<Vec<crate::updates::Update>>,
     update: bool,
@@ -187,6 +207,8 @@ struct App {
 /// The running mark: a braille spinner, one frame per SPIN_MS while anything runs (the only redraws then).
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPIN_MS: u128 = 120;
+/// How long after a permission request appears its answer keys are ignored.
+const ANSWER_GRACE: Duration = Duration::from_millis(300);
 
 impl App {
     fn say(&mut self, text: impl AsRef<str>) {
@@ -199,7 +221,7 @@ impl App {
     }
 
     fn help_text(&self) -> String {
-        HELP.replace("{backend}", &self.s.backend).replace("{theme}", self.theme.name)
+        HELP.replace("{backend}", &self.s.backend).replace("{theme}", self.theme.name).replace("{mode}", self.s.mode.name())
             .replace("{route}", if self.route { "on" } else { "off" })
     }
 
@@ -223,6 +245,64 @@ impl App {
         let able: Vec<&str> = self.agents.iter().filter(|a| !read || (a.spec().read && self.s.busy(**a).is_none()))
             .map(|a| a.name()).collect();
         crate::route::owner(&able).and_then(Agent::from_name)
+    }
+
+    /// Sets the mode for the turns started from now on (a running turn keeps its own), and saves it.
+    fn set_mode(&mut self, mode: Mode) -> String {
+        self.s.mode = mode;
+        let saved = crate::theme::set_setting("mode", serde_json::json!(mode.name())).err()
+            .map_or(String::new(), |e| format!(" (not saved: {e})"));
+        let what = match mode {
+            Mode::Ask => "agents ask you before commands, connectors, the network, pushes and PRs",
+            Mode::Auto => "agents act on their own; flagged actions and always-ask rules still wait for you",
+            Mode::Read => "agents look but do not touch",
+        };
+        format!("  mode: {}: {what}; turns already running keep theirs{saved}", mode.name())
+    }
+
+    /// Starts the task an ask call routed (`ROUTE: <route>`): code turns go to their owner, sources to /research;
+    /// a review needs its range, so it is put in the input line to complete.
+    fn start_routed(&mut self, ask: usize, route: &str) {
+        let line = self.s.job(ask).map(|j| j.title_full.clone()).unwrap_or_default();
+        let (kind, write) = match route {
+            "edit" => (crate::route::Route::Edit, true),
+            "read" => (crate::route::Route::Read, false),
+            "research" => {
+                match self.s.research(&line) {
+                    Ok(id) => {
+                        self.say(format!("  → #{ask} is a task for live sources: started /research as #{id}"));
+                        self.selected = id;
+                    }
+                    Err(e) => self.say(format!("  → #{ask} needs live sources, but /research did not start: {e}")),
+                }
+                return;
+            }
+            "review" => {
+                self.say(format!("  → #{ask} asks for a review: say what to review (Enter sends it)"));
+                if self.input.is_empty() {
+                    self.input = "/review HEAD~1".chars().collect();
+                    self.cursor = self.input.len();
+                }
+                return;
+            }
+            other => {
+                self.say(format!("  → #{ask} came back as route `{other}`, which Ringo does not know; nothing started"));
+                return;
+            }
+        };
+        let Some(agent) = self.owner(&kind) else {
+            self.say(format!("  → #{ask} is a task, but no agent can take it now (/setup adds one)"));
+            return;
+        };
+        match self.s.launch_agent(agent, write, &line) {
+            Ok(id) => {
+                let how = if write { "edits in a worktree" } else { "reads this folder" };
+                self.say(format!("  → #{ask} is a task: @{}{} {how} as #{id} (mode: {})", agent.name(),
+                                 if write { "!" } else { "" }, self.s.mode.name()));
+                self.selected = id;
+            }
+            Err(e) => self.say(format!("  → #{ask} is a task for @{}: {e}", agent.name())),
+        }
     }
 
     fn spinner(&self) -> &'static str {
@@ -278,6 +358,12 @@ impl App {
         };
         Ok(match cmd {
             Cmd::Help => Some(self.help_text()),
+            Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
+            Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
+            Cmd::Auto => {
+                let mode = if self.s.mode == Mode::Auto { Mode::Ask } else { Mode::Auto };
+                Some(self.set_mode(mode))
+            }
             Cmd::Route(on) => {
                 self.route = on;
                 let saved = crate::theme::set_setting("route", serde_json::json!(on)).err()
@@ -397,6 +483,29 @@ impl App {
         if !(ctrl && matches!(k.code, KeyCode::Char('c' | 'd'))) {
             self.quit_armed = false;
         }
+        // An agent waiting for an answer has the keys once the input line is empty: y, a or n (Esc declines); Tab,
+        // PgUp and PgDn still look around first, Ctrl-C still quits, anything else is ignored. A line being typed
+        // keeps its keys until it is sent or cleared, and keys in the first moment after a request appears are
+        // ignored, so a word being typed never answers by accident.
+        if let Some((id, _)) = self.s.pending().filter(|_| self.input.is_empty()) {
+            if self.asked.as_ref().is_some_and(|(_, at)| at.elapsed() < ANSWER_GRACE) {
+                return;
+            }
+            let decision = match k.code {
+                KeyCode::Char('y' | 'Y') if !ctrl => Some(Decision::Once),
+                KeyCode::Char('a' | 'A') if !ctrl => Some(Decision::Session),
+                KeyCode::Char('n' | 'N') if !ctrl => Some(Decision::Deny),
+                KeyCode::Esc => Some(Decision::Deny),
+                KeyCode::Tab | KeyCode::PageUp | KeyCode::PageDown => None,
+                KeyCode::Char('c' | 'd') if ctrl => None,
+                _ => return,
+            };
+            if let Some(decision) = decision {
+                let said = self.s.decide(id, decision).unwrap_or_else(|e| e);
+                self.say(format!("  #{id}: {said}"));
+                return;
+            }
+        }
         match k.code {
             KeyCode::Char('c' | 'd') if ctrl => {
                 if !self.input.is_empty() {
@@ -447,8 +556,9 @@ impl App {
                 self.scroll = 0;
             }
             KeyCode::BackTab => {
-                self.selected = (self.selected + self.s.jobs.len()) % (self.s.jobs.len() + 1);
-                self.scroll = 0;
+                let text = self.set_mode(self.s.mode.next());
+                self.say(text);
+                self.selected = 0;
             }
             KeyCode::PageUp => self.scroll += self.log_height.max(1),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(self.log_height.max(1)),
@@ -595,27 +705,32 @@ impl App {
         let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(4)]).areas(area);
         let header = Line::from(vec![
             Span::styled(" ringo ", t.brand),
-            Span::styled(format!(" {}  ·  {} running  ·  {} tokens this session  ·  pipelines: {}", self.label,
-                                 self.s.running(), fmt_tokens(self.s.tokens()), self.s.backend), t.header),
+            Span::styled(format!(" {}  ·  mode: {}  ·  {} running  ·  {} tokens this session  ·  pipelines: {}", self.label,
+                                 self.s.mode.name(), self.s.running(), fmt_tokens(self.s.tokens()), self.s.backend), t.header),
         ]);
         f.render_widget(Paragraph::new(header).style(t.header), top);
         let block = |title: String, focused: bool| Block::bordered().border_type(BorderType::Rounded)
             .border_style(if focused { t.focus } else { t.border }).title(Span::styled(title, t.title));
 
         // Wide terminals: the agents in a column on the left, the chat beside it. Narrow ones: stacked.
-        let (log, input) = if area.width >= SIDE_MIN_WIDTH {
-            let side_w = (area.width * 32 / 100).clamp(34, 52);
+        let wide = area.width >= SIDE_MIN_WIDTH;
+        let side_w = (area.width * 32 / 100).clamp(34, 52);
+        let main_w = if wide { area.width.saturating_sub(side_w) } else { area.width };
+        let ask = self.prompt_lines(main_w.saturating_sub(2) as usize);
+        let ask_h = ask.as_ref().map_or(0, |(_, lines)| (lines.len() as u16 + 2).clamp(3, (body.height / 2).max(3)));
+        let input_h = 3 + ask_h;
+        let (log, input) = if wide {
             let [side, main] = Layout::horizontal([Constraint::Length(side_w), Constraint::Min(40)]).areas(body);
             let panel = self.side_lines(side.width.saturating_sub(2) as usize);
             let skip = panel.len().saturating_sub(side.height.saturating_sub(2) as usize); // newest jobs stay visible
             f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(block(" agents ".into(), false)), side);
-            let [log, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).areas(main);
+            let [log, input] = Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(main);
             (log, input)
         } else {
             let panel = self.panel_lines(area.width.saturating_sub(2) as usize);
             let panel_h = (panel.len() as u16 + 2).clamp(3, (body.height / 2).max(3));
             let [jobs, log, input] = Layout::vertical([Constraint::Length(panel_h), Constraint::Min(3),
-                Constraint::Length(3)]).areas(body);
+                Constraint::Length(input_h)]).areas(body);
             let skip = panel.len().saturating_sub(panel_h as usize - 2);
             f.render_widget(Paragraph::new(panel[skip..].to_vec()).block(block(" agents ".into(), false)), jobs);
             (log, input)
@@ -642,12 +757,46 @@ impl App {
         let title = if title.chars().count() > width { ringo_cli::parse::short(&title, width.saturating_sub(2)) } else { title };
         f.render_widget(Paragraph::new(visible).block(block(title, self.selected > 0)), log);
 
-        let hint = " ask anything · @codex or @claude for an agent · Tab jobs · /help ".to_string();
+        let input = if let Some((title, lines)) = ask {
+            // The whole request, wrapped, above the input line; when it is taller than its box, its end (and the
+            // keys) stay visible.
+            let [asked, input] = Layout::vertical([Constraint::Length(ask_h), Constraint::Length(3)]).areas(input);
+            let room = asked.height.saturating_sub(2) as usize;
+            let shown: Vec<Line> = lines[lines.len().saturating_sub(room)..].to_vec();
+            f.render_widget(Paragraph::new(shown).block(block(title, true).border_style(t.warn)), asked);
+            input
+        } else {
+            input
+        };
+        let hint = format!(" ask anything · @codex or @claude for an agent · Tab jobs · Shift-Tab mode: {} · /help ",
+                           self.s.mode.name());
         let room = input.width.saturating_sub(2).max(1) as usize;
         let start = self.cursor.saturating_sub(room - 1);
         let shown: String = self.input.iter().skip(start).take(room).collect();
         f.render_widget(Paragraph::new(shown).block(block(hint, true)), input);
         f.set_cursor_position((input.x + 1 + (self.cursor - start) as u16, input.y + 1));
+    }
+}
+
+impl App {
+    /// A waiting permission request as the input box shows it: its title, then every line of the action, wrapped,
+    /// and the keys.
+    fn prompt_lines(&self, width: usize) -> Option<(String, Vec<Line<'static>>)> {
+        let (id, p) = self.s.pending()?;
+        let job = self.s.job(id).ok()?;
+        let who = match job.kind { Kind::Agent { agent, write } => format!("{}{}", agent.name(), if write { "!" } else { "" }),
+                                   Kind::Ringo { .. } => "ringo".into() };
+        let more = self.s.waiting() - 1;
+        let title = format!(" {who} #{id} asks before it acts{} ", if more > 0 { format!(" · {more} more waiting") } else { String::new() });
+        let mut lines: Vec<Line<'static>> = p.what.lines().flat_map(|l| wrap(l, width)).map(Line::raw).collect();
+        let keys = if self.input.is_empty() {
+            format!("y allow · a allow `{}` for this session · n decline · Tab to look first",
+                    ringo_cli::parse::short(&p.rule, 60))
+        } else {
+            "send or clear (Esc) your line to answer: y allow · a allow for this session · n decline".to_string()
+        };
+        lines.push(Line::styled(keys, self.theme.dim));
+        Some((title, lines))
     }
 }
 
@@ -695,7 +844,10 @@ pub fn run() -> ExitCode {
                         log_height: 0, console: VecDeque::new(), quit_armed: false, quit: false,
                         setup: false, label, agents, theme: Theme::load(), started: Instant::now(),
                         route: crate::theme::setting("route").and_then(|v| v.as_bool()).unwrap_or(false),
-                        suggested: None, pending: None, update: false };
+                        suggested: None, asked: None, pending: None, update: false };
+    if let Some(mode) = crate::theme::setting("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
+        app.s.mode = mode;
+    }
     let found: Vec<&str> = app.agents.iter().map(|a| a.name()).collect();
     app.say(format!("Ringo shell in {}. Agents: {} (/setup adds another).", app.s.repo.display(), found.join(", ")));
     app.say(format!("Private state: {}", app.s.dir.display()));
@@ -738,6 +890,15 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
+        while let Some((ask, route)) = app.s.routed.pop_front() {
+            app.start_routed(ask, &route);
+            dirty = true;
+        }
+        let asking = app.s.pending().map(|(_, p)| p.id.clone());
+        if asking != app.asked.as_ref().map(|(id, _)| id.clone()) {
+            app.asked = asking.map(|id| (id, Instant::now()));
+            dirty = true;
+        }
         while let Ok((applied, (lines, pending))) = news.try_recv() {
             lines.iter().for_each(|line| app.say(line));
             dirty = true;
@@ -811,6 +972,11 @@ mod tests {
         assert_eq!(parse("/apply 2", Codex), Ok(Cmd::Apply(2)));
         assert_eq!(parse("/design a cache for X", Codex), Ok(Cmd::Design("a cache for X".into())));
         assert!(parse("/frobnicate", Codex).is_err());
+        assert_eq!(parse("/mode", Codex), Ok(Cmd::Mode(None)));
+        assert_eq!(parse("/mode auto", Codex), Ok(Cmd::Mode(Some(Mode::Auto))));
+        assert_eq!(parse("/mode read", Codex), Ok(Cmd::Mode(Some(Mode::Read))));
+        assert!(parse("/mode yolo", Codex).is_err());
+        assert_eq!(parse("/auto", Codex), Ok(Cmd::Auto));
     }
 
     #[test]
