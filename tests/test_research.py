@@ -136,7 +136,7 @@ class Fixture(unittest.TestCase):
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.port = self.server.server_address[1]
-        self.codex = python_cli(self.tmp / 'codex', FAKE_CODEX)
+        self.codex = python_cli(self.tmp / 'codex', FAKE_CODEX)[0]
         self.calls_log = self.tmp / 'calls.jsonl'
         for d in ('home', 'owner'):
             (self.tmp / d).mkdir()
@@ -658,6 +658,7 @@ class VerifierTest(Fixture):
         self.assertIn(f'Also at <{self.url("/copy", "mirror.test")}>', entry)
 
 
+@unittest.skipIf(os.name == 'nt', 'the fake codex is a #! script; Windows refuses the batch launcher it would need')
 class PipelineTest(Fixture):
     """The whole command with a fake Codex: each path's exact number of model calls."""
 

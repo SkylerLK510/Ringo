@@ -67,9 +67,9 @@ class CallTest(unittest.TestCase):
                                'print(json.dumps({"result": " ".join(keys)}))\n')
         env = {'ANTHROPIC_API_KEY': 'x', 'ANTHROPIC_BASE_URL': 'http://x', 'CLAUDE_CODE_USE_BEDROCK': '1', 'KEEP': '1'}
         with mock.patch.dict(os.environ, env):
-            preset = {**harness.backend('claude'), 'argv': [exe, '-p']}
+            preset = {**harness.backend('claude'), 'argv': [*exe, '-p']}
             self.assertEqual(harness.call(preset, 's', 'm', 30)[0], 'KEEP')
-            custom = {**harness.backend('claude:claude -p'), 'argv': [exe, '-p']}
+            custom = {**harness.backend('claude:claude -p'), 'argv': [*exe, '-p']}
             self.assertEqual(harness.call(custom, 's', 'm', 30)[0], 'ANTHROPIC_API_KEY ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK KEEP')
 
     def test_claude_errors_and_non_json_raise(self):

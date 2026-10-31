@@ -576,6 +576,8 @@ class Run:
             if self.incident_dir is None:
                 if self.trace:
                     folder = self.trace / 'incidents'
+                    if os.name != 'nt':  # POSIX keeps the path even when mkdir fails, as the native runtime does
+                        self.incident_dir = folder
                     backends.private_directory(folder, create=True, mode=0o700, exist_ok=True)
                 else:
                     with backends.private_tempdir(prefix='ringo-incidents-', cleanup=False) as tmp:

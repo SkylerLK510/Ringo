@@ -182,7 +182,7 @@ def search_unavailable(backend):
             top = _probe([exe, '--help'], env, d)
             run = _probe([exe, 'exec', '--help'], env, d)
             features = _probe([exe, 'features', 'list'], env, d)
-        except (OSError, subprocess.SubprocessError) as exc:
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:  # ValueError: Windows refuses .cmd
             return f'the installed {name} could not be asked what it supports ({type(exc).__name__}: {exc})'
     if not re.search(r'^\s*--search\b', top, re.M):
         return f'the installed {name} has no --search option, so it cannot search the web live'
