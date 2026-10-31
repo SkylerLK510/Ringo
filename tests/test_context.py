@@ -295,6 +295,33 @@ class GrepFallbackTest(unittest.TestCase):
             self.assertEqual([r.split('\0')[1] for r in fast.split('\n') if r], ['2', '3', '5'])
             self.assertEqual(context.grep(repo, 'HEAD', ['café']), '')  # non-ASCII names take the -F -w path
 
+    def test_a_change_with_thousands_of_names_greps_in_one_short_command(self):
+        # git refuses one PCRE alternation past about 31 KB, and the -F -w fallback grows worse than linearly (a merge
+        # with 1,899 names ran for minutes): the names go in several patterns of at most GREP_CHUNK bytes, one per
+        # stdin line, so the command line stays short (Windows refuses one past 32,767 characters).
+        names = [f'name_{i:05d}_symbol' for i in range(2600)]  # about 44 KB of names
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d)
+            subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+            (repo / 'a.py').write_text('x = name_00000_symbol\ny = name_02599_symbol(name_01300_symbol)\nz = 1\n')
+            subprocess.run(['git', '-C', str(repo), 'add', '.'], check=True)
+            subprocess.run(['git', '-C', str(repo), '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'x'], check=True)
+            pcre = subprocess.run(['git', '-C', str(repo), 'grep', '-P', '-e', 'x', 'HEAD', '--'],
+                                  capture_output=True).returncode == 0
+            real, seen = context.git, []
+            def record(r, *args, **kw):
+                seen.append((args, kw.get('input')))
+                return real(r, *args, **kw)
+            with mock.patch.object(context, 'git', side_effect=record):
+                out = context.grep(repo, 'HEAD', names)
+            self.assertEqual([r.split('\0')[1] for r in out.split('\n') if r], ['1', '2'], 'each line once, in order')
+            self.assertTrue(all(sum(map(len, args)) < 200 for args, _ in seen), 'the patterns are not arguments')
+            if pcre:  # git built without PCRE falls back to -F -w, with the same lines
+                self.assertEqual(len(seen), 1, 'no -F -w fallback')
+                lines = seen[0][1].decode().split('\n')
+                self.assertGreater(len(lines), 1)
+                self.assertTrue(all(len(line) < 20_000 for line in lines))
+
     def test_word_boundaries_beside_unicode_letters_match_git_w_in_a_utf8_locale(self):
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ, {'LC_ALL': 'en_US.UTF-8'}):
             repo = Path(d)

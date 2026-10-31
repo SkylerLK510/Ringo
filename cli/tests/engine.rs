@@ -17,7 +17,7 @@ const CODEX_OK: &str = r#"#!/bin/sh
 echo "$@" >> "$0.args"
 env > "$0.env"
 cat > "$0.stdin"
-case "$*" in *workspace-write*) echo made > made.txt; printf 'y\nx\n\n' > b.txt
+case "$*" in *workspace-write*) echo made > made.txt; printf 'y\nx\n\n' > b.txt; printf '\000\001\002binary' > c.bin
   echo "{\"type\":\"item.started\",\"item\":{\"type\":\"file_change\",\"changes\":[{\"path\":\"$PWD/made.txt\",\"kind\":\"add\"}]}}" ;; esac
 echo '{"type":"thread.started","thread_id":"t-1"}'
 echo '{"type":"item.started","item":{"type":"command_execution","command":"ls"}}'
@@ -138,13 +138,19 @@ fn write_jobs_stay_in_their_worktree_until_applied() {
     assert!(!r.join("made.txt").exists(), "nothing lands without /apply");
     assert_eq!(s.overlaps(one), vec![(two, vec!["made.txt".to_string()])], "both jobs edit made.txt");
     assert!(s.diff(one).unwrap().contains("made.txt"));
-    assert!(s.expand("check {#1} please").unwrap().contains("--- change made by job #1 ---"));
+    let handoff = s.expand("check {#1} please").unwrap();
+    assert!(handoff.contains("--- change made by job #1 ---") && handoff.contains("made.txt"));
+    assert!(handoff.contains("Binary files") && !handoff.contains("GIT binary patch"),
+            "a binary file is named, not sent as base85: {handoff}");
+    assert_eq!(s.expand("render {# note #} and {#x} here").unwrap(), "render {# note #} and {#x} here",
+               "only {{#N}} is a handoff");
     fs::write(r.join("a.txt"), "dirty\n").unwrap();
     assert!(s.apply(one).unwrap_err().contains("uncommitted"));
     git(&r, &["checkout", "--", "a.txt"]);
     s.apply(one).unwrap();
     assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "made\n");
     assert_eq!(fs::read_to_string(r.join("b.txt")).unwrap(), "y\nx\n\n");
+    assert_eq!(fs::read(r.join("c.bin")).unwrap(), b"\x00\x01\x02binary", "/apply still carries binary files");
     let wt = s.job(one).unwrap().worktree.clone().unwrap();
     s.drop_worktree(one).unwrap();
     assert!(!wt.exists());
@@ -360,7 +366,10 @@ fn agent_commands_are_pinned() {
             .map(|a| a.replace(&repo, "REPO")).collect();
         (argv, stdin)
     };
-    let tail = ["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"", "-"];
+    // Codex cannot ask, so the ask tool, its mode text and analytics go; plugins and apps only for a connector task.
+    let tail = ["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"",
+                "-c", "features.default_mode_request_user_input=false", "-c", "include_collaboration_mode_instructions=false",
+                "-c", "analytics.enabled=false", "-c", "features.plugins=false", "-c", "features.apps=false", "-"];
     let want = |head: &[&str], rest: &[&str]| -> Vec<String> { head.iter().chain(rest).map(|a| a.to_string()).collect() };
     assert_eq!(turn(agent("codex"), false, &codex), (want(&["exec", "-s", "read-only", "-C", "REPO"], &tail), "the task".into()));
     assert_eq!(turn(agent("codex"), false, &codex),
@@ -371,8 +380,11 @@ fn agent_commands_are_pinned() {
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
-    let read = ["default", "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit", "AskUserQuestion", "EnterPlanMode",
-                "ExitPlanMode", "--settings", &rules];
+    let deny = |extra: &[&'static str]| -> Vec<&'static str> {
+        ["--disallowed-tools"].into_iter().chain(extra.iter().copied()).chain(ringo_cli::OUT_OF_TURN_TOOLS)
+            .chain(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]).collect()
+    };
+    let read = [&["default"][..], &deny(&["Bash", "Edit", "Write", "NotebookEdit"]), &["--settings", &rules]].concat();
     let message = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the task\"}}\n".to_string();
     assert_eq!(turn(agent("claude"), false, &claude),
                (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
@@ -380,8 +392,8 @@ fn agent_commands_are_pinned() {
                (want(&head, &[&read[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
                 message.clone()));
     assert_eq!(turn(agent("claude"), true, &claude),
-               (want(&head, &["acceptEdits", "--disallowed-tools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
-                              "--settings", &rules, "--append-system-prompt-file", "WT/AGENTS.md"]),
+               (want(&head, &[&["acceptEdits"][..], &deny(&[]), &["--settings", &rules, "--append-system-prompt-file",
+                                                                  "WT/AGENTS.md"]].concat()),
                 message.clone()));
     assert_eq!(turn(agent("grok"), true, &grok),
                (want(&["-p", "the task", "--output-format", "plain", "--no-auto-update", "--always-approve", "--cwd", "WT"], &[]),
@@ -562,13 +574,20 @@ fn modes_change_what_each_agent_may_do() {
     turn(&mut s, "claude", true, "fix the retry loop");
     let argv = read(&claude, "argv");
     assert!(has(&argv, &["--safe-mode", "--permission-prompt-tool", "stdio", "--permission-mode", "auto"]), "{argv}");
-    assert!(has(&argv, &["--disallowed-tools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "--settings"]),
-            "a write turn edits and runs commands; only the tools Ringo does not serve are denied, and the always-ask \
-             rules ride along: {argv}");
+    let denied: Vec<&str> = argv.lines().skip_while(|a| *a != "--disallowed-tools").skip(1)
+        .take_while(|a| !a.starts_with("--")).collect();
+    assert!(!denied.contains(&"Bash") && !denied.contains(&"Edit") && denied.contains(&"AskUserQuestion")
+            && denied.contains(&"Workflow") && argv.contains("--settings"),
+            "a write turn edits and runs commands; only tools Ringo does not serve or that act outside the turn are \
+             denied, and the always-ask rules ride along: {argv}");
     turn(&mut s, "codex", true, "fix the retry loop");
     let argv = read(&codex, "argv");
     assert!(has(&argv, &["exec", "--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]), "{argv}");
     assert!(!argv.lines().any(|a| a == "-s"), "--approve-for-me picks the sandbox itself: {argv}");
+    assert!(argv.contains("features.plugins=false"), "no connector named: no plugins: {argv}");
+    turn(&mut s, "codex", true, "summarise my unread Gmail");
+    let argv = read(&codex, "argv");
+    assert!(!argv.contains("features.plugins=false") && argv.contains("analytics.enabled=false"), "{argv}");
 
     // A task naming a connector gets the owner's connectors, without their CLAUDE.md, memory, skills or main agent.
     turn(&mut s, "claude", false, "what is in my Jira sprint?");
@@ -607,7 +626,7 @@ fn a_task_typed_as_a_plain_line_comes_back_routed() {
         pathlib.Path(sys.argv[0]).with_name(f'seen-{n}.json').write_text(json.dumps({'material': material}))\n\
         t = pathlib.Path(val('--trace')); t.mkdir(parents=True, exist_ok=True)\n\
         (t / 'trace.jsonl').write_text(json.dumps({'step': 'answer', 'status': 'ok', 'usage': {'input': 900, 'output': 5}}) + '\\n')\n\
-        pathlib.Path(val('--out')).write_text('ROUTE: Edit\\n' if n == 1 else 'an answer\\n')\n").unwrap();
+        pathlib.Path(val('--out')).write_text('ROUTE: Edit.\\nIt changes client.rs.\\n' if n == 1 else 'an answer\\n')\n").unwrap();
     let mut s = Session::new(&r).unwrap();
     s.ringo_home = home.clone();
     let task = s.ask("fix the retry loop in client.rs").unwrap();
@@ -653,4 +672,16 @@ fn always_ask_actions_reach_the_owner_every_time() {
     assert!(covers("Edit(~/.claude/**)", &ask("Edit", serde_json::json!({"file_path": format!("{home}/.claude/settings.json")}))));
     assert!(!covers("Edit(~/.claude/**)", &ask("Edit", serde_json::json!({"file_path": format!("{home}/.claudex/a")}))));
     assert!(covers("WebFetch", &ask("WebFetch", serde_json::json!({}))) && covers("Bash(make)", &bash("make")));
+}
+
+#[test]
+fn quitting_waits_only_until_the_jobs_are_gone() {
+    let r = repo("shutdown");
+    let slow = fake(&root(), "codex-shutdown", "#!/bin/sh\nsleep 30\n");
+    let mut s = session(&r, agent("codex"), &slow);
+    s.launch_agent(agent("codex"), true, "x").unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    let started = Instant::now();
+    s.shutdown();
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}: TERM ends the fake at once", started.elapsed());
 }

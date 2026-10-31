@@ -198,6 +198,20 @@ nothing. Times ranged from 1.4 s to 3.8 s across these single runs with no patte
 claimed either way. Claude Code does not report its auto-mode review's own calls, so whether they count against a
 plan's usage is not known.
 
+**Tools a Ringo turn never needs.** Claude Code also gives every turn tools that act outside it: scheduling (`Cron*`,
+`ScheduleWakeup`), `RemoteTrigger`, `PushNotification`, sending to other projects, `EnterWorktree`/`ExitWorktree` on
+your repository, design sync, review reports and multi-agent `Workflow`. Their schemas are sent in full, so the shell
+denies them in every mode; subagents, skills, search and the file and shell tools stay. Codex turns lose its ask tool
+and the collaboration-mode text that goes with it, and analytics; unless the task names a connector they also lose
+plugins and apps (13 of the 17 skills listed, recommended plugins, and a computer-use tool that acts outside the
+sandbox). One trivial turn each (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0):
+
+| Turn | Before | After |
+|---|---|---|
+| Claude read turn (`@claude`) | 16,547 | 11,984 |
+| Claude write turn (`@claude!`) | 17,133 | 12,570 |
+| Codex turn (`@codex`), per call | 17,133 | 14,350 |
+
 Not yet: Codex cannot stop to ask, so it does not take ask mode's prompts. Its app-server protocol has the same
 three answers (`accept`, `acceptForSession`, `decline` for command, file-change and permission approvals) and could
 bring them, but it is marked experimental. agy keeps the deny rules described under Safety model.
@@ -248,12 +262,13 @@ tokens per task, against 148 at 50,325 for the stock Codex agent with the same m
 command away (`/review`, `/design`, `/work`) and makes full agent turns explicit, with their tokens on screen. Agent
 turns on repository-level work have not been measured against the pipelines yet.
 
-Measured while building the shell (2026-10-29, one run each, trivial prompts):
+Measured while building the shell (2026-10-29, one run each, trivial prompts; today's turns are lighter, see Modes and
+permissions):
 
 | | Tokens |
 |---|---|
 | Claude Code turn with the owner's normal setup (138 tools, 21 MCP servers, CLAUDE.md, plugins) | 50,201 |
-| the same turn with `--safe-mode`, which the shell uses | 16,567 |
+| the same turn with `--safe-mode`, which the shell used then | 16,567 |
 | a Codex agent turn, first / one-word follow-up | 16,834 / 18,011 |
 | a Claude agent turn, first / one-word follow-up | 16,501 / 16,555 |
 | an agy turn, first / one-word follow-up (2026-10-31, agy 1.4.12) | 7,064 / 7,314 |

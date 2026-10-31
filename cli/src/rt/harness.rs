@@ -1508,6 +1508,8 @@ struct Plan<'p> {
     run: &'p Arc<Run>,
     call_fn: &'p CallFn,
     timeout_s: Num,
+    /// The seconds the caller still has, when it caps each attempt's limits (`left=`).
+    left: Option<&'p (dyn Fn() -> f64 + Sync)>,
     replies: Mutex<pipelines::Replies>,
     skipped: Mutex<HashSet<String>>,
     gates: Mutex<HashMap<(String, Option<String>), Event>>,
@@ -1580,13 +1582,19 @@ impl Plan<'_> {
             rec.insert("system_sha256".into(), Value::String(sha(&self.system)));
             rec.insert("message_sha256".into(), Value::String(sha(message)));
             rec.insert("started".into(), pyjson::float_value(now()));
+            let (mut soft, mut limit) = (self.timeout_s, limit_for(self.timeout_s));
+            if let Some(left) = self.left {
+                // read once, so the limit is never below the soft limit
+                let remaining = Num::Float(left());
+                (soft, limit) = (self.timeout_s.min(remaining), limit.min(remaining));
+            }
             let mut watch: Option<Arc<Watch>> = None;
             if accepts_watch(self.call_fn) {
                 // timeout_s is soft: probe and ask past it, stop at the limit
                 let (run, b, f, probe_label) = (Arc::clone(self.run), backend.clone(), self.call_fn.clone(), format!("{label}.{attempt}"));
                 let probe_fn: ProbeFn = Box::new(move |done| probe(&run, &b, &probe_label, Some(&f), Some(done)));
-                let w = Watch::new(self.run, label, attempt, &backend, self.timeout_s, limit_for(self.timeout_s), &pass_id, Some(probe_fn));
-                rec.insert("soft_s".into(), self.timeout_s.to_value());
+                let w = Watch::new(self.run, label, attempt, &backend, soft, limit, &pass_id, Some(probe_fn));
+                rec.insert("soft_s".into(), soft.to_value());
                 rec.insert("limit_s".into(), w.limit_s.to_value());
                 watch = Some(Arc::new(w));
             }
@@ -1595,7 +1603,7 @@ impl Plan<'_> {
             let seconds = || pyjson::float_value(py::round(t0.elapsed().as_secs_f64(), 3));
             let model = p.get("model").and_then(Value::as_str);
             let as_watch = watch.clone().map(|w| w as Arc<dyn backends::Watch>);
-            let (text, usage) = match self.call_fn.call(&backend, &self.system, message, self.timeout_s, model, as_watch) {
+            let (text, usage) = match self.call_fn.call(&backend, &self.system, message, soft, model, as_watch) {
                 Ok(reply) => reply,
                 Err(exc) if exc.is(Exc::Admission) => {
                     self.run.refuse_reservation()?;
@@ -1627,8 +1635,10 @@ impl Plan<'_> {
                     let raw = attr(&exc, "raw").filter(|r| py::truthy(r)).or_else(|| attr(&exc, "stdout")).map(py::value_str);
                     self.run.record(&with(&rec, &fields), None, raw.as_deref())?;
                     let retried = exc.is(Exc::Judge) || exc.is(Exc::Value) || exc.is(Exc::Timeout);
-                    if attempt == 2 || stopped == Some("limit") || !retried {
-                        return Err(exc); // a call stopped at its hard limit already had its whole window: no retry
+                    if attempt == 2 || stopped == Some("limit") || exc.msg.contains("input_too_large") || !retried {
+                        // a call stopped at its hard limit already had its whole window, and an input the provider
+                        // refused as too large (Codex: input_too_large) fails the same way again: no retry
+                        return Err(exc);
                     }
                     last = Some(exc);
                     continue;
@@ -1751,6 +1761,7 @@ pub fn run_plan(
     timeout_s: Num,
     scope: Option<&str>,
     checker_spec: Option<&Backend>,
+    left: Option<&(dyn Fn() -> f64 + Sync)>,
 ) -> Result<(String, Value)> {
     if valid_price(&timeout_s.to_value()).is_none() || !Num::Int(0).py_cmp(timeout_s).is_some_and(Ordering::is_lt) {
         return Err(Error::value("timeout_s must be finite and positive"));
@@ -1764,6 +1775,7 @@ pub fn run_plan(
         run,
         call_fn,
         timeout_s,
+        left,
         replies: Mutex::new(pipelines::Replies::new()),
         skipped: Mutex::new(HashSet::new()),
         gates: Mutex::new(HashMap::new()),
@@ -2019,7 +2031,7 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
         m
     };
     backends::install_interrupt();
-    let ran = run_plan(&plan, &material, &b, &run, &CallFn::real(), args.timeout, None, c.as_ref());
+    let ran = run_plan(&plan, &material, &b, &run, &CallFn::real(), args.timeout, None, c.as_ref(), None);
     let ran = match ran {
         Ok(_) if backends::interrupted() => Err(backends::keyboard_interrupt()),
         other => other,

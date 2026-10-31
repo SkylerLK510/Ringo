@@ -68,7 +68,7 @@ def wait(argv):
                 pass  # another user's process, or no pid: only the timeout ends the wait
         if state and state.get('status') != 'running' or time.monotonic() >= deadline:
             break
-        time.sleep(1)
+        time.sleep(0.1)  # state.json is under 1 KB: a finished run is seen within 0.1 s
     if not state:
         print(json.dumps({'status': 'not_started', 'folder': str(path.parent)}))
         return 3

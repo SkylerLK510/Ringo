@@ -88,7 +88,8 @@ pub fn main(argv: &[String]) -> i32 {
         return 2;
     };
     let path = pure(&folder).join("state.json");
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout.max(0.0));
+    // `--timeout inf` (or a value past what an Instant can hold) waits without a limit, as in Python
+    let deadline = Duration::try_from_secs_f64(timeout.max(0.0)).ok().and_then(|d| Instant::now().checked_add(d));
     let mut state;
     loop {
         state = read(&path);
@@ -100,10 +101,10 @@ pub fn main(argv: &[String]) -> i32 {
                 s.insert("error".into(), "the run process is gone".into());
             }
         }
-        if (state.is_some() && !running(&state)) || Instant::now() >= deadline {
+        if (state.is_some() && !running(&state)) || deadline.is_some_and(|d| Instant::now() >= d) {
             break;
         }
-        std::thread::sleep(Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(100)); // state.json is under 1 KB: a finished run is seen within 0.1 s
     }
     let Some(Value::Object(mut state)) = state else {
         let parent = path.parent().unwrap().to_string_lossy().into_owned();

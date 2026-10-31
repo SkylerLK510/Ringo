@@ -1805,7 +1805,7 @@ fn rust_plan(case: &Value, sink: &Arc<Mutex<String>>) -> String {
         run = Some(Arc::clone(&r));
         let checker = case.get("checker").filter(|c| !c.is_null()).map(backend_of);
         let (text, stats) = h::run_plan(&plan, case["material"].as_str().unwrap(), &backend_of(&case["backend"]), &r, &call_fn,
-                                        num(&case["timeout"]), case.get("scope").and_then(Value::as_str), checker.as_ref())?;
+                                        num(&case["timeout"]), case.get("scope").and_then(Value::as_str), checker.as_ref(), None)?;
         Ok(json!([text, stats]))
     })();
     let res = ok_or_err(result);
@@ -1921,6 +1921,8 @@ fn plan_cases(base: &Path) -> Vec<Value> {
     // retries: a failed call or a wrong shape is asked once more
     for first in [
         json!({"raise": "CallError", "msg": "codex turn rejected: x", "usage": usage, "raw": "events"}),
+        json!({"raise": "CallError", "msg": "codex exited with 1: Error: turn/start: turn/start failed: Input exceeds the \
+               maximum length of 1048576 characters. (code -32602), data: {\"input_error_code\":\"input_too_large\"}"}),
         json!({"raise": "JudgeError", "msg": "x exited with 1: boom", "stdout": "partial"}),
         json!({"raise": "ValueError", "msg": "bad"}),
         json!({"raise": "TimeoutExpired", "usage": {"cost_usd": null, "items": {}, "warnings": []}, "raw": "", "stdout": "so far"}),

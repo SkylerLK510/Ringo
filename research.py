@@ -62,7 +62,7 @@ TIMEOUT_S = 600  # hard seconds per model call
 MAX_URLS = 10            # candidate URLs fetched; also the cap on identifier lookups
 MAX_REDIRECTS = 3        # per fetch chain
 MAX_BYTES = 2 * 1024 * 1024    # body bytes transferred per fetch chain
-MAX_DECODED = 2 * 1024 * 1024  # body bytes after decompression
+MAX_DECODED = 8 * 1024 * 1024  # body bytes after decompression (documentation pages decode to 0.4-2+ MiB)
 CHAIN_S = 10.0           # one fetch chain, redirects included
 TOTAL_S = 60.0           # all fetching and extraction
 GRACE_S = 1.0            # a worker stopped at the deadline reports within this
@@ -652,11 +652,12 @@ META = frozenset(('citation_title', 'og:title', 'dc.title', 'citation_publicatio
                   'citation_doi', 'citation_arxiv_id'))
 HTML_TYPES = ('text/html', 'application/xhtml+xml')
 TEXT_TYPES = ('text/plain', 'text/markdown')
-# Conservative normalisation: whitespace runs, typographic quotes and dashes, the ellipsis character and invisible
-# formatting characters. Case, accents, other punctuation and digits are kept.
+# Conservative normalisation: whitespace runs, typographic quotes and dashes, the ellipsis character, invisible
+# formatting characters and Markdown backticks (a quote of `5m` from a page whose <code>5m</code> extracts as 5m).
+# Case, accents, other punctuation and digits are kept.
 TYPOGRAPHY = str.maketrans({**dict.fromkeys('\u2018\u2019\u201a\u201b', "'"), **dict.fromkeys('\u201c\u201d\u201e\u201f', '"'),
                             **dict.fromkeys('\u2010\u2011\u2012\u2013\u2014\u2015\u2212', '-'), '\u2026': '...',
-                            **dict.fromkeys('\u00ad\u200b\u200c\u200d\u2060\ufeff')})
+                            **dict.fromkeys('\u00ad\u200b\u200c\u200d\u2060\ufeff`')})
 META_CHARSET = re.compile(rb'<meta[^>]+charset\s*=\s*["\']?\s*([A-Za-z0-9_.:-]+)', re.I)
 
 

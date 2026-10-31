@@ -1,5 +1,5 @@
 //! The `ringo` shell: a live panel of jobs and their subagents, the selected job's log, and one input line.
-//! It redraws only when something changed (an event, a key) or once a second while jobs run.
+//! It redraws only when something changed (an event, a key), and for the spinner (every SPIN_MS) while jobs run.
 
 use ratatui::crossterm::event::{self, Event as Term, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout};
@@ -738,9 +738,9 @@ impl App {
         };
 
         let width = log.width.saturating_sub(2) as usize;
-        let (title, source): (String, Vec<&String>) = match self.s.job(self.selected) {
-            Ok(job) if self.selected > 0 => (format!(" #{} {} ", job.id, job.title), job.log.iter().collect()),
-            _ => (" console ".into(), self.console.iter().collect()),
+        let (title, source): (String, &VecDeque<String>) = match self.s.job(self.selected) {
+            Ok(job) if self.selected > 0 => (format!(" #{} {} ", job.id, job.title), &job.log),
+            _ => (" console ".into(), &self.console),
         };
         let height = log.height.saturating_sub(2) as usize;
         self.log_height = height;
@@ -880,7 +880,9 @@ pub fn run() -> ExitCode {
             }
             dirty = false;
         }
-        let wait = if app.s.running() > 0 { SPIN_MS as u64 } else { 250 };
+        // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
+        // while jobs run (a pump is a few microseconds; redraws still happen only when something changed).
+        let wait = if app.s.running() > 0 { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             match event::read() {
                 Ok(Term::Key(k)) if k.kind == KeyEventKind::Press => {

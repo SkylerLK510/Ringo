@@ -53,7 +53,6 @@ from pathlib import Path
 
 import backends
 import context
-import findings
 import pipelines
 
 TIMEOUT_S = 900
@@ -648,14 +647,15 @@ def checker_pass(plan, checker_spec):
         raise ValueError('a checker backend needs a plan with a verdicts pass')
 
 
-def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_S, scope=None, checker_spec=None):
+def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_S, scope=None, checker_spec=None, left=None):
     """Run every pass of the plan, then assemble; returns (result text, stats). Each reply in the wrong shape is
     asked once more; a failed call is retried once; a command that cannot start stops the run. The number of calls
     is structural: one per pass (one per batch of findings for a batched checker, at most
     ceil(readers x pipelines.MAX_FINDINGS / batch)) plus one checker repair when a verdict is missing, each with
     at most one retry, so a run makes at most 2 x (calls + 1). checker_spec, when
     set, makes the verdicts pass and its repair, so a second model or provider checks the findings; every call
-    still shares `run`, its cost cap and its trace."""
+    still shares `run`, its cost cap and its trace. left, when set, returns the seconds the caller still has: each
+    attempt's soft and hard limits are capped by it, as work's own calls are."""
     if valid_price(timeout_s) is None or timeout_s <= 0:
         raise ValueError('timeout_s must be finite and positive')
     checker_pass(plan, checker_spec)
@@ -712,15 +712,19 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
             rec = {'step': label, 'attempt': attempt, 'pass': p['id'], 'backend': backend['name'],
                    'system_sha256': sha(system),
                    'message_sha256': sha(message), 'started': time.time()}
+            soft, limit = timeout_s, limit_for(timeout_s)
+            if left is not None:  # read once, so the limit is never below the soft limit
+                remaining = left()
+                soft, limit = min(timeout_s, remaining), min(limit, remaining)
             watch = None
             if accepts_watch(call_fn):  # timeout_s is soft: probe and ask past it, stop at the limit
-                watch = Watch(run, label, attempt, backend, timeout_s, limit_for(timeout_s), p['id'],
+                watch = Watch(run, label, attempt, backend, soft, limit, p['id'],
                               lambda done, a=attempt, b=backend: probe(run, b, f'{label}.{a}', call_fn, done))
-                rec.update(soft_s=timeout_s, limit_s=watch.limit_s)
+                rec.update(soft_s=soft, limit_s=watch.limit_s)
             run.record({**rec, 'status': 'started'})  # so an interrupted attempt is visible, and its cost unknown
             t0 = time.monotonic()
             try:
-                text, usage = call_fn(backend, system, message, timeout_s, p.get('model'),
+                text, usage = call_fn(backend, system, message, soft, p.get('model'),
                                       **({'watch': watch} if watch else {}))
             except AdmissionRefused as exc:
                 run.refuse_reservation()
@@ -737,9 +741,11 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                             'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3),
                             **({'stopped': stopped} if stopped else {})},
                            raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
-                if attempt == 2 or stopped == 'limit' or \
+                if attempt == 2 or stopped == 'limit' or 'input_too_large' in str(exc) or \
                         not isinstance(exc, (backends.JudgeError, ValueError, subprocess.TimeoutExpired)):
-                    raise  # a call stopped at its hard limit already had its whole window: no retry
+                    # a call stopped at its hard limit already had its whole window, and an input the provider refused
+                    # as too large (Codex: input_too_large) fails the same way again: no retry
+                    raise
                 last = exc
                 continue
             except BaseException as exc:
@@ -815,6 +821,7 @@ def findings_pr(args):
 def write_findings(args, text, run):
     """Write the review's findings as ReviewBench contract JSON to --findings-json (and the trace); anchors are
     checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary."""
+    import findings  # deferred: only --findings-json uses it
     found = findings.parse(text)
     kept, dropped = findings.anchor(found, args.repo, args.head, args.base) if getattr(args, 'repo', None) else (found, [])
     data = json.dumps(findings.reviewbench(kept, args.findings_pr, args.agent), indent=1) + '\n'

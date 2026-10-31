@@ -72,11 +72,6 @@ static ID_FULL: LazyLock<Regex> = LazyLock::new(|| re(r"\A[A-Za-z][\p{L}\p{N}_-]
 static MODEL: LazyLock<Regex> = LazyLock::new(|| re(r"\A[\p{L}\p{N}_.:-]+\z"));
 static PROMPT: LazyLock<Regex> = LazyLock::new(|| re(r"\A[\p{L}\p{N}_.-]+\.md\z"));
 
-/// Python's `re.fullmatch(ID, s)`.
-pub fn is_id(s: &str) -> bool {
-    ID_FULL.is_match(s)
-}
-
 /// Python's `NO_DEFECTS.search(text)` as a bool.
 pub fn no_defects(text: &str) -> bool {
     NO_DEFECTS.is_match(text)

@@ -607,6 +607,29 @@ fn module_functions_match_on_the_edge_repository() {
 // ---------------------------------------------------------------------------------------------------------------
 // Errors: the exact text of every refusal.
 
+/// git refuses one PCRE alternation past about 31 KB, and the -F -w fallback ran for minutes on a 1,899-name merge:
+/// thousands of names go in several -e patterns, with the same lines as Python, each once, and the same matches.
+#[test]
+fn thousands_of_names_grep_and_match_as_python_does() {
+    let repo = init("many-names");
+    let head = commit(&repo, &[f("a.py", "x = name_00000_symbol\ny = name_02599_symbol(name_01300_symbol)\nz = 1\n")], &[]);
+    let names: Vec<String> = (0..2600).map(|i| format!("name_{i:05}_symbol")).collect();
+    let r = repo.to_str().unwrap();
+    let started = std::time::Instant::now();
+    let out = context::grep(&repo, &head, &names).unwrap();
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    let lines: Vec<&str> = out.split('\n').filter(|l| !l.is_empty()).map(|l| l.split('\0').nth(1).unwrap()).collect();
+    assert_eq!(lines, ["1", "2"]);
+    let found = context::matches(&repo, &head, &names, &[], &Default::default()).unwrap();
+    let found_json: serde_json::Map<String, Value> = found
+        .iter()
+        .map(|(p, e)| (p.clone(), json!({"lines": e.lines, "why": e.why.iter().map(|(k, s)| json!([k, s])).collect::<Vec<_>>()})))
+        .collect();
+    let want = oracle(&[("grep", json!([r, head, names])), ("matches", json!([r, head, names, [], []]))]);
+    assert_eq!(want[0], json!({"ok": out}));
+    assert_eq!(want[1], json!({"ok": found_json}));
+}
+
 #[test]
 fn errors_have_python_s_exact_text() {
     let (repo, base, head) = fixture(&[]);

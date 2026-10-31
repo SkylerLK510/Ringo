@@ -217,5 +217,31 @@ class SoftLimitTest(unittest.TestCase):
         self.assertTrue(50 < writer[0]['soft_s'] <= writer[0]['limit_s'] <= 60)  # both capped by max_seconds
 
 
+    def test_the_work_review_is_soft_too_and_capped_by_the_time_left(self):
+        # The review goes through run_plan: it gets a watch (so a slow review is probed, not killed and sent again),
+        # and its limits are capped by the run's time left, as the writer's are.
+        spec = {'version': 1, 'brief': 'Implement f(x)=2*x.\n\nHard constraints:\n- Return twice x.\n',
+                'files': {'value.py': ''},
+                'fixtures': {'check.py': "from pathlib import Path\nn={}\nexec(Path('value.py').read_text(), n)\nassert n['f'](5)==10\n"},
+                'checks': [{'name': 'reference', 'argv': [sys.executable, '-I', '-B', 'check.py']}],
+                'writer': 'fake', 'judge': 'fake', 'allow_tool_backends': True, 'allow_execution': True,
+                'max_rounds': 1, 'max_seconds': 60}
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(spec))
+        watches = []
+
+        def call(_backend, system, message, timeout_s, watch=None):
+            watches.append(watch)
+            if system.startswith('Implement the task'):
+                return json.dumps({'files': {'value.py': 'def f(x): return 2*x\n'}, 'rationale': 'r'}), {'cost_usd': 0.01}
+            return 'What this change does: adds f.\n\nNo defects found.', {'cost_usd': 0.01}
+
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual([type(w) for w in watches], [harness.Watch, harness.Watch])  # writer, review
+        review = [r for r in self.rows(self.root / 'run') if r.get('pass') == 'review' and r['status'] == 'started']
+        self.assertEqual(len(review), 1)
+        self.assertTrue(50 < review[0]['soft_s'] <= review[0]['limit_s'] <= 60, review[0])
+
 if __name__ == '__main__':
     unittest.main()

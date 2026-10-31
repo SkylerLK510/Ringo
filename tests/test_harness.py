@@ -400,6 +400,18 @@ class RunTest(unittest.TestCase):
             raw = Path(d, 't', 'steps', f"{rows[1]['step']}.1.raw.txt")
             self.assertEqual(raw.stat().st_size, harness.RAW_LIMIT)
 
+    def test_an_input_refused_as_too_large_is_not_sent_again(self):
+        calls = []
+        def too_large(*args):
+            calls.append(1)
+            raise harness.CallError('codex exited with 1: Error: turn/start failed: Input exceeds the maximum length of '
+                                    '1048576 characters. (code -32602), data: {"input_error_code":"input_too_large"}')
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d, 't'))
+            with self.assertRaisesRegex(harness.CallError, 'input_too_large'):
+                harness.run_plan(pl.load_plan(None, 'review'), 'M', B, run, call_fn=too_large)
+            self.assertEqual(len(calls), 1, 'the same input fails the same way: no retry')
+
     def test_a_failed_call_whose_retry_cannot_start_names_its_error(self):
         def timeout(*args):
             raise backends.JudgeError('codex exited with 1: stream disconnected')
