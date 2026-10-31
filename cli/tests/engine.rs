@@ -371,7 +371,8 @@ fn agent_commands_are_pinned() {
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
-    let read = ["default", "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit", "--settings", &rules];
+    let read = ["default", "--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit", "AskUserQuestion", "EnterPlanMode",
+                "ExitPlanMode", "--settings", &rules];
     let message = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the task\"}}\n".to_string();
     assert_eq!(turn(agent("claude"), false, &claude),
                (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
@@ -379,7 +380,8 @@ fn agent_commands_are_pinned() {
                (want(&head, &[&read[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
                 message.clone()));
     assert_eq!(turn(agent("claude"), true, &claude),
-               (want(&head, &["acceptEdits", "--settings", &rules, "--append-system-prompt-file", "WT/AGENTS.md"]),
+               (want(&head, &["acceptEdits", "--disallowed-tools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+                              "--settings", &rules, "--append-system-prompt-file", "WT/AGENTS.md"]),
                 message.clone()));
     assert_eq!(turn(agent("grok"), true, &grok),
                (want(&["-p", "the task", "--output-format", "plain", "--no-auto-update", "--always-approve", "--cwd", "WT"], &[]),
@@ -560,7 +562,9 @@ fn modes_change_what_each_agent_may_do() {
     turn(&mut s, "claude", true, "fix the retry loop");
     let argv = read(&claude, "argv");
     assert!(has(&argv, &["--safe-mode", "--permission-prompt-tool", "stdio", "--permission-mode", "auto"]), "{argv}");
-    assert!(!argv.contains("--disallowed-tools") && argv.contains("--settings"), "a write turn edits; the always-ask rules ride along");
+    assert!(has(&argv, &["--disallowed-tools", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "--settings"]),
+            "a write turn edits and runs commands; only the tools Ringo does not serve are denied, and the always-ask \
+             rules ride along: {argv}");
     turn(&mut s, "codex", true, "fix the retry loop");
     let argv = read(&codex, "argv");
     assert!(has(&argv, &["exec", "--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]), "{argv}");
@@ -585,6 +589,7 @@ fn modes_change_what_each_agent_may_do() {
     let argv = read(&claude, "argv");
     assert!(has(&argv, &["--safe-mode", "--permission-prompts", "none", "--permission-mode", "default"]), "{argv}");
     assert!(has(&argv, &["--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit"]) && !argv.contains("--settings"));
+    assert!(!argv.contains("AskUserQuestion"), "read mode has no permission host, so Claude adds no host tools");
     assert_eq!((Mode::Ask.next(), Mode::Auto.next(), Mode::Read.next()), (Mode::Auto, Mode::Read, Mode::Ask));
 }
 

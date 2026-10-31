@@ -645,8 +645,18 @@ impl Session {
                 };
                 // Read turns run in the owner's own tree with no sandbox, so they never edit and never run commands (a
                 // command could write files); deny rules win in every mode. Commands run in write turns' worktrees.
+                // With a permission host, Claude Code also offers AskUserQuestion, EnterPlanMode and ExitPlanMode,
+                // which Ringo does not serve: they cost 1,566 tokens a trivial turn (18,113 against 16,547, Claude
+                // Code 2.1.316), and denying them puts every mode back at the old floor.
+                let mut deny: Vec<&str> = Vec::new();
                 if !write {
-                    cmd.arg("--disallowed-tools").args(["Bash", "Edit", "Write", "NotebookEdit"]);
+                    deny.extend(["Bash", "Edit", "Write", "NotebookEdit"]);
+                }
+                if self.mode != Mode::Read {
+                    deny.extend(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
+                }
+                if !deny.is_empty() {
+                    cmd.arg("--disallowed-tools").args(deny);
                 }
                 if self.mode != Mode::Read {
                     cmd.arg("--settings").arg(serde_json::json!({"permissions": {"ask": self.always_ask}}).to_string());

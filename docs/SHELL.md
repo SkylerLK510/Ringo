@@ -184,8 +184,19 @@ and answered correctly (5 model calls, 18.5 s, 167,291 tokens, most of them cach
 | auto mode, Claude: `mkdir -p made && ls`, then `sudo -n true` | `mkdir` ran without asking; `sudo` waited, was declined, Claude carried on | 57,691 |
 | auto mode, Codex: the same `curl` | `HTTP/2 200` (in ask mode its sandbox has no network) | 35,326 |
 
-Auto mode added nothing measurable to the tokens Claude reports (a comparable ask-mode turn: 37,783 against 38,373);
-Claude Code does not report its review's own calls, so whether they count against a plan's usage is not known.
+**What the modes cost.** One trivial Claude turn each, the shell's flags before and after (2026-10-31, Claude Code
+2.1.316, one run each):
+
+| Turn | Before | Ask mode | Auto mode |
+|---|---|---|---|
+| read turn (`@claude`) | 16,547 | 16,547 | 16,547 |
+| write turn (`@claude!`) | 17,139 | 17,133 | |
+
+The first version cost 18,113 for the read turn: with a permission host, Claude Code also offers `AskUserQuestion`,
+`EnterPlanMode` and `ExitPlanMode`, which Ringo does not serve, so the shell denies them. The always-ask rules add
+nothing. Times ranged from 1.4 s to 3.8 s across these single runs with no pattern by mode, so no latency change can be
+claimed either way. Claude Code does not report its auto-mode review's own calls, so whether they count against a
+plan's usage is not known.
 
 Not yet: Codex cannot stop to ask, so it does not take ask mode's prompts. Its app-server protocol has the same
 three answers (`accept`, `acceptForSession`, `decline` for command, file-change and permission approvals) and could
