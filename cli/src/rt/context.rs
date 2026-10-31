@@ -143,22 +143,44 @@ fn decode(data: Vec<u8>) -> String {
 /// Run one read-only git command in repo with lazy fetching off; ContextError with git's message. `ok`: the exit
 /// codes that count as success (a code in it still fails when git wrote to stderr).
 pub fn git_binary_ok(repo: &Path, args: &[&str], ok: &[i32]) -> Result<Vec<u8>> {
+    git_input_ok(repo, args, ok, None)
+}
+
+/// `git(repo, *args, binary=True, ok=ok, input=input)`: with input, git reads it on stdin (written from a thread,
+/// so a large output cannot block it); without, stdin is inherited.
+pub fn git_input_ok(repo: &Path, args: &[&str], ok: &[i32], input: Option<&[u8]>) -> Result<Vec<u8>> {
     #[cfg(not(unix))]
     {
-        let _ = (repo, args, ok);
+        let _ = (repo, args, ok, input);
         Err(Error::os(crate::rt::NATIVE_ONLY))
     }
     #[cfg(unix)]
     {
+        use std::io::Write;
         use std::os::unix::process::ExitStatusExt;
-        let p = Command::new("git")
+        let mut child = Command::new("git")
             .arg("-C")
             .arg(repo)
             .args(args)
             .envs(ENV)
-            .stdin(Stdio::inherit())
-            .output()
+            .stdin(if input.is_some() { Stdio::piped() } else { Stdio::inherit() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| Error::io(&e, Some("git")))?;
+        let writer = match (input, child.stdin.take()) {
+            (Some(data), Some(mut pipe)) => {
+                let data = data.to_vec();
+                Some(std::thread::spawn(move || {
+                    let _ = pipe.write_all(&data); // git stops reading at an error; its exit status says why
+                }))
+            }
+            _ => None,
+        };
+        let p = child.wait_with_output().map_err(|e| Error::io(&e, Some("git")))?;
+        if let Some(w) = writer {
+            let _ = w.join();
+        }
         let code = p.status.code().unwrap_or_else(|| -p.status.signal().unwrap_or(0));
         // bytes.strip(): ASCII whitespace including \x0b, which trim_ascii keeps
         if !ok.contains(&code) || (code != 0 && p.stderr.iter().any(|c| !b" \t\n\r\x0b\x0c".contains(c))) {
@@ -743,7 +765,8 @@ pub fn kind(line: &str, sym: &str) -> &'static str {
 pub fn grep(repo: &Path, head: &str, names: &[String]) -> Result<String> {
     let common = ["grep", "-n", "-I", "-z", "--no-color", "--no-column"];
     if names.iter().all(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')) {
-        // git's PCRE refuses one alternation past about 31 KB; several -e patterns print the same lines once each
+        // git's PCRE refuses one alternation past about 31 KB: several patterns, one per stdin line (no argument-length
+        // limit), print the same lines once each
         let mut patterns: Vec<String> = Vec::new();
         let mut group: Vec<&str> = Vec::new();
         let mut size = 0;
@@ -757,24 +780,16 @@ pub fn grep(repo: &Path, head: &str, names: &[String]) -> Result<String> {
         }
         patterns.push(format!("(?<![A-Za-z0-9_])(?:{})(?![A-Za-z0-9_])", group.join("|")));
         let mut args = common.to_vec();
-        args.push("-P");
-        for p in &patterns {
-            args.extend(["-e", p.as_str()]);
-        }
-        args.extend([head, "--"]);
-        match git_ok(repo, &args, &[0, 1]) {
+        args.extend(["-P", "-f", "-", head, "--"]);
+        match git_input_ok(repo, &args, &[0, 1], Some(patterns.join("\n").as_bytes())).map(decode) {
             Ok(out) => return Ok(out),
             Err(e) if e.is(Exc::Context) => {} // git built without PCRE, or a pattern too large for it
             Err(e) => return Err(e),
         }
     }
     let mut args = common.to_vec();
-    args.extend(["-w", "-F"]);
-    for n in names {
-        args.extend(["-e", n]);
-    }
-    args.extend([head, "--"]);
-    git_ok(repo, &args, &[0, 1])
+    args.extend(["-w", "-F", "-f", "-", head, "--"]);
+    git_input_ok(repo, &args, &[0, 1], Some(names.join("\n").as_bytes())).map(decode)
 }
 
 enum Word {

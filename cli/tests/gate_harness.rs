@@ -1921,6 +1921,8 @@ fn plan_cases(base: &Path) -> Vec<Value> {
     // retries: a failed call or a wrong shape is asked once more
     for first in [
         json!({"raise": "CallError", "msg": "codex turn rejected: x", "usage": usage, "raw": "events"}),
+        json!({"raise": "CallError", "msg": "codex exited with 1: Error: turn/start: turn/start failed: Input exceeds the \
+               maximum length of 1048576 characters. (code -32602), data: {\"input_error_code\":\"input_too_large\"}"}),
         json!({"raise": "JudgeError", "msg": "x exited with 1: boom", "stdout": "partial"}),
         json!({"raise": "ValueError", "msg": "bad"}),
         json!({"raise": "TimeoutExpired", "usage": {"cost_usd": null, "items": {}, "warnings": []}, "raw": "", "stdout": "so far"}),

@@ -1635,8 +1635,10 @@ impl Plan<'_> {
                     let raw = attr(&exc, "raw").filter(|r| py::truthy(r)).or_else(|| attr(&exc, "stdout")).map(py::value_str);
                     self.run.record(&with(&rec, &fields), None, raw.as_deref())?;
                     let retried = exc.is(Exc::Judge) || exc.is(Exc::Value) || exc.is(Exc::Timeout);
-                    if attempt == 2 || stopped == Some("limit") || !retried {
-                        return Err(exc); // a call stopped at its hard limit already had its whole window: no retry
+                    if attempt == 2 || stopped == Some("limit") || exc.msg.contains("input_too_large") || !retried {
+                        // a call stopped at its hard limit already had its whole window, and an input the provider
+                        // refused as too large (Codex: input_too_large) fails the same way again: no retry
+                        return Err(exc);
                     }
                     last = Some(exc);
                     continue;

@@ -54,9 +54,10 @@ class ContextError(ValueError):
     """The repository or revisions cannot give complete, offline material."""
 
 
-def git(repo, *args, binary=False, ok=(0,)):
-    """Run one read-only git command in repo with lazy fetching off; raise ContextError with git's message."""
-    p = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, env={**os.environ, **ENV})
+def git(repo, *args, binary=False, ok=(0,), input=None):
+    """Run one read-only git command in repo with lazy fetching off (input, bytes, on its stdin); raise ContextError
+    with git's message."""
+    p = subprocess.run(['git', '-C', str(repo), *args], capture_output=True, env={**os.environ, **ENV}, input=input)
     if p.returncode not in ok or (p.returncode and p.stderr.strip()):
         raise ContextError(f"git {args[0]} failed: {p.stderr.decode('utf-8', 'replace').strip()[:500]}")
     return p.stdout if binary else p.stdout.decode('utf-8', 'replace')
@@ -315,19 +316,21 @@ def grep(repo, head, names):
     patterns, whose word rule is the same."""
     common = ['grep', '-n', '-I', '-z', '--no-color', '--no-column']
     if all(re.fullmatch(r'[A-Za-z0-9_]+', n) for n in names):
-        groups, size = [[]], 0  # git's PCRE refuses one alternation past about 31 KB; -e patterns print a line once
+        # git's PCRE refuses one alternation past about 31 KB: several patterns, one per stdin line (no command-line
+        # limit, which is 32,767 characters on Windows), print the same lines once each
+        groups, size = [[]], 0
         for n in names:
             if groups[-1] and size + len(n) + 1 > GREP_CHUNK:
                 groups.append([])
                 size = 0
             groups[-1].append(n)
             size += len(n) + 1
-        patterns = [x for g in groups for x in ('-e', rf'(?<![A-Za-z0-9_])(?:{"|".join(g)})(?![A-Za-z0-9_])')]
+        patterns = '\n'.join(rf'(?<![A-Za-z0-9_])(?:{"|".join(g)})(?![A-Za-z0-9_])' for g in groups)
         try:
-            return git(repo, *common, '-P', *patterns, head, '--', ok=(0, 1))  # 1: no match
+            return git(repo, *common, '-P', '-f', '-', head, '--', ok=(0, 1), input=patterns.encode())  # 1: no match
         except ContextError:
             pass  # git built without PCRE, or a pattern too large for it
-    return git(repo, *common, '-w', '-F', *[x for n in names for x in ('-e', n)], head, '--', ok=(0, 1))
+    return git(repo, *common, '-w', '-F', '-f', '-', head, '--', ok=(0, 1), input='\n'.join(names).encode())
 
 
 def matches(repo, head, syms, owners, exclude):

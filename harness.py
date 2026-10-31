@@ -741,9 +741,11 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                             'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3),
                             **({'stopped': stopped} if stopped else {})},
                            raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
-                if attempt == 2 or stopped == 'limit' or \
+                if attempt == 2 or stopped == 'limit' or 'input_too_large' in str(exc) or \
                         not isinstance(exc, (backends.JudgeError, ValueError, subprocess.TimeoutExpired)):
-                    raise  # a call stopped at its hard limit already had its whole window: no retry
+                    # a call stopped at its hard limit already had its whole window, and an input the provider refused
+                    # as too large (Codex: input_too_large) fails the same way again: no retry
+                    raise
                 last = exc
                 continue
             except BaseException as exc:
