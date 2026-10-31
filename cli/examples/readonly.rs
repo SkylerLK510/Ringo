@@ -1,11 +1,16 @@
-//! Live check (two small turns): read turns cannot create files. `cargo run --example readonly -- REPO`.
+//! Live check (one small turn each): read turns cannot create files.
+//! `cargo run --example readonly -- REPO [AGENT...]` (default: claude codex).
 use ringo_cli::{Agent, Session};
 use std::time::Duration;
 
 fn main() {
     let repo = std::path::PathBuf::from(std::env::args().nth(1).expect("a scratch git repository"));
     let mut s = Session::new(&repo).unwrap();
-    for agent in [Agent::Claude, Agent::Codex] {
+    let mut names: Vec<String> = std::env::args().skip(2).collect();
+    if names.is_empty() {
+        names = vec!["claude".into(), "codex".into()];
+    }
+    for agent in names.iter().map(|n| Agent::from_name(n).expect("an agent Ringo knows")) {
         let file = format!("{}-was-here.txt", agent.name());
         let id = s.launch_agent(agent, false, &format!("Create a file named {file} containing hi, then say what happened.")).unwrap();
         while s.job(id).unwrap().running() {

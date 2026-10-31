@@ -20,26 +20,130 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOG_LINES: usize = 2000; // per job in memory; the full stream is on disk
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Agent {
+/// How Ringo talks to an agent's program. The protocols are code; which agents use them, and how each one is
+/// installed, signed in and updated, is data: agents.json in the binary, plus the owner's own entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adapter {
+    /// `codex exec --json`.
     Codex,
+    /// `claude -p --output-format stream-json`.
     Claude,
-    Grok,
+    /// `agy --print=… --output-format stream-json`.
+    Agy,
+    /// Any other program: its own command line, the reply as plain text, write turns only.
+    Plain,
 }
 
+/// One agent Ringo can drive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spec {
+    pub name: String,
+    pub company: String,
+    pub adapter: Adapter,
+    /// The program run (default: the name).
+    pub program: String,
+    pub install: String,
+    /// Its own sign-in command, run in the owner's terminal (empty: its first interactive start signs in).
+    pub login: Vec<String>,
+    /// Whether it has a verified read-only mode; without one only `@name!` write turns run.
+    pub read: bool,
+    /// Plain adapter: the arguments after the program, `{prompt}` and `{cwd}` filled in; without `{prompt}` the
+    /// prompt goes on stdin.
+    pub args: Vec<String>,
+    /// The npm package whose latest release the update check compares against (none: no release check).
+    pub npm: Option<String>,
+    /// The agent's own updater, for an install that is neither Homebrew nor npm.
+    pub self_update: Option<String>,
+    /// The vendor's install script for this OS: the update for any other install, run only by `/update`.
+    pub installer: Option<String>,
+    /// Added by the owner (kept in agents.json), not shipped with Ringo.
+    pub custom: bool,
+}
+
+/// A name that can be a program on PATH and go into a command line: letters, digits, `-`, `_`, `.`.
+pub fn valid_name(name: &str) -> bool {
+    name.len() <= 40 && name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+}
+
+impl Spec {
+    /// An agents.json entry, or why Ringo cannot run it.
+    pub fn from_json(v: &serde_json::Value, custom: bool) -> Result<Spec, String> {
+        let text = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+        let list = |k: &str| -> Result<Vec<String>, String> {
+            let Some(items) = v.get(k) else { return Ok(Vec::new()) };
+            items.as_array().ok_or(format!("\"{k}\" must be a list of strings"))?.iter()
+                .map(|x| x.as_str().map(str::to_string).ok_or(format!("\"{k}\" must be a list of strings"))).collect()
+        };
+        let name = text("name").ok_or("an entry without a \"name\"")?;
+        if !valid_name(&name) {
+            return Err(format!("`{name}` cannot be an agent name: use letters, digits, - _ or ."));
+        }
+        let adapter = match text("adapter").as_deref().unwrap_or("plain") {
+            "codex" => Adapter::Codex,
+            "claude" => Adapter::Claude,
+            "agy" => Adapter::Agy,
+            "plain" => Adapter::Plain,
+            other => return Err(format!("{name}: no adapter `{other}` (codex, claude, agy or plain)")),
+        };
+        let read = v.get("read").and_then(|b| b.as_bool()).unwrap_or(false);
+        if read && adapter == Adapter::Plain {
+            return Err(format!("{name}: Ringo cannot verify a read-only mode for a plain agent, so \"read\" must be \
+                                false"));
+        }
+        let os = if cfg!(windows) { "windows" } else { "unix" };
+        let installer = v.get("installer").and_then(|i| i.get(os)).and_then(|s| s.as_str()).map(str::to_string);
+        Ok(Spec { program: text("program").unwrap_or_else(|| name.clone()),
+                  company: text("company").unwrap_or_else(|| format!("{name} (added by you)")),
+                  install: text("install").unwrap_or_default(), login: list("login")?, read, args: list("args")?,
+                  npm: text("npm"), self_update: text("self_update"), installer, adapter, name, custom })
+    }
+}
+
+static REGISTRY: std::sync::RwLock<Vec<&'static Spec>> = std::sync::RwLock::new(Vec::new());
+
+/// Every agent this process knows, the built-in ones first.
+fn registry() -> std::sync::RwLockReadGuard<'static, Vec<&'static Spec>> {
+    static BUILT_IN: std::sync::Once = std::sync::Once::new();
+    BUILT_IN.call_once(|| {
+        let list: Vec<serde_json::Value> = serde_json::from_str(include_str!("agents.json")).expect("agents.json");
+        let mut r = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        r.extend(list.iter().map(|v| &*Box::leak(Box::new(Spec::from_json(v, false).expect("built-in agent")))));
+    });
+    REGISTRY.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An agent: a handle on its entry, cheap to copy and compare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Agent(usize);
+
 impl Agent {
-    pub const ALL: [Agent; 3] = [Agent::Codex, Agent::Claude, Agent::Grok];
+    /// Every agent Ringo knows: the built-in ones, then the owner's.
+    pub fn all() -> Vec<Agent> {
+        (0..registry().len()).map(Agent).collect()
+    }
+
+    pub fn spec(self) -> &'static Spec {
+        registry()[self.0]
+    }
 
     pub fn name(self) -> &'static str {
-        match self {
-            Agent::Codex => "codex",
-            Agent::Claude => "claude",
-            Agent::Grok => "grok",
-        }
+        &self.spec().name
     }
 
     pub fn from_name(name: &str) -> Option<Agent> {
-        Agent::ALL.into_iter().find(|a| a.name() == name)
+        registry().iter().position(|s| s.name == name).map(Agent)
+    }
+
+    /// Adds an agent to this process; refused when the name is taken. Each entry lives as long as the process.
+    pub fn register(spec: Spec) -> Result<Agent, String> {
+        drop(registry()); // the built-in agents first
+        let mut r = REGISTRY.write().unwrap_or_else(|e| e.into_inner());
+        if r.iter().any(|s| s.name == spec.name) {
+            return Err(format!("Ringo already has an agent called {}", spec.name));
+        }
+        r.push(Box::leak(Box::new(spec)));
+        Ok(Agent(r.len() - 1))
     }
 }
 
@@ -287,7 +391,7 @@ impl Session {
             .find(|d| fs::create_dir(d).is_ok()).ok_or(format!("cannot create a session folder in {}", parent.display()))?;
         private_dir(&dir)?;
         let (tx, rx) = channel();
-        let programs = Agent::ALL.iter().map(|a| (*a, PathBuf::from(a.name()))).collect();
+        let programs = Agent::all().into_iter().map(|a| (a, PathBuf::from(&a.spec().program))).collect();
         Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), tx, rx })
     }
@@ -304,8 +408,19 @@ impl Session {
         self.jobs.get(id.wrapping_sub(1)).ok_or(format!("no job #{id}"))
     }
 
+    /// The program an agent runs: as set (tests point it at a fake), else its entry's (an agent added after the
+    /// session opened).
+    pub fn program(&self, agent: Agent) -> PathBuf {
+        self.programs.get(&agent).cloned().unwrap_or_else(|| PathBuf::from(&agent.spec().program))
+    }
+
     pub fn installed(&self, agent: Agent) -> bool {
-        installed(&self.programs[&agent])
+        installed(&self.program(agent))
+    }
+
+    /// The read turn the agent is busy with: its conversation takes one turn at a time.
+    pub fn busy(&self, agent: Agent) -> Option<usize> {
+        self.jobs.iter().find(|j| j.running() && j.kind == (Kind::Agent { agent, write: false })).map(|j| j.id)
     }
 
     fn new_job(&mut self, kind: Kind, title: &str) -> Result<usize, String> {
@@ -332,14 +447,15 @@ impl Session {
             return Err(format!("@{}! edits in a private git worktree, so it needs a git project: start ringo inside one \
                                 (or run git init here). @{} without ! works in any folder", agent.name(), agent.name()));
         }
+        let (name, spec) = (agent.name(), agent.spec());
         if !self.installed(agent) {
-            return Err(format!("{} is not installed (no `{}` on PATH)", agent.name(), self.programs[&agent].display()));
+            return Err(format!("{name} is not installed (no `{}` on PATH)", self.program(agent).display()));
         }
-        if agent == Agent::Grok && !write {
-            return Err("grok has no verified read-only mode; use @grok! for a write job in its own worktree".into());
+        if !spec.read && !write {
+            return Err(format!("{name} has no verified read-only mode; use @{name}! for a write job in its own worktree"));
         }
-        if !write && let Some(busy) = self.jobs.iter().find(|j| j.running() && j.kind == (Kind::Agent { agent, write: false })) {
-            return Err(format!("{} is busy with #{}; its conversation takes one turn at a time", agent.name(), busy.id));
+        if !write && let Some(busy) = self.busy(agent) {
+            return Err(format!("{name} is busy with #{busy}; its conversation takes one turn at a time"));
         }
         let base = if write { Some(git(&self.repo, &["rev-parse", "HEAD"])?) } else { None };
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
@@ -361,13 +477,12 @@ impl Session {
             }
             None => self.repo.clone(),
         };
-        let program = self.programs[&agent].clone();
-        let mut cmd = Command::new(&program);
+        let mut cmd = Command::new(self.program(agent));
         let resume = if write { None } else { self.threads.get(&agent).cloned() };
         let sandbox = if write { "workspace-write" } else { "read-only" };
         let mut stdin_prompt = true;
-        let style = match agent {
-            Agent::Codex => {
+        let style = match spec.adapter {
+            Adapter::Codex => {
                 cmd.args(["exec"]);
                 if let Some(thread) = &resume {
                     cmd.args(["resume", thread]).arg("-c").arg(format!("sandbox_mode=\"{sandbox}\""));
@@ -378,7 +493,7 @@ impl Session {
                           "-c", "model_provider=\"openai\"", "-"]);
                 Style::Codex
             }
-            Agent::Claude => {
+            Adapter::Claude => {
                 // --safe-mode drops the owner's CLAUDE.md, skills, plugins, hooks and MCP servers: one trivial turn
                 // measured 16.6k tokens instead of 50.2k, with the subscription login and built-in subagents kept.
                 // The repository's own instructions are appended instead.
@@ -395,12 +510,33 @@ impl Session {
                 }
                 Style::Claude
             }
-            Agent::Grok => {
-                // Documented flags (docs.x.ai/build/cli/headless-scripting); unverified here: grok is not installed.
-                // --always-approve approves every tool call, so this runs unsandboxed inside its worktree.
-                cmd.arg("-p").arg(prompt).args(["--output-format", "plain", "--no-auto-update", "--always-approve",
-                                                "--cwd"]).arg(&cwd);
+            Adapter::Agy => {
+                // Measured with agy 1.4.11: print mode cannot ask, so a tool needing a permission it lacks ends the
+                // turn with no reply; a deny rule instead returns an error the model sees and works around. Write turns
+                // edit (accept-edits) but run no commands, MCP tools or browser actions, as claude's write turns run no
+                // Bash; read turns cannot write files either. The rules last for this session only.
+                // ceiling: the prompt is one argument (about 1 MB on macOS); stdin needs agy's stream-json input.
+                let deny = if write { r#"["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# }
+                           else { r#"["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# };
+                cmd.arg(format!("--print={prompt}")).args(["--output-format", "stream-json", "--settings"])
+                    .arg(format!(r#"{{"permissions":{{"deny":{deny}}}}}"#));
+                if write {
+                    cmd.args(["--mode", "accept-edits"]);
+                }
+                if let Some(conversation) = &resume {
+                    cmd.args(["--conversation", conversation]);
+                }
                 stdin_prompt = false;
+                Style::Agy
+            }
+            Adapter::Plain => {
+                // The entry's own command line, e.g. grok's documented headless flags (docs.x.ai/build/cli/
+                // headless-scripting; unverified here). Grok's --always-approve runs every tool call unsandboxed
+                // inside its worktree.
+                for arg in &spec.args { // the prompt goes in last, so its own text is never filled in
+                    cmd.arg(arg.replace("{cwd}", &cwd.to_string_lossy()).replace("{prompt}", prompt));
+                }
+                stdin_prompt = !spec.args.iter().any(|a| a.contains("{prompt}"));
                 Style::Plain
             }
         };
@@ -821,21 +957,71 @@ impl Session {
 
 // --- Agents the owner has set up, and their sign-in -------------------------------------------------------------
 
-/// The agents set up with `ringo setup` (state_root()/agents.json); None before the first setup.
+fn agents_file(root: &Path) -> PathBuf {
+    root.join("agents.json")
+}
+
+/// The owner's agents.json: `agents` (the ones set up) and `custom` (entries they added), or an empty one.
+fn read_agents_file(root: &Path) -> serde_json::Value {
+    fs::read(agents_file(root)).ok().and_then(|b| serde_json::from_slice(&b).ok())
+        .filter(serde_json::Value::is_object).unwrap_or_else(|| serde_json::json!({}))
+}
+
+/// Written whole and renamed into place, so a crash or a second shell cannot leave half a file.
+fn write_agents_file(root: &Path, value: &serde_json::Value) -> Result<(), String> {
+    private_dir(root)?;
+    let (path, tmp) = (agents_file(root), root.join(format!("agents.json.tmp{}", std::process::id())));
+    fs::write(&tmp, format!("{value:#}\n")).and_then(|_| fs::rename(&tmp, &path))
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Registers the owner's own entries from `root`/agents.json; the reason for each one that cannot run.
+pub fn load_custom_agents(root: &Path) -> Vec<String> {
+    let file = read_agents_file(root);
+    let mut problems = Vec::new();
+    for entry in file.get("custom").and_then(|c| c.as_array()).into_iter().flatten() {
+        match Spec::from_json(entry, true) {
+            Ok(spec) if Agent::from_name(&spec.name).is_some_and(|a| a.spec() == &spec) => {} // loaded already
+            Ok(spec) => {
+                if let Err(e) = Agent::register(spec) {
+                    problems.push(e);
+                }
+            }
+            Err(e) => problems.push(e),
+        }
+    }
+    problems
+}
+
+/// Adds the owner's entry for an agent Ringo does not ship, kept in `root`/agents.json for next time.
+pub fn add_custom_agent(root: &Path, entry: serde_json::Value) -> Result<Agent, String> {
+    let agent = Agent::register(Spec::from_json(&entry, true)?)?;
+    let mut file = read_agents_file(root);
+    if !file["custom"].is_array() {
+        file["custom"] = serde_json::json!([]);
+    }
+    file["custom"].as_array_mut().unwrap().push(entry);
+    write_agents_file(root, &file)?;
+    Ok(agent)
+}
+
+/// The agents set up with `ringo setup` (state_root()/agents.json), the owner's own entries registered first;
+/// None before the first setup.
 pub fn configured_agents() -> Option<Vec<Agent>> {
-    let text = fs::read_to_string(state_root().join("agents.json")).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    let agents: Vec<Agent> = value.get("agents")?.as_array()?.iter()
+    let root = state_root();
+    load_custom_agents(&root);
+    let file = read_agents_file(&root);
+    let agents: Vec<Agent> = file.get("agents")?.as_array()?.iter()
         .filter_map(|a| a.as_str().and_then(Agent::from_name)).collect();
     Some(agents)
 }
 
+/// Saves which agents are set up; the owner's own entries are kept as they are.
 pub fn save_agents(agents: &[Agent]) -> Result<(), String> {
     let root = state_root();
-    private_dir(&root)?;
-    let names: Vec<&str> = agents.iter().map(|a| a.name()).collect();
-    fs::write(root.join("agents.json"), format!("{}\n", serde_json::json!({ "agents": names })))
-        .map_err(|e| e.to_string())
+    let mut file = read_agents_file(&root);
+    file["agents"] = agents.iter().map(|a| a.name()).collect::<Vec<_>>().into();
+    write_agents_file(&root, &file)
 }
 
 #[derive(Debug, PartialEq)]
@@ -850,20 +1036,21 @@ pub enum SignIn {
 /// Whether the agent is signed in the way Ringo runs it: a subscription login, with API keys removed from the
 /// environment. Reads the agent's own status command; no model call is made.
 pub fn sign_in(agent: Agent, program: &Path) -> SignIn {
-    let args: &[&str] = match agent {
-        Agent::Codex => &["login", "status"],
-        Agent::Claude => &["auth", "status", "--json"],
-        Agent::Grok => return SignIn::Unknown,
+    let adapter = agent.spec().adapter;
+    let args: &[&str] = match adapter {
+        Adapter::Codex => &["login", "status"],
+        Adapter::Claude => &["auth", "status", "--json"],
+        Adapter::Agy | Adapter::Plain => return SignIn::Unknown,
     };
     let mut cmd = Command::new(program);
     cmd.args(args).stdin(Stdio::null());
     agent_env(&mut cmd);
     let Ok(out) = cmd.output() else { return SignIn::No("its status command did not run".into()) };
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    match agent {
-        Agent::Codex if out.status.success() && text.contains("ChatGPT") => SignIn::Yes("ChatGPT".into()),
-        Agent::Codex if out.status.success() => SignIn::No(format!("{} (Ringo uses the ChatGPT login)", text.trim())),
-        Agent::Claude => {
+    match adapter {
+        Adapter::Codex if out.status.success() && text.contains("ChatGPT") => SignIn::Yes("ChatGPT".into()),
+        Adapter::Codex if out.status.success() => SignIn::No(format!("{} (Ringo uses the ChatGPT login)", text.trim())),
+        Adapter::Claude => {
             let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
             match (v.get("loggedIn").and_then(|b| b.as_bool()), v.get("authMethod").and_then(|m| m.as_str())) {
                 (Some(true), Some("claude.ai")) => SignIn::Yes(format!(
@@ -873,30 +1060,5 @@ pub fn sign_in(agent: Agent, program: &Path) -> SignIn {
             }
         }
         _ => SignIn::No(parse::short(&text, 120)),
-    }
-}
-
-/// The agent's own sign-in command, run in the owner's terminal.
-pub fn login_args(agent: Agent) -> &'static [&'static str] {
-    match agent {
-        Agent::Codex => &["login"],
-        Agent::Claude => &["auth", "login"],
-        Agent::Grok => &[], // its first interactive start opens the browser sign-in
-    }
-}
-
-pub fn install_hint(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Codex => "npm install -g @openai/codex      (or: brew install --cask codex)",
-        Agent::Claude => "curl -fsSL https://claude.ai/install.sh | bash      (Windows: irm https://claude.ai/install.ps1 | iex)",
-        Agent::Grok => "curl -fsSL https://x.ai/cli/install.sh | bash      (Windows: irm https://x.ai/cli/install.ps1 | iex)",
-    }
-}
-
-pub fn company(agent: Agent) -> &'static str {
-    match agent {
-        Agent::Codex => "OpenAI Codex CLI",
-        Agent::Claude => "Anthropic Claude Code",
-        Agent::Grok => "xAI Grok Build",
     }
 }

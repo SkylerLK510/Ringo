@@ -29,7 +29,9 @@ Agents (full agent turns: about 17,000 tokens before they start, far more when t
 counts every one), for questions about your code and for changes:
   @codex TASK          ask an agent; it can read the repository but not change it (conversation continues)
   @codex! TASK         let it edit, in a private worktree from HEAD; nothing lands until you /apply
-  @codex @claude TASK  the same task to several agents at once; @all means codex and claude
+  @codex @claude TASK  the same task to several agents at once; @all means every agent set up (read turns skip
+                       the ones with no read-only mode, such as grok)
+  @agy TASK            Google's Antigravity CLI, set up with /setup; agents you add yourself take @name! turns
   {#N} in a TASK       hands job N's reply (and change) to the agent, shown before it is sent
   /setup               add another agent and sign in to it
   /update              update the agents the opening check found out of date, in this terminal (no tokens);
@@ -118,8 +120,11 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             None => (&word[1..], false),
         };
         match name {
-            "all" => agents.extend(all.iter().filter(|a| write || **a != Agent::Grok).map(|a| (*a, write))),
-            _ => agents.push((Agent::from_name(name).ok_or(format!("no agent {name}: codex, claude, grok or all"))?, write)),
+            "all" => agents.extend(all.iter().filter(|a| write || a.spec().read).map(|a| (*a, write))),
+            _ => agents.push((Agent::from_name(name).ok_or_else(|| {
+                let known: Vec<&str> = Agent::all().into_iter().map(|a| a.name()).collect();
+                format!("no agent {name}: {} or all (/setup adds one)", known.join(", "))
+            })?, write)),
         }
         rest = rest.trim_start()[word.len()..].trim_start();
     }
@@ -204,11 +209,20 @@ impl App {
     }
 
     fn agent_style(&self, agent: Agent) -> Style {
-        match agent {
-            Agent::Codex => self.theme.codex,
-            Agent::Claude => self.theme.claude,
-            Agent::Grok => self.theme.grok,
+        match agent.name() {
+            "codex" => self.theme.codex,
+            "claude" => self.theme.claude,
+            _ => self.theme.grok, // every other agent shares the third colour
         }
+    }
+
+    /// Who takes a suggested agent turn: the set-up agents that can take it now (a read turn needs a read-only mode
+    /// and a free conversation), with claude, then codex, preferred (see route::owner).
+    fn owner(&self, route: &crate::route::Route) -> Option<Agent> {
+        let read = *route == crate::route::Route::Read;
+        let able: Vec<&str> = self.agents.iter().filter(|a| !read || (a.spec().read && self.s.busy(**a).is_none()))
+            .map(|a| a.name()).collect();
+        crate::route::owner(&able).and_then(Agent::from_name)
     }
 
     fn spinner(&self) -> &'static str {
@@ -225,9 +239,11 @@ impl App {
         let was_suggested = self.suggested.take().is_some();
         let plain = !line.trim_start().starts_with(['/', '@']);
         if self.route && plain && !was_suggested {
-            let agent = self.agents.iter().find(|a| **a != Agent::Grok).copied().unwrap_or(self.agents[0]);
             let route = crate::route::classify(&line, self.s.git);
-            if let Some((cmd, cost)) = crate::route::suggestion(&route, line.trim(), agent.name()) {
+            let agent = self.owner(&route).map_or("", |a| a.name());
+            let needs = matches!(route, crate::route::Route::Edit | crate::route::Route::Read);
+            let suggested = crate::route::suggestion(&route, line.trim(), agent).filter(|_| !needs || !agent.is_empty());
+            if let Some((cmd, cost)) = suggested {
                 self.say(format!("  → suggested: {cmd}\n    ({cost}). Enter sends it; change it if you like; Esc asks it \
                                   as a plain question instead (about 1-2k tokens)."));
                 self.input = cmd.chars().collect();
@@ -768,8 +784,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(non_snake_case)] // the names the agents had as enum variants, so this test reads as before
     fn parses_routes_and_commands() {
-        use Agent::*;
+        let named = |n: &str| Agent::from_name(n).unwrap();
+        let (Codex, Claude, Grok) = (named("codex"), named("claude"), named("grok"));
         let all = [Codex, Claude, Grok];
         let parse = |line: &str, _: Agent| super::parse(line, &all);
         assert_eq!(parse("why is it slow?", Codex), Ok(Cmd::Ask("why is it slow?".into())));
@@ -782,7 +800,11 @@ mod tests {
         assert_eq!(parse("@claude! fix it", Codex), Ok(Cmd::Agents(vec![(Claude, true)], "fix it".into())));
         assert_eq!(parse("@codex @claude! do x", Grok), Ok(Cmd::Agents(vec![(Codex, false), (Claude, true)], "do x".into())));
         assert_eq!(parse("@all compare", Codex), Ok(Cmd::Agents(vec![(Codex, false), (Claude, false)], "compare".into())));
-        assert!(parse("@nobody x", Codex).is_err());
+        assert!(parse("@nobody x", Codex).unwrap_err().contains("agy"));
+        let with_agy = [Codex, named("agy"), Grok];
+        assert_eq!(super::parse("@all! x", &with_agy),
+                   Ok(Cmd::Agents(vec![(Codex, true), (named("agy"), true), (Grok, true)], "x".into())));
+        assert_eq!(super::parse("@all x", &with_agy), Ok(Cmd::Agents(vec![(Codex, false), (named("agy"), false)], "x".into())));
         assert!(parse("@codex", Codex).is_err());
         assert_eq!(parse("/review #3", Codex), Ok(Cmd::ReviewJob(3)));
         assert_eq!(parse("/review main", Codex), Ok(Cmd::ReviewRepo("main".into(), "HEAD".into())));

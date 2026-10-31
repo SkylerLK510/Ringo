@@ -53,11 +53,8 @@ fn locate(name: &str) -> Option<PathBuf> {
 
 /// Where to ask for the newest release, and the update for this install, from where the program lives.
 fn source(agent: Agent, path: &Path) -> Option<(String, Update)> {
-    let package = match agent {
-        Agent::Codex => "@openai/codex",
-        Agent::Claude => "@anthropic-ai/claude-code",
-        Agent::Grok => return None, // no public release feed to ask
-    };
+    let spec = agent.spec();
+    let package = spec.npm.as_deref()?; // no npm package: no public release feed to ask
     let real = path.to_string_lossy().replace('\\', "/");
     // A Homebrew name comes from the path, so it goes into a shell command only if it looks like one.
     let brew = |dir: &str| real.split(dir).nth(1).and_then(|rest| rest.split('/').next())
@@ -70,13 +67,10 @@ fn source(agent: Agent, path: &Path) -> Option<(String, Update)> {
         (format!("https://formulae.brew.sh/api/formula/{formula}.json"), format!("brew upgrade {formula}"), true)
     } else if real.contains("/node_modules/") || real.ends_with(".cmd") {
         (npm_feed, format!("npm install -g {package}@latest"), true) // a .cmd is npm's Windows shim
-    } else if agent == Agent::Claude {
-        (npm_feed, "claude update".into(), true)
-    } else if cfg!(windows) {
-        let script = r#"powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex""#;
-        (npm_feed, script.into(), false)
+    } else if let Some(own) = &spec.self_update {
+        (npm_feed, own.clone(), true)
     } else {
-        (npm_feed, "curl -fsSL https://chatgpt.com/codex/install.sh | sh".into(), false)
+        (npm_feed, spec.installer.clone()?, false)
     };
     Some((feed, Update { agent, command, unattended, have: String::new() }))
 }
@@ -153,7 +147,7 @@ pub fn check(agents: &[Agent], state: &Path) -> (Vec<String>, Vec<Update>) {
     let (mut lines, mut pending) = (Vec::new(), Vec::new());
     for &agent in agents {
         let name = agent.name();
-        let Some(path) = locate(name) else { continue };
+        let Some(path) = locate(&agent.spec().program) else { continue };
         let Some(have) = installed_version(&path) else { continue };
         if let Some(before) = memo["installed"][name].as_str().filter(|b| *b != have) {
             lines.push(format!("  {name} changed {before} -> {have} since the last session; answers and token use \
@@ -185,7 +179,7 @@ fn shell(command: &str) -> Command {
 /// What an agent reports after its update ran, and whether it is now newer than when the check ran.
 fn after(update: &Update, ran: Option<bool>, log: Option<&Path>) -> (String, bool) {
     let name = update.agent.name();
-    let now = locate(name).and_then(|p| installed_version(&p));
+    let now = locate(&update.agent.spec().program).and_then(|p| installed_version(&p));
     let output = log.map_or("its output is above the shell".into(), |l| format!("its output is in {}", l.display()));
     let line = match (ran, &now) {
         (Some(true), Some(v)) if newer(v, &update.have) => format!("  {name} updated: {} -> {v}", update.have),
@@ -253,23 +247,25 @@ mod tests {
     #[test]
     fn picks_the_install_method() {
         let at = |agent, path: &str| source(agent, Path::new(path)).unwrap();
-        let (feed, update) = at(Agent::Codex, "/opt/homebrew/Caskroom/codex/0.165.0/bin/codex");
+        let (codex, claude) = (Agent::from_name("codex").unwrap(), Agent::from_name("claude").unwrap());
+        let (feed, update) = at(codex, "/opt/homebrew/Caskroom/codex/0.165.0/bin/codex");
         assert_eq!(feed, "https://formulae.brew.sh/api/cask/codex.json");
         assert_eq!((update.command.as_str(), update.unattended), ("brew upgrade --cask codex", true));
-        let (feed, update) = at(Agent::Claude, "/opt/homebrew/Caskroom/claude-code/2.1.314/claude");
+        let (feed, update) = at(claude, "/opt/homebrew/Caskroom/claude-code/2.1.314/claude");
         assert_eq!(feed, "https://formulae.brew.sh/api/cask/claude-code.json");
         assert_eq!(update.command, "brew upgrade --cask claude-code");
-        assert_eq!(at(Agent::Codex, "/opt/homebrew/Cellar/codex/0.165.0/bin/codex").1.command, "brew upgrade codex");
-        assert_eq!(at(Agent::Codex, "/usr/local/lib/node_modules/@openai/codex/bin/codex.js").1.command,
+        assert_eq!(at(codex, "/opt/homebrew/Cellar/codex/0.165.0/bin/codex").1.command, "brew upgrade codex");
+        assert_eq!(at(codex, "/usr/local/lib/node_modules/@openai/codex/bin/codex.js").1.command,
                    "npm install -g @openai/codex@latest");
-        let shim = at(Agent::Codex, r"C:\Users\u\AppData\Roaming\npm\codex.cmd");
+        let shim = at(codex, r"C:\Users\u\AppData\Roaming\npm\codex.cmd");
         assert_eq!(shim.1.command, "npm install -g @openai/codex@latest");
-        assert_eq!(at(Agent::Claude, "/Users/u/.local/share/claude/versions/2.1.314").1.command, "claude update");
-        let native = at(Agent::Codex, "/Users/u/.local/bin/codex").1;
+        assert_eq!(at(claude, "/Users/u/.local/share/claude/versions/2.1.314").1.command, "claude update");
+        let native = at(codex, "/Users/u/.local/bin/codex").1;
         assert!(native.command.contains("chatgpt.com/codex/install") && !native.unattended);
-        assert!(source(Agent::Grok, Path::new("/usr/local/bin/grok")).is_none());
+        assert!(source(Agent::from_name("grok").unwrap(), Path::new("/usr/local/bin/grok")).is_none());
+        assert!(source(Agent::from_name("agy").unwrap(), Path::new("/opt/homebrew/bin/agy")).is_none());
         // A path segment that is not a Homebrew name never reaches a shell command.
-        let odd = at(Agent::Codex, "/opt/homebrew/Caskroom/codex;rm -rf ~/1/bin/codex").1;
+        let odd = at(codex, "/opt/homebrew/Caskroom/codex;rm -rf ~/1/bin/codex").1;
         assert!(!odd.command.contains("rm -rf"));
     }
 

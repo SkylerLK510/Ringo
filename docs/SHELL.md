@@ -1,7 +1,8 @@
 # The `ringo` shell
 
 Type `ringo` in a terminal and Ringo opens its own session, the way `claude` opens Claude Code. From that one
-terminal you route work to the coding agents you already use (OpenAI Codex CLI, Claude Code, xAI Grok Build), run
+terminal you route work to the coding agents you already use (OpenAI Codex CLI, Claude Code, Google Antigravity CLI,
+xAI Grok Build, or one you add), run
 Ringo's own pipelines with them, and watch every job and subagent in a live panel.
 
 The shell is a small Rust program (`cli/`). Its `/review`, `/design` and `/work` start the same binary, which runs
@@ -37,7 +38,7 @@ The first `ringo` asks which agents you use:
 
 ```
 Welcome to Ringo.
-Type the command you start an agent with, as you would in a terminal (codex, claude or grok).
+Type the command you start an agent with, as you would in a terminal (codex, claude, grok, agy).
 agent> codex
   codex: installed ✓  signed in ✓ (ChatGPT)
 Would you like to add another agent [y/n] y
@@ -51,10 +52,42 @@ Set up: codex, claude. Next time just type ringo.
 
 For each agent Ringo checks it is installed (and prints the official install command if not) and signed in, using
 the agent's own status command, which makes no model call: `codex login status`, `claude auth status`. When an
-agent is not signed in, Ringo runs that agent's own sign-in (`codex login`, `claude auth login`, or `grok`'s
-browser sign-in) in your terminal. Ringo uses subscription logins only: it removes API-key variables from every
+agent is not signed in, Ringo runs that agent's own sign-in (`codex login`, `claude auth login`, or the browser
+sign-in `grok` and `agy` open on their first start) in your terminal. Ringo uses subscription logins only: it removes API-key variables from every
 agent it starts, forces Codex's ChatGPT login, and stops a Claude turn that reports an API key. `/setup` in the
 shell, or `ringo setup`, adds another agent later.
+
+### Agents Ringo does not ship
+
+Ringo never runs a program to find out what it is. A name that is not a program on your PATH gets
+"`tle` is not an agent: nothing called tle is installed." An installed program Ringo has no entry for gets
+"`git` is a program, but not an agent Ringo knows.", then the offer to add it: you give the command that runs one
+prompt and prints the answer, with `{prompt}` where the prompt goes and `{cwd}` for the folder (without `{prompt}`,
+the prompt goes on stdin). An agent you add takes `@name!` write turns in its own worktree, with its reply read as
+plain text; it has no read turns, because Ringo cannot verify a read-only mode for it.
+
+Your entries live in `agents.json` in Ringo's state folder, beside the list of agents you set up, and you can edit
+them there:
+
+```json
+{"agents": ["codex", "claude", "mytool"],
+ "custom": [{"name": "mytool", "args": ["run", "--prompt", "{prompt}", "--dir", "{cwd}"],
+             "company": "My tool", "install": "pipx install mytool"}]}
+```
+
+Fields: `name` (letters, digits, `-`, `_`, `.`), `program` (default: the name; a path works), `args`, `company`,
+`install`, `login` (its sign-in arguments), `npm` (a package to check for updates), and `adapter`: `plain`
+(default), or `codex`, `claude` or `agy` for another install of one of those (say, a second Claude Code at another
+path), which then gets that agent's own write turns, and its read turns with `"read": true`. The agents Ringo ships are the same kind of entry,
+in `cli/src/agents.json`; how each protocol is spoken stays in code.
+
+### Who takes which turn
+
+Codex owns the abstract work: Ringo's pipelines (`/research`, `/design`, `/review`) and plain asks run on it.
+Claude owns writing and reading code: with `/route on`, an edit line is suggested as `@claude! ...` and a question
+about the files as `@claude ...`. The preference is soft. When Claude is not set up, or a read turn finds its
+conversation busy, the suggestion names Codex, then any other agent that can take the turn; typing `@codex`,
+`@agy` or any `@agent` yourself always picks for you.
 
 ## Using it
 
@@ -88,7 +121,7 @@ panel moves above the chat, one row per job.
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once |
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
-| `/route on` | route suggestions: a line that reads like a research, design, review or edit task, or a question about this folder's files, is not sent; the matching command (`/research ...`, `/design ...`, `/review ...`, `@codex! ...`, or `@codex ...` for a read-only look at the files) appears in the input line with what it costs, for you to send with Enter, change, or ask as a plain question with Esc. Word rules only, no model call; an agent turn is only ever suggested. On 100 held-out lines the suggestions were acceptable 35 times in 38 and covered about half of the tasks; the rest are asked as plain questions. `/route off` turns it off |
+| `/route on` | route suggestions: a line that reads like a research, design, review or edit task, or a question about this folder's files, is not sent; the matching command (`/research ...`, `/design ...`, `/review ...`, `@claude! ...`, or `@claude ...` for a read-only look at the files; see "Who takes which turn") appears in the input line with what it costs, for you to send with Enter, change, or ask as a plain question with Esc. Word rules only, no model call; an agent turn is only ever suggested. On 100 held-out lines the suggestions were acceptable 35 times in 38 and covered about half of the tasks; the rest are asked as plain questions. `/route off` turns it off |
 | `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | select a job, stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
@@ -119,14 +152,15 @@ jobs run, an automatic update starts only when none is running, and no job start
 that fails or brings no newer version stays on the list for the next `/update`. Claude Code installed with its own installer already updates itself; the shell reports when that happened.
 
 The release lookup asks the Homebrew or npm registry about each agent at most once a day (no account);
-`RINGO_NO_UPDATE_CHECK=1` turns it off. Versions are kept in `engine-versions.json` in Ringo's state folder. Grok is
-only reported when its version changes: it has no public release feed.
+`RINGO_NO_UPDATE_CHECK=1` turns it off. Versions are kept in `engine-versions.json` in Ringo's state folder. Grok and
+agy are only reported when their version changes: Ringo knows no public release feed for them (agy updates itself
+with `agy update`).
 
 ## Colours
 
 The default theme, `siamese`, takes its palette from a seal-point Siamese: cream and fawn for text and frames, seal
 brown for the header bar, and sapphire, the eye colour, for whatever is running and for the line you type in. Each
-agent keeps one colour (Codex mint, Claude clay, Grok silver), finished jobs are sage, failures rose, and the
+agent keeps one colour (Codex mint, Claude clay, every other agent silver), finished jobs are sage, failures rose, and the
 same-files warning amber.
 
 | Theme | For |
@@ -173,13 +207,17 @@ or for the spinner while a job runs.
 ## Safety model
 
 - **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with `--permission-prompts none` and deny
-  rules for `Bash`, `Edit`, `Write` and `NotebookEdit`, which win over any allow rules in your own settings. Grok has
-  no read-only mode Ringo has verified, so it only runs write jobs. Checked live: asked in a read turn to create a
+  rules for `Bash`, `Edit`, `Write` and `NotebookEdit`, which win over any allow rules in your own settings. agy runs
+  with session-only deny rules for `write_file(*)`, `command(*)`, `unsandboxed(*)`, `mcp(*)` and
+  `execute_url(*)`, which win over its accept rules; asked to edit, it gets an error it can see and answers anyway
+  (checked live with agy 1.4.11: no file appeared). Grok and agents you add have
+  no read-only mode Ringo has verified, so they only run write jobs. Checked live: asked in a read turn to create a
   file, both refused and no file appeared, but trying cost Claude 98k tokens and Codex 40k. Use `@agent!` when you
   want edits.
 - **Write turns** run in a worktree under Ringo's private state folder: Codex with `workspace-write` (its sandbox allows commands in
   the worktree), Claude with `acceptEdits` and a deny rule for `Bash` (edits allowed, shell commands refused: Claude
-  has no sandbox here), Grok with `--always-approve` (every tool call approved, so
+  has no sandbox here), agy with `--mode accept-edits` and the same deny rules minus `write_file` (edits allowed;
+  commands, MCP tools and browser actions refused, as for Claude), Grok with `--always-approve` (every tool call approved, so
   it is not contained; its flags come from xAI's documentation and are untested here). A worktree keeps parallel
   edits apart; it is not a security boundary.
 - **Applying:** `/apply` needs a finished job and a clean tree, checks the patch first, and applies it with

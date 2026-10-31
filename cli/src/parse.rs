@@ -49,6 +49,8 @@ pub enum Style {
     Codex,
     /// `claude -p --output-format stream-json --verbose` events.
     Claude,
+    /// `agy --print=… --output-format stream-json` events.
+    Agy,
     /// Plain text: every line is reply text.
     Plain,
     /// A Ringo trace.jsonl, read as it grows.
@@ -112,6 +114,7 @@ impl Parser {
         match self.style {
             Style::Codex => self.codex(&event),
             Style::Claude => self.claude(&event),
+            Style::Agy => self.agy(&event),
             _ => self.trace(&event),
         }
     }
@@ -274,6 +277,62 @@ impl Parser {
         notes
     }
 
+    /// agy 1.4.11 stream-json: `init`, `step_update` per model step or tool (ACTIVE, then DONE or ERROR; text arrives
+    /// as `text_delta`), and one `result` with the reply and the whole turn's usage.
+    fn agy(&mut self, e: &Value) -> Vec<Note> {
+        let mut notes = Vec::new();
+        match s(e, "event") {
+            "init" => notes.push(Note::Session(s(e, "conversation_id").to_string())),
+            "step_update" => {
+                let step = e.get("step_update").cloned().unwrap_or(Value::Null);
+                let (state, tool) = (s(&step, "state"), s(&step, "tool_name"));
+                let params = step.pointer("/tool_info/parameters").cloned().unwrap_or(Value::Null);
+                let target = ["Path", "TargetFile", "AbsolutePath", "CommandLine", "Query", "Url"].iter()
+                    .map(|k| s(&params, k)).find(|v| !v.is_empty()).unwrap_or("");
+                match (s(&step, "step_type"), state) {
+                    ("tool", "ACTIVE") => {
+                        let shown = if params.get("CommandLine").is_some() { target } else { base_name(target) };
+                        let text = format!("{tool} {}", short(shown, 70));
+                        notes.push(Note::Activity { node: None, text: text.clone() });
+                        notes.push(Note::Log(text));
+                        let reads = tool.starts_with("view") || tool.starts_with("read");
+                        if tool.contains("file") && !reads && !target.is_empty() {
+                            notes.push(Note::Touched(target.to_string()));
+                        }
+                    }
+                    ("tool", "ERROR") => {
+                        let why = step.pointer("/tool_info/error/message").and_then(Value::as_str).unwrap_or("");
+                        notes.push(Note::Log(format!("  {tool} refused: {}", short(why, 160))));
+                    }
+                    ("agent_response", "ACTIVE") => notes.push(Note::Activity { node: None, text: "writing".into() }),
+                    _ => {}
+                }
+            }
+            "result" => {
+                self.completed += 1;
+                let r = e.get("result").cloned().unwrap_or(Value::Null);
+                let usage = r.get("usage").cloned().unwrap_or(Value::Null);
+                // Thinking is part of output_tokens (input + output = total_tokens); cache reads are taken to be part
+                // of input_tokens, as Gemini counts them.
+                let cached = u(&usage, "cache_read_tokens").min(u(&usage, "input_tokens"));
+                notes.push(Note::Tokens(Tokens { input: u(&usage, "input_tokens") - cached, cache_read: cached,
+                                                 cache_write: 0, output: u(&usage, "output_tokens") }));
+                self.reply = s(&r, "response").to_string();
+                let denied: Vec<&str> = r.get("denied_actions").and_then(Value::as_array).into_iter().flatten()
+                    .map(|d| s(d, "action")).collect();
+                if s(&r, "status") != "SUCCESS" {
+                    let why = format!("agy ended with {}: {}", s(&r, "status"), short(&self.reply.clone(), 200));
+                    notes.extend(self.fail(why));
+                } else if self.reply.trim().is_empty() && !denied.is_empty() {
+                    notes.extend(self.fail(format!("agy stopped: it needed permission for {}", denied.join(", "))));
+                }
+            }
+            "error" => return self.fail(format!("agy: {}", short(&e.to_string(), 200))),
+            _ => {}
+        }
+        notes
+    }
+
     /// One Ringo trace record: a call starting, or a finished (paid) attempt with its usage.
     fn trace(&mut self, e: &Value) -> Vec<Note> {
         let step = s(e, "step");
@@ -296,8 +355,8 @@ impl Parser {
         }
         match self.style {
             Style::Codex if self.completed != 1 => Err(format!("{} turn.completed events", self.completed)),
-            Style::Claude if self.completed != 1 => Err("no result event".into()),
-            Style::Codex | Style::Claude | Style::Plain if self.reply.trim().is_empty() => Err("no final reply".into()),
+            Style::Claude | Style::Agy if self.completed != 1 => Err("no result event".into()),
+            Style::Codex | Style::Claude | Style::Agy | Style::Plain if self.reply.trim().is_empty() => Err("no final reply".into()),
             _ => Ok(()),
         }
     }
@@ -403,6 +462,38 @@ mod tests {
         assert!(p.finish().is_err());
         let err = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"result":""}"#;
         assert!(run(Style::Claude, &[CLAUDE[0], err]).0.finish().is_err());
+    }
+
+    // Shapes taken from real agy 1.4.11 stream-json output (paths shortened).
+    const AGY: &[&str] = &[
+        r#"{"event":"init","conversation_id":"bb23","init":{"cwd":"/w","tools":["view_file","edit_file"],"permission_mode":"request-review"}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"bb23","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"read_file","tool_info":{"name":"read_file","parameters":{"Path":"/w/calc.py"}}}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"bb23","step_index":4,"state":"ERROR","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls -la"},"error":{"type":"TOOL_ERROR","message":"Permission denied for unsandboxed(ls -la). Matches user-configured deny rule."}}}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"bb23","step_index":6,"state":"ACTIVE","step_type":"tool","tool_name":"edit_file","tool_info":{"name":"edit_file","parameters":{"Path":"/w/calc.py"}}}}"#,
+        r#"{"event":"step_update","step_update":{"conversation_id":"bb23","step_index":9,"state":"ACTIVE","step_type":"agent_response","text_delta":"Fixed"}}"#,
+        r#"{"event":"result","result":{"conversation_id":"bb23","status":"SUCCESS","response":"Fixed calc.py.","duration_seconds":12.1,"num_turns":1,"usage":{"input_tokens":37365,"output_tokens":827,"thinking_tokens":481,"cache_read_tokens":0,"total_tokens":38192}}}"#,
+    ];
+
+    #[test]
+    fn agy_turn() {
+        let (p, notes) = run(Style::Agy, AGY);
+        assert_eq!(p.finish(), Ok(()));
+        assert_eq!(p.reply(), "Fixed calc.py.");
+        assert!(notes.contains(&Note::Session("bb23".into())));
+        assert!(notes.contains(&Note::Activity { node: None, text: "edit_file calc.py".into() }));
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Touched(_))).collect::<Vec<_>>(), [&Note::Touched("/w/calc.py".into())]);
+        assert!(notes.iter().any(|n| matches!(n, Note::Log(l) if l.contains("run_command refused"))));
+        assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
+    }
+
+    #[test]
+    fn agy_fails_closed() {
+        assert!(run(Style::Agy, &AGY[..5]).0.finish().is_err()); // no result
+        let denied = r#"{"event":"result","result":{"status":"SUCCESS","response":"","usage":{},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}"#;
+        assert!(run(Style::Agy, &[AGY[0], denied]).0.finish().unwrap_err().contains("permission for command"));
+        let failed = r#"{"event":"result","result":{"status":"ERROR","response":"quota","usage":{}}}"#;
+        assert!(run(Style::Agy, &[AGY[0], failed]).0.finish().is_err());
+        assert!(run(Style::Agy, &[AGY[0], "not json"]).0.finish().is_err());
     }
 
     #[test]

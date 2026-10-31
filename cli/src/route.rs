@@ -150,6 +150,13 @@ pub fn classify(line: &str, git: bool) -> Route {
     Route::Ask
 }
 
+/// Who takes a suggested agent turn, from the set-up agents able to take it now. Claude owns writing and reading
+/// code; Codex owns the abstract work (Ringo's pipelines and plain asks run on it) and takes agent turns when
+/// claude is not set up or is busy; then any other agent. A soft preference: `@agent` always picks for itself.
+pub fn owner<'a>(able: &[&'a str]) -> Option<&'a str> {
+    ["claude", "codex"].iter().find_map(|o| able.iter().find(|a| *a == o).copied()).or(able.first().copied())
+}
+
 /// The command to put in the input line for a route, and what it costs, for the suggestion line.
 pub fn suggestion(route: &Route, line: &str, agent: &str) -> Option<(String, &'static str)> {
     match route {
@@ -168,6 +175,14 @@ pub fn suggestion(route: &Route, line: &str, agent: &str) -> Option<(String, &'s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_owns_code_turns_codex_the_rest() {
+        assert_eq!(owner(&["codex", "claude"]), Some("claude"));
+        assert_eq!(owner(&["agy", "codex"]), Some("codex"));
+        assert_eq!(owner(&["agy", "grok"]), Some("agy"));
+        assert_eq!(owner(&[]), None);
+    }
 
     #[test]
     fn plain_questions_stay_questions() {

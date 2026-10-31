@@ -16,7 +16,7 @@ const USAGE: &str = "\
 ringo: Ringo's shell and harness.
 
   ringo                     open the shell (on a terminal); type /help there
-  ringo setup               add a coding agent (codex, claude, grok) and sign in to it
+  ringo setup               add a coding agent (codex, claude, agy, grok, or one you name) and sign in
   ringo review|design|work ...
                             run a Ringo pipeline natively: the same requests as python3 ringo.py ...
                             (with release state, ringo.py decides which runtime runs it)
