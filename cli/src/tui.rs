@@ -164,16 +164,13 @@ fn history_file() -> PathBuf {
 /// How many earlier lines Up reaches.
 const HISTORY: usize = 1000;
 
+/// The last HISTORY lines. The file is only ever appended to, so shells open at once never lose each other's lines;
+/// ceiling: it grows by a few MB a year at heavy use, read whole at every start.
 fn load_history() -> Vec<String> {
     let text = std::fs::read_to_string(history_file()).unwrap_or_default();
     let mut lines: Vec<String> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
     let extra = lines.len().saturating_sub(HISTORY);
     lines.drain(..extra);
-    if extra > HISTORY {
-        // the file is appended to; once it holds twice what is read, it keeps only that
-        let kept: String = lines.iter().map(|l| format!("{}\n", serde_json::json!(l))).collect();
-        let _ = std::fs::write(history_file(), kept);
-    }
     lines
 }
 
@@ -878,11 +875,12 @@ fn paint(terminal: &mut DefaultTerminal, app: &mut App, shape: &mut u16) -> std:
         let room = size.height.saturating_sub(*shape) as usize;
         let mut again: Vec<Line<'static>> = Vec::new();
         for entry in app.recent.iter().rev() {
+            // the end of an entry taller than what is left (a long reply) still comes back
             let rows = entry.rows(size.width as usize, &app.theme);
-            if again.len() + rows.len() > room {
+            again.extend(rows.into_iter().rev().take(room.saturating_sub(again.len())));
+            if again.len() >= room {
                 break;
             }
-            again.extend(rows.into_iter().rev());
         }
         again.reverse();
         flush(terminal, again)?;
