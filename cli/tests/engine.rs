@@ -269,7 +269,7 @@ fn kill_stops_the_whole_process_group() {
 #[test]
 fn malformed_output_and_api_key_logins_fail_closed() {
     let r = repo("fail");
-    let garbage = fake(&root(), "codex-garbage", "#!/bin/sh\nread -r hello\necho 'not json'\nsleep 5\n");
+    let garbage = fake(&root(), "codex-garbage", "#!/bin/sh\nread -r hello\necho 'not json'\n");
     let mut s = session(&r, agent("codex"), &garbage);
     let id = s.launch_agent(agent("codex"), false, "x").unwrap();
     assert!(matches!(wait(&mut s, id), Status::Failed(_)));
@@ -363,6 +363,45 @@ fn a_repository_holding_the_home_folder_is_not_a_project() {
     let project = repo("project-under-home");
     let s = Session::with_state_home(&project, &state, &home).unwrap();
     assert!(s.git);
+    // the home folder itself gets no undo store: hashing all of it at every turn would be far too slow
+    let s = Session::with_state_home(&home, &state, &home).unwrap();
+    assert!(!s.undoable() && s.no_undo.as_deref().unwrap().contains("home folder"));
+}
+
+#[test]
+fn turns_outside_git_undo_from_ringos_own_store() {
+    // A school folder inside a dotfiles repository at the home folder, as on the owner's machine: the session is
+    // not a project, yet each turn can be undone, from a store under Ringo's state that the folder never sees.
+    let home = repo("school-home");
+    let class = home.join("CSC138");
+    fs::create_dir_all(class.join("src")).unwrap();
+    fs::write(class.join("src/Main.java"), "class Main {}\n").unwrap();
+    fs::write(class.join("b.txt"), "x\n\n").unwrap();
+    let state = home.join(".local/share/ringo");
+    let codex = fake(&root(), "codex-school", &codex_ok());
+    let mut s = Session::with_state_home(&class, &state, &home).unwrap();
+    s.programs.insert(agent("codex"), codex.clone());
+    assert!(!s.git && s.undoable() && s.no_undo.is_none());
+    let id = s.launch_agent(agent("codex"), false, "add a file").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert_eq!(s.job(id).unwrap().changed, ["b.txt", "c.bin", "made.txt"]);
+    assert!(!class.join(".git").exists(), "the folder gets no repository of its own");
+    let home_status = Command::new("git").arg("-C").arg(&home).args(["status", "--porcelain"]).output().unwrap().stdout;
+    assert!(!String::from_utf8_lossy(&home_status).contains(".local"), "the home repository never sees the store");
+    assert!(s.expand("check {#1}").unwrap().contains("made.txt"), "a handoff carries the turn's change");
+    assert!(s.review_job(id).unwrap_err().contains("needs a git project"));
+    // the owner edits a changed file: nothing is undone; put back, the turn is undone exactly
+    fs::write(class.join("made.txt"), "mine\n").unwrap();
+    assert!(s.undo().unwrap_err().contains("made.txt changed after #1"));
+    fs::write(class.join("made.txt"), "made\n").unwrap();
+    assert!(s.undo().unwrap().contains("undid #1"));
+    assert!(!class.join("made.txt").exists() && !class.join("c.bin").exists());
+    assert_eq!(fs::read_to_string(class.join("b.txt")).unwrap(), "x\n\n");
+    assert_eq!(fs::read_to_string(class.join("src/Main.java")).unwrap(), "class Main {}\n");
+    // a second session in the same folder reuses the store
+    let again = Session::with_state_home(&class, &state, &home).unwrap();
+    assert!(again.undoable());
+    assert_eq!(fs::read_dir(state.join("undo")).unwrap().count(), 1);
 }
 
 #[test]
@@ -419,9 +458,13 @@ fn killing_a_pipeline_stops_its_model_calls_too() {
     s.kill(id).unwrap();
     assert_eq!(wait(&mut s, id), Status::Cancelled);
     let child: i32 = fs::read_to_string(&child_file).unwrap().trim().parse().unwrap();
-    std::thread::sleep(Duration::from_millis(200));
+    // A killed call stays a zombie until the system reaps it, which a busy machine can take a while to do.
+    let deadline = Instant::now() + Duration::from_secs(5);
     // SAFETY: signal 0 only checks that the process exists.
-    assert_eq!(unsafe { libc::kill(child, 0) }, -1, "the model call in its own session is gone");
+    while unsafe { libc::kill(child, 0) } == 0 {
+        assert!(Instant::now() < deadline, "the model call in its own session is gone");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Every argument and the stdin each built-in adapter sends, pinned: the registry must reproduce them exactly.

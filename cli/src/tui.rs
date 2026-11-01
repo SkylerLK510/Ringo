@@ -1045,9 +1045,9 @@ impl App {
                     found.join(", "), self.s.mode.name()),
         ]));
         self.gap();
-        let undo = match self.s.git {
-            true => "; /undo takes back its last change.",
-            false => ". This folder is not a git project, so /undo is off here.",
+        let undo = match &self.s.no_undo {
+            None => "; /undo takes back its last change.".to_string(),
+            Some(why) => format!(". /undo is off here: {why}."),
         };
         self.say(format!("  Type what you want done, in your own words, and press Enter. {} works in this folder and \
                           asks before it runs a command{undo}", self.main.name()));
@@ -2182,11 +2182,8 @@ pub fn run() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let branch = std::process::Command::new("git").arg("-C").arg(&session.repo)
-        .args(["rev-parse", "--abbrev-ref", "HEAD"]).output().ok()
-        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     let name = session.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let label = match branch { Some(b) => format!("{name} ({b})"), None => name };
+    let label = match &session.branch { Some(b) => format!("{name} ({b})"), None => name };
     let mut app = App::new(session, agents, label, Theme::load(), load_history());
     if let Some(mode) = crate::theme::setting("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
@@ -2438,7 +2435,7 @@ mod tests {
         assert!(rows[1].chars().all(|c| c == '─') && rows[22].chars().all(|c| c == '─'), "no side panel at 80: {rows:#?}");
         assert_eq!(rows[2], " Welcome to Ringo");
         let words = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains("so /undo is off here"), "outside git, the opening lines say so: {rows:#?}");
+        assert!(words.contains("/undo takes back its last change"), "outside git too, in Ringo's own store: {rows:#?}");
         assert!(rows[23].starts_with(" ❯ Tell Ringo what you want to do") && rows[23].ends_with("⇧⇥ mode · ? keys"),
                 "{rows:#?}");
         let narrow = screen(&mut a, 30, 24);

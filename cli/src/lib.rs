@@ -367,6 +367,13 @@ pub struct Session {
     pub repo: PathBuf,
     /// Whether `repo` is a git project; outside one, agents can read and answer but not edit in a worktree.
     pub git: bool,
+    /// The project's own index file and the branch it is on, read once when the session opens.
+    index: Option<PathBuf>,
+    pub branch: Option<String>,
+    /// Outside a git project: Ringo's own undo store for the folder (see `undo_store`).
+    store: Option<PathBuf>,
+    /// Why /undo is off here, when it is.
+    pub no_undo: Option<String>,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -435,28 +442,102 @@ fn private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// git's stdout exactly as written (a patch must stay byte-for-byte intact).
-fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
+/// The git command's stdout exactly as written (a patch must stay byte-for-byte intact).
+fn run_git(mut cmd: Command, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = cmd.args(args).output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(out.stdout)
 }
 
+fn trimmed(out: Vec<u8>) -> String {
+    String::from_utf8_lossy(&out).trim_end().to_string()
+}
+
+fn git_in(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    cmd
+}
+
+fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    run_git(git_in(dir), args)
+}
+
 /// git's stdout as a trimmed value (an id, a path, a status).
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    Ok(String::from_utf8_lossy(&git_raw(dir, args)?).trim_end().to_string())
+    git_raw(dir, args).map(trimmed)
 }
 
 /// `git` with a private index file in place of the repository's own.
 fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_INDEX_FILE", index).output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+    let mut cmd = git_in(dir);
+    cmd.env("GIT_INDEX_FILE", index);
+    run_git(cmd, args).map(trimmed)
+}
+
+/// What Ringo's undo store ignores, past the folder's own .gitignore files: tools' caches and installed packages.
+const STORE_IGNORES: &[&str] = &["node_modules", ".venv", "venv", "__pycache__", "*.pyc", ".DS_Store", ".gradle"];
+/// The most a folder outside git may hold for Ringo's undo store, past what it ignores: each turn's start and end
+/// hash every new or changed file in it.
+const STORE_FILES: u64 = 5_000;
+const STORE_BYTES: u64 = 200 << 20;
+
+/// Whether `dir` holds at most `files` files and `bytes` bytes, not counting what the undo store ignores. Stops
+/// counting at the first limit it passes; symlinks are not followed.
+fn small(dir: &Path, files: u64, bytes: u64) -> bool {
+    let ignored = |name: &str| name == ".git" || STORE_IGNORES.iter().any(|i| match i.strip_prefix('*') {
+        Some(ext) => name.ends_with(ext),
+        None => name == *i,
+    });
+    let (mut seen, mut size, mut todo) = (0, 0, vec![dir.to_path_buf()]);
+    while let Some(d) = todo.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let (Ok(kind), name) = (entry.file_type(), entry.file_name()) else { continue };
+            if ignored(&name.to_string_lossy()) {
+                continue;
+            }
+            if kind.is_dir() {
+                todo.push(entry.path());
+            } else if kind.is_file() {
+                seen += 1;
+                size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if seen > files || size > bytes {
+                    return false;
+                }
+            }
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    true
+}
+
+/// Outside a git project, each turn's before and after for /undo live in a git store of Ringo's own, one for each
+/// folder, under its state folder (`root`/undo); the folder itself gets no repository. Not for the home folder or
+/// one holding it or Ringo's state, and not for a folder too big to hash at every turn.
+// ceiling: a store is never pruned, and a folder moved or renamed starts a new one; delete `root`/undo to reclaim it.
+fn undo_store(root: &Path, folder: &Path, home: &Path) -> Result<PathBuf, String> {
+    if folder.parent().is_none() || (!home.as_os_str().is_empty() && home.starts_with(folder)) {
+        return Err("Ringo keeps no /undo for your whole home folder; start ringo in the folder you work on".into());
+    }
+    if resolved(root).starts_with(folder) {
+        return Err("Ringo's own state is inside this folder".into());
+    }
+    if !small(folder, STORE_FILES, STORE_BYTES) {
+        return Err(format!("this folder holds more than {STORE_FILES} files or {} MB; run `git init` here once to \
+                            turn /undo on", STORE_BYTES >> 20));
+    }
+    let hash = folder.as_os_str().as_encoded_bytes().iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)); // FNV-1a
+    let store = root.join("undo").join(format!("{hash:016x}"));
+    if !store.join("HEAD").is_file() {
+        private_dir(&store)?;
+        git(&store, &["init", "--bare", "-q", "."])?;
+        let ignores: String = STORE_IGNORES.iter().map(|i| format!("{i}\n")).collect();
+        fs::write(store.join("info").join("exclude"), ignores).map_err(|e| e.to_string())?;
+        fs::write(store.join("folder"), folder.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+    }
+    Ok(store)
 }
 
 /// An absolute path with symlinks resolved, for a path whose tail may not exist yet.
@@ -535,9 +616,18 @@ impl Session {
     /// current folder, as claude and codex do, and only `@agent!` and `/review` (which need a project) are refused.
     pub fn with_state_home(cwd: &Path, root: &Path, home: &Path) -> Result<Session, String> {
         let home = resolved(home);
-        let top = git(cwd, &["rev-parse", "--show-toplevel"]).ok().map(|t| resolved(Path::new(&t)));
+        // One git call: the project's top, its index file and its HEAD file (paths relative to `cwd`)
+        let found = git(cwd, &["rev-parse", "--show-toplevel", "--git-path", "index", "--git-path", "HEAD"]).unwrap_or_default();
+        let mut found = found.lines();
+        let (top, index, head) = (found.next().map(|t| resolved(Path::new(t))), found.next(), found.next());
         let project = top.filter(|t| home.as_os_str().is_empty() || !home.starts_with(t));
         let repo = project.clone().unwrap_or_else(|| resolved(cwd));
+        let index = project.as_ref().and(index).map(|i| cwd.join(i));
+        // `ref: refs/heads/NAME` on a branch; a commit id when detached, shown as HEAD as git does
+        let branch = project.as_ref().and(head).map(|h| match fs::read_to_string(cwd.join(h)) {
+            Ok(text) => text.trim().strip_prefix("ref: refs/heads/").unwrap_or("HEAD").to_string(),
+            Err(_) => "HEAD".into(),
+        });
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if root.is_symlink() {
             return Err(format!("the state folder {} cannot be a symlink", root.display()));
@@ -564,7 +654,15 @@ impl Session {
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
         always_ask.extend(own.iter().filter_map(|v| v.get("ask")?.as_array()).flatten()
             .filter_map(|r| r.as_str()).map(str::to_string).filter(|r| !always_ask.contains(r)).collect::<Vec<_>>());
-        Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
+        let (store, no_undo) = match project {
+            Some(_) => (None, None),
+            None => match undo_store(root, &repo, &home) {
+                Ok(store) => (Some(store), None),
+                Err(why) => (None, Some(why)),
+            },
+        };
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, dir, jobs: Vec::new(), max_jobs: 3,
+                     backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
                      usage_so_far: HashMap::new(), mode: Mode::Ask, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
@@ -612,13 +710,40 @@ impl Session {
     /// private copy of the index (`index`) stages them, so the owner's index, stash and HEAD are never touched.
     /// ceiling: hashes each new or changed file every call; a large file git does not ignore slows a turn's start.
     fn snapshot(&self, index: &Path) -> Result<String, String> {
-        let own = self.repo.join(git(&self.repo, &["rev-parse", "--git-path", "index"])?);
+        if self.store.is_some() {
+            // the store keeps its own index: each file's stat stays in it, so only new or changed files are hashed
+            self.folder_git(&["add", "-A"])?;
+            return self.folder_git(&["write-tree"]);
+        }
+        let own = self.index.clone().ok_or("not a git project")?;
         match own.is_file() {
             true => fs::copy(&own, index).map(|_| ()).map_err(|e| format!("{}: {e}", own.display()))?,
             false => { let _ = fs::remove_file(index); } // a repository with nothing staged yet has no index
         }
         git_index(&self.repo, index, &["add", "-A"])?;
         git_index(&self.repo, index, &["write-tree"])
+    }
+
+    /// git on the owner's folder as /undo keeps it: the project's repository, or outside one Ringo's undo store,
+    /// run from the folder's top (a patch applied from below it would skip the files outside it).
+    fn folder(&self) -> Command {
+        match &self.store {
+            Some(store) => {
+                let mut cmd = Command::new("git");
+                cmd.arg("--git-dir").arg(store).arg("--work-tree").arg(&self.repo).current_dir(&self.repo);
+                cmd
+            }
+            None => git_in(&self.repo),
+        }
+    }
+
+    fn folder_git(&self, args: &[&str]) -> Result<String, String> {
+        run_git(self.folder(), args).map(trimmed)
+    }
+
+    /// Whether /undo works here: a git project, or Ringo's own store for the folder.
+    pub fn undoable(&self) -> bool {
+        self.git || self.store.is_some()
     }
 
     /// A commit holding `tree`, on `parent` when there is one; no branch points at it.
@@ -643,9 +768,8 @@ impl Session {
     /// /undo goes one turn further back). Any of them edited since that turn, anywhere in it, makes it refuse,
     /// leaving everything as is.
     pub fn undo(&mut self) -> Result<String, String> {
-        if !self.git {
-            return Err("/undo needs a git project: Ringo keeps each turn's before and after with git (run `git init` \
-                        here once, and later turns can be undone)".into());
+        if let Some(why) = &self.no_undo {
+            return Err(format!("/undo is off here: {why}"));
         }
         self.idle("/undo")?;
         let job = self.jobs.iter().rev()
@@ -657,15 +781,15 @@ impl Session {
         let now = self.snapshot(&index)?;
         let mut args = vec!["diff", "--name-only", after.as_str(), now.as_str(), "--"];
         args.extend(changed.iter().map(String::as_str));
-        let edited = git(&self.repo, &args)?;
+        let edited = self.folder_git(&args)?;
         if !edited.is_empty() {
             return Err(format!("{} changed after #{id}, so nothing was undone", edited.lines().collect::<Vec<_>>().join(", ")));
         }
-        fs::write(&file, git_raw(&self.repo, &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
+        fs::write(&file, run_git(self.folder(), &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
         let file = file.to_string_lossy().into_owned();
-        git(&self.repo, &["apply", "--check", &file])
+        self.folder_git(&["apply", "--check", &file])
             .map_err(|e| format!("#{id}'s files no longer match it, so nothing was undone ({e})"))?;
-        git(&self.repo, &["apply", &file])?;
+        self.folder_git(&["apply", &file])?;
         let job = &mut self.jobs[id - 1];
         job.undone = true;
         Ok(format!("undid #{id}: {} back as before", job.changed.join(", ")))
@@ -736,7 +860,7 @@ impl Session {
             job.push_log(format!("its own copy of this folder as it is now (/show {id}: where)"));
             wt
         } else {
-            if edits && self.git {
+            if edits && self.undoable() {
                 // Kept for /undo; a turn whose before cannot be taken still runs, without an undo.
                 match self.snapshot(&dir.join("index")) {
                     Ok(tree) => self.jobs[id - 1].before = Some(tree),
@@ -932,6 +1056,9 @@ impl Session {
                 let tree = git(&wt, &["write-tree"])?;
                 let head = self.commit(&tree, Some(&base), &format!("ringo job {of}"))?;
                 (wt, base, head)
+            }
+            (_, _, Some(_), Some(_)) if !self.git && !job.changed.is_empty() => {
+                return Err(format!("/review #{of} needs a git project"));
             }
             (_, _, Some(before), Some(after)) if !job.changed.is_empty() => {
                 let base = self.commit(&before, None, &format!("ringo job {of}: before"))?;
@@ -1187,7 +1314,7 @@ impl Session {
         // A turn in the owner's folder, stopped or not: what it changed there, for its last line and /undo.
         if let Some(before) = self.jobs[id - 1].before.clone()
             && let Ok(after) = self.snapshot(&self.jobs[id - 1].dir.join("index")) {
-            let changed = git(&self.repo, &["diff", "--name-only", &before, &after]).unwrap_or_default();
+            let changed = self.folder_git(&["diff", "--name-only", &before, &after]).unwrap_or_default();
             let job = &mut self.jobs[id - 1];
             job.changed = changed.lines().map(str::to_string).collect();
             job.after = Some(after);
@@ -1480,7 +1607,7 @@ impl Session {
                     git(wt, &["add", "-A"])?;
                     Some(git_raw(wt, &["diff", "--cached", base])?)
                 }
-                (_, _, Some(before), Some(after)) => Some(git_raw(&self.repo, &["diff", before, after])?),
+                (_, _, Some(before), Some(after)) => Some(run_git(self.folder(), &["diff", before, after])?),
                 _ => None,
             };
             if let Some(patch) = patch.filter(|p| !p.is_empty()) {
@@ -1642,5 +1769,22 @@ pub fn sign_in(agent: Agent, program: &Path) -> SignIn {
             }
         }
         _ => SignIn::No(parse::short(&text, 120)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_undo_store_takes_only_a_small_folder() {
+        let dir = std::env::temp_dir().join(format!("ringo-small-{}", std::process::id()));
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        for (name, text) in [("a.txt", "12345"), ("b.txt", "12345"), ("node_modules/pkg/x.js", "ignored"), ("c.pyc", "ignored")] {
+            fs::write(dir.join(name), text).unwrap();
+        }
+        assert!(small(&dir, 2, 10), "two files of five bytes; what the store ignores is not counted");
+        assert!(!small(&dir, 1, 10) && !small(&dir, 2, 9));
+        let _ = fs::remove_dir_all(dir);
     }
 }
