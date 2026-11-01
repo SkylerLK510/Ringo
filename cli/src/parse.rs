@@ -101,6 +101,8 @@ pub struct Parser {
     /// usage, so each id counts once. The sum is 93% of the turn's own count on a real 452.9k-token turn (a message's
     /// output tokens are reported before it is written).
     seen: Vec<(String, Tokens)>,
+    /// Claude reported a compaction (`/compact`), whose result may carry no text.
+    compacted: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -128,6 +130,8 @@ pub fn short(text: &str, n: usize) -> String {
 /// a job's log reads the same.
 pub const FAILED: &str = "✗ ";
 pub const UNFINISHED: &str = "◌ ";
+/// A step whose start is all its agent reports (an agy tool, a Codex edit): shown without a claim about its outcome.
+pub const STARTED: &str = "· ";
 
 /// What a tool call came to, for its line: an error's first line; how much a search or a read found.
 fn outcome(tool: &str, result: &Value, ok: bool) -> String {
@@ -160,7 +164,7 @@ fn base_name(path: &str) -> &str {
 impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new() }
+                 seen: Vec::new(), compacted: false }
     }
 
     /// The final reply text so far.
@@ -249,7 +253,7 @@ impl Parser {
                 let paths: Vec<&str> = item.get("changes").and_then(Value::as_array).into_iter().flatten()
                     .map(|c| base_name(s(c, "path"))).collect();
                 notes.push(activity(format!("editing {}", paths.join(", "))));
-                notes.push(Note::Step(format!("edit {}", paths.join(", "))));
+                notes.push(Note::Step(format!("{STARTED}edit {}", paths.join(", "))));
                 for c in item.get("changes").and_then(Value::as_array).into_iter().flatten() {
                     notes.push(Note::Touched(s(c, "path").to_string()));
                 }
@@ -305,6 +309,7 @@ impl Parser {
             ("system", "compact_boundary") => {
                 let before = e.pointer("/compact_metadata/pre_tokens").and_then(Value::as_u64).unwrap_or(0);
                 notes.push(Note::Log(format!("compacted the conversation (it held {before} tokens)")));
+                self.compacted = true;
             }
             ("assistant", _) => {
                 if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
@@ -352,6 +357,9 @@ impl Parser {
                 notes.push(Note::Tokens(claude_tokens(e)));
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
+                }
+                if self.compacted && self.reply.trim().is_empty() {
+                    self.reply = "compacted the conversation".into(); // a compaction is done without words
                 }
                 if e.get("is_error") == Some(&Value::Bool(true)) || subtype != "success" {
                     notes.extend(self.fail(format!("claude ended with {subtype}: {}", short(&self.reply.clone(), 200))));
@@ -435,7 +443,7 @@ impl Parser {
                         let shown = if params.get("CommandLine").is_some() { target } else { base_name(target) };
                         let text = format!("{tool} {}", short(shown, 70));
                         notes.push(Note::Activity { node: None, text: text.clone() });
-                        notes.push(Note::Step(text));
+                        notes.push(Note::Step(format!("{STARTED}{text}")));
                         let reads = tool.starts_with("view") || tool.starts_with("read");
                         if tool.contains("file") && !reads && !target.is_empty() {
                             notes.push(Note::Touched(target.to_string()));
@@ -665,6 +673,11 @@ mod tests {
         // The shape the Agent SDK documents for `/compact` on a resumed session.
         let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":41230}}"#;
         assert_eq!(run(Style::Claude, &[boundary]).1, [Note::Log("compacted the conversation (it held 41230 tokens)".into())]);
+        let done = r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#;
+        let (p, _) = run(Style::Claude, &[boundary, done]);
+        assert_eq!(p.finish(), Ok(()), "a compaction that says nothing is still done");
+        let (p, _) = run(Style::Claude, &[done]);
+        assert!(p.finish().is_err(), "any other turn without a reply fails closed");
     }
 
     #[test]

@@ -805,13 +805,15 @@ fn one_row(text: &str, width: usize) -> String {
     }
 }
 
-/// A step's row: ✓ when it went through, ✗ when it failed, ◌ when the turn ended before its result; the verb in lower
+/// A step's row: ✓ when it went through, ✗ when it failed, ◌ when the turn ended before its result, · when its agent
+/// reports only that it started; the verb in lower
 /// case (`run` for a command), and what came of it right-aligned at the row's end, or at 64 columns on a wide pane.
 fn step_row(text: &str, width: usize, theme: &Theme) -> Line<'static> {
-    use ringo_cli::parse::{FAILED, UNFINISHED};
-    let (mark, style, body) = match (text.strip_prefix(FAILED), text.strip_prefix(UNFINISHED)) {
-        (Some(body), _) => ("✗", theme.fail, body),
-        (_, Some(body)) => ("◌", theme.dim, body),
+    use ringo_cli::parse::{FAILED, STARTED, UNFINISHED};
+    let (mark, style, body) = match (text.strip_prefix(FAILED), text.strip_prefix(UNFINISHED), text.strip_prefix(STARTED)) {
+        (Some(body), ..) => ("✗", theme.fail, body),
+        (_, Some(body), _) => ("◌", theme.dim, body),
+        (.., Some(body)) => ("·", theme.dim, body),
         _ => ("✓", theme.ok, text),
     };
     let body = match body.strip_prefix("$ ") {
@@ -1251,6 +1253,10 @@ impl App {
     }
 
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
+        // checked again here: a queued /compact can come up after /clear took its conversation away
+        if task == "/compact" && !self.s.has_conversation(agent) {
+            return Err(format!("{} has no conversation here to compact", agent.name()));
+        }
         let expanded = self.s.expand(task)?;
         self.s.launch_agent(agent, false, &expanded)?;
         Ok((expanded.len() != task.len()).then(|| {
@@ -1919,9 +1925,12 @@ impl App {
                 None if agent == self.main => ("○", "talking to you".to_string(), t.dim),
                 None => ("○", "idle".to_string(), t.dim),
             };
+            // a long name gives way to the state
+            let name = one_row(agent.name(), width.saturating_sub(2 + 1 + cols(&what)).clamp(4, 12));
+            let what = one_row(&what, width.saturating_sub(2 + cols(&name).max(8) + 1));
             out.push(Line::from(vec![Span::styled(format!("{dot} "), style),
-                                     Span::styled(format!("{:<8}", agent.name()), self.agent_style(agent)),
-                                     Span::styled(fit(&what), t.dim)]));
+                                     Span::styled(format!("{name:<8} "), self.agent_style(agent)),
+                                     Span::styled(what, t.dim)]));
         }
         for job in self.s.jobs.iter().filter(|j| j.running() && matches!(j.kind, Kind::Ringo { .. })) {
             let (who, style) = self.who(job);
@@ -2427,6 +2436,8 @@ mod tests {
         assert!(side.iter().any(|r| r.starts_with("○ claude") && r.contains("talking to you")), "{side:#?}");
         assert!(side.iter().any(|r| r.starts_with("○ codex") && r.ends_with("idle")), "{side:#?}");
         assert!(rows[2..28].iter().all(|r| r.chars().nth(split) == Some('│')), "the bar runs the panel's height");
+        let long = a.panel(31, 30).into_iter().find(|l| l.spans.len() == 3 && l.spans[1].content.contains("claude")).unwrap();
+        assert!(plain(&[long])[0].ends_with("talking to you"), "the state stays whole");
     }
 
     #[test]
@@ -2452,7 +2463,17 @@ mod tests {
         assert_eq!(cols(&row("Read a.rs · 2 lines", 200)), 68, "results line up at 64 columns on a wide pane");
         assert!(row("✗ $ make test · exit 2", 40).starts_with("  ✗ run make test") && row("✗ $ make test · exit 2", 40).ends_with("exit 2"));
         assert_eq!(row("◌ Edit a.rs", 40), "  ◌ edit a.rs");
+        assert_eq!(row("· view_file a.rs", 40), "  · view_file a.rs", "only started: no claim about the outcome");
         assert_eq!(cols(&row(&format!("Grep {} · Found 3 files", "x".repeat(80)), 30)), 30, "a long step keeps to one row");
+    }
+
+    #[test]
+    fn a_queued_compaction_checks_its_conversation_again() {
+        let mut a = app(&["claude"]);
+        assert!(a.run(Cmd::Compact, "/compact").unwrap_err().contains("no conversation"));
+        assert!(a.turn(a.main, "/compact").unwrap_err().contains("no conversation"), "nor when it comes off the queue");
+        let mut b = app(&["codex"]);
+        assert!(b.run(Cmd::Compact, "/compact").unwrap_err().contains("compacts its conversation on its own"));
     }
 
     #[test]
