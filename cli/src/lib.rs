@@ -290,7 +290,8 @@ pub struct Job {
     pub worktree: Option<PathBuf>,
     pub base: Option<String>,
     pub applied: bool,
-    /// A write job that finished without changing anything: its worktree was removed.
+    /// A write job that finished without changing anything (an empty diff; its worktree is kept: a file git ignores,
+    /// which the agent may have written, is not in the diff).
     pub unchanged: bool,
     /// Files the job edited, relative to its working folder.
     pub touched: BTreeSet<String>,
@@ -1022,9 +1023,9 @@ impl Session {
             sub.ended = Some(false);
             sub.activity = "stopped with its parent".into();
         }
-        // A write job that changed nothing leaves nothing to see or apply: its worktree goes, its log stays.
-        if job.status == Status::Done && job.worktree.is_some() && self.diff(id).is_ok_and(|p| p.is_empty())
-            && self.drop_worktree(id).is_ok() {
+        // A write job that changed nothing has nothing to apply. Its worktree stays for /drop: removing it here would
+        // also remove what the diff cannot see (a file git ignores that the agent wrote).
+        if job.status == Status::Done && job.worktree.is_some() && self.diff(id).is_ok_and(|p| p.is_empty()) {
             self.jobs[id - 1].unchanged = true;
         }
     }
@@ -1120,7 +1121,11 @@ impl Session {
                                 _ => t,
                             };
                             job.tokens.add(t);
-                            job.live = Tokens::default(); // the turn's own count replaces what its messages said
+                            if t.total() > 0 {
+                                // the turn's own count replaces what its messages said; a result without one (an
+                                // error result) keeps them
+                                job.live = Tokens::default();
+                            }
                         }
                         Note::Live(t) => job.live = t,
                         Note::Call => job.calls += 1,
@@ -1233,9 +1238,6 @@ impl Session {
     /// folder).
     pub fn diff(&self, id: usize) -> Result<String, String> {
         let job = self.job(id)?;
-        if job.unchanged {
-            return Ok(String::new());
-        }
         let (Some(wt), Some(base)) = (&job.worktree, &job.base) else {
             return Err(format!("#{id} is not a write job with a worktree"));
         };

@@ -819,9 +819,10 @@ fn one_row(text: &str, width: usize) -> String {
         return text.to_string();
     }
     let cut = |t: &str, room: usize| {
-        let mut out = String::new();
+        let (mut out, mut used) = (String::new(), 0);
         for c in t.chars() {
-            if cols(&out) + c.width().unwrap_or(0) + 1 > room {
+            used += c.width().unwrap_or(0);
+            if used + 1 > room {
                 break;
             }
             out.push(c);
@@ -1054,7 +1055,7 @@ impl App {
         let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
         let mut tail = format!(" {what} · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
         if job.unchanged {
-            tail += " · no change";
+            tail += &format!(" · no change; /drop {} removes its worktree", job.id);
         } else if job.worktree.is_some() && job.status == Status::Done {
             tail += &format!(" · change ready: /diff {0}, /apply {0}", job.id);
         }

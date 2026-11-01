@@ -122,8 +122,9 @@ The conversation prints into the terminal's own scrollback, as Claude Code's and
 reply, and what each agent does under its job number: one `•` row per tool call or command once it has run, with
 what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit code;
 a step too long for the row loses the end of its pattern or command to `…`, and `/show N` has it whole), then one
-line when a job ends with its time, tokens and Ringo model calls. A write job that changed nothing ends `no change`,
-and its worktree is removed (its log stays). Replies render their markdown: headings,
+line when a job ends with its time, tokens and Ringo model calls. A write job that changed nothing says `no change`
+instead of `change ready`; its worktree stays until `/drop N`, as a file git ignores that the agent wrote is not in
+the diff. Replies render their markdown: headings,
 emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned columns (a long last column wraps under itself), or,
 when even that does not fit, as one block per row with each cell under its column's name. Scroll it with the mouse wheel and select from it as in any
 other program; the shell never captures the mouse. Below it, a live area holds one row per running job and

@@ -39,8 +39,8 @@ The agent reads the repository but cannot change it. Later `@claude` lines conti
 2. The agent works in its own copy of the repository, a git worktree made from your last commit. Your uncommitted
    changes are not in it, and nothing touches your files yet.
 3. Each step it takes prints as a `•` line, with what came of it. When it finishes you see
-   `✓ #1 claude! done · … · change ready: /diff 1, /apply 1`. If it changed nothing, the line ends `no change`
-   instead and its worktree is removed.
+   `✓ #1 claude! done · … · change ready: /diff 1, /apply 1`. If it changed nothing, the line says `no change`
+   instead; `/drop 1` removes its worktree.
 4. Read the change with `/diff 1`. For a second opinion, `/review #1`.
 5. Commit or stash your own changes, then `/apply 1`. The change lands in your tree, uncommitted, for you to check
    and commit.
