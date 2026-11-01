@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use crate::theme::Theme;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame, Terminal};
 use ringo_cli::{Agent, Decision, Kind, Mode, Said, Session, Status};
 use std::collections::VecDeque;
@@ -37,6 +37,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/undo", "take back the last change an agent made here"),
     ("/copy", "copy the last answer"),
     ("/clear", "start a new conversation"),
+    ("/compact", "shrink a long conversation so later turns cost less"),
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/auto", "auto mode on, or back to ask"),
@@ -128,6 +129,7 @@ pub enum Cmd {
     Undo,
     Copy,
     Clear,
+    Compact,
     /// `?`: the keys.
     Keys,
     Backend(String),
@@ -175,6 +177,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "undo" => Ok(Cmd::Undo),
             "copy" => Ok(Cmd::Copy),
             "clear" | "new" => Ok(Cmd::Clear),
+            "compact" => Ok(Cmd::Compact),
             "ask" if !tail.is_empty() => Ok(Cmd::Ask(tail.into())),
             "auto" => Ok(Cmd::Auto),
             "mode" => match words.next() {
@@ -740,8 +743,8 @@ enum Out {
     Line(Line<'static>, usize),
     /// An agent's reply, as markdown, two columns in.
     Reply(String),
-    /// A step an agent took, on one row under its job: its bullet's style and the text.
-    Step(Style, String),
+    /// A step an agent took, on one row under its job.
+    Step(String),
     /// The box the shell opens with, a line per row (the first is its title).
     Welcome(Vec<String>),
 }
@@ -756,22 +759,14 @@ impl Out {
                     line
                 })
                 .collect(),
-            Out::Step(bullet, text) => vec![Line::from(vec![Span::styled("  • ", *bullet),
-                                                            Span::styled(one_row(text, width.saturating_sub(4)), theme.dim)])],
+            Out::Step(text) => vec![step_row(text, width, theme)],
             Out::Welcome(lines) => {
-                let inner = lines.iter().map(|l| cols(l)).max().unwrap_or(0).min(width.saturating_sub(4)).max(1);
-                let edge = |l: &str, r: &str| Line::styled(format!("{l}{}{r}", "─".repeat(inner + 2)), theme.border);
-                let mut rows = vec![edge("╭", "╮")];
+                // the title in the brand colour, the rest under it, dim
+                let mut rows = Vec::new();
                 for (i, text) in lines.iter().enumerate() {
-                    for row in fit(&Line::raw(text.clone()), inner, 8) {
-                        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
-                        let pad = " ".repeat(inner - cols(&text));
-                        rows.push(Line::from(vec![Span::styled("│ ", theme.border),
-                                                  Span::styled(text, if i == 0 { theme.title } else { theme.dim }),
-                                                  Span::raw(pad), Span::styled(" │", theme.border)]));
-                    }
+                    let style = if i == 0 { theme.brand.add_modifier(Modifier::BOLD) } else { theme.dim };
+                    rows.extend(fit(&Line::from(vec![Span::raw(" "), Span::styled(text.clone(), style)]), width, 1));
                 }
-                rows.push(edge("╰", "╯"));
                 rows
             }
         }
@@ -808,6 +803,36 @@ fn one_row(text: &str, width: usize) -> String {
         Some((what, came)) if cols(came) + 3 <= width / 2 => format!("{} · {came}", cut(what, width - cols(came) - 3)),
         _ => cut(text, width),
     }
+}
+
+/// A step's row: ✓ when it went through, ✗ when it failed, ◌ when the turn ended before its result, · when its agent
+/// reports only that it started; the verb in lower
+/// case (`run` for a command), and what came of it right-aligned at the row's end, or at 64 columns on a wide pane.
+fn step_row(text: &str, width: usize, theme: &Theme) -> Line<'static> {
+    use ringo_cli::parse::{FAILED, STARTED, UNFINISHED};
+    let (mark, style, body) = match (text.strip_prefix(FAILED), text.strip_prefix(UNFINISHED), text.strip_prefix(STARTED)) {
+        (Some(body), ..) => ("✗", theme.fail, body),
+        (_, Some(body), _) => ("◌", theme.dim, body),
+        (.., Some(body)) => ("·", theme.dim, body),
+        _ => ("✓", theme.ok, text),
+    };
+    let body = match body.strip_prefix("$ ") {
+        Some(command) => format!("run {command}"),
+        None => match body.split_once(' ') {
+            Some((verb, rest)) => format!("{} {rest}", verb.to_lowercase()),
+            None => body.to_lowercase(),
+        },
+    };
+    let room = width.saturating_sub(4);
+    let line = room.min(64);
+    let (what, came) = body.rsplit_once(" · ").unwrap_or((&body, ""));
+    let (what, pad, came) = if !came.is_empty() && cols(what) + 2 + cols(came) <= line {
+        (what.to_string(), line - cols(what) - cols(came), came.to_string())
+    } else {
+        (one_row(&body, room), 0, String::new())
+    };
+    Line::from(vec![Span::styled(format!("  {mark} "), style), Span::styled(what, theme.dim), Span::raw(" ".repeat(pad)),
+                    Span::styled(came, theme.dim)])
 }
 
 /// The columns `from..to` of a row of text (a wide character counts where it starts).
@@ -903,8 +928,13 @@ struct App {
     top: usize,
     sel: Option<(Spot, Spot)>,
     dragging: bool,
-    /// A short note in the status line (copied, could not copy) and when it appeared.
+    /// A short note at the input's right end (copied, could not copy) and when it appeared.
     toast: Option<(String, Instant)>,
+    /// How the last job ended (true: done) and when, for the cat; and the cat's look last drawn.
+    ended_at: Option<(bool, Instant)>,
+    drawn_look: (&'static str, usize),
+    /// Each job's reply being written: its place in `out`, and its pieces as they came.
+    streams: std::collections::HashMap<usize, (usize, String)>,
     /// The agent plain lines go to, and lines waiting for the turn running in this folder: (agent, task, as typed).
     main: Agent,
     queue: VecDeque<(Agent, String, String)>,
@@ -934,6 +964,8 @@ struct App {
 /// What the bottom of the screen holds in one frame: the running jobs' rows, the queued lines, the permission
 /// request, the input's rows (when it shows), and the menu.
 struct Live {
+    /// The side panel shows (a wide enough screen); without it the jobs and the queue sit above the input.
+    panel: bool,
     jobs: Vec<Line<'static>>,
     queue: Vec<Line<'static>>,
     ask: Option<(String, Vec<Line<'static>>)>,
@@ -949,7 +981,7 @@ struct Live {
 
 impl Live {
     fn input_h(&self) -> u16 {
-        if self.typing { self.shown as u16 + 2 } else { 0 }
+        if self.typing { self.shown as u16 } else { 0 }
     }
 }
 
@@ -961,13 +993,44 @@ const SPIN_MS: u128 = 120;
 const BURST: Duration = Duration::from_millis(15);
 /// How long after a permission request appears its answer keys are ignored.
 const ANSWER_GRACE: Duration = Duration::from_millis(300);
-/// How long a note stays in the status line.
+/// How long a note stays at the input's right end.
 const TOAST: Duration = Duration::from_millis(2500);
+/// The side panel shows from this width, this wide.
+const PANEL_AT: u16 = 100;
+const PANEL_W: u16 = 32;
+/// How long the cat shows each frame, and how long it shows how the last job ended.
+const MASCOT_MS: u128 = 240;
+const MOOD: Duration = Duration::from_secs(4);
+
+/// The cat's frames for a state, from mascot.txt (idle's when the file has none for it); each frame its rows.
+fn mascot(state: &str) -> Vec<Vec<&'static str>> {
+    const ART: &str = include_str!("mascot.txt");
+    let read = |want: &str| {
+        let (mut frames, mut inside): (Vec<Vec<&'static str>>, bool) = (Vec::new(), false);
+        for line in ART.lines() {
+            if let Some(name) = line.strip_prefix("== ") {
+                inside = name.trim() == want;
+                if inside {
+                    frames.push(Vec::new());
+                }
+            } else if inside && line == "--" {
+                frames.push(Vec::new());
+            } else if inside && let Some(frame) = frames.last_mut() {
+                frame.push(line);
+            }
+        }
+        frames.retain(|f| !f.is_empty());
+        frames
+    };
+    let frames = read(state);
+    if frames.is_empty() { read("idle") } else { frames }
+}
 
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
         App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, out: Vec::new(), fitted: Vec::new(),
               fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
+              ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false }
@@ -977,10 +1040,9 @@ impl App {
     fn welcome(&mut self) {
         let found: Vec<&str> = self.agents.iter().map(|a| a.name()).collect();
         self.out.push(Out::Welcome(vec![
-            "✻ Welcome to Ringo".into(), String::new(),
-            format!("folder  {}", home_short(&self.s.repo)),
-            format!("agents  {} (/setup adds another)", found.join(", ")),
-            format!("mode    {} (Shift-Tab changes it)", self.s.mode.name()),
+            "Welcome to Ringo".into(),
+            format!("{} · agents {} (/setup adds another) · {} mode (Shift-Tab changes it)", home_short(&self.s.repo),
+                    found.join(", "), self.s.mode.name()),
         ]));
         self.gap();
         let undo = match self.s.git {
@@ -1010,8 +1072,9 @@ impl App {
     fn echo(&mut self, line: &str) {
         self.gap();
         for (i, l) in clean(line).lines().enumerate() {
-            self.out.push(Out::Line(Line::from(vec![Span::styled(if i == 0 { "› " } else { "  " }, self.theme.focus),
-                                                    Span::styled(l.to_string(), self.theme.selected)]), 2));
+            let label = if i == 0 { " you  " } else { "      " };
+            self.out.push(Out::Line(Line::from(vec![Span::styled(label, self.theme.focus.add_modifier(Modifier::BOLD)),
+                                                    Span::styled(l.to_string(), self.theme.selected)]), 6));
         }
         self.last = 0;
     }
@@ -1062,14 +1125,36 @@ impl App {
             let (who, style) = self.who(&self.s.jobs[i]);
             if !fresh.is_empty() && self.last != id {
                 self.gap();
-                self.out.push(Out::Line(Line::from(vec![Span::styled(format!("#{id} "), self.theme.dim),
-                                                        Span::styled(who, style)]), 0));
+                self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who}"), style.add_modifier(Modifier::BOLD)),
+                                                        Span::styled(format!("  #{id}"), self.theme.dim)]), 0));
             }
             for said in fresh {
                 match said {
-                    Said::Reply(text) => self.reply(&text),
+                    // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
+                    // ceiling: the growing reply is fitted again (its markdown parsed) for each frame it grows in.
+                    // The raw pieces are kept and cleaned whole, so a line end split across two pieces stays one.
+                    Said::Partial(text) => match self.streams.get_mut(&id) {
+                        Some((at, raw)) if *at < self.out.len() => {
+                            raw.push_str(&text);
+                            self.out[*at] = Out::Reply(clean(raw));
+                            self.fitted.truncate(*at);
+                        }
+                        _ => {
+                            self.gap();
+                            self.out.push(Out::Reply(clean(&text)));
+                            self.streams.insert(id, (self.out.len() - 1, text));
+                        }
+                    },
+                    Said::Reply(text) => match self.streams.remove(&id) {
+                        Some((at, _)) if at < self.out.len() => {
+                            self.out[at] = Out::Reply(clean(&text));
+                            self.fitted.truncate(at);
+                            self.gap();
+                        }
+                        _ => self.reply(&text),
+                    },
                     Said::Step(text) => {
-                        self.out.push(Out::Step(style, clean(&text)));
+                        self.out.push(Out::Step(clean(&text)));
                     }
                     Said::Line(text) => {
                         for line in clean(&text).lines() {
@@ -1080,6 +1165,12 @@ impl App {
                 self.last = id;
             }
             if ends {
+                self.streams.remove(&id); // a reply cut off stays as far as it got
+                self.ended_at = match self.s.jobs[i].status {
+                    Status::Done => Some((true, Instant::now())),
+                    Status::Failed(_) => Some((false, Instant::now())),
+                    _ => None,
+                };
                 let lines = self.job_end(&self.s.jobs[i]);
                 self.out.extend(lines.into_iter().map(|l| Out::Line(l, 2)));
                 self.ended[i] = true;
@@ -1097,9 +1188,8 @@ impl App {
             Status::Cancelled => ("■", t.cancelled, "stopped"),
             Status::Running => return Vec::new(),
         };
-        let (who, who_style) = self.who(job);
         let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
-        let mut tail = format!(" {what} · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
+        let mut tail = format!(" · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
         if job.unchanged {
             tail += &format!(" · no change; /drop {} removes its copy", job.id);
         } else if job.worktree.is_some() && job.status == Status::Done {
@@ -1111,8 +1201,9 @@ impl App {
             };
             tail += &format!(" · changed {files} (/undo takes it back)");
         }
-        let mut lines = vec![Line::from(vec![Span::styled(format!("{mark} "), style), Span::styled(format!("#{} ", job.id), t.dim),
-                                             Span::styled(who, who_style), Span::styled(tail, t.dim)])];
+        // the job's own header above names it
+        let mut lines = vec![Line::from(vec![Span::styled("── ", t.border), Span::styled(format!("{mark} {what}"), style),
+                                             Span::styled(tail, t.dim)])];
         let overlaps: Vec<String> = self.s.overlaps(job.id).into_iter()
             .map(|(other, files)| format!("#{other} {}", files.join(", "))).collect();
         if !overlaps.is_empty() {
@@ -1187,6 +1278,10 @@ impl App {
     }
 
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
+        // checked again here: a queued /compact can come up after /clear took its conversation away
+        if task == "/compact" && !self.s.has_conversation(agent) {
+            return Err(format!("{} has no conversation here to compact", agent.name()));
+        }
         let expanded = self.s.expand(task)?;
         self.s.launch_agent(agent, false, &expanded)?;
         Ok((expanded.len() != task.len()).then(|| {
@@ -1208,7 +1303,7 @@ impl App {
     /// Whether a line would wait in the queue: a line for an agent in this folder while a turn runs here.
     fn waits(&self, cmd: &Result<Cmd, String>) -> bool {
         let here = match cmd {
-            Ok(Cmd::Talk(_)) => self.main.spec().read,
+            Ok(Cmd::Talk(_) | Cmd::Compact) => self.main.spec().read,
             Ok(Cmd::Agents(agents, _)) => matches!(agents[..], [(a, false)] if a.spec().read),
             _ => false,
         };
@@ -1263,9 +1358,24 @@ impl App {
                 self.s.forget();
                 self.out.clear();
                 self.fitted.clear();
+                self.streams.clear();
                 self.scroll = 0;
                 self.sel = None;
                 Some("  a new conversation: each agent's next turn starts fresh".into())
+            }
+            Cmd::Compact => {
+                // Claude's own compaction, which the Agent SDK documents for a resumed session: `/compact` as the
+                // prompt. It is one model call over the conversation (Claude reports what it held).
+                let agent = self.main;
+                if agent.spec().adapter != ringo_cli::Adapter::Claude {
+                    return Err(format!("{0} compacts its conversation on its own when it fills up; Ringo can start \
+                                        /compact only for claude, where it is documented. /clear starts {0} fresh",
+                                       agent.name()));
+                }
+                if !self.s.has_conversation(agent) {
+                    return Err(format!("{} has no conversation here to compact yet", agent.name()));
+                }
+                return self.talk(agent, "/compact".into(), line.to_string());
             }
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
@@ -1679,6 +1789,7 @@ impl App {
             let extra = self.out.len() - KEEP;
             self.out.drain(..extra);
             self.fitted.drain(..extra.min(self.fitted.len()));
+            self.streams.retain(|_, (at, _)| at.checked_sub(extra).map(|n| *at = n).is_some());
         }
         let same = width == self.fitted_w;
         if !same {
@@ -1768,18 +1879,23 @@ impl App {
     fn live(&self, width: u16, height: u16) -> Live {
         let w = width as usize;
         let t = &self.theme;
-        let jobs = self.job_rows(w, (height / 3).max(2) as usize);
-        let mut queue: Vec<Line<'static>> = self.queue.iter().take(3).map(|(_, _, line)| {
-            let text = one_row(&clean(line).replace('\n', " "), w.saturating_sub(12));
-            Line::from(vec![Span::styled("   ↳ next: ", t.dim), Span::styled(text, t.selected)])
-        }).collect();
-        if self.queue.len() > 3 {
-            queue.push(Line::styled(format!("   … {} more queued", self.queue.len() - 3), t.dim));
+        let panel = width >= PANEL_AT;
+        // Without the side panel, the running jobs and the queue sit above the input.
+        let jobs = if panel { Vec::new() } else { self.job_rows(w, (height / 3).max(2) as usize) };
+        let mut queue: Vec<Line<'static>> = Vec::new();
+        if !panel {
+            queue = self.queue.iter().take(3).map(|(_, _, line)| {
+                let text = one_row(&clean(line).replace('\n', " "), w.saturating_sub(12));
+                Line::from(vec![Span::styled("   ↳ next: ", t.dim), Span::styled(text, t.selected)])
+            }).collect();
+            if self.queue.len() > 3 {
+                queue.push(Line::styled(format!("   … {} more queued", self.queue.len() - 3), t.dim));
+            }
         }
-        let ask = self.prompt_lines(w.saturating_sub(4));
-        let ask_h = ask.as_ref().map_or(0, |(_, lines)| (lines.len() as u16 + 2).clamp(3, (height / 2).max(3)));
+        let ask = self.prompt_lines(w.saturating_sub(2));
+        let ask_h = ask.as_ref().map_or(0, |(_, lines)| (lines.len() as u16 + 1).clamp(2, (height / 2).max(2)));
         let typing = ask.is_none() || !self.input.is_empty();
-        let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(5)); // the borders and " › "
+        let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(3)); // " ❯ "
         let shown = rows.len().min((height / 4).clamp(1, 10) as usize);
         let top = (at.0 + 1).saturating_sub(shown);
         let entries = if typing { self.menu_entries() } else { Vec::new() };
@@ -1794,27 +1910,169 @@ impl App {
                                 Span::styled(what.clone(), t.dim)])
             })
             .collect();
-        Live { jobs, queue, ask, ask_h, typing, rows, at, top, shown, menu }
+        Live { panel, jobs, queue, ask, ask_h, typing, rows, at, top, shown, menu }
+    }
+
+    /// The cat's state now: asking beats working beats how the last job ended (for MOOD after it) beats idle.
+    fn mood(&self) -> (&'static str, Style) {
+        let t = &self.theme;
+        match self.ended_at {
+            _ if self.s.pending().is_some() => ("asking", t.warn),
+            _ if self.s.running() > 0 => ("working", t.running),
+            Some((ok, at)) if at.elapsed() < MOOD => if ok { ("done", t.ok) } else { ("failed", t.fail) },
+            _ => ("idle", t.title),
+        }
+    }
+
+    /// What the cat shows now: its state and frame (the shell redraws when this changes).
+    fn look(&self) -> (&'static str, usize) {
+        let (state, _) = self.mood();
+        let n = mascot(state).len().max(1);
+        (state, (self.started.elapsed().as_millis() / MASCOT_MS) as usize % n)
+    }
+
+    /// The side panel: the cat, then what is going on, section by section, at most `height` rows of `width`.
+    fn panel(&self, width: usize, height: usize) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let head = |text: &str| Line::styled(text.to_string(), t.focus.add_modifier(Modifier::BOLD));
+        let fit = |text: &str| one_row(text, width);
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let ((_, style), (state, frame)) = (self.mood(), self.look());
+        if let Some(rows) = mascot(state).get(frame) {
+            out.extend(rows.iter().map(|r| Line::styled(fit(r), style)));
+            out.push(Line::default());
+        }
+        out.push(head("AGENTS"));
+        for &agent in &self.agents {
+            let job = self.s.jobs.iter().rev()
+                .find(|j| j.running() && matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent));
+            let (dot, what, style) = match job {
+                Some(j) if !j.asks.is_empty() => ("◍", "asking you".to_string(), t.warn),
+                Some(j) => ("◉", format!("working {}", fmt_age(j.age())), t.running),
+                None if agent == self.main => ("○", "talking to you".to_string(), t.dim),
+                None => ("○", "idle".to_string(), t.dim),
+            };
+            // a long name gives way to the state
+            let name = one_row(agent.name(), width.saturating_sub(2 + 1 + cols(&what)).clamp(4, 12));
+            let what = one_row(&what, width.saturating_sub(2 + cols(&name).max(8) + 1));
+            out.push(Line::from(vec![Span::styled(format!("{dot} "), style),
+                                     Span::styled(format!("{name:<8} "), self.agent_style(agent)),
+                                     Span::styled(what, t.dim)]));
+        }
+        for job in self.s.jobs.iter().filter(|j| j.running() && matches!(j.kind, Kind::Ringo { .. })) {
+            let (who, style) = self.who(job);
+            out.push(Line::from(vec![Span::styled("◉ ", t.running), Span::styled(fit(&who), style),
+                                     Span::styled(format!(" {}", fmt_age(job.age())), t.dim)]));
+        }
+        // the turn in this folder: the running one, else the last
+        let turn = self.s.jobs.iter().rev().find(|j| matches!(j.kind, Kind::Agent { write: false, .. }));
+        if let Some(job) = turn {
+            let (who, style) = self.who(job);
+            out.push(Line::default());
+            out.push(head(if job.running() { "THIS TURN" } else { "LAST TURN" }));
+            out.push(Line::from(vec![Span::styled(format!("#{} ", job.id), t.dim), Span::styled(who, style),
+                                     Span::styled(format!(" · {}", fmt_age(job.age())), t.dim)]));
+            // one cell per 12,500 tokens, eight cells: past 100,000 the gauge turns to a warning
+            let tokens = job.tokens_so_far();
+            let cells = (tokens.div_ceil(12_500) as usize).min(8);
+            let gauge = format!("{}{}", "▰".repeat(cells), "▱".repeat(8 - cells));
+            out.push(Line::from(vec![Span::styled(gauge, if tokens > 100_000 { t.warn } else { t.running }),
+                                     Span::styled(format!(" {} tokens", fmt_tokens(tokens)), t.dim)]));
+            if job.running() {
+                out.push(Line::styled(fit(&job.activity), t.dim));
+                for sub in job.subs.iter().filter(|s| s.ended.is_none()) {
+                    out.push(Line::styled(fit(&format!("└ {}", sub.label)), t.dim));
+                }
+            }
+        }
+        if let Some(job) = self.s.jobs.iter().rev().find(|j| !j.running() && j.after.is_some() && !j.changed.is_empty())
+            .filter(|j| !j.undone) {
+            out.push(Line::default());
+            out.push(head("CHANGED"));
+            out.extend(job.changed.iter().take(4).map(|f| Line::raw(fit(f))));
+            if job.changed.len() > 4 {
+                out.push(Line::styled(format!("and {} more", job.changed.len() - 4), t.dim));
+            }
+            out.push(Line::styled(fit("/undo takes it back"), t.dim));
+        }
+        let copies: Vec<&ringo_cli::Job> = self.s.jobs.iter().filter(|j| j.worktree.is_some() && !j.applied).collect();
+        if !copies.is_empty() {
+            out.push(Line::default());
+            out.push(head("COPIES"));
+            for job in copies {
+                let what = match &job.status {
+                    Status::Running => format!("working {}", fmt_age(job.age())),
+                    Status::Done if job.unchanged => "no change".into(),
+                    Status::Done => format!("ready · /apply {}", job.id),
+                    Status::Failed(_) => "failed".into(),
+                    Status::Cancelled => "stopped".into(),
+                };
+                let name = match job.kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
+                out.push(Line::from(vec![Span::styled(format!("#{} {name} ", job.id), t.dim), Span::raw(fit(&what))]));
+            }
+        }
+        if !self.queue.is_empty() {
+            out.push(Line::default());
+            out.push(head("NEXT"));
+            for (_, _, line) in &self.queue {
+                out.push(Line::styled(fit(&format!("↳ {}", clean(line).replace('\n', " "))), t.selected));
+            }
+        }
+        if out.len() > height {
+            out.truncate(height.saturating_sub(1));
+            out.push(Line::styled("…", t.dim));
+        }
+        out
     }
 
     fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
         let live = self.live(area.width, area.height);
         let t = self.theme;
-        let [view, jobs, queue, asked, input, menu, foot] = Layout::vertical([Constraint::Min(1),
-            Constraint::Length(live.jobs.len() as u16), Constraint::Length(live.queue.len() as u16),
+        let w = area.width as usize;
+        let [head, rule, middle, below, base, asked, input, menu] = Layout::vertical([Constraint::Length(1),
+            Constraint::Length(1), Constraint::Min(1),
+            Constraint::Length(live.jobs.len() as u16 + live.queue.len() as u16), Constraint::Length(1),
             Constraint::Length(live.ask_h), Constraint::Length(live.input_h()),
-            Constraint::Length(live.menu.len() as u16), Constraint::Length(1)]).areas(area);
+            Constraint::Length(live.menu.len() as u16)]).areas(area);
+        // the head: the mark and the folder; the mode and the session's tokens at the right
+        let (mode, tokens) = (self.s.mode.name(), fmt_tokens(self.s.tokens()));
+        let right = [format!("{mode} mode · {tokens} tokens "), format!("{mode} · {tokens} "), String::new()].into_iter()
+            .find(|r| 10 + 8 + cols(r) <= w).unwrap_or_default(); // a narrow head keeps the folder's start
+        let left = one_row(&self.label, w.saturating_sub(12 + cols(&right)));
+        let pad = w.saturating_sub(10 + cols(&left) + cols(&right));
+        f.render_widget(Paragraph::new(Line::from(vec![Span::raw(" ▲▲ "), Span::styled("ringo", t.brand),
+            Span::raw("  "), Span::raw(left), Span::raw(" ".repeat(pad)), Span::raw(right)])).style(t.header), head);
+        self.drawn_look = self.look();
+        // the conversation, and the side panel beside it behind a bar
+        let (view, split) = if live.panel {
+            let [view, bar, side] = Layout::horizontal([Constraint::Min(1), Constraint::Length(1),
+                                                        Constraint::Length(PANEL_W)]).areas(middle);
+            f.render_widget(Paragraph::new(vec![Line::styled("│", t.border); bar.height as usize]), bar);
+            let side = Rect { x: side.x + 1, width: side.width.saturating_sub(1), ..side };
+            f.render_widget(Paragraph::new(self.panel(side.width as usize, side.height as usize)), side);
+            (view, Some((bar.x - area.x) as usize))
+        } else {
+            (middle, None)
+        };
+        let ruled = |joint: &str| -> Line<'static> {
+            let mut text = "─".repeat(w);
+            if let Some(at) = split {
+                text = format!("{}{joint}{}", "─".repeat(at), "─".repeat(w.saturating_sub(at + 1)));
+            }
+            Line::styled(text, t.border)
+        };
+        f.render_widget(Paragraph::new(ruled("┬")), rule);
+        f.render_widget(Paragraph::new(ruled("┴")), base);
         self.conversation(f, view);
-        f.render_widget(Paragraph::new(live.jobs.clone()), jobs);
-        f.render_widget(Paragraph::new(live.queue.clone()), queue);
+        let mut rows_below = live.jobs.clone();
+        rows_below.extend(live.queue.iter().cloned());
+        f.render_widget(Paragraph::new(rows_below), below);
         f.render_widget(Paragraph::new(live.menu.clone()), menu);
-        let block = |title: String| Block::bordered().border_type(BorderType::Rounded).border_style(t.border)
-            .title(Span::styled(title, t.title));
         if let Some((title, lines)) = &live.ask {
-            // The request, wrapped, from its first line: a long one shows how much more there is (all of it is in
-            // the conversation above), and the answers stay at the end.
-            let room = asked.height.saturating_sub(2) as usize;
+            // The request, wrapped, from its first line, under a rule in the warning colour: a long one shows how
+            // much more there is (all of it is in the conversation above), and the answers stay at the end.
+            let room = asked.height.saturating_sub(1) as usize;
             let answers = lines.iter().rev().take_while(|l| l.width() > 0).count();
             let (what, tail) = lines.split_at(lines.len() - answers);
             let mut shown: Vec<Line> = what.to_vec();
@@ -1824,40 +2082,44 @@ impl App {
                 shown.push(Line::styled(format!("… {more} more lines, all of them in the conversation above"), t.warn));
             }
             shown.extend(tail.iter().cloned());
-            let frame = block(title.clone()).border_style(t.warn).padding(Padding::horizontal(1));
+            let frame = Block::new().borders(Borders::TOP).border_style(t.warn)
+                .title(Span::styled(title.clone(), t.warn.add_modifier(Modifier::BOLD))).padding(Padding::horizontal(1));
             f.render_widget(Paragraph::new(shown).block(frame), asked);
         }
         if live.typing {
-            let rows: Vec<Line> = if self.input.is_empty() {
-                let hint = match self.s.busy() {
-                    Some(_) => "type what comes next (it waits for this turn) · Esc stops the turn".to_string(),
-                    None => format!("tell {} what you want, in your own words · / commands · ? keys", self.main.name()),
+            let hint = match &self.toast {
+                Some((text, at)) if at.elapsed() < TOAST => text.clone(),
+                _ if self.scroll > 0 => "scrolled up · PgDn goes back".into(),
+                _ if self.s.busy().is_some() => "Esc stops the turn".into(),
+                _ => "⇧⇥ mode · ? keys".into(),
+            };
+            let mut rows: Vec<Line> = if self.input.is_empty() {
+                let ask = match self.s.busy() {
+                    Some(_) => "type what comes next; it waits for this turn".to_string(),
+                    None => format!("tell {} what you want", self.main.name()),
                 };
-                vec![Line::from(vec![Span::styled(" › ", t.focus), Span::styled(hint, t.dim)])]
+                vec![Line::from(vec![Span::styled(" ❯ ", t.focus), Span::styled(ask, t.dim)])]
             } else {
                 live.rows.iter().enumerate().skip(live.top).take(live.shown).map(|(i, r)| {
-                    Line::from(vec![Span::styled(if i == 0 { " › " } else { "   " }, t.focus), Span::raw(r.clone())])
+                    Line::from(vec![Span::styled(if i == 0 { " ❯ " } else { "   " }, t.focus), Span::raw(r.clone())])
                 }).collect()
             };
-            f.render_widget(Paragraph::new(rows).block(block(String::new())), input);
+            // the hint at the right of the first row where the text leaves room for it; an empty input without the
+            // room shows the hint instead of its invitation
+            if let Some(first) = rows.first_mut() {
+                if first.width() + cols(&hint) + 3 <= w {
+                    let pad = w - first.width() - cols(&hint) - 1;
+                    first.spans.push(Span::raw(" ".repeat(pad)));
+                    first.spans.push(Span::styled(hint, t.dim));
+                } else if self.input.is_empty() {
+                    *first = Line::from(vec![Span::styled(" ❯ ", t.focus), Span::styled(hint, t.dim)]);
+                }
+            }
+            f.render_widget(Paragraph::new(rows), input);
             if live.ask.is_none() || !self.input.is_empty() {
-                f.set_cursor_position((input.x + 4 + live.at.1 as u16, input.y + 1 + (live.at.0 - live.top) as u16));
+                f.set_cursor_position((input.x + 3 + live.at.1 as u16, input.y + (live.at.0 - live.top) as u16));
             }
         }
-        let status = format!(" {} · {} mode · talking to {} · {} tokens ", self.label, self.s.mode.name(),
-                             self.main.name(), fmt_tokens(self.s.tokens()));
-        let right = match &self.toast {
-            Some((text, at)) if at.elapsed() < TOAST => format!("{text} "),
-            _ if self.scroll > 0 => "scrolled up · PgDn or the wheel goes back ".to_string(),
-            _ if self.s.busy().is_some() => "Esc stops · ? keys ".to_string(),
-            _ => "? keys ".to_string(),
-        };
-        // a narrow screen cuts the status before what the right end says
-        let status = one_row(&status, (area.width as usize).saturating_sub(7 + cols(&right)));
-        let pad = (area.width as usize).saturating_sub(7 + cols(&status) + cols(&right));
-        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ringo ", t.brand), Span::styled(status, t.header),
-                                                        Span::raw(" ".repeat(pad)), Span::styled(right, t.header)]))
-            .style(t.header), foot);
     }
 
     /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
@@ -2056,6 +2318,9 @@ pub fn run() -> ExitCode {
             app.toast = None;
             dirty = true;
         }
+        if app.look() != app.drawn_look {
+            dirty = true; // the cat's next frame, or its next state
+        }
         if app.s.running() > 0 && tick.elapsed() >= Duration::from_millis(SPIN_MS as u64) {
             dirty = true; // the spinner and the running clocks
             tick = Instant::now();
@@ -2164,23 +2429,107 @@ mod tests {
     }
 
     #[test]
-    fn the_screen_holds_the_conversation_the_input_and_the_status() {
+    fn the_screen_holds_the_head_the_conversation_and_the_input() {
         let mut a = app(&["codex", "claude"]);
         assert_eq!(a.main.name(), "claude", "claude takes code when it is set up");
         a.welcome();
         let rows = screen(&mut a, 80, 24);
-        assert!(rows[0].starts_with("╭") && rows[1].contains("Welcome to Ringo"), "{rows:#?}");
+        assert!(rows[0].starts_with(" ▲▲ ringo  folder") && rows[0].ends_with("ask mode · 0 tokens"), "{rows:#?}");
+        assert!(rows[1].chars().all(|c| c == '─') && rows[22].chars().all(|c| c == '─'), "no side panel at 80: {rows:#?}");
+        assert_eq!(rows[2], " Welcome to Ringo");
         let words = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains("so /undo is off here"), "outside git, the opening lines say so: {rows:#?}");
-        assert!(rows[21].starts_with("│ › tell claude what you want"), "the input invites a request: {rows:#?}");
-        assert!(rows[23].starts_with(" ringo  folder · ask mode · talking to claude") && rows[23].ends_with("? keys"),
+        assert!(rows[23].starts_with(" ❯ tell claude what you want") && rows[23].ends_with("⇧⇥ mode · ? keys"),
                 "{rows:#?}");
-        let narrow = screen(&mut a, 40, 24);
-        assert!(narrow[23].ends_with("? keys") && narrow[23].contains('…'), "a narrow status keeps its end: {narrow:#?}");
-        for row in narrow {
-            assert!(cols(&row) <= 40, "{row:?}");
+        let narrow = screen(&mut a, 30, 24);
+        for row in &narrow {
+            assert!(cols(row) <= 30, "{row:?}");
         }
+        assert!(narrow[0].contains("ringo") && !narrow[0].contains("mode"), "a narrow head drops its right end: {narrow:#?}");
         assert_eq!(first_choice(&[Agent::from_name("grok").unwrap(), Agent::from_name("codex").unwrap()]).name(), "codex");
+    }
+
+    #[test]
+    fn a_wide_screen_has_the_side_panel_with_the_cat() {
+        let mut a = app(&["codex", "claude"]);
+        a.welcome();
+        let rows = screen(&mut a, 120, 30);
+        let split = rows[1].chars().position(|c| c == '┬').expect("the rule meets the panel's bar");
+        assert_eq!(split, 120 - PANEL_W as usize - 1);
+        assert_eq!(rows[28].chars().position(|c| c == '┴'), Some(split));
+        let side: Vec<String> = rows[2..28].iter().map(|r| r.chars().skip(split + 2).collect()).collect();
+        assert_eq!(side[0..3], mascot("idle")[0].iter().map(|r| r.to_string()).collect::<Vec<_>>()[..], "{side:#?}");
+        assert!(side.contains(&"AGENTS".to_string()), "{side:#?}");
+        assert!(side.iter().any(|r| r.starts_with("○ claude") && r.contains("talking to you")), "{side:#?}");
+        assert!(side.iter().any(|r| r.starts_with("○ codex") && r.ends_with("idle")), "{side:#?}");
+        assert!(rows[2..28].iter().all(|r| r.chars().nth(split) == Some('│')), "the bar runs the panel's height");
+        let long = a.panel(31, 30).into_iter().find(|l| l.spans.len() == 3 && l.spans[1].content.contains("claude")).unwrap();
+        assert!(plain(&[long])[0].ends_with("talking to you"), "the state stays whole");
+    }
+
+    #[test]
+    fn the_cat_has_every_state_and_fits_the_panel() {
+        let rows = mascot("idle")[0].len();
+        for state in ["idle", "working", "asking", "done", "failed"] {
+            let frames = mascot(state);
+            assert!(!frames.is_empty(), "{state}");
+            for frame in frames {
+                assert_eq!(frame.len(), rows, "{state}: every frame has the same rows");
+                assert!(frame.iter().all(|r| cols(r) <= PANEL_W as usize - 4), "{state}: {frame:?}");
+            }
+        }
+        assert_eq!(mascot("nonesuch"), mascot("idle"), "a state the art does not draw shows idle");
+        assert!(mascot("working").len() > 1, "the working cat moves");
+    }
+
+    #[test]
+    fn a_step_says_how_it_went() {
+        let theme = Theme::named("mono", crate::theme::Depth::Mono).unwrap();
+        let row = |text: &str, width: usize| plain(&[step_row(text, width, &theme)])[0].clone();
+        assert_eq!(row("Read a.rs · 2 lines", 40), format!("  ✓ read a.rs{}2 lines", " ".repeat(36 - 9 - 7)));
+        assert_eq!(cols(&row("Read a.rs · 2 lines", 200)), 68, "results line up at 64 columns on a wide pane");
+        assert!(row("✗ $ make test · exit 2", 40).starts_with("  ✗ run make test") && row("✗ $ make test · exit 2", 40).ends_with("exit 2"));
+        assert_eq!(row("◌ Edit a.rs", 40), "  ◌ edit a.rs");
+        assert_eq!(row("· view_file a.rs", 40), "  · view_file a.rs", "only started: no claim about the outcome");
+        assert_eq!(cols(&row(&format!("Grep {} · Found 3 files", "x".repeat(80)), 30)), 30, "a long step keeps to one row");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_grows_as_it_is_written_and_the_whole_one_replaces_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app(&["claude"]);
+        let fake = std::env::temp_dir().join(format!("ringo-tui-fake-claude-{}", std::process::id()));
+        std::fs::write(&fake, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(a.main, fake);
+        a.talk(a.main, "hi".into(), "hi".into()).unwrap();
+        let replies = |a: &App| a.out.iter().filter_map(|o| match o { Out::Reply(t) => Some(t.clone()), _ => None })
+            .collect::<Vec<_>>();
+        a.s.jobs[0].fresh = vec![Said::Partial("Hel".into()), Said::Partial("lo".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello"], "the pieces grow one reply");
+        screen(&mut a, 60, 12);
+        a.s.jobs[0].fresh = vec![Said::Partial(", wor".into())];
+        a.feed();
+        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"), "and it shows as it grows");
+        a.s.jobs[0].fresh = vec![Said::Partial("ld\r".into()), Said::Partial("\nmore".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world\nmore"], "a line end split across pieces stays one");
+        a.s.jobs[0].fresh = vec![Said::Reply("Hello, world.".into()), Said::Step("Read a.rs · 2 lines".into()),
+                                 Said::Partial("Next".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world.", "Next"], "the whole reply replaces its pieces; the next block opens anew");
+        a.s.shutdown();
+    }
+
+    #[test]
+    fn a_queued_compaction_checks_its_conversation_again() {
+        let mut a = app(&["claude"]);
+        assert!(a.run(Cmd::Compact, "/compact").unwrap_err().contains("no conversation"));
+        assert!(a.turn(a.main, "/compact").unwrap_err().contains("no conversation"), "nor when it comes off the queue");
+        let mut b = app(&["codex"]);
+        assert!(b.run(Cmd::Compact, "/compact").unwrap_err().contains("compacts its conversation on its own"));
     }
 
     #[test]
@@ -2200,23 +2549,24 @@ mod tests {
         for i in 0..30 {
             a.say(format!("line {i}"));
         }
+        // 10 rows: the head and its rule, six of conversation (rows 2 to 7), a rule, the input
         let rows = screen(&mut a, 30, 10);
-        assert_eq!(rows[5], "line 29", "the end shows, above the input box and the status: {rows:#?}");
+        assert_eq!(rows[7], "line 29", "the end shows, above the rule and the input: {rows:#?}");
         a.key(KeyEvent::from(KeyCode::PageUp));
         let up = screen(&mut a, 30, 10);
-        assert_eq!(up[5], "line 25", "PgUp goes back a screen less two rows: {up:#?}");
+        assert_eq!(up[7], "line 25", "PgUp goes back a screen less two rows: {up:#?}");
         assert!(up[9].contains("scrolled up"), "{up:#?}");
         a.say("line 30");
-        assert_eq!(screen(&mut a, 30, 10)[5], "line 25", "new lines below keep what shows still");
+        assert_eq!(screen(&mut a, 30, 10)[7], "line 25", "new lines below keep what shows still");
         a.key(KeyEvent::from(KeyCode::Char('x')));
-        assert_eq!(screen(&mut a, 30, 10)[5], "line 30", "typing goes back to the end");
-        // a drag from "ne 29" through "line 3" (rows 4 and 5 of the screen) selects just that text
+        assert_eq!(screen(&mut a, 30, 10)[7], "line 30", "typing goes back to the end");
+        // a drag from "ne 29" through "line 3" (screen rows 6 and 7) selects just that text
         a.sel = Some(((a.top + 4, 2), (a.top + 5, 5)));
         assert_eq!(a.selected(), "ne 29\nline 3");
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
         terminal.draw(|f| a.draw(f)).unwrap();
         let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].modifier.contains(Modifier::REVERSED);
-        assert!(cell(2, 4) && !cell(1, 4) && cell(5, 5) && !cell(6, 5), "the selection shows reversed");
+        assert!(cell(2, 6) && !cell(1, 6) && cell(5, 7) && !cell(6, 7), "the selection shows reversed");
     }
 
     #[test]
@@ -2225,7 +2575,7 @@ mod tests {
         a.say("\u{2705} ok");
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(8, 5)).unwrap();
         terminal.draw(|f| a.draw(f)).unwrap();
-        let row: Vec<&str> = terminal.backend().buffer().content[..5].iter().map(|c| c.symbol()).collect();
+        let row: Vec<&str> = terminal.backend().buffer().content[16..21].iter().map(|c| c.symbol()).collect(); // row 2
         assert_eq!(row, ["\u{2705}", " ", " ", "o", "k"]);
     }
 

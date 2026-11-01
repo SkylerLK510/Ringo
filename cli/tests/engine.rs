@@ -443,7 +443,8 @@ fn agent_commands_are_pinned() {
     assert_eq!(turn(agent("codex"), true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
     // Ask mode (the default): edits go through, every permission prompt comes to Ringo, the always-ask rules ride
     // along; the prompt is one stream-json message on stdin, which stays open for the answers.
-    let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
+    let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--include-partial-messages", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
     let deny = |extra: &[&'static str]| -> Vec<&'static str> {

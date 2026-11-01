@@ -29,7 +29,8 @@ add a dark mode switch to the settings page
   to stop it.
 - You can type the next message while it works. It waits under the box and goes when the turn ends.
 - The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
-  `/clear` starts a new conversation.
+  `/clear` starts a new conversation. When a long conversation makes each turn cost a lot, `/compact` has Claude
+  shrink it to a summary: one call over the whole conversation, and every turn after it is smaller.
 
 ## Take back a change
 

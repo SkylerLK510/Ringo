@@ -53,6 +53,8 @@ pub enum Note {
     /// A line for the job's log, shown as it is.
     Log(String),
     /// The agent's own words: its reply, as markdown.
+    /// A piece of the reply as it is written (Claude's text deltas, agy's); the whole Reply replaces them.
+    Partial(String),
     Reply(String),
     /// A step the agent took (a tool call or a command) and, once known, what came of it.
     Step(String),
@@ -101,6 +103,8 @@ pub struct Parser {
     /// usage, so each id counts once. The sum is 93% of the turn's own count on a real 452.9k-token turn (a message's
     /// output tokens are reported before it is written).
     seen: Vec<(String, Tokens)>,
+    /// Claude reported a compaction (`/compact`), whose result may carry no text.
+    compacted: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -123,6 +127,13 @@ pub fn short(text: &str, n: usize) -> String {
         line.to_string()
     }
 }
+
+/// How a step's text starts when it failed, and when the turn ended before its result came: the shell marks it, and
+/// a job's log reads the same.
+pub const FAILED: &str = "✗ ";
+pub const UNFINISHED: &str = "◌ ";
+/// A step whose start is all its agent reports (an agy tool, a Codex edit): shown without a claim about its outcome.
+pub const STARTED: &str = "· ";
 
 /// What a tool call came to, for its line: an error's first line; how much a search or a read found.
 fn outcome(tool: &str, result: &Value, ok: bool) -> String {
@@ -155,7 +166,7 @@ fn base_name(path: &str) -> &str {
 impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new() }
+                 seen: Vec::new(), compacted: false }
     }
 
     /// The final reply text so far.
@@ -237,13 +248,14 @@ impl Parser {
                     (None, "" | "completed") => String::new(),
                     (None, status) => format!(" · {status}"),
                 };
-                notes.push(Note::Step(format!("$ {}{how}", short(s(item, "command"), 300))));
+                let mark = if how.is_empty() { "" } else { FAILED };
+                notes.push(Note::Step(format!("{mark}$ {}{how}", short(s(item, "command"), 300))));
             }
             "file_change" if !done => {
                 let paths: Vec<&str> = item.get("changes").and_then(Value::as_array).into_iter().flatten()
                     .map(|c| base_name(s(c, "path"))).collect();
                 notes.push(activity(format!("editing {}", paths.join(", "))));
-                notes.push(Note::Step(format!("edit {}", paths.join(", "))));
+                notes.push(Note::Step(format!("{STARTED}edit {}", paths.join(", "))));
                 for c in item.get("changes").and_then(Value::as_array).into_iter().flatten() {
                     notes.push(Note::Touched(s(c, "path").to_string()));
                 }
@@ -296,6 +308,20 @@ impl Parser {
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
             }
+            ("stream_event", _) => {
+                // --include-partial-messages: the reply's text as it is written. Claude Code sends these for the main
+                // conversation only; each text block's whole Reply follows them.
+                let event = e.get("event").unwrap_or(&NULL);
+                if s(event, "type") == "content_block_delta" && event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                    && parent.is_none() {
+                    notes.push(Note::Partial(event.pointer("/delta/text").and_then(Value::as_str).unwrap_or("").to_string()));
+                }
+            }
+            ("system", "compact_boundary") => {
+                let before = e.pointer("/compact_metadata/pre_tokens").and_then(Value::as_u64).unwrap_or(0);
+                notes.push(Note::Log(format!("compacted the conversation (it held {before} tokens)")));
+                self.compacted = true;
+            }
             ("assistant", _) => {
                 if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
                     let t = Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
@@ -330,17 +356,21 @@ impl Parser {
                         notes.push(Note::SubagentEnd { id: id.to_string(), ok });
                     } else if let Some(at) = self.calls.iter().position(|(call, ..)| call == id) {
                         let (_, tool, text) = self.calls.remove(at);
-                        notes.push(Note::Step(format!("{text}{}", outcome(&tool, block, ok))));
+                        let mark = if ok { "" } else { FAILED };
+                        notes.push(Note::Step(format!("{mark}{text}{}", outcome(&tool, block, ok))));
                     }
                 }
             }
             ("result", subtype) => {
                 self.completed += 1;
                 // calls whose result never came (the turn stopped first) are shown as they were made
-                notes.extend(self.calls.drain(..).map(|(_, _, text)| Note::Step(text)));
+                notes.extend(self.calls.drain(..).map(|(_, _, text)| Note::Step(format!("{UNFINISHED}{text}"))));
                 notes.push(Note::Tokens(claude_tokens(e)));
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
+                }
+                if self.compacted && self.reply.trim().is_empty() {
+                    self.reply = "compacted the conversation".into(); // a compaction is done without words
                 }
                 if e.get("is_error") == Some(&Value::Bool(true)) || subtype != "success" {
                     notes.extend(self.fail(format!("claude ended with {subtype}: {}", short(&self.reply.clone(), 200))));
@@ -424,7 +454,7 @@ impl Parser {
                         let shown = if params.get("CommandLine").is_some() { target } else { base_name(target) };
                         let text = format!("{tool} {}", short(shown, 70));
                         notes.push(Note::Activity { node: None, text: text.clone() });
-                        notes.push(Note::Step(text));
+                        notes.push(Note::Step(format!("{STARTED}{text}")));
                         let reads = tool.starts_with("view") || tool.starts_with("read");
                         if tool.contains("file") && !reads && !target.is_empty() {
                             notes.push(Note::Touched(target.to_string()));
@@ -432,9 +462,14 @@ impl Parser {
                     }
                     ("tool", "ERROR") => {
                         let why = step.pointer("/tool_info/error/message").and_then(Value::as_str).unwrap_or("");
-                        notes.push(Note::Step(format!("{tool} refused: {}", short(why, 160))));
+                        notes.push(Note::Step(format!("{FAILED}{tool} refused: {}", short(why, 160))));
                     }
-                    ("agent_response", "ACTIVE") => notes.push(Note::Activity { node: None, text: "writing".into() }),
+                    ("agent_response", "ACTIVE") => {
+                        notes.push(Note::Activity { node: None, text: "writing".into() });
+                        if let Some(delta) = step.get("text_delta").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+                            notes.push(Note::Partial(delta.to_string()));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -560,7 +595,7 @@ mod tests {
         // a command is one line once it ran; its exit code only when it failed
         assert!(notes.contains(&Note::Step("$ /bin/zsh -lc 'ls'".into())));
         let failed = r#"{"type":"item.completed","item":{"type":"command_execution","command":"make test","exit_code":2,"status":"failed"}}"#;
-        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("$ make test · exit 2".into())]);
+        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("✗ $ make test · exit 2".into())]);
     }
 
     #[test]
@@ -584,8 +619,8 @@ mod tests {
         assert_eq!(steps, [
             Note::Step("Read a.rs · 2 lines".into()),
             Note::Step("Grep fn parse in src · Found 3 files".into()),
-            Note::Step("$ cargo test · Permission to use Bash has been denied.".into()),
-            Note::Step("Edit a.rs".into()), // no result before the turn ended
+            Note::Step("✗ $ cargo test · Permission to use Bash has been denied.".into()),
+            Note::Step("◌ Edit a.rs".into()), // no result before the turn ended
         ]);
         let limited = [call("l", "Grep", r#"{"pattern":"x"}"#),
                        result("l", r#""Found 50 files limit: 50, offset: 0\na.rs""#, false)];
@@ -647,6 +682,33 @@ mod tests {
         assert!(notes.contains(&Note::Activity { node: Some("tu1".into()), text: "Grep fn parse".into() }));
         assert!(notes.contains(&Note::SubagentEnd { id: "tu1".into(), ok: true }));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 2, cache_write: 5181, cache_read: 11382, output: 4 })));
+    }
+
+    #[test]
+    fn replies_stream_as_they_are_written() {
+        // Shapes from the Agent SDK's streaming docs: text deltas of the main conversation, then the whole block.
+        let delta = |text: &str, parent: &str| format!(r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}},"parent_tool_use_id":{parent}}}"#);
+        let input = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        let whole = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"Hello"}]},"parent_tool_use_id":null}"#;
+        let lines = [delta("Hel", "null"), delta("lo", "null"), input.to_string(), delta("x", "\"tu1\""), whole.to_string()];
+        let notes = run(Style::Claude, &lines.iter().map(String::as_str).collect::<Vec<_>>()).1;
+        let shown: Vec<&Note> = notes.iter().filter(|n| matches!(n, Note::Partial(_) | Note::Reply(_))).collect();
+        assert_eq!(shown, [&Note::Partial("Hel".into()), &Note::Partial("lo".into()), &Note::Reply("Hello".into())],
+                   "tool input and a subagent's text are not the reply");
+        let agy = r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"Fix"}}"#;
+        assert!(run(Style::Agy, &[agy]).1.contains(&Note::Partial("Fix".into())));
+    }
+
+    #[test]
+    fn a_compaction_is_logged() {
+        // The shape the Agent SDK documents for `/compact` on a resumed session.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":41230}}"#;
+        assert_eq!(run(Style::Claude, &[boundary]).1, [Note::Log("compacted the conversation (it held 41230 tokens)".into())]);
+        let done = r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#;
+        let (p, _) = run(Style::Claude, &[boundary, done]);
+        assert_eq!(p.finish(), Ok(()), "a compaction that says nothing is still done");
+        let (p, _) = run(Style::Claude, &[done]);
+        assert!(p.finish().is_err(), "any other turn without a reply fails closed");
     }
 
     #[test]

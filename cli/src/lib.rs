@@ -331,7 +331,10 @@ impl Job {
     }
 
     fn push(&mut self, said: Said) {
-        let (Said::Reply(text) | Said::Step(text) | Said::Line(text)) = &said;
+        let (Said::Reply(text) | Said::Step(text) | Said::Line(text)) = &said else {
+            self.fresh.push(said); // a piece of the reply: the log takes the whole reply when it comes
+            return;
+        };
         for l in text.lines() {
             if self.log.len() == LOG_LINES {
                 self.log.pop_front();
@@ -346,6 +349,8 @@ impl Job {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Said {
     /// The agent's reply, as markdown.
+    /// A piece of the reply as it is written; the Reply that follows replaces the pieces.
+    Partial(String),
     Reply(String),
     /// A step it took (a tool call or a command) and what came of it.
     Step(String),
@@ -593,6 +598,11 @@ impl Session {
         self.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })).map(|j| j.id)
     }
 
+    /// Whether the agent has a conversation to continue (a turn of it in the folder has started one).
+    pub fn has_conversation(&self, agent: Agent) -> bool {
+        self.threads.contains_key(&agent)
+    }
+
     /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
     pub fn forget(&mut self) {
         self.threads.clear();
@@ -776,7 +786,9 @@ impl Session {
             Adapter::Claude => {
                 // The prompt goes in on stdin as one stream-json message, and stdin stays open until the result: a
                 // permission request comes out as a control_request and Ringo writes the owner's answer back.
-                cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]);
+                // The reply streams as it is written (--include-partial-messages); it changes no tokens.
+                cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                          "--include-partial-messages"]);
                 if self.mode != Mode::Read && names_connector(prompt) {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
@@ -1216,6 +1228,7 @@ impl Session {
                         }
                         Note::Log(line) => job.push_log(line),
                         Note::Reply(text) => job.push(Said::Reply(text)),
+                        Note::Partial(text) => job.push(Said::Partial(text)),
                         Note::Step(text) => job.push(Said::Step(text)),
                         Note::Subagent { id: sub, label } => {
                             job.activity = format!("started subagent {label}");
