@@ -75,7 +75,7 @@ fn session(repo: &Path, agent: Agent, program: &Path) -> Session {
 }
 
 #[test]
-fn read_turns_continue_one_conversation_one_at_a_time() {
+fn turns_in_the_folder_continue_one_conversation_one_at_a_time_and_undo() {
     let r = repo("read");
     // A resumed thread reports its usage so far, as the real Codex does.
     let so_far = r#"case "$*" in *resume*) echo '{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":4}}'; exit ;; esac
@@ -97,9 +97,65 @@ echo '{"type":"turn.completed""#;
     assert_eq!(s.job(second).unwrap().tokens.total(), 12, "only what the resumed turn added (24 so far)");
     let args = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
     let lines: Vec<&str> = args.lines().collect();
-    assert!(lines[0].contains("-s read-only") && lines[0].contains("forced_login_method"));
-    assert!(lines[1].starts_with("exec resume t-1") && lines[1].contains("sandbox_mode=\"read-only\""));
-    assert!(fs::read_to_string(r.join("a.txt")).unwrap() == "one\n" && !r.join("made.txt").exists());
+    assert!(lines[0].contains("-s workspace-write") && lines[0].contains("forced_login_method"), "ask mode edits here");
+    assert!(lines[1].starts_with("exec resume t-1") && lines[1].contains("sandbox_mode=\"workspace-write\""));
+    // The first turn's edits landed in the folder and are known; the second wrote the same again, so changed nothing.
+    assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "made\n");
+    assert_eq!(s.job(first).unwrap().changed, ["b.txt", "c.bin", "made.txt"]);
+    assert!(s.job(second).unwrap().changed.is_empty());
+    let status = Command::new("git").arg("-C").arg(&r).args(["status", "--porcelain"]).output().unwrap().stdout;
+    assert_eq!(String::from_utf8_lossy(&status), "?? b.txt\n?? c.bin\n?? made.txt\n", "nothing staged, nothing stashed");
+    assert!(s.undo().unwrap().contains("undid #1"));
+    assert!(!r.join("made.txt").exists() && !r.join("c.bin").exists() && fs::read_to_string(r.join("a.txt")).unwrap() == "one\n");
+    assert!(s.undo().unwrap_err().contains("nothing to undo"));
+    // A file the owner edited after the turn: /undo refuses and touches nothing.
+    let third = s.launch_agent(agent("codex"), false, "once more").unwrap();
+    assert_eq!(wait(&mut s, third), Status::Done);
+    fs::write(r.join("made.txt"), "mine\n").unwrap();
+    assert!(s.undo().unwrap_err().contains("made.txt changed after #3"));
+    assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "mine\n");
+    assert!(r.join("c.bin").exists());
+    // Read mode: the same agent only looks.
+    s.mode = Mode::Read;
+    let looked = s.launch_agent(agent("codex"), false, "just look").unwrap();
+    assert_eq!(wait(&mut s, looked), Status::Done);
+    let args = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
+    assert!(args.lines().last().unwrap().contains("sandbox_mode=\"read-only\""));
+    assert!(s.job(looked).unwrap().before.is_none(), "a turn that cannot edit keeps no before");
+}
+
+#[test]
+fn undo_refuses_after_any_later_edit_and_while_a_turn_runs() {
+    let r = repo("undo");
+    let lines: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+    fs::write(r.join("long.txt"), &lines).unwrap();
+    git(&r, &["add", "."]);
+    git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "long"]);
+    // An agent that changes the first line, and waits first when asked to.
+    let codex = fake(&root(), "codex-undo", "#!/bin/sh
+cat > \"$0.stdin\"
+        case \"$(cat \"$0.stdin\")\" in *slow*) sleep 1 ;; esac
+        { echo changed; tail -n +2 long.txt; } > t && mv t long.txt
+        echo '{\"type\":\"thread.started\",\"thread_id\":\"t-u\"}'
+        echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}'
+        echo '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'
+");
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "change it").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert_eq!(s.job(id).unwrap().changed, ["long.txt"]);
+    // The owner's own line at the end, far from the turn's: git apply would take the turn's back anyway.
+    fs::write(r.join("long.txt"), format!("changed\n{}mine\n", &lines["line 1\n".len()..])).unwrap();
+    assert!(s.undo().unwrap_err().contains("long.txt changed after #1"));
+    assert!(fs::read_to_string(r.join("long.txt")).unwrap().ends_with("mine\n"), "nothing was undone");
+    fs::write(r.join("long.txt"), format!("changed\n{}", &lines["line 1\n".len()..])).unwrap();
+    // While a turn works in the folder, neither /undo nor /apply touches it.
+    let slow = s.launch_agent(agent("codex"), false, "slow").unwrap();
+    assert!(s.undo().unwrap_err().contains(&format!("#{slow} is working in this folder")));
+    assert_eq!(wait(&mut s, slow), Status::Done);
+    assert!(s.job(slow).unwrap().changed.is_empty(), "the first line was already changed");
+    assert!(s.undo().unwrap().contains("undid #1"));
+    assert_eq!(fs::read_to_string(r.join("long.txt")).unwrap(), lines);
 }
 
 #[test]
@@ -144,10 +200,15 @@ fn write_jobs_stay_in_their_worktree_until_applied() {
             "a binary file is named, not sent as base85: {handoff}");
     assert_eq!(s.expand("render {# note #} and {#x} here").unwrap(), "render {# note #} and {#x} here",
                "only {{#N}} is a handoff");
+    // The copies began as the folder was, so a change applies onto it with the owner's own edit kept; a clash with
+    // that edit leaves everything as it was.
     fs::write(r.join("a.txt"), "dirty\n").unwrap();
-    assert!(s.apply(one).unwrap_err().contains("uncommitted"));
-    git(&r, &["checkout", "--", "a.txt"]);
-    s.apply(one).unwrap();
+    fs::write(r.join("made.txt"), "mine\n").unwrap();
+    assert!(s.apply(one).unwrap_err().contains("your files changed where #1 edits them"));
+    assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "mine\n");
+    fs::remove_file(r.join("made.txt")).unwrap();
+    assert!(s.apply(one).unwrap().contains("made.txt"));
+    assert_eq!(fs::read_to_string(r.join("a.txt")).unwrap(), "dirty\n");
     assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "made\n");
     assert_eq!(fs::read_to_string(r.join("b.txt")).unwrap(), "y\nx\n\n");
     assert_eq!(fs::read(r.join("c.bin")).unwrap(), b"\x00\x01\x02binary", "/apply still carries binary files");
@@ -373,12 +434,15 @@ fn agent_commands_are_pinned() {
                 "-c", "features.default_mode_request_user_input=false", "-c", "include_collaboration_mode_instructions=false",
                 "-c", "analytics.enabled=false", "-c", "features.plugins=false", "-c", "features.apps=false", "-"];
     let want = |head: &[&str], rest: &[&str]| -> Vec<String> { head.iter().chain(rest).map(|a| a.to_string()).collect() };
-    assert_eq!(turn(agent("codex"), false, &codex), (want(&["exec", "-s", "read-only", "-C", "REPO"], &tail), "the task".into()));
     assert_eq!(turn(agent("codex"), false, &codex),
-               (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"read-only\""], &tail), "the task".into()));
+               (want(&["exec", "-s", "workspace-write", "-C", "REPO"], &tail), "the task".into()));
+    assert_eq!(turn(agent("codex"), false, &codex),
+               (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"workspace-write\"", "-c",
+                       "sandbox_workspace_write.network_access=false"], &tail), "the task".into()),
+               "a resumed turn in ask mode says the network is off, whatever an earlier turn had");
     assert_eq!(turn(agent("codex"), true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
-    // Ask mode (the default): every permission prompt comes to Ringo, the always-ask rules ride along, read turns
-    // neither edit nor run commands; the prompt is one stream-json message on stdin, which stays open for the answers.
+    // Ask mode (the default): edits go through, every permission prompt comes to Ringo, the always-ask rules ride
+    // along; the prompt is one stream-json message on stdin, which stays open for the answers.
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
@@ -386,12 +450,12 @@ fn agent_commands_are_pinned() {
         ["--disallowed-tools"].into_iter().chain(extra.iter().copied()).chain(ringo_cli::OUT_OF_TURN_TOOLS)
             .chain(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]).collect()
     };
-    let read = [&["default"][..], &deny(&["Bash", "Edit", "Write", "NotebookEdit"]), &["--settings", &rules]].concat();
+    let here = [&["acceptEdits"][..], &deny(&[]), &["--settings", &rules]].concat();
     let message = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the task\"}}\n".to_string();
     assert_eq!(turn(agent("claude"), false, &claude),
-               (want(&head, &[&read[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
+               (want(&head, &[&here[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
     assert_eq!(turn(agent("claude"), false, &claude),
-               (want(&head, &[&read[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
+               (want(&head, &[&here[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
                 message.clone()));
     assert_eq!(turn(agent("claude"), true, &claude),
                (want(&head, &[&["acceptEdits"][..], &deny(&[]), &["--settings", &rules, "--append-system-prompt-file",
@@ -413,12 +477,12 @@ fn agy_turns_and_their_permissions() {
     let agy = fake(&root(), "agy", &format!("#!/bin/sh\n{RECORD}\
         echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
         if [ -e \"$0.fail\" ]; then rm \"$0.fail\"; echo '{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"response\":\"quota\",\"usage\":{{}}}}}}'; exit 0; fi\n\
-        case \" $* \" in *' --mode '*) k=1 ;; *' --conversation '*) k=$(($(cat \"$0.k\") + 1)); echo $k > \"$0.k\" ;; *) k=1; echo 1 > \"$0.k\" ;; esac\n\
+        case \" $* \" in *' --conversation '*) k=$(($(cat \"$0.k\") + 1)); echo $k > \"$0.k\" ;; *) k=1; [ -e \"$0.k\" ] || echo 1 > \"$0.k\" ;; esac\n\
         echo \"{{\\\"event\\\":\\\"result\\\",\\\"result\\\":{{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"done\\\",\\\"usage\\\":{{\\\"input_tokens\\\":$((7*k)),\\\"output_tokens\\\":$((2*k))}}}}}}\"\n"));
     let mut s = session(&r, agent("agy"), &agy);
-    let mut turn = |write: bool| -> Vec<String> {
+    let turn = |s: &mut Session, write: bool| -> Vec<String> {
         let id = s.launch_agent(agent("agy"), write, r#"-x the "task""#).unwrap();
-        assert_eq!(wait(&mut s, id), Status::Done);
+        assert_eq!(wait(s, id), Status::Done);
         assert_eq!(s.job(id).unwrap().tokens.total(), 9);
         assert_eq!(fs::read_to_string(format!("{}.stdin", agy.display())).unwrap(),
                    "{\"event\":\"user\",\"message\":{\"content\":\"-x the \\\"task\\\"\"}}\n");
@@ -426,10 +490,13 @@ fn agy_turns_and_their_permissions() {
     };
     let read = r#"{"permissions":{"deny":["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
     let head = ["--input-format", "stream-json", "--output-format", "stream-json", "--settings"];
-    assert_eq!(turn(false), [&head[..], &[read]].concat());
-    assert_eq!(turn(false), [&head[..], &[read, "--conversation", "c-1"]].concat());
     let write = r#"{"permissions":{"deny":["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
-    assert_eq!(turn(true), [&head[..], &[write, "--mode", "accept-edits"]].concat());
+    assert_eq!(turn(&mut s, false), [&head[..], &[write, "--mode", "accept-edits"]].concat(), "ask mode edits here");
+    assert_eq!(turn(&mut s, false), [&head[..], &[write, "--mode", "accept-edits", "--conversation", "c-1"]].concat());
+    assert_eq!(turn(&mut s, true), [&head[..], &[write, "--mode", "accept-edits"]].concat());
+    s.mode = Mode::Read;
+    assert_eq!(turn(&mut s, false), [&head[..], &[read, "--conversation", "c-1"]].concat(), "read mode cannot write files");
+    s.mode = Mode::Ask;
     // A failed resumed turn reports no usage; the running total it leaves is still the last one reported.
     fs::write(format!("{}.fail", agy.display()), "").unwrap();
     let failed = s.launch_agent(agent("agy"), false, "again").unwrap();
@@ -437,7 +504,7 @@ fn agy_turns_and_their_permissions() {
     assert_eq!(s.job(failed).unwrap().tokens.total(), 0);
     let next = s.launch_agent(agent("agy"), false, "and now?").unwrap();
     assert_eq!(wait(&mut s, next), Status::Done);
-    assert_eq!(s.job(next).unwrap().tokens.total(), 9, "27 so far, 18 at the last report");
+    assert_eq!(s.job(next).unwrap().tokens.total(), 9, "36 so far, 27 at the last report");
 }
 
 /// An agent the owner adds: kept in agents.json beside the set-up list, run with its own command line (the prompt
@@ -463,7 +530,7 @@ fn an_agent_the_owner_adds() {
     let tool = fake(&root(), "mytool", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
         cat > \"$0.stdin\"\necho done\n");
     let mut s = session(&r, added, &tool);
-    assert!(s.launch_agent(added, false, "x").unwrap_err().contains("no verified read-only mode"));
+    assert!(s.launch_agent(added, false, "x").unwrap_err().contains("only in its own copy"));
     let id = s.launch_agent(added, true, "fix {cwd} please").unwrap();
     assert_eq!(wait(&mut s, id), Status::Done);
     let job = s.job(id).unwrap();
@@ -598,8 +665,8 @@ fn modes_change_what_each_agent_may_do() {
     turn(&mut s, "claude", false, "what is in my Jira sprint?");
     let (argv, env) = (read(&claude, "argv"), read(&claude, "env"));
     assert!(has(&argv, &["--agent", "claude", "--disable-slash-commands"]) && !argv.contains("--safe-mode"), "{argv}");
-    assert!(has(&argv, &["--disallowed-tools", "Bash", "Edit", "Write", "NotebookEdit"]),
-            "a read turn, in the owner's own tree, neither edits nor runs commands: {argv}");
+    assert!(!has(&argv, &["--disallowed-tools", "Bash"]) && argv.contains("--disallowed-tools"),
+            "a turn in the owner's folder edits and runs commands as its mode allows: {argv}");
     for var in ["CLAUDE_CODE_DISABLE_CLAUDE_MDS=1", "CLAUDE_CODE_DISABLE_AUTO_MEMORY=1", "RINGO_CHILD=1"] {
         assert!(env.lines().any(|l| l == var), "{var}");
     }

@@ -295,6 +295,12 @@ pub struct Job {
     pub unchanged: bool,
     /// Files the job edited, relative to its working folder.
     pub touched: BTreeSet<String>,
+    /// A turn in the owner's folder that could edit it: the folder's files as git trees before and after it (see
+    /// `snapshot`), the files that differ, and whether /undo put them back.
+    pub before: Option<String>,
+    pub after: Option<String>,
+    pub changed: Vec<String>,
+    pub undone: bool,
     /// What the agent waits for the owner to allow, oldest first.
     pub asks: VecDeque<Permission>,
     /// Lines for the agent's stdin while the turn runs (Claude's answers to its permission requests); None closes it.
@@ -438,6 +444,16 @@ fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&git_raw(dir, args)?).trim_end().to_string())
 }
 
+/// `git` with a private index file in place of the repository's own.
+fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_INDEX_FILE", index).output()
+        .map_err(|e| format!("git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
 /// An absolute path with symlinks resolved, for a path whose tail may not exist yet.
 fn resolved(path: &Path) -> PathBuf {
     let path = std::env::current_dir().map(|cwd| cwd.join(path)).unwrap_or_else(|_| path.to_path_buf());
@@ -571,9 +587,78 @@ impl Session {
         installed(&self.program(agent))
     }
 
-    /// The read turn the agent is busy with: its conversation takes one turn at a time.
-    pub fn busy(&self, agent: Agent) -> Option<usize> {
-        self.jobs.iter().find(|j| j.running() && j.kind == (Kind::Agent { agent, write: false })).map(|j| j.id)
+    /// The agent turn running in the owner's folder, if one is: one at a time, since it may edit the folder and
+    /// continues its agent's conversation.
+    pub fn busy(&self) -> Option<usize> {
+        self.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })).map(|j| j.id)
+    }
+
+    /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
+    pub fn forget(&mut self) {
+        self.threads.clear();
+    }
+
+    /// The folder's files as they are now, as a git tree: every file git does not ignore, untracked ones too. A
+    /// private copy of the index (`index`) stages them, so the owner's index, stash and HEAD are never touched.
+    /// ceiling: hashes each new or changed file every call; a large file git does not ignore slows a turn's start.
+    fn snapshot(&self, index: &Path) -> Result<String, String> {
+        let own = self.repo.join(git(&self.repo, &["rev-parse", "--git-path", "index"])?);
+        match own.is_file() {
+            true => fs::copy(&own, index).map(|_| ()).map_err(|e| format!("{}: {e}", own.display()))?,
+            false => { let _ = fs::remove_file(index); } // a repository with nothing staged yet has no index
+        }
+        git_index(&self.repo, index, &["add", "-A"])?;
+        git_index(&self.repo, index, &["write-tree"])
+    }
+
+    /// A commit holding `tree`, on `parent` when there is one; no branch points at it.
+    fn commit(&self, tree: &str, parent: Option<&str>, message: &str) -> Result<String, String> {
+        let mut args = vec!["-c", "user.name=ringo", "-c", "user.email=ringo@localhost", "commit-tree", "--no-gpg-sign",
+                            tree, "-m", message];
+        if let Some(parent) = parent {
+            args.extend(["-p", parent]);
+        }
+        git(&self.repo, &args)
+    }
+
+    /// Refuses a change to the owner's folder while an agent turn works in it: the turn's own after would take it in.
+    fn idle(&self, what: &str) -> Result<(), String> {
+        match self.busy() {
+            Some(id) => Err(format!("#{id} is working in this folder: {what} when it ends (Esc stops it)")),
+            None => Ok(()),
+        }
+    }
+
+    /// `/undo`: the files the latest agent turn in this folder changed go back to how they were before it (each
+    /// /undo goes one turn further back). Any of them edited since that turn, anywhere in it, makes it refuse,
+    /// leaving everything as is.
+    pub fn undo(&mut self) -> Result<String, String> {
+        if !self.git {
+            return Err("/undo needs a git project: Ringo keeps each turn's before and after with git (run `git init` \
+                        here once, and later turns can be undone)".into());
+        }
+        self.idle("/undo")?;
+        let job = self.jobs.iter().rev()
+            .find(|j| !j.running() && !j.undone && j.after.is_some() && !j.changed.is_empty())
+            .ok_or("nothing to undo: no agent turn has changed files here yet")?;
+        let (id, before, after) = (job.id, job.before.clone().unwrap_or_default(), job.after.clone().unwrap_or_default());
+        let (file, index, changed) = (job.dir.join("undo.patch"), job.dir.join("index"), job.changed.clone());
+        // git apply alone would also take back a turn's lines in a file edited elsewhere since: compare first
+        let now = self.snapshot(&index)?;
+        let mut args = vec!["diff", "--name-only", after.as_str(), now.as_str(), "--"];
+        args.extend(changed.iter().map(String::as_str));
+        let edited = git(&self.repo, &args)?;
+        if !edited.is_empty() {
+            return Err(format!("{} changed after #{id}, so nothing was undone", edited.lines().collect::<Vec<_>>().join(", ")));
+        }
+        fs::write(&file, git_raw(&self.repo, &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
+        let file = file.to_string_lossy().into_owned();
+        git(&self.repo, &["apply", "--check", &file])
+            .map_err(|e| format!("#{id}'s files no longer match it, so nothing was undone ({e})"))?;
+        git(&self.repo, &["apply", &file])?;
+        let job = &mut self.jobs[id - 1];
+        job.undone = true;
+        Ok(format!("undid #{id}: {} back as before", job.changed.join(", ")))
     }
 
     fn new_job(&mut self, kind: Kind, title: &str) -> Result<usize, String> {
@@ -589,7 +674,8 @@ impl Session {
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
-                             touched: BTreeSet::new(), asks: VecDeque::new(), input: None, pid: None,
+                             touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
+                             asks: VecDeque::new(), input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)) });
         Ok(id)
     }
@@ -606,44 +692,65 @@ impl Session {
             return Err(format!("{name} is not installed (no `{}` on PATH)", self.program(agent).display()));
         }
         if !spec.read && !write {
-            return Err(format!("{name} has no verified read-only mode; use @{name}! for a write job in its own worktree"));
+            return Err(format!("{name} works only in its own copy of the folder: use @{name}!"));
         }
         if write && self.mode == Mode::Read {
-            return Err(format!("read mode: agents do not edit. /mode ask (or Shift-Tab) lets @{name}! edit in a worktree"));
+            return Err(format!("read mode: agents do not edit. /mode ask (or Shift-Tab) lets @{name}! edit its own copy"));
         }
-        if !write && let Some(busy) = self.busy(agent) {
-            return Err(format!("{name} is busy with #{busy}; its conversation takes one turn at a time"));
+        if !write && let Some(busy) = self.busy() {
+            return Err(format!("busy: #{busy} is working in this folder; one turn at a time"));
         }
-        let base = if write { Some(git(&self.repo, &["rev-parse", "HEAD"])?) } else { None };
+        // A turn in the owner's folder edits it, unless in read mode; a write turn edits its own copy.
+        let edits = write || self.mode != Mode::Read;
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
         let _ = fs::write(dir.join("prompt.txt"), prompt);
-        let cwd = match &base {
-            Some(base) => {
-                let wt = dir.join("wt");
-                if let Err(e) = git(&self.repo, &["worktree", "add", "--detach", &wt.to_string_lossy(), base]) {
+        let cwd = if write {
+            // The copy starts from the folder as it is now, uncommitted changes included, so its change applies
+            // back onto it.
+            let wt = dir.join("wt");
+            let head = git(&self.repo, &["rev-parse", "--verify", "-q", "HEAD"]).ok();
+            let base = self.snapshot(&dir.join("index"))
+                .and_then(|tree| self.commit(&tree, head.as_deref(), &format!("ringo job {id}: the folder as it began")))
+                .and_then(|base| git(&self.repo, &["worktree", "add", "--detach", &wt.to_string_lossy(), &base]).map(|_| base));
+            let base = match base {
+                Ok(base) => base,
+                Err(e) => {
                     self.end(id, Status::Failed(e.clone()));
                     return Err(e);
                 }
-                let job = &mut self.jobs[id - 1];
-                job.worktree = Some(wt.clone());
-                job.base = Some(base.clone());
-                job.push_log(format!("own worktree from HEAD {} (/show {id}: its path); your uncommitted changes \
-                                      are not in it", &base[..7.min(base.len())]));
-                wt
+            };
+            let job = &mut self.jobs[id - 1];
+            job.worktree = Some(wt.clone());
+            job.base = Some(base);
+            job.push_log(format!("its own copy of this folder as it is now (/show {id}: where)"));
+            wt
+        } else {
+            if edits && self.git {
+                // Kept for /undo; a turn whose before cannot be taken still runs, without an undo.
+                match self.snapshot(&dir.join("index")) {
+                    Ok(tree) => self.jobs[id - 1].before = Some(tree),
+                    Err(e) => self.jobs[id - 1].push_log(format!("no /undo for this turn: {e}")),
+                }
             }
-            None => self.repo.clone(),
+            self.repo.clone()
         };
         let mut cmd = Command::new(self.program(agent));
         let resume = if write { None } else { self.threads.get(&agent).cloned() };
-        let sandbox = if write { "workspace-write" } else { "read-only" };
+        let sandbox = if edits { "workspace-write" } else { "read-only" };
         let mut input = Some(prompt.to_string());
         let style = match spec.adapter {
             Adapter::Codex => {
                 cmd.args(["exec"]);
                 if let Some(thread) = &resume {
                     cmd.args(["resume", thread]).arg("-c").arg(format!("sandbox_mode=\"{sandbox}\""));
-                } else if write && self.mode == Mode::Auto {
+                    if edits {
+                        // `exec resume` takes no --approve-for-me (codex-cli 0.165.0): in auto mode the sandbox keeps
+                        // its network; in ask mode it is off, said outright, whatever an earlier turn had
+                        let net = self.mode == Mode::Auto;
+                        cmd.args(["-c", &format!("sandbox_workspace_write.network_access={net}")]);
+                    }
+                } else if edits && self.mode == Mode::Auto {
                     // Auto: Codex's own reviewer answers its approval requests (--approve-for-me implies the
                     // workspace-write sandbox), and the sandbox has the network, for git, gh and package installs.
                     // Verified with codex-cli 0.165.0: the sandbox alone has no network.
@@ -687,19 +794,19 @@ impl Session {
                 // auto mode, whose review sends what it blocks repeatedly to Ringo too. Read: nothing may prompt.
                 match self.mode {
                     Mode::Read => cmd.args(["--permission-prompts", "none", "--permission-mode", "default"]),
-                    Mode::Ask => cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode",
-                                           if write { "acceptEdits" } else { "default" }]),
+                    Mode::Ask => cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode", "acceptEdits"]),
                     Mode::Auto => cmd.args(["--permission-prompt-tool", "stdio", "--permission-mode", "auto"]),
                 };
-                // Read turns run in the owner's own tree with no sandbox, so they never edit and never run commands (a
-                // command could write files); deny rules win in every mode. Commands run in write turns' worktrees.
+                // A turn in read mode runs in the owner's own tree with no sandbox, so it never edits and never runs
+                // commands (a command could write files); deny rules win in every mode. Otherwise edits in its folder
+                // go through (/undo puts them back) and a command asks first, as Claude Code's accept-edits mode does.
                 // Tools that act outside the turn go in every mode: scheduling, notifications, remote triggers, other
                 // projects, entering a worktree of the owner's repository, design sync, review reports and
                 // multi-agent workflows. With a permission host Claude Code also offers AskUserQuestion,
                 // EnterPlanMode and ExitPlanMode, which Ringo does not serve. A trivial turn (Claude Code 2.1.316):
                 // read 16,547 tokens before, 11,984 after; write 17,133 before, 12,570 after.
                 let mut deny: Vec<&str> = Vec::new();
-                if !write {
+                if !edits {
                     deny.extend(["Bash", "Edit", "Write", "NotebookEdit"]);
                 }
                 deny.extend(OUT_OF_TURN_TOOLS);
@@ -729,11 +836,11 @@ impl Session {
                 // Bash; read turns cannot write files either. The rules last for this session only.
                 // The prompt goes in on stdin as one stream-json message (verified with agy 1.4.12, which drops a
                 // flag's prompt in this mode): no argument-length limit, and the process table never shows it.
-                let deny = if write { r#"["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# }
+                let deny = if edits { r#"["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# }
                            else { r#"["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# };
                 cmd.args(["--input-format", "stream-json", "--output-format", "stream-json", "--settings"])
                     .arg(format!(r#"{{"permissions":{{"deny":{deny}}}}}"#));
-                if write {
+                if edits {
                     cmd.args(["--mode", "accept-edits"]);
                 }
                 if let Some(conversation) = &resume {
@@ -781,16 +888,25 @@ impl Session {
     /// no branch), reviewed by Ringo with the task as the change description.
     pub fn review_job(&mut self, of: usize) -> Result<usize, String> {
         let job = self.job(of)?;
-        let (Some(wt), Some(base)) = (job.worktree.clone(), job.base.clone()) else {
-            return Err(format!("#{of} is not a write job with a worktree"));
-        };
         if job.status != Status::Done {
             return Err(format!("#{of} has not finished"));
         }
-        git(&wt, &["add", "-A"])?;
-        let tree = git(&wt, &["write-tree"])?;
-        let head = git(&wt, &["-c", "user.name=ringo", "-c", "user.email=ringo@localhost", "commit-tree", &tree,
-                              "-p", &base, "-m", &format!("ringo job {of}")])?;
+        // A copy's change against where it began; a turn in this folder's, from its before and after.
+        let (wt, base, head) = match (job.worktree.clone(), job.base.clone(), job.before.clone(), job.after.clone()) {
+            (Some(wt), Some(base), ..) => {
+                git(&wt, &["add", "-A"])?;
+                let tree = git(&wt, &["write-tree"])?;
+                let head = self.commit(&tree, Some(&base), &format!("ringo job {of}"))?;
+                (wt, base, head)
+            }
+            (_, _, Some(before), Some(after)) if !job.changed.is_empty() => {
+                let base = self.commit(&before, None, &format!("ringo job {of}: before"))?;
+                let head = self.commit(&after, Some(&base), &format!("ringo job {of}"))?;
+                (self.repo.clone(), base, head)
+            }
+            _ => return Err(format!("#{of} changed no files to review")),
+        };
+        let job = self.job(of)?;
         let prompt = fs::read_to_string(job.dir.join("prompt.txt")).unwrap_or_else(|_| job.title.clone());
         let dir = self.next_dir()?;
         let pr = dir.join("pr.txt");
@@ -1028,6 +1144,14 @@ impl Session {
         if job.status == Status::Done && job.worktree.is_some() && self.diff(id).is_ok_and(|p| p.is_empty()) {
             self.jobs[id - 1].unchanged = true;
         }
+        // A turn in the owner's folder, stopped or not: what it changed there, for its last line and /undo.
+        if let Some(before) = self.jobs[id - 1].before.clone()
+            && let Ok(after) = self.snapshot(&self.jobs[id - 1].dir.join("index")) {
+            let changed = git(&self.repo, &["diff", "--name-only", &before, &after]).unwrap_or_default();
+            let job = &mut self.jobs[id - 1];
+            job.changed = changed.lines().map(str::to_string).collect();
+            job.after = Some(after);
+        }
     }
 
     /// Folds pending events into the jobs; true when anything changed.
@@ -1247,26 +1371,33 @@ impl Session {
         Ok(String::from_utf8_lossy(&patch).into_owned())
     }
 
-    /// Applies a finished write job's change to the owner's tree, which must be clean. Nothing is committed; a
-    /// conflict leaves both the tree and the job as they were.
+    /// Applies a finished write job's change to the owner's files. Nothing is staged or committed. The copy began
+    /// as the folder was, so the change applies onto it as it is, uncommitted changes and all; where the folder has
+    /// moved on (a commit since), a clean tree gets a three-way merge. Anything else that does not apply leaves both
+    /// the folder and the job as they were.
     pub fn apply(&mut self, id: usize) -> Result<String, String> {
         let job = self.job(id)?;
         if job.status != Status::Done {
             return Err(format!("#{id} has not finished successfully"));
         }
+        self.idle(&format!("/apply {id}"))?;
         let patch = self.diff(id)?;
         if patch.is_empty() {
             return Err(format!("#{id} changed nothing"));
         }
-        if !git(&self.repo, &["status", "--porcelain"])?.is_empty() {
-            return Err("your tree has uncommitted changes; commit or stash them, then /apply again".into());
-        }
         let file = self.job(id)?.dir.join("change.patch").to_string_lossy().into_owned();
-        git(&self.repo, &["apply", "--check", "--3way", &file])
-            .map_err(|e| format!("{e}\n#{id} is untouched; inspect it with /diff {id}"))?;
-        git(&self.repo, &["apply", "--3way", &file])?;
+        if git(&self.repo, &["apply", "--check", &file]).is_ok() {
+            git(&self.repo, &["apply", &file])?;
+        } else if git(&self.repo, &["status", "--porcelain"])?.is_empty() {
+            git(&self.repo, &["apply", "--check", "--3way", &file])
+                .map_err(|e| format!("{e}\n#{id} is untouched; inspect it with /diff {id}"))?;
+            git(&self.repo, &["apply", "--3way", &file])?;
+        } else {
+            return Err(format!("your files changed where #{id} edits them, so nothing was applied; /diff {id} shows its \
+                                change (commit or stash yours and /apply {id} again for a three-way merge)"));
+        }
         self.jobs[id - 1].applied = true;
-        git(&self.repo, &["diff", "--stat", "HEAD"])
+        git(&self.repo, &["apply", "--stat", &file])
     }
 
     /// Removes a finished write job's worktree (its folder and logs stay).
@@ -1301,11 +1432,17 @@ impl Session {
             }
             out.push_str(&rest[..start]);
             out.push_str(&format!("\n--- reply of job #{n} ---\n{}\n", job.reply().trim_end()));
-            if let (Some(wt), Some(base)) = (&job.worktree, &job.base) {
-                // The change as text: a binary file is one "Binary files ... differ" line, not base85 the agent
-                // cannot read (a 20 KB binary file was 19,546 tokens of it). /apply keeps the binary patch.
-                git(wt, &["add", "-A"])?;
-                let patch = git_raw(wt, &["diff", "--cached", base])?;
+            // The change as text: a binary file is one "Binary files ... differ" line, not base85 the agent cannot
+            // read (a 20 KB binary file was 19,546 tokens of it). /apply keeps the binary patch.
+            let patch = match (&job.worktree, &job.base, &job.before, &job.after) {
+                (Some(wt), Some(base), ..) => {
+                    git(wt, &["add", "-A"])?;
+                    Some(git_raw(wt, &["diff", "--cached", base])?)
+                }
+                (_, _, Some(before), Some(after)) => Some(git_raw(&self.repo, &["diff", before, after])?),
+                _ => None,
+            };
+            if let Some(patch) = patch.filter(|p| !p.is_empty()) {
                 out.push_str(&format!("--- change made by job #{n} ---\n{}\n", String::from_utf8_lossy(&patch)));
             }
             out.push_str("---\n");

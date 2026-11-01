@@ -1,20 +1,24 @@
-//! The `ringo` shell. The conversation, and what every agent does, prints into the terminal's own scrollback, as
-//! Claude Code's and Codex's do, so the mouse wheel scrolls it and a drag selects its text alone. Below it, a live area
-//! holds the running jobs, any permission request, the input box and a status line. That area redraws only when
-//! something changed (an event, a key), and for the spinner (every SPIN_MS) while jobs run.
+//! The `ringo` shell: a full-screen app, as Codex's is. A plain line goes to the agent you are talking to, which works
+//! in this folder (each turn's change can be undone) and asks before it runs a command. The conversation fills the
+//! screen above the input; the mouse wheel and PgUp/PgDn scroll it, and a drag selects its text alone and copies it.
+//! Below it sit the running jobs, the lines queued behind the current turn, a permission request or the input box,
+//! and a status line. The screen redraws only when something changed (an event, a key), and for the spinner (every
+//! SPIN_MS) while jobs run.
 
-use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event as Term, KeyCode, KeyEvent,
-                                KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-                                PushKeyboardEnhancementFlags};
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+                                EnableMouseCapture, Event as Term, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+                                KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+                                PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
 use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::terminal::{disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
+                                   EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::layout::{Constraint, Layout, Rect};
 use crate::theme::Theme;
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Paragraph, Widget, Wrap};
-use ratatui::{DefaultTerminal, Frame, Terminal, TerminalOptions, Viewport};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph};
+use ratatui::{DefaultTerminal, Frame, Terminal};
 use ringo_cli::{Agent, Decision, Kind, Mode, Said, Session, Status};
 use std::collections::VecDeque;
 use std::io::stdout;
@@ -29,7 +33,11 @@ const MANUAL: &str = include_str!("../../docs/USER-GUIDE.md");
 
 /// What the menu offers as a line starts with `/`: each command as it reads, and what it does.
 const COMMANDS: &[(&str, &str)] = &[
-    ("/usrman", "the manual"),
+    ("/help", "the guide (also /usrman)"),
+    ("/undo", "take back the last change an agent made here"),
+    ("/copy", "copy the last answer"),
+    ("/clear", "start a new conversation"),
+    ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/auto", "auto mode on, or back to ask"),
     ("/review #N", "review job N's change"),
@@ -44,7 +52,6 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/kill N", "stop job N"),
     ("/setup", "add an agent and sign in to it"),
     ("/update", "update the agents found out of date"),
-    ("/route on|off", "suggest a command for a line that reads like a task"),
     ("/theme NAME", "colours"),
     ("/backend SPEC", "backend for the pipelines"),
     ("/quit", "leave (or Ctrl-C twice)"),
@@ -68,17 +75,17 @@ fn menu(before: &str, agents: &[(&str, bool)]) -> Vec<(String, String, String)> 
         return Vec::new();
     }
     let mut entries = Vec::new();
-    for &(name, read) in agents.iter().chain(&[("all", true)]) {
-        let (asks, edits) = if name == "all" {
-            ("every set-up agent reads and answers".to_string(), "every set-up agent edits, each in its own worktree".to_string())
-        } else {
-            (format!("{name} reads and answers; it cannot edit"), format!("{name} edits in its own worktree; /apply lands it"))
-        };
-        for (tag, what) in [(format!("@{name}"), asks), (format!("@{name}!"), edits)] {
-            if tag.starts_with(word) && (read || tag.ends_with('!')) {
+    for &(name, here) in agents {
+        let tags = [(format!("@{name}"), format!("talk to {name}: it works in this folder")),
+                    (format!("@{name}!"), format!("{name} works in its own copy; /apply keeps its change"))];
+        for (tag, what) in tags {
+            if tag.starts_with(word) && (here || tag.ends_with('!')) {
                 entries.push((format!("{tag} "), tag, what));
             }
         }
+    }
+    if "@all".starts_with(word) {
+        entries.push(("@all ".into(), "@all".into(), "every agent, each in its own copy, to compare".into()));
     }
     entries
 }
@@ -113,8 +120,16 @@ fn save_history(line: &str) {
 
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
+    /// A plain line: for the agent the owner is talking to.
+    Talk(String),
     Agents(Vec<(Agent, bool)>, String),
+    /// `/ask TEXT`: one tool-free call.
     Ask(String),
+    Undo,
+    Copy,
+    Clear,
+    /// `?`: the keys.
+    Keys,
     Backend(String),
     Show(usize),
     Kill(usize),
@@ -129,7 +144,6 @@ pub enum Cmd {
     Help,
     Setup,
     Theme(Option<String>),
-    Route(bool),
     /// `/update` (None) or `/update auto on|off`.
     Update(Option<bool>),
     /// `/mode` (None: show it) or `/mode ask|auto|read`.
@@ -143,10 +157,13 @@ fn job_number(word: Option<&str>) -> Result<usize, String> {
     word.map(|w| w.trim_start_matches('#')).and_then(|w| w.parse().ok()).ok_or("give a job number, e.g. 3".into())
 }
 
-/// One input line as a command. A line without `/` or `@` is a question (one tool-free call); @all means every
-/// set-up agent that can read.
+/// One input line as a command. A line without `/` or `@` is for the agent the owner is talking to; @all means every
+/// set-up agent.
 pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
     let line = line.trim();
+    if line == "?" {
+        return Ok(Cmd::Keys);
+    }
     if let Some(rest) = line.strip_prefix('/') {
         let mut words = rest.split_whitespace();
         let name = words.next().unwrap_or("");
@@ -155,17 +172,16 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "usrman" | "instructions" | "manual" | "help" | "?" => Ok(Cmd::Help),
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "setup" => Ok(Cmd::Setup),
+            "undo" => Ok(Cmd::Undo),
+            "copy" => Ok(Cmd::Copy),
+            "clear" | "new" => Ok(Cmd::Clear),
+            "ask" if !tail.is_empty() => Ok(Cmd::Ask(tail.into())),
             "auto" => Ok(Cmd::Auto),
             "mode" => match words.next() {
                 None => Ok(Cmd::Mode(None)),
                 Some(m) => Mode::from_name(m).map(|m| Cmd::Mode(Some(m))).ok_or("/mode ask, /mode auto or /mode read".into()),
             },
             "theme" => Ok(Cmd::Theme(words.next().map(str::to_string))),
-            "route" => match words.next() {
-                Some("on") => Ok(Cmd::Route(true)),
-                Some("off") => Ok(Cmd::Route(false)),
-                _ => Err("/route on or /route off".into()),
-            },
             "update" => match (words.next(), words.next()) {
                 (None, _) => Ok(Cmd::Update(None)),
                 (Some("auto"), Some("on")) => Ok(Cmd::Update(Some(true))),
@@ -186,7 +202,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "design" if !tail.is_empty() => Ok(Cmd::Design(tail.into())),
             "research" if !tail.is_empty() => Ok(Cmd::Research(tail.into())),
             "work" if !tail.is_empty() => Ok(Cmd::Work(tail.into())),
-            _ => Err(format!("unknown or incomplete command /{name}; /usrman lists them")),
+            _ => Err(format!("unknown or incomplete command /{name}; /help lists them")),
         };
     }
     let mut agents = Vec::new();
@@ -197,7 +213,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             None => (&word[1..], false),
         };
         match name {
-            "all" => agents.extend(all.iter().filter(|a| write || a.spec().read).map(|a| (*a, write))),
+            "all" => agents.extend(all.iter().map(|a| (*a, true))), // each in its own copy, to compare
             _ => agents.push((Agent::from_name(name).ok_or_else(|| {
                 let known: Vec<&str> = Agent::all().into_iter().map(|a| a.name()).collect();
                 format!("no agent {name}: {} or all (/setup adds one)", known.join(", "))
@@ -206,7 +222,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
         rest = rest.trim_start()[word.len()..].trim_start();
     }
     if agents.is_empty() {
-        return if rest.is_empty() { Err("type a question, or /usrman".into()) } else { Ok(Cmd::Ask(rest.to_string())) };
+        return if rest.is_empty() { Err("type what you want, or /help".into()) } else { Ok(Cmd::Talk(rest.to_string())) };
     }
     if rest.is_empty() {
         return Err("say what the agent should do".into());
@@ -686,58 +702,11 @@ impl Md {
     }
 }
 
-/// The most rows one print into the scrollback takes (a longer single line is cut there; all of it is on disk).
-const CHUNK_ROWS: usize = 1000;
-
-/// Prints conversation lines into the scrollback above the live area, word-wrapped to the terminal's width.
-fn flush<B: Backend>(terminal: &mut Terminal<B>, lines: Vec<Line<'static>>) -> Result<(), B::Error> {
-    terminal.autoresize()?;
-    let width = terminal.size()?.width.max(1);
-    let (mut chunk, mut rows) = (Vec::new(), 0);
-    for line in lines {
-        let n = Paragraph::new(line.clone()).wrap(Wrap { trim: false }).line_count(width).clamp(1, CHUNK_ROWS);
-        if rows > 0 && rows + n > CHUNK_ROWS {
-            insert(terminal, std::mem::take(&mut chunk), rows)?;
-            rows = 0;
-        }
-        chunk.push(line);
-        rows += n;
-    }
-    if rows > 0 {
-        insert(terminal, chunk, rows)?;
-    }
-    Ok(())
-}
-
-fn insert<B: Backend>(terminal: &mut Terminal<B>, lines: Vec<Line<'static>>, rows: usize) -> Result<(), B::Error> {
-    let text = Paragraph::new(lines).wrap(Wrap { trim: false });
-    terminal.insert_before(rows as u16, |buf| {
-        text.render(buf.area, buf);
-        uncover(buf);
-    })
-}
-
-/// ratatui prints every cell of an inserted line, the cell a wide character covers too (a space). The terminal has
-/// already moved two columns for that character, so the space would push the rest of the row one column right; an
-/// empty cell prints nothing.
-fn uncover(buf: &mut ratatui::buffer::Buffer) {
-    use unicode_width::UnicodeWidthStr;
-    let width = buf.area.width as usize;
-    for i in 0..buf.content.len() {
-        let covers = buf.content[i].symbol().width().saturating_sub(1);
-        for k in 1..=covers.min(width - 1 - i % width) {
-            buf.content[i + k].set_symbol("");
-        }
-    }
-}
-
-/// An inline live area of `height` rows at the cursor: no alternate screen, so the terminal keeps its scrollback.
-fn inline(height: u16) -> std::io::Result<DefaultTerminal> {
-    Terminal::with_options(CrosstermBackend::new(stdout()), TerminalOptions { viewport: Viewport::Inline(height) })
-}
-
-fn open(height: u16) -> std::io::Result<DefaultTerminal> {
+/// The terminal, full screen: raw mode, the alternate screen, the mouse (the wheel scrolls, a drag selects), bracketed
+/// paste, and Shift-Enter where the terminal can report it.
+fn open() -> std::io::Result<DefaultTerminal> {
     enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     // A paste arrives as one event, not as keys (its newlines as Enter). Not fatal: the legacy Windows console has no
     // bracketed paste, and there a paste's keys are told apart by their timing (see BURST).
     let _ = execute!(stdout(), EnableBracketedPaste);
@@ -745,38 +714,26 @@ fn open(height: u16) -> std::io::Result<DefaultTerminal> {
     let keys = supports_keyboard_enhancement().unwrap_or(false)
         && execute!(stdout(), PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)).is_ok();
     SHIFT_ENTER.store(keys, Ordering::Relaxed);
-    inline(height)
+    Terminal::new(CrosstermBackend::new(stdout()))
 }
 
-/// The keyboard protocol and bracketed paste off, and raw mode left.
+/// The terminal as it was: the keyboard protocol, bracketed paste and the mouse off, the alternate screen and raw mode
+/// left.
 fn restore() {
     if SHIFT_ENTER.swap(false, Ordering::Relaxed) {
         let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
     }
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    let _ = execute!(stdout(), DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen);
     let _ = disable_raw_mode();
 }
 
-/// The live area goes and the terminal is as it was (for an agent's sign-in, an update, or the end); the
-/// conversation stays in the scrollback.
+/// The screen goes and the terminal is as it was (for an agent's sign-in, an update, or the end).
 fn close(terminal: &mut DefaultTerminal) {
-    let top = terminal.get_frame().area().y;
-    let _ = terminal.clear();
-    let _ = terminal.set_cursor_position((0, top));
     let _ = terminal.show_cursor();
     restore();
 }
 
-/// A live area of a new height, where the old one began (growing pushes the conversation up into the scrollback).
-fn reshape(terminal: &mut DefaultTerminal, height: u16) -> std::io::Result<()> {
-    let top = terminal.get_frame().area().y;
-    terminal.clear()?;
-    terminal.set_cursor_position((0, top))?;
-    *terminal = inline(height)?;
-    Ok(())
-}
-
-/// A conversation entry. It is fitted to the terminal's width when it prints (and again if the window narrows).
+/// A conversation entry. It is fitted to the screen's width when it shows (and again when the width changes).
 #[derive(Clone, Debug)]
 enum Out {
     /// A line; a row past the width continues this many columns in.
@@ -785,6 +742,8 @@ enum Out {
     Reply(String),
     /// A step an agent took, on one row under its job: its bullet's style and the text.
     Step(Style, String),
+    /// The box the shell opens with, a line per row (the first is its title).
+    Welcome(Vec<String>),
 }
 
 impl Out {
@@ -799,6 +758,22 @@ impl Out {
                 .collect(),
             Out::Step(bullet, text) => vec![Line::from(vec![Span::styled("  • ", *bullet),
                                                             Span::styled(one_row(text, width.saturating_sub(4)), theme.dim)])],
+            Out::Welcome(lines) => {
+                let inner = lines.iter().map(|l| cols(l)).max().unwrap_or(0).min(width.saturating_sub(4)).max(1);
+                let edge = |l: &str, r: &str| Line::styled(format!("{l}{}{r}", "─".repeat(inner + 2)), theme.border);
+                let mut rows = vec![edge("╭", "╮")];
+                for (i, text) in lines.iter().enumerate() {
+                    for row in fit(&Line::raw(text.clone()), inner, 8) {
+                        let text: String = row.spans.iter().map(|s| s.content.as_ref()).collect();
+                        let pad = " ".repeat(inner - cols(&text));
+                        rows.push(Line::from(vec![Span::styled("│ ", theme.border),
+                                                  Span::styled(text, if i == 0 { theme.title } else { theme.dim }),
+                                                  Span::raw(pad), Span::styled(" │", theme.border)]));
+                    }
+                }
+                rows.push(edge("╰", "╯"));
+                rows
+            }
         }
     }
 
@@ -835,54 +810,80 @@ fn one_row(text: &str, width: usize) -> String {
     }
 }
 
-/// How many printed entries the shell keeps, to print the end of the conversation again after the window narrows.
-const RECENT: usize = 300;
-
-/// Prints the conversation lines that wait for the scrollback.
-fn print(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
-    terminal.autoresize()?;
-    let width = terminal.size()?.width as usize;
-    let out = std::mem::take(&mut app.out);
-    let lines: Vec<Line<'static>> = out.iter().flat_map(|o| o.rows(width, &app.theme)).collect();
-    app.recent.extend(out);
-    let extra = app.recent.len().saturating_sub(RECENT);
-    app.recent.drain(..extra);
-    flush(terminal, lines)
+/// The columns `from..to` of a row of text (a wide character counts where it starts).
+fn slice_cols(text: &str, from: usize, to: usize) -> String {
+    let mut col = 0;
+    text.chars().filter(|c| {
+        let keep = col >= from && col < to;
+        col += c.width().unwrap_or(0);
+        keep
+    }).collect()
 }
 
-/// Prints what waits for the scrollback, fits the live area to what it holds, and draws it.
-fn paint(terminal: &mut DefaultTerminal, app: &mut App, shape: &mut u16) -> std::io::Result<()> {
-    let size = terminal.size()?;
-    if size.width < app.width {
-        // A narrower window: ratatui clears the whole screen (rows the terminal re-wrapped would garble it), and the
-        // visible end of the conversation goes with it, so that end is printed again at the new width.
-        terminal.autoresize()?;
-        let room = size.height.saturating_sub(*shape) as usize;
-        let mut again: Vec<Line<'static>> = Vec::new();
-        for entry in app.recent.iter().rev() {
-            // the end of an entry taller than what is left (a long reply) still comes back
-            let rows = entry.rows(size.width as usize, &app.theme);
-            again.extend(rows.into_iter().rev().take(room.saturating_sub(again.len())));
-            if again.len() >= room {
-                break;
-            }
+fn base64(bytes: &[u8]) -> String {
+    const ABC: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= chunk.len() { ABC[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
         }
-        again.reverse();
-        flush(terminal, again)?;
     }
-    app.width = size.width;
-    if !app.out.is_empty() {
-        print(terminal, app)?;
-    }
-    let live = app.live(size.width, size.height);
-    let want = live.height().clamp(1, size.height.max(1));
-    if want != *shape {
-        reshape(terminal, want)?;
-        *shape = want;
-    }
-    terminal.draw(|f| app.draw(f, &live))?;
-    Ok(())
+    out
 }
+
+/// Puts text on the clipboard with the system's own tool; where there is none (a server over ssh), the terminal is
+/// asked to (OSC 52, which many allow). True when a tool took it. ceiling: Windows' clip garbles non-ASCII text.
+fn copy(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let tools: &[&[&str]] = if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else if cfg!(windows) {
+        &[&["clip"]]
+    } else {
+        &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]]
+    };
+    for tool in tools {
+        let Ok(mut child) = Command::new(tool[0]).args(&tool[1..]).stdin(Stdio::piped()).stdout(Stdio::null())
+            .stderr(Stdio::null()).spawn() else { continue };
+        let wrote = child.stdin.take().is_some_and(|mut pipe| pipe.write_all(text.as_bytes()).is_ok());
+        if child.wait().is_ok_and(|s| s.success()) && wrote {
+            return true;
+        }
+    }
+    let _ = write!(stdout(), "\x1b]52;c;{}\x07", base64(text.as_bytes()));
+    let _ = stdout().flush();
+    false
+}
+
+/// The Keys section of the guide, for `?`.
+fn keys() -> String {
+    let section = MANUAL.split_once("## Keys").map_or("", |(_, rest)| rest.split("\n## ").next().unwrap_or(rest));
+    format!("## Keys{section}")
+}
+
+/// The agent a plain line goes to before the owner picks one with @: claude for code, else codex, else any that
+/// works in the folder.
+fn first_choice(agents: &[Agent]) -> Agent {
+    ["claude", "codex"].iter().find_map(|n| agents.iter().find(|a| a.name() == *n))
+        .or_else(|| agents.iter().find(|a| a.spec().read)).copied().unwrap_or(agents[0])
+}
+
+/// A path under the home folder as `~/…`.
+fn home_short(path: &Path) -> String {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    match path.strip_prefix(&home) {
+        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
+}
+
+/// A spot in the conversation: (row, column).
+type Spot = (usize, usize);
+
+/// How many entries the conversation keeps on screen before the oldest go (all of it is saved when the shell ends).
+const KEEP: usize = 20_000;
 
 struct App {
     s: Session,
@@ -890,13 +891,26 @@ struct App {
     cursor: usize,
     history: Vec<String>,
     hist: usize,
-    /// Conversation lines not yet printed into the scrollback, the last RECENT printed, and the width they were
-    /// printed at.
+    /// The conversation, and each entry fitted to `fitted_w` (fitted lazily; all again when the width changes).
     out: Vec<Out>,
-    recent: VecDeque<Out>,
-    width: u16,
-    /// The menu's chosen row (see `menu`).
+    fitted: Vec<Vec<Line<'static>>>,
+    fitted_w: usize,
+    rows: usize,
+    /// Rows scrolled up from the end (0: following it), where the conversation showed in the last frame and its
+    /// first row there, and the text selected with the mouse (from, to) and whether a drag is under way.
+    scroll: usize,
+    view: Rect,
+    top: usize,
+    sel: Option<(Spot, Spot)>,
+    dragging: bool,
+    /// A short note in the status line (copied, could not copy) and when it appeared.
+    toast: Option<(String, Instant)>,
+    /// The agent plain lines go to, and lines waiting for the turn running in this folder: (agent, task, as typed).
+    main: Agent,
+    queue: VecDeque<(Agent, String, String)>,
+    /// The menu's chosen row (see `menu`), and the chosen answer to a permission request.
     pick: usize,
+    choice: usize,
     /// Per job (at its id - 1): whether the line it ended with is printed.
     ended: Vec<bool>,
     /// When the last key arrived: an Enter right behind another key is part of a paste (see BURST).
@@ -910,9 +924,6 @@ struct App {
     agents: Vec<Agent>,
     theme: Theme,
     started: Instant,
-    /// Route suggestions on (/route on), and the plain line a suggestion is standing in for.
-    route: bool,
-    suggested: Option<String>,
     /// The permission request on screen and when it appeared (answer keys wait ANSWER_GRACE after that).
     asked: Option<(String, Instant)>,
     /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
@@ -920,11 +931,14 @@ struct App {
     update: bool,
 }
 
-/// What the live area holds in one frame: the running jobs' rows, the permission request, and the input's rows.
+/// What the bottom of the screen holds in one frame: the running jobs' rows, the queued lines, the permission
+/// request, the input's rows (when it shows), and the menu.
 struct Live {
     jobs: Vec<Line<'static>>,
+    queue: Vec<Line<'static>>,
     ask: Option<(String, Vec<Line<'static>>)>,
     ask_h: u16,
+    typing: bool,
     rows: Vec<String>,
     at: (usize, usize),
     /// The first input row shown, and how many are.
@@ -934,9 +948,8 @@ struct Live {
 }
 
 impl Live {
-    fn height(&self) -> u16 {
-        // the input's border, the status line
-        self.jobs.len() as u16 + self.ask_h + self.shown as u16 + 2 + self.menu.len() as u16 + 1
+    fn input_h(&self) -> u16 {
+        if self.typing { self.shown as u16 + 2 } else { 0 }
     }
 }
 
@@ -948,8 +961,37 @@ const SPIN_MS: u128 = 120;
 const BURST: Duration = Duration::from_millis(15);
 /// How long after a permission request appears its answer keys are ignored.
 const ANSWER_GRACE: Duration = Duration::from_millis(300);
+/// How long a note stays in the status line.
+const TOAST: Duration = Duration::from_millis(2500);
 
 impl App {
+    fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
+        App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, out: Vec::new(), fitted: Vec::new(),
+              fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
+              main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
+              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
+              started: Instant::now(), asked: None, pending: None, update: false }
+    }
+
+    /// The box and the three lines the shell opens with.
+    fn welcome(&mut self) {
+        let found: Vec<&str> = self.agents.iter().map(|a| a.name()).collect();
+        self.out.push(Out::Welcome(vec![
+            "✻ Welcome to Ringo".into(), String::new(),
+            format!("folder  {}", home_short(&self.s.repo)),
+            format!("agents  {} (/setup adds another)", found.join(", ")),
+            format!("mode    {} (Shift-Tab changes it)", self.s.mode.name()),
+        ]));
+        self.gap();
+        let undo = match self.s.git {
+            true => "; /undo takes back its last change.",
+            false => ". This folder is not a git project, so /undo is off here.",
+        };
+        self.say(format!("  Type what you want done, in your own words, and press Enter. {} works in this folder and \
+                          asks before it runs a command{undo}", self.main.name()));
+        self.say("  @codex or @claude picks who you talk to · / lists the commands · ? the keys · /help the guide");
+    }
+
     fn say(&mut self, text: impl AsRef<str>) {
         for line in clean(text.as_ref()).lines() {
             self.out.push(Out::text(line));
@@ -959,7 +1001,7 @@ impl App {
 
     /// A blank line, unless the conversation just had one.
     fn gap(&mut self) {
-        if self.out.last().or(self.recent.back()).is_some_and(|o| !o.blank()) {
+        if self.out.last().is_some_and(|o| !o.blank()) {
             self.out.push(Out::Line(Line::default(), 0));
         }
     }
@@ -974,11 +1016,14 @@ impl App {
         self.last = 0;
     }
 
+    fn note(&mut self, text: impl Into<String>) {
+        self.toast = Some((text.into(), Instant::now()));
+    }
+
     /// The settings in force, printed under the manual.
     fn settings(&self) -> String {
-        format!("  now: mode {} · questions and pipelines on {} · theme {} · route suggestions {}\n  private state: {}",
-                self.s.mode.name(), self.s.backend, self.theme.name, if self.route { "on" } else { "off" },
-                self.s.dir.display())
+        format!("  now: mode {} · talking to {} · questions and pipelines on {} · theme {}\n  private state: {}",
+                self.s.mode.name(), self.main.name(), self.s.backend, self.theme.name, self.s.dir.display())
     }
 
     /// An agent's reply, or the manual: markdown, between blank lines.
@@ -999,7 +1044,8 @@ impl App {
     /// Who runs a job, as the shell names it, in that agent's colour.
     fn who(&self, job: &ringo_cli::Job) -> (String, Style) {
         match &job.kind {
-            Kind::Agent { agent, write } => (format!("{}{}", agent.name(), if *write { "!" } else { "" }), self.agent_style(*agent)),
+            Kind::Agent { agent, write } => (format!("{}{}", agent.name(), if *write { " (own copy)" } else { "" }),
+                                             self.agent_style(*agent)),
             Kind::Ringo { command } => (format!("ringo {command}"), self.theme.ringo),
         }
     }
@@ -1055,9 +1101,15 @@ impl App {
         let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
         let mut tail = format!(" {what} · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
         if job.unchanged {
-            tail += &format!(" · no change; /drop {} removes its worktree", job.id);
+            tail += &format!(" · no change; /drop {} removes its copy", job.id);
         } else if job.worktree.is_some() && job.status == Status::Done {
-            tail += &format!(" · change ready: /diff {0}, /apply {0}", job.id);
+            tail += &format!(" · change ready: /diff {0} shows it, /apply {0} keeps it", job.id);
+        } else if !job.changed.is_empty() {
+            let files = match job.changed.len() {
+                n if n <= 3 => job.changed.join(", "),
+                n => format!("{} and {} more", job.changed[..2].join(", "), n - 2),
+            };
+            tail += &format!(" · changed {files} (/undo takes it back)");
         }
         let mut lines = vec![Line::from(vec![Span::styled(format!("{mark} "), style), Span::styled(format!("#{} ", job.id), t.dim),
                                              Span::styled(who, who_style), Span::styled(tail, t.dim)])];
@@ -1069,66 +1121,43 @@ impl App {
         lines
     }
 
-    /// Who takes a suggested agent turn: the set-up agents that can take it now (a read turn needs a read-only mode
-    /// and a free conversation), with claude, then codex, preferred (see route::owner).
-    fn owner(&self, route: &crate::route::Route) -> Option<Agent> {
-        let read = *route == crate::route::Route::Read;
-        let able: Vec<&str> = self.agents.iter().filter(|a| !read || (a.spec().read && self.s.busy(**a).is_none()))
-            .map(|a| a.name()).collect();
-        crate::route::owner(&able).and_then(Agent::from_name)
-    }
-
     /// Sets the mode for the turns started from now on (a running turn keeps its own), and saves it.
     fn set_mode(&mut self, mode: Mode) -> String {
         self.s.mode = mode;
         let saved = crate::theme::set_setting("mode", serde_json::json!(mode.name())).err()
             .map_or(String::new(), |e| format!(" (not saved: {e})"));
         let what = match mode {
-            Mode::Ask => "agents ask you before commands, connectors, the network, pushes and PRs",
+            Mode::Ask => "agents edit files here (/undo takes it back) and ask before commands, the network, pushes and PRs",
             Mode::Auto => "agents act on their own; flagged actions and always-ask rules still wait for you",
             Mode::Read => "agents look but do not touch",
         };
-        format!("  mode: {}: {what}; turns already running keep theirs{saved}", mode.name())
+        format!("  mode: {}: {what}; a turn already running keeps its own{saved}", mode.name())
     }
 
-    /// Starts the task an ask call routed (`ROUTE: <route>`): code turns go to their owner, sources to /research;
-    /// a review needs its range, so it is put in the input line to complete.
+    /// Starts the task an /ask call routed (`ROUTE: <route>`): code turns go to the agent the owner talks to, sources
+    /// to /research; a review needs its range, so it is put in the input line to complete.
     fn start_routed(&mut self, ask: usize, route: &str) {
         let line = self.s.job(ask).map(|j| j.title_full.clone()).unwrap_or_default();
-        let (kind, write) = match route {
-            "edit" => (crate::route::Route::Edit, true),
-            "read" => (crate::route::Route::Read, false),
-            "research" => {
-                match self.s.research(&line) {
-                    Ok(id) => self.say(format!("  → #{ask} is a task for live sources: started /research as #{id}")),
-                    Err(e) => self.say(format!("  → #{ask} needs live sources, but /research did not start: {e}")),
+        match route {
+            "edit" | "read" => {
+                let main = self.main;
+                match self.talk(main, line.clone(), line) {
+                    Ok(_) => self.say(format!("  → #{ask} is a task for the files here: {} takes it", main.name())),
+                    Err(e) => self.say(format!("  → #{ask} is a task for {}: {e}", main.name())),
                 }
-                return;
             }
+            "research" => match self.s.research(&line) {
+                Ok(id) => self.say(format!("  → #{ask} is a task for live sources: started /research as #{id}")),
+                Err(e) => self.say(format!("  → #{ask} needs live sources, but /research did not start: {e}")),
+            },
             "review" => {
                 self.say(format!("  → #{ask} asks for a review: say what to review (Enter sends it)"));
                 if self.input.is_empty() {
                     self.input = "/review HEAD~1".chars().collect();
                     self.cursor = self.input.len();
                 }
-                return;
             }
-            other => {
-                self.say(format!("  → #{ask} came back as route `{other}`, which Ringo does not know; nothing started"));
-                return;
-            }
-        };
-        let Some(agent) = self.owner(&kind) else {
-            self.say(format!("  → #{ask} is a task, but no agent can take it now (/setup adds one)"));
-            return;
-        };
-        match self.s.launch_agent(agent, write, &line) {
-            Ok(id) => {
-                let how = if write { "edits in a worktree" } else { "reads this folder" };
-                self.say(format!("  → #{ask} is a task: @{}{} {how} as #{id} (mode: {})", agent.name(),
-                                 if write { "!" } else { "" }, self.s.mode.name()));
-            }
-            Err(e) => self.say(format!("  → #{ask} is a task for @{}: {e}", agent.name())),
+            other => self.say(format!("  → #{ask} came back as route `{other}`, which Ringo does not know; nothing started")),
         }
     }
 
@@ -1136,60 +1165,113 @@ impl App {
         SPIN[(self.started.elapsed().as_millis() / SPIN_MS) as usize % SPIN.len()]
     }
 
+    /// A line for `agent` in this folder, continuing their conversation: now, or next while a turn runs here (as it
+    /// was typed, `line`, it shows when it starts). An agent that works only in its own copy takes it there.
+    fn talk(&mut self, agent: Agent, task: String, line: String) -> Result<Option<String>, String> {
+        if !agent.spec().read {
+            let expanded = self.s.expand(&task)?;
+            let id = self.s.launch_agent(agent, true, &expanded)?;
+            return Ok(Some(format!("  #{id}: {} works only in its own copy; /apply {id} keeps its change", agent.name())));
+        }
+        if self.must_wait() {
+            self.queue.push_back((agent, task, line));
+            return Ok(None);
+        }
+        self.turn(agent, &task)
+    }
+
+    /// Whether a turn in this folder has to wait: one runs here, lines wait before it, every job slot is taken, or an
+    /// agent update holds the session.
+    fn must_wait(&self) -> bool {
+        self.s.busy().is_some() || !self.queue.is_empty() || self.s.running() >= self.s.max_jobs || self.s.hold.is_some()
+    }
+
+    fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
+        let expanded = self.s.expand(task)?;
+        self.s.launch_agent(agent, false, &expanded)?;
+        Ok((expanded.len() != task.len()).then(|| {
+            format!("  the handoff adds {} characters to the task:\n{expanded}", expanded.len() - task.len())
+        }))
+    }
+
+    /// Stops the turn running in this folder; lines queued behind it go back into the input, to send or change.
+    fn stop(&mut self, id: usize) {
+        let _ = self.s.kill(id);
+        let queued: Vec<String> = self.queue.drain(..).map(|(_, _, line)| line).collect();
+        if !queued.is_empty() && self.input.is_empty() {
+            self.input = queued.join("\n").chars().collect();
+            self.cursor = self.input.len();
+        }
+        self.say(format!("  stopping #{id}; what it changed so far stays (/undo takes it back)"));
+    }
+
+    /// Whether a line would wait in the queue: a line for an agent in this folder while a turn runs here.
+    fn waits(&self, cmd: &Result<Cmd, String>) -> bool {
+        let here = match cmd {
+            Ok(Cmd::Talk(_)) => self.main.spec().read,
+            Ok(Cmd::Agents(agents, _)) => matches!(agents[..], [(a, false)] if a.spec().read),
+            _ => false,
+        };
+        here && self.must_wait()
+    }
+
     fn submit(&mut self) {
         let line: String = self.input.iter().collect();
         self.input.clear();
         self.cursor = 0;
+        self.scroll = 0;
         if line.trim().is_empty() {
             return;
-        }
-        let was_suggested = self.suggested.take().is_some();
-        let plain = !line.trim_start().starts_with(['/', '@']);
-        if self.route && plain && !was_suggested {
-            let route = crate::route::classify(&line, self.s.git);
-            let agent = self.owner(&route).map_or("", |a| a.name());
-            let needs = matches!(route, crate::route::Route::Edit | crate::route::Route::Read);
-            let suggested = crate::route::suggestion(&route, line.trim(), agent).filter(|_| !needs || !agent.is_empty());
-            if let Some((cmd, cost)) = suggested {
-                self.say(format!("  → suggested: {cmd}\n    ({cost}). Enter sends it; change it if you like; Esc asks it \
-                                  as a plain question instead (about 1-2k tokens)."));
-                self.input = cmd.chars().collect();
-                self.cursor = self.input.len();
-                self.suggested = Some(line);
-                return;
-            }
         }
         if self.history.last() != Some(&line) {
             save_history(&line);
             self.history.push(line.clone());
         }
         self.hist = self.history.len();
-        self.echo(&line);
-        match parse(&line, &self.agents.clone()).and_then(|cmd| self.run(cmd)) {
+        let cmd = parse(&line, &self.agents.clone());
+        if !self.waits(&cmd) {
+            self.echo(&line); // a queued line shows when it starts
+        }
+        match cmd.and_then(|cmd| self.run(cmd, &line)) {
             Ok(Some(text)) => self.say(text),
             Ok(None) => {}
             Err(e) => self.say(format!("  {e}")),
         }
     }
 
-    /// Runs a command; Some(text) goes to the conversation. A started job's own lines follow there as they come.
-    fn run(&mut self, cmd: Cmd) -> Result<Option<String>, String> {
+    /// Runs a command (`line`: as typed); Some(text) goes to the conversation. A started job's own lines follow
+    /// there as they come.
+    fn run(&mut self, cmd: Cmd, line: &str) -> Result<Option<String>, String> {
         Ok(match cmd {
+            Cmd::Talk(text) => return self.talk(self.main, text, line.to_string()),
             Cmd::Help => {
                 self.reply(MANUAL);
                 Some(self.settings())
+            }
+            Cmd::Keys => {
+                self.reply(&keys());
+                None
+            }
+            Cmd::Undo => Some(format!("  {}", self.s.undo()?)),
+            Cmd::Copy => {
+                let last = self.out.iter().rev().find_map(|o| match o { Out::Reply(text) => Some(text.clone()), _ => None });
+                let text = last.ok_or("no answer to copy yet")?;
+                self.note(if copy(&text) { "copied the last answer" } else { "asked the terminal to copy the last answer" });
+                None
+            }
+            Cmd::Clear => {
+                self.s.forget();
+                self.out.clear();
+                self.fitted.clear();
+                self.scroll = 0;
+                self.sel = None;
+                Some("  a new conversation: each agent's next turn starts fresh".into())
             }
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
             Cmd::Auto => {
                 let mode = if self.s.mode == Mode::Auto { Mode::Ask } else { Mode::Auto };
                 Some(self.set_mode(mode))
-            }
-            Cmd::Route(on) => {
-                self.route = on;
-                let saved = crate::theme::set_setting("route", serde_json::json!(on)).err()
-                    .map_or(" (saved for next time)".to_string(), |e| format!(" (not saved: {e})"));
-                Some(format!("  route suggestions {}{saved}", if on { "on" } else { "off" }))
             }
             Cmd::Theme(None) => Some(format!("  theme: {} (also: {})", self.theme.name,
                 crate::theme::NAMES.iter().filter(|n| **n != self.theme.name).copied().collect::<Vec<_>>().join(", "))),
@@ -1198,6 +1280,7 @@ impl App {
                 match Theme::named(&name, depth) {
                     Some(theme) => {
                         self.theme = theme;
+                        self.fitted.clear(); // the conversation in the new colours
                         match crate::theme::save(theme.name) {
                             Ok(()) => Some(format!("  theme: {} (saved for next time)", theme.name)),
                             Err(e) => Some(format!("  theme: {} (not saved: {e})", theme.name)),
@@ -1241,11 +1324,15 @@ impl App {
                 let job = self.s.job(id)?;
                 let (who, _) = self.who(job);
                 let log: Vec<String> = job.log.iter().map(|l| format!("  {l}")).collect();
-                let wt = job.worktree.as_ref().map_or(String::new(), |w| format!("; its worktree: {}", w.display()));
+                let wt = job.worktree.as_ref().map_or(String::new(), |w| format!("; its copy: {}", w.display()));
                 Some(format!("#{id} {who} · {}: its last {} log lines (the whole stream is in {}{wt})\n{}", job.title_full,
                              log.len(), job.dir.display(), log.join("\n")))
             }
             Cmd::Kill(id) => {
+                if self.s.busy() == Some(id) {
+                    self.stop(id);
+                    return Ok(None);
+                }
                 self.s.kill(id)?;
                 Some(format!("  stopping #{id}"))
             }
@@ -1253,10 +1340,10 @@ impl App {
                 let patch = self.s.diff(id)?;
                 Some(if patch.is_empty() { format!("  #{id} changed nothing") } else { patch })
             }
-            Cmd::Apply(id) => Some(format!("  applied #{id} to your tree (not committed):\n{}", self.s.apply(id)?)),
+            Cmd::Apply(id) => Some(format!("  applied #{id} to your files (not committed):\n{}", self.s.apply(id)?)),
             Cmd::Drop(id) => {
                 self.s.drop_worktree(id)?;
-                Some(format!("  removed #{id}'s worktree; its logs stay in {}", self.s.job(id)?.dir.display()))
+                Some(format!("  removed #{id}'s copy; its logs stay in {}", self.s.job(id)?.dir.display()))
             }
             Cmd::ReviewJob(of) => {
                 self.s.review_job(of)?;
@@ -1286,14 +1373,23 @@ impl App {
                 None
             }
             Cmd::Agents(agents, prompt) => {
+                // One agent: the conversation goes on with it, here. Two or more: each in its own copy, to compare.
+                if let [(agent, false)] = agents[..] {
+                    self.main = agent;
+                    return self.talk(agent, prompt, line.to_string());
+                }
+                if agents.len() > 1 && !self.s.git {
+                    return Err("two agents at once each work in their own copy of the folder, which needs a git \
+                                project; here, ask them one at a time".into());
+                }
                 let expanded = self.s.expand(&prompt)?;
                 let mut notes = Vec::new();
                 if expanded.len() != prompt.len() {
-                    notes.push(format!("  handoff adds {} characters to the task:", expanded.len() - prompt.len()));
+                    notes.push(format!("  the handoff adds {} characters to the task:", expanded.len() - prompt.len()));
                     notes.push(expanded.clone());
                 }
-                for (agent, write) in agents {
-                    if let Err(e) = self.s.launch_agent(agent, write, &expanded) {
+                for (agent, _) in agents {
+                    if let Err(e) = self.s.launch_agent(agent, true, &expanded) {
                         notes.push(format!("  {}: {e}", agent.name()));
                     }
                 }
@@ -1308,7 +1404,6 @@ impl App {
         menu(&before, &agents)
     }
 
-    /// The word before the cursor becomes a menu entry.
     /// Ctrl-W, Alt-Backspace: the word before the cursor goes, with the spaces after it.
     fn cut_word_back(&mut self) {
         let start = word_start(&self.input, self.cursor);
@@ -1316,6 +1411,7 @@ impl App {
         self.cursor = start;
     }
 
+    /// The word before the cursor becomes a menu entry.
     fn complete(&mut self, with: &str) {
         let start = self.input[..self.cursor].iter().rposition(|c| matches!(c, ' ' | '\n')).map_or(0, |i| i + 1);
         let chars: Vec<char> = with.chars().collect();
@@ -1330,6 +1426,7 @@ impl App {
         let n = chars.len();
         self.input.splice(self.cursor..self.cursor, chars);
         self.cursor += n;
+        self.scroll = 0;
     }
 
     /// A paste goes into the input as it is, its lines kept; nothing is sent until Enter.
@@ -1342,6 +1439,57 @@ impl App {
         self.cursor = self.input.len();
     }
 
+    /// The answers a permission request offers, in order: once, for the session (unless an always-ask rule covers
+    /// it), no.
+    fn choices(&self, p: &ringo_cli::parse::Permission) -> Vec<(Decision, String)> {
+        let mut choices = vec![(Decision::Once, "Yes".to_string())];
+        if !self.s.always_asks(p) {
+            choices.push((Decision::Session, format!("Yes, and allow `{}` for the rest of this session",
+                                                     ringo_cli::parse::short(&p.rule, 50))));
+        }
+        choices.push((Decision::Deny, "No, carry on without it (Esc)".into()));
+        choices
+    }
+
+    /// Keys while an agent waits for an answer and the input is empty. True when the key was the dialog's.
+    fn answer_key(&mut self, k: &KeyEvent) -> bool {
+        let Some((id, p)) = self.s.pending().filter(|_| self.input.is_empty()) else { return false };
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(k.code, KeyCode::Char('c' | 'd')) {
+            return false; // Ctrl-C still quits
+        }
+        if self.asked.as_ref().is_some_and(|(_, at)| at.elapsed() < ANSWER_GRACE) {
+            return true; // keys of a word being typed as the request appeared never answer it
+        }
+        let choices = self.choices(p);
+        let pick = |d: Decision| choices.iter().position(|(c, _)| *c == d);
+        let chosen = match k.code {
+            KeyCode::Up => {
+                self.choice = (self.choice + choices.len() - 1) % choices.len();
+                None
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.choice = (self.choice + 1) % choices.len();
+                None
+            }
+            KeyCode::Enter => Some(self.choice.min(choices.len() - 1)),
+            KeyCode::Char(c @ '1'..='9') if !ctrl => Some(c as usize - '1' as usize).filter(|i| *i < choices.len()),
+            KeyCode::Char('y' | 'Y') if !ctrl => pick(Decision::Once),
+            KeyCode::Char('a' | 'A') if !ctrl => pick(Decision::Session),
+            KeyCode::Char('n' | 'N') if !ctrl => pick(Decision::Deny),
+            KeyCode::Esc => pick(Decision::Deny),
+            _ => None,
+        };
+        if let Some(i) = chosen {
+            // the job's own lines say what was answered
+            if let Err(e) = self.s.decide(id, choices[i].0) {
+                self.say(format!("  #{id}: {e}"));
+            }
+            self.choice = 0;
+        }
+        true
+    }
+
     fn key(&mut self, k: KeyEvent) {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -1351,26 +1499,13 @@ impl App {
         if !(ctrl && matches!(k.code, KeyCode::Char('c' | 'd'))) {
             self.quit_armed = false;
         }
-        // An agent waiting for an answer has the keys once the input is empty: y, a or n (Esc declines); Ctrl-C still
-        // quits, anything else is ignored. A line being typed keeps its keys until it is sent or cleared, and keys in
-        // the first moment after a request appears are ignored, so a word being typed never answers by accident.
-        if let Some((id, _)) = self.s.pending().filter(|_| self.input.is_empty()) {
-            if self.asked.as_ref().is_some_and(|(_, at)| at.elapsed() < ANSWER_GRACE) {
-                return;
-            }
-            let decision = match k.code {
-                KeyCode::Char('y' | 'Y') if !ctrl => Some(Decision::Once),
-                KeyCode::Char('a' | 'A') if !ctrl => Some(Decision::Session),
-                KeyCode::Char('n' | 'N') if !ctrl => Some(Decision::Deny),
-                KeyCode::Esc => Some(Decision::Deny),
-                KeyCode::Char('c' | 'd') if ctrl => None,
-                _ => return,
-            };
-            if let Some(decision) = decision {
-                let said = self.s.decide(id, decision).unwrap_or_else(|e| e);
-                self.say(format!("  #{id}: {said}"));
-                return;
-            }
+        if !matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
+            self.sel = None;
+        }
+        // An agent waiting for an answer has the keys once the input is empty. A line being typed keeps its keys
+        // until it is sent or cleared.
+        if self.answer_key(&k) {
+            return;
         }
         // The menu under the input (a / command or an @agent being typed) has Up, Down and Tab, and Enter while the
         // word is not yet a whole entry that takes nothing more (a paste's Enter is left alone).
@@ -1391,20 +1526,27 @@ impl App {
             }
         }
         self.pick = 0;
+        let page = (self.view.height as usize).saturating_sub(2).max(1);
         match k.code {
             KeyCode::Char('c' | 'd') if ctrl => {
                 if !self.input.is_empty() {
                     self.input.clear();
                     self.cursor = 0;
-                } else if self.s.running() > 0 && !self.quit_armed {
+                } else if let Some(id) = self.s.busy() {
+                    self.stop(id);
+                } else if self.quit_armed {
+                    self.quit = true;
+                } else {
                     self.quit_armed = true;
                     let n = self.s.running();
-                    self.say(format!("  {n} job{} running; Ctrl-C again stops {} and quits",
-                                     if n == 1 { " is" } else { "s are" }, if n == 1 { "it" } else { "them" }));
-                } else {
-                    self.quit = true;
+                    self.say(match n {
+                        0 => "  Ctrl-C again quits".to_string(),
+                        n => format!("  Ctrl-C again stops {} and quits", if n == 1 { "the job running".into() } else { format!("the {n} jobs running") }),
+                    });
                 }
             }
+            KeyCode::PageUp => self.scroll += page,
+            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(page),
             // the line-editing keys of a shell: to the line's start or end, a word back or on, and cutting either way
             KeyCode::Char('u') if ctrl => {
                 let start = line_bounds(&self.input, self.cursor).0;
@@ -1466,19 +1608,120 @@ impl App {
                 let text = self.set_mode(self.s.mode.next());
                 self.say(text);
             }
-            KeyCode::Esc if self.suggested.is_some() => {
-                // a suggestion declined: ask the original line as a plain question instead
-                let line = self.suggested.take().unwrap_or_default();
-                self.input = line.chars().collect();
-                self.suggested = Some(String::new()); // so this submit is not routed again
-                self.submit();
-            }
-            KeyCode::Esc => {
+            KeyCode::Esc if !self.input.is_empty() => {
                 self.input.clear();
                 self.cursor = 0;
             }
+            KeyCode::Esc => match self.s.busy() {
+                Some(id) => self.stop(id),
+                None => self.scroll = 0,
+            },
             _ => {}
         }
+    }
+
+    /// The wheel scrolls the conversation; a drag over it selects its text and copies it when the button comes up.
+    fn mouse(&mut self, m: MouseEvent) -> bool {
+        let v = self.view;
+        let row = m.row.clamp(v.y, (v.y + v.height).saturating_sub(1));
+        let spot = (self.top + (row - v.y) as usize, m.column.saturating_sub(v.x) as usize);
+        match m.kind {
+            MouseEventKind::ScrollUp => self.scroll += 3,
+            MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let inside = m.row >= v.y && m.row < v.y + v.height && m.column >= v.x && m.column < v.x + v.width;
+                self.sel = inside.then_some((spot, spot));
+                self.dragging = inside;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                if let Some((_, to)) = &mut self.sel {
+                    *to = spot;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.dragging => {
+                self.dragging = false;
+                let text = self.selected();
+                if self.sel.is_some_and(|(a, b)| a == b) || text.trim().is_empty() {
+                    self.sel = None; // a click, not a selection
+                } else {
+                    let n = text.lines().count();
+                    let what = if n == 1 { "1 line".to_string() } else { format!("{n} lines") };
+                    self.note(if copy(&text) { format!("copied {what}") } else { format!("asked the terminal to copy {what}") });
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The selection, first spot first.
+    fn selection(&self) -> Option<(Spot, Spot)> {
+        let (a, b) = self.sel?;
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// The selected text: each row's selected columns, its trailing spaces cut.
+    fn selected(&self) -> String {
+        let Some((a, b)) = self.selection() else { return String::new() };
+        self.fitted.iter().flatten().enumerate().skip(a.0).take(b.0 - a.0 + 1)
+            .map(|(r, line)| {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let from = if r == a.0 { a.1 } else { 0 };
+                let to = if r == b.0 { b.1 + 1 } else { usize::MAX };
+                slice_cols(&text, from, to).trim_end().to_string()
+            })
+            .collect::<Vec<_>>().join("\n")
+    }
+
+    /// Fits the entries not yet fitted to `width` (every entry after the width changed); the conversation's rows.
+    fn fit_to(&mut self, width: usize) -> usize {
+        if self.out.len() > KEEP {
+            let extra = self.out.len() - KEEP;
+            self.out.drain(..extra);
+            self.fitted.drain(..extra.min(self.fitted.len()));
+        }
+        let same = width == self.fitted_w;
+        if !same {
+            self.fitted.clear();
+            self.fitted_w = width;
+        }
+        while self.fitted.len() < self.out.len() {
+            let rows = self.out[self.fitted.len()].rows(width, &self.theme);
+            self.fitted.push(rows);
+        }
+        let rows = self.fitted.iter().map(Vec::len).sum();
+        if same && self.scroll > 0 {
+            self.scroll += rows - self.rows.min(rows); // rows added below keep what is on screen still
+        }
+        self.rows = rows;
+        rows
+    }
+
+    /// The conversation's rows that fit `area`, scrolled as set, with the selection shown.
+    fn conversation(&mut self, f: &mut Frame, area: Rect) {
+        let total = self.fit_to(area.width as usize);
+        let h = area.height as usize;
+        self.scroll = self.scroll.min(total.saturating_sub(h));
+        let top = total.saturating_sub(h + self.scroll);
+        let shown: Vec<Line<'static>> = self.fitted.iter().flatten().skip(top).take(h).cloned().collect();
+        f.render_widget(Paragraph::new(shown), area);
+        if let Some((a, b)) = self.selection() {
+            for y in 0..area.height {
+                let r = top + y as usize;
+                if r < a.0 || r > b.0 {
+                    continue;
+                }
+                let from = if r == a.0 { a.1 } else { 0 };
+                let to = if r == b.0 { b.1 } else { area.width as usize };
+                for x in from..=to.min(area.width.saturating_sub(1) as usize) {
+                    if let Some(cell) = f.buffer_mut().cell_mut((area.x + x as u16, area.y + y)) {
+                        cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+                    }
+                }
+            }
+        }
+        self.view = area;
+        self.top = top;
     }
 
     /// The live area's rows for the running jobs (mark, number, who, time and tokens, any same-files warning, what it
@@ -1521,21 +1764,29 @@ impl App {
         lines
     }
 
-    /// What the live area holds for a terminal of `width` x `height`.
+    /// What the bottom of the screen holds for a terminal of `width` x `height`.
     fn live(&self, width: u16, height: u16) -> Live {
         let w = width as usize;
+        let t = &self.theme;
         let jobs = self.job_rows(w, (height / 3).max(2) as usize);
-        let ask = self.prompt_lines(w.saturating_sub(2));
+        let mut queue: Vec<Line<'static>> = self.queue.iter().take(3).map(|(_, _, line)| {
+            let text = one_row(&clean(line).replace('\n', " "), w.saturating_sub(12));
+            Line::from(vec![Span::styled("   ↳ next: ", t.dim), Span::styled(text, t.selected)])
+        }).collect();
+        if self.queue.len() > 3 {
+            queue.push(Line::styled(format!("   … {} more queued", self.queue.len() - 3), t.dim));
+        }
+        let ask = self.prompt_lines(w.saturating_sub(4));
         let ask_h = ask.as_ref().map_or(0, |(_, lines)| (lines.len() as u16 + 2).clamp(3, (height / 2).max(3)));
-        let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(2));
+        let typing = ask.is_none() || !self.input.is_empty();
+        let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(5)); // the borders and " › "
         let shown = rows.len().min((height / 4).clamp(1, 10) as usize);
         let top = (at.0 + 1).saturating_sub(shown);
-        let entries = self.menu_entries();
+        let entries = if typing { self.menu_entries() } else { Vec::new() };
         let room = (height / 4).clamp(1, 6) as usize;
         let pick = self.pick.min(entries.len().saturating_sub(1));
         let first = (pick + 1).saturating_sub(room);
         let label = entries.iter().map(|(_, l, _)| cols(l)).max().unwrap_or(0);
-        let t = &self.theme;
         let menu = entries.iter().enumerate().skip(first).take(room)
             .map(|(i, (_, l, what))| {
                 let (mark, style) = if i == pick { ("› ", t.focus) } else { ("  ", t.dim) };
@@ -1543,62 +1794,107 @@ impl App {
                                 Span::styled(what.clone(), t.dim)])
             })
             .collect();
-        Live { jobs, ask, ask_h, rows, at, top, shown, menu }
+        Live { jobs, queue, ask, ask_h, typing, rows, at, top, shown, menu }
     }
 
-    fn draw(&self, f: &mut Frame, live: &Live) {
+    fn draw(&mut self, f: &mut Frame) {
+        let area = f.area();
+        let live = self.live(area.width, area.height);
         let t = self.theme;
-        let [jobs, asked, input, menu, foot] = Layout::vertical([Constraint::Length(live.jobs.len() as u16),
-            Constraint::Length(live.ask_h), Constraint::Length(live.shown as u16 + 2),
-            Constraint::Length(live.menu.len() as u16), Constraint::Length(1)]).areas(f.area());
+        let [view, jobs, queue, asked, input, menu, foot] = Layout::vertical([Constraint::Min(1),
+            Constraint::Length(live.jobs.len() as u16), Constraint::Length(live.queue.len() as u16),
+            Constraint::Length(live.ask_h), Constraint::Length(live.input_h()),
+            Constraint::Length(live.menu.len() as u16), Constraint::Length(1)]).areas(area);
+        self.conversation(f, view);
+        f.render_widget(Paragraph::new(live.jobs.clone()), jobs);
+        f.render_widget(Paragraph::new(live.queue.clone()), queue);
         f.render_widget(Paragraph::new(live.menu.clone()), menu);
         let block = |title: String| Block::bordered().border_type(BorderType::Rounded).border_style(t.border)
             .title(Span::styled(title, t.title));
-        f.render_widget(Paragraph::new(live.jobs.clone()), jobs);
         if let Some((title, lines)) = &live.ask {
-            // The request, wrapped, above the input, from its first line: a long one shows how much more there is (all
-            // of it is in the conversation above), and the keys stay on the last line.
+            // The request, wrapped, from its first line: a long one shows how much more there is (all of it is in
+            // the conversation above), and the answers stay at the end.
             let room = asked.height.saturating_sub(2) as usize;
-            let mut lines = lines.clone();
-            let keys = lines.pop().unwrap_or_default();
-            let mut shown = lines.clone();
-            if shown.len() + 1 > room {
-                shown.truncate(room.saturating_sub(2));
-                let more = lines.len() - shown.len();
+            let answers = lines.iter().rev().take_while(|l| l.width() > 0).count();
+            let (what, tail) = lines.split_at(lines.len() - answers);
+            let mut shown: Vec<Line> = what.to_vec();
+            if shown.len() + tail.len() > room {
+                shown.truncate(room.saturating_sub(tail.len() + 1));
+                let more = what.len() - shown.len();
                 shown.push(Line::styled(format!("… {more} more lines, all of them in the conversation above"), t.warn));
             }
-            shown.push(keys);
-            f.render_widget(Paragraph::new(shown).block(block(title.clone()).border_style(t.warn)), asked);
+            shown.extend(tail.iter().cloned());
+            let frame = block(title.clone()).border_style(t.warn).padding(Padding::horizontal(1));
+            f.render_widget(Paragraph::new(shown).block(frame), asked);
         }
-        let newline = if SHIFT_ENTER.load(Ordering::Relaxed) { "Shift-Enter" } else { "Ctrl-J" };
-        let hint = format!(" / commands · @ agents · {newline} new line ");
-        let rows: Vec<Line> = live.rows.iter().skip(live.top).take(live.shown).map(|r| Line::raw(r.clone())).collect();
-        f.render_widget(Paragraph::new(rows).block(block(hint)), input);
-        f.set_cursor_position((input.x + 1 + live.at.1 as u16, input.y + 1 + (live.at.0 - live.top) as u16));
-        let status = format!(" {} · mode: {} · {} running · {} tokens", self.label, self.s.mode.name(), self.s.running(),
-                             fmt_tokens(self.s.tokens()));
-        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ringo ", t.brand), Span::styled(status, t.header)]))
+        if live.typing {
+            let rows: Vec<Line> = if self.input.is_empty() {
+                let hint = match self.s.busy() {
+                    Some(_) => "type what comes next (it waits for this turn) · Esc stops the turn".to_string(),
+                    None => format!("tell {} what you want, in your own words · / commands · ? keys", self.main.name()),
+                };
+                vec![Line::from(vec![Span::styled(" › ", t.focus), Span::styled(hint, t.dim)])]
+            } else {
+                live.rows.iter().enumerate().skip(live.top).take(live.shown).map(|(i, r)| {
+                    Line::from(vec![Span::styled(if i == 0 { " › " } else { "   " }, t.focus), Span::raw(r.clone())])
+                }).collect()
+            };
+            f.render_widget(Paragraph::new(rows).block(block(String::new())), input);
+            if live.ask.is_none() || !self.input.is_empty() {
+                f.set_cursor_position((input.x + 4 + live.at.1 as u16, input.y + 1 + (live.at.0 - live.top) as u16));
+            }
+        }
+        let status = format!(" {} · {} mode · talking to {} · {} tokens ", self.label, self.s.mode.name(),
+                             self.main.name(), fmt_tokens(self.s.tokens()));
+        let right = match &self.toast {
+            Some((text, at)) if at.elapsed() < TOAST => format!("{text} "),
+            _ if self.scroll > 0 => "scrolled up · PgDn or the wheel goes back ".to_string(),
+            _ if self.s.busy().is_some() => "Esc stops · ? keys ".to_string(),
+            _ => "? keys ".to_string(),
+        };
+        // a narrow screen cuts the status before what the right end says
+        let status = one_row(&status, (area.width as usize).saturating_sub(7 + cols(&right)));
+        let pad = (area.width as usize).saturating_sub(7 + cols(&status) + cols(&right));
+        f.render_widget(Paragraph::new(Line::from(vec![Span::styled(" ringo ", t.brand), Span::styled(status, t.header),
+                                                        Span::raw(" ".repeat(pad)), Span::styled(right, t.header)]))
             .style(t.header), foot);
     }
 
-    /// A waiting permission request as the live area shows it: its title, then every line of the action, wrapped,
-    /// and the keys.
+    /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
+    /// blank row, and the answers (or how to reach them while a line is being typed).
     fn prompt_lines(&self, width: usize) -> Option<(String, Vec<Line<'static>>)> {
         let (id, p) = self.s.pending()?;
         let job = self.s.job(id).ok()?;
         let (who, _) = self.who(job);
         let more = self.s.waiting() - 1;
-        let title = format!(" {who} #{id} asks before it acts{} ", if more > 0 { format!(" · {more} more waiting") } else { String::new() });
-        let mut lines: Vec<Line<'static>> = p.what.lines().flat_map(|l| wrap(&clean(l), width)).map(Line::raw).collect();
-        let keys = if !self.input.is_empty() {
-            "send or clear (Esc) your line to answer: y allow · a allow for this session · n decline".to_string()
-        } else if self.s.always_asks(p) {
-            "y allow this once (an always-ask rule: it asks every time) · n decline".to_string()
-        } else {
-            format!("y allow · a allow `{}` for this session · n decline", ringo_cli::parse::short(&p.rule, 60))
+        let wants = match p.tool.as_str() {
+            "Bash" => "run a command".to_string(),
+            "WebFetch" => "open a web page".into(),
+            "WebSearch" => "search the web".into(),
+            "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => "change a file".into(),
+            tool if tool.starts_with("mcp__") => "use a connector".into(),
+            tool => format!("use {tool}"),
         };
-        lines.push(Line::styled(keys, self.theme.dim));
+        let title = format!(" {who} #{id} wants to {wants}{} ", if more > 0 { format!(" · {more} more waiting") } else { String::new() });
+        let mut lines: Vec<Line<'static>> = p.what.lines().flat_map(|l| wrap(&clean(l), width)).map(Line::raw).collect();
+        lines.push(Line::default());
+        if !self.input.is_empty() {
+            lines.push(Line::styled("your line is still in the input: send it, or clear it with Esc, to answer", self.theme.dim));
+        } else {
+            for (i, (_, label)) in self.choices(p).into_iter().enumerate() {
+                let (mark, style) = if i == self.choice { ("›", self.theme.focus) } else { (" ", self.theme.dim) };
+                lines.push(Line::styled(format!("{mark} {}. {label}", i + 1), style));
+            }
+        }
         Some((title, lines))
+    }
+
+    /// The conversation as plain text, saved in the session's folder when the shell ends.
+    fn save(&self) -> Option<PathBuf> {
+        let text: Vec<String> = self.out.iter().flat_map(|o| o.rows(100, &self.theme))
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect();
+        let path = self.s.dir.join("conversation.txt");
+        std::fs::write(&path, text.join("\n") + "\n").ok().map(|_| path)
     }
 }
 
@@ -1629,19 +1925,11 @@ pub fn run() -> ExitCode {
         .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     let name = session.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let label = match branch { Some(b) => format!("{name} ({b})"), None => name };
-    let mut app = App { s: session, input: Vec::new(), cursor: 0, history: load_history(), hist: 0, out: Vec::new(),
-                        recent: VecDeque::new(), width: 0, pick: 0, ended: Vec::new(), last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents,
-                        theme: Theme::load(), started: Instant::now(),
-                        route: crate::theme::setting("route").and_then(|v| v.as_bool()).unwrap_or(false),
-                        suggested: None, asked: None, pending: None, update: false };
-    app.hist = app.history.len();
+    let mut app = App::new(session, agents, label, Theme::load(), load_history());
     if let Some(mode) = crate::theme::setting("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
     }
-    let found: Vec<&str> = app.agents.iter().map(|a| a.name()).collect();
-    let greeting = format!(" {} · agents: {} (/setup adds another) · mode: {}", app.label, found.join(", "), app.s.mode.name());
-    app.out.push(Out::Line(Line::from(vec![Span::styled(" ringo ", app.theme.brand), Span::styled(greeting, app.theme.dim)]), 1));
-    app.say("Ask anything, or @claude / @codex for an agent turn. /usrman shows the manual.");
+    app.welcome();
     let (notes, news) = std::sync::mpsc::channel();
     let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
     let auto = crate::theme::setting("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1655,11 +1943,10 @@ pub fn run() -> ExitCode {
         restore();
         hook(info);
     }));
-    let mut shape = 4; // the live area's height; it follows what the area holds
-    let mut terminal = match open(shape) {
+    let mut terminal = match open() {
         Ok(terminal) => terminal,
         Err(e) => {
-            let _ = disable_raw_mode();
+            restore();
             eprintln!("ringo: cannot open the terminal: {e}");
             return ExitCode::from(2);
         }
@@ -1667,7 +1954,7 @@ pub fn run() -> ExitCode {
     let (mut dirty, mut tick) = (true, Instant::now());
     while !app.quit {
         if dirty {
-            if paint(&mut terminal, &mut app, &mut shape).is_err() {
+            if terminal.draw(|f| app.draw(f)).is_err() {
                 break;
             }
             dirty = false;
@@ -1675,7 +1962,7 @@ pub fn run() -> ExitCode {
         // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
         // while jobs run (a pump is a few microseconds; redraws still happen only when something changed). Every event
         // already queued is taken before the next redraw.
-        let wait = if app.s.running() > 0 { 25 } else { 250 };
+        let wait = if app.s.running() > 0 || app.toast.is_some() { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             loop {
                 match event::read() {
@@ -1687,6 +1974,7 @@ pub fn run() -> ExitCode {
                         app.paste(&text);
                         dirty = true;
                     }
+                    Ok(Term::Mouse(m)) => dirty |= app.mouse(m),
                     Ok(Term::Resize(..)) => dirty = true,
                     _ => {}
                 }
@@ -1696,10 +1984,9 @@ pub fn run() -> ExitCode {
             }
         }
         if app.setup {
-            let _ = print(&mut terminal, &mut app);
             close(&mut terminal); // the agents' own sign-in runs in the plain terminal
             app.agents = crate::setup::run();
-            match open(shape) {
+            match open() {
                 Ok(t) => terminal = t,
                 Err(_) => break,
             }
@@ -1713,9 +2000,20 @@ pub fn run() -> ExitCode {
             app.start_routed(ask, &route);
             dirty = true;
         }
+        let free = app.s.busy().is_none() && app.s.running() < app.s.max_jobs && app.s.hold.is_none();
+        if free && let Some((agent, task, line)) = app.queue.pop_front() {
+            app.echo(&line);
+            match app.turn(agent, &task) {
+                Ok(Some(text)) => app.say(text),
+                Ok(None) => {}
+                Err(e) => app.say(format!("  {e}")),
+            }
+            dirty = true;
+        }
         let asking = app.s.pending().map(|(_, p)| p.id.clone());
         if asking != app.asked.as_ref().map(|(id, _)| id.clone()) {
             app.asked = asking.map(|id| (id, Instant::now()));
+            app.choice = 0;
             dirty = true;
         }
         while let Ok((applied, (lines, pending))) = news.try_recv() {
@@ -1740,11 +2038,10 @@ pub fn run() -> ExitCode {
             app.pending = Some(pending);
         }
         if app.update {
-            let _ = print(&mut terminal, &mut app);
             close(&mut terminal); // the updates run in the plain terminal, so their prompts and progress show
             println!("Updating agents; the shell comes back when they finish.");
             let (lines, left) = crate::updates::apply_here(app.pending.take().unwrap_or_default());
-            match open(shape) {
+            match open() {
                 Ok(t) => terminal = t,
                 Err(_) => break,
             }
@@ -1754,16 +2051,21 @@ pub fn run() -> ExitCode {
             dirty = true;
         }
         app.feed();
-        dirty |= !app.out.is_empty();
+        dirty |= app.fitted.len() != app.out.len();
+        if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST) {
+            app.toast = None;
+            dirty = true;
+        }
         if app.s.running() > 0 && tick.elapsed() >= Duration::from_millis(SPIN_MS as u64) {
             dirty = true; // the spinner and the running clocks
             tick = Instant::now();
         }
     }
     app.feed();
-    let _ = print(&mut terminal, &mut app);
     close(&mut terminal);
     app.s.shutdown();
+    let saved = app.save().map_or(String::new(), |p| format!("; the conversation is saved in {}", p.display()));
+    println!("ringo: {} tokens this session{saved}", fmt_tokens(app.s.tokens()));
     ExitCode::SUCCESS
 }
 
@@ -1778,7 +2080,12 @@ mod tests {
         let (Codex, Claude, Grok) = (named("codex"), named("claude"), named("grok"));
         let all = [Codex, Claude, Grok];
         let parse = |line: &str, _: Agent| super::parse(line, &all);
-        assert_eq!(parse("why is it slow?", Codex), Ok(Cmd::Ask("why is it slow?".into())));
+        assert_eq!(parse("why is it slow?", Codex), Ok(Cmd::Talk("why is it slow?".into())));
+        assert_eq!(parse("/ask why is it slow?", Codex), Ok(Cmd::Ask("why is it slow?".into())));
+        assert!(parse("/ask", Codex).is_err());
+        assert_eq!(parse("?", Codex), Ok(Cmd::Keys));
+        assert_eq!((parse("/undo", Codex), parse("/copy", Codex), parse("/clear", Codex)),
+                   (Ok(Cmd::Undo), Ok(Cmd::Copy), Ok(Cmd::Clear)));
         assert!(parse("   ", Codex).is_err());
         assert_eq!(parse("/update", Codex), Ok(Cmd::Update(None)));
         assert_eq!(parse("/update auto on", Codex), Ok(Cmd::Update(Some(true))));
@@ -1787,12 +2094,11 @@ mod tests {
         assert_eq!(parse("@codex why is it slow?", Codex), Ok(Cmd::Agents(vec![(Codex, false)], "why is it slow?".into())));
         assert_eq!(parse("@claude! fix it", Codex), Ok(Cmd::Agents(vec![(Claude, true)], "fix it".into())));
         assert_eq!(parse("@codex @claude! do x", Grok), Ok(Cmd::Agents(vec![(Codex, false), (Claude, true)], "do x".into())));
-        assert_eq!(parse("@all compare", Codex), Ok(Cmd::Agents(vec![(Codex, false), (Claude, false)], "compare".into())));
+        assert_eq!(parse("@all compare", Codex),
+                   Ok(Cmd::Agents(vec![(Codex, true), (Claude, true), (Grok, true)], "compare".into())),
+                   "every agent, each in its own copy");
+        assert_eq!(parse("@all! compare", Codex), parse("@all compare", Codex));
         assert!(parse("@nobody x", Codex).unwrap_err().contains("agy"));
-        let with_agy = [Codex, named("agy"), Grok];
-        assert_eq!(super::parse("@all! x", &with_agy),
-                   Ok(Cmd::Agents(vec![(Codex, true), (named("agy"), true), (Grok, true)], "x".into())));
-        assert_eq!(super::parse("@all x", &with_agy), Ok(Cmd::Agents(vec![(Codex, false), (named("agy"), false)], "x".into())));
         assert!(parse("@codex", Codex).is_err());
         assert_eq!(parse("/review #3", Codex), Ok(Cmd::ReviewJob(3)));
         assert_eq!(parse("/review main", Codex), Ok(Cmd::ReviewRepo("main".into(), "HEAD".into())));
@@ -1807,7 +2113,7 @@ mod tests {
         for manual in ["/usrman", "/instructions", "/manual", "/help", "/?"] {
             assert_eq!(parse(manual, Codex), Ok(Cmd::Help), "{manual}");
         }
-        assert_eq!(parse("line one\nline two", Codex), Ok(Cmd::Ask("line one\nline two".into())));
+        assert_eq!(parse("line one\nline two", Codex), Ok(Cmd::Talk("line one\nline two".into())));
     }
 
     #[test]
@@ -1839,27 +2145,88 @@ mod tests {
         assert_eq!(vertical(&input, 9, false), None); // the last line: history
     }
 
+    /// A shell on a session in a fresh folder outside git, for drawing its screen.
+    fn app(agents: &[&str]) -> App {
+        let dir = std::env::temp_dir().join(format!("ringo-tui-test-{}-{}", std::process::id(), agents.join("-")));
+        let (cwd, state) = (dir.join("folder"), dir.join("state"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let s = Session::with_state_home(&cwd, &state, &dir).unwrap();
+        let agents = agents.iter().map(|n| Agent::from_name(n).unwrap()).collect();
+        App::new(s, agents, "folder".into(), Theme::named("mono", crate::theme::Depth::Mono).unwrap(), Vec::new())
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let b = terminal.backend().buffer();
+        b.content.chunks(b.area.width as usize)
+            .map(|r| r.iter().map(|c| c.symbol()).collect::<String>().trim_end().to_string()).collect()
+    }
+
     #[test]
-    fn the_conversation_goes_into_the_scrollback_word_wrapped() {
-        use ratatui::backend::TestBackend;
-        let rows = |b: &ratatui::buffer::Buffer| -> Vec<String> {
-            b.content.chunks(b.area.width as usize)
-                .map(|r| r.iter().map(|c| c.symbol()).collect::<String>().trim_end().to_string()).collect()
-        };
-        let mut terminal = Terminal::with_options(TestBackend::new(10, 4), TerminalOptions { viewport: Viewport::Inline(2) })
-            .unwrap();
-        flush(&mut terminal, vec![Line::raw("one"), Line::raw("two words wrap"), Line::raw("three")]).unwrap();
-        let mut all = rows(terminal.backend().scrollback());
-        all.extend(rows(terminal.backend().buffer()));
-        let all: Vec<String> = all.into_iter().filter(|r| !r.is_empty()).collect();
-        assert_eq!(all, ["one", "two words", "wrap", "three"]);
-        // more than one print's worth of rows still arrives whole, in order
-        let many: Vec<Line> = (0..CHUNK_ROWS + 5).map(|i| Line::raw(i.to_string())).collect();
-        flush(&mut terminal, many).unwrap();
-        let mut all = rows(terminal.backend().scrollback());
-        all.extend(rows(terminal.backend().buffer()));
-        let tail: Vec<String> = all.into_iter().filter(|r| !r.is_empty()).rev().take(3).collect();
-        assert_eq!(tail, [(CHUNK_ROWS + 4).to_string(), (CHUNK_ROWS + 3).to_string(), (CHUNK_ROWS + 2).to_string()]);
+    fn the_screen_holds_the_conversation_the_input_and_the_status() {
+        let mut a = app(&["codex", "claude"]);
+        assert_eq!(a.main.name(), "claude", "claude takes code when it is set up");
+        a.welcome();
+        let rows = screen(&mut a, 80, 24);
+        assert!(rows[0].starts_with("╭") && rows[1].contains("Welcome to Ringo"), "{rows:#?}");
+        let words = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("so /undo is off here"), "outside git, the opening lines say so: {rows:#?}");
+        assert!(rows[21].starts_with("│ › tell claude what you want"), "the input invites a request: {rows:#?}");
+        assert!(rows[23].starts_with(" ringo  folder · ask mode · talking to claude") && rows[23].ends_with("? keys"),
+                "{rows:#?}");
+        let narrow = screen(&mut a, 40, 24);
+        assert!(narrow[23].ends_with("? keys") && narrow[23].contains('…'), "a narrow status keeps its end: {narrow:#?}");
+        for row in narrow {
+            assert!(cols(&row) <= 40, "{row:?}");
+        }
+        assert_eq!(first_choice(&[Agent::from_name("grok").unwrap(), Agent::from_name("codex").unwrap()]).name(), "codex");
+    }
+
+    #[test]
+    fn a_line_waits_while_it_cannot_start() {
+        let mut a = app(&["claude"]);
+        a.s.max_jobs = 0; // every job slot taken
+        assert_eq!(a.talk(a.main, "fix it".into(), "fix it".into()), Ok(None));
+        assert_eq!(a.queue.len(), 1, "it waits instead of being refused");
+        assert!(a.waits(&Ok(Cmd::Talk("and this".into()))), "and the next line shows when it starts, not now");
+        let rows = screen(&mut a, 60, 12);
+        assert!(rows.iter().any(|r| r.contains("↳ next: fix it")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_conversation_scrolls_and_its_text_selects() {
+        let mut a = app(&["claude"]);
+        for i in 0..30 {
+            a.say(format!("line {i}"));
+        }
+        let rows = screen(&mut a, 30, 10);
+        assert_eq!(rows[5], "line 29", "the end shows, above the input box and the status: {rows:#?}");
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        let up = screen(&mut a, 30, 10);
+        assert_eq!(up[5], "line 25", "PgUp goes back a screen less two rows: {up:#?}");
+        assert!(up[9].contains("scrolled up"), "{up:#?}");
+        a.say("line 30");
+        assert_eq!(screen(&mut a, 30, 10)[5], "line 25", "new lines below keep what shows still");
+        a.key(KeyEvent::from(KeyCode::Char('x')));
+        assert_eq!(screen(&mut a, 30, 10)[5], "line 30", "typing goes back to the end");
+        // a drag from "ne 29" through "line 3" (rows 4 and 5 of the screen) selects just that text
+        a.sel = Some(((a.top + 4, 2), (a.top + 5, 5)));
+        assert_eq!(a.selected(), "ne 29\nline 3");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].modifier.contains(Modifier::REVERSED);
+        assert!(cell(2, 4) && !cell(1, 4) && cell(5, 5) && !cell(6, 5), "the selection shows reversed");
+    }
+
+    #[test]
+    fn a_wide_character_takes_its_two_columns() {
+        let mut a = app(&["claude"]);
+        a.say("\u{2705} ok");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(8, 5)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        let row: Vec<&str> = terminal.backend().buffer().content[..5].iter().map(|c| c.symbol()).collect();
+        assert_eq!(row, ["\u{2705}", " ", " ", "o", "k"]);
     }
 
     fn plain(lines: &[Line]) -> Vec<String> {
@@ -1940,21 +2307,11 @@ mod tests {
         let agents = [("claude", true), ("grok", false)];
         let to = |before: &str| menu(before, &agents).into_iter().map(|(to, ..)| to).collect::<Vec<_>>();
         assert_eq!(to("/re"), ["/review ", "/review ", "/research "]);
-        assert_eq!(to("/usr"), ["/usrman"], "a command that takes nothing more completes without a space");
-        assert_eq!(to("@"), ["@claude ", "@claude! ", "@grok! ", "@all ", "@all! "], "grok has no read-only mode");
+        assert_eq!(to("/he"), ["/help"], "a command that takes nothing more completes without a space");
+        assert_eq!(to("@"), ["@claude ", "@claude! ", "@grok! ", "@all "], "grok works only in its own copy");
         assert_eq!(to("fix it @cl"), ["@claude ", "@claude! "]);
         assert!(to("a /re").is_empty(), "a command only as the line's first word");
         assert!(to("ping @someone").is_empty() && to("plain words").is_empty());
-    }
-
-    #[test]
-    fn a_wide_character_does_not_shift_its_row() {
-        use ratatui::buffer::Buffer;
-        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 6, 1));
-        buf.set_string(0, 0, "\u{2705} ok", Style::default());
-        uncover(&mut buf);
-        let symbols: Vec<&str> = buf.content.iter().map(|c| c.symbol()).collect();
-        assert_eq!(symbols, ["\u{2705}", "", " ", "o", "k", " "]);
     }
 
     #[test]
@@ -1963,5 +2320,7 @@ mod tests {
         assert_eq!(fmt_tokens(12_400), "12.4k");
         assert_eq!(fmt_age(Duration::from_secs(75)), "1:15");
         assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
+        assert_eq!([base64(b"hi"), base64(b"hey"), base64(b"heya")], ["aGk=", "aGV5", "aGV5YQ=="]);
+        assert_eq!(slice_cols("a漢字b", 1, 3), "漢", "a wide character counts where it starts");
     }
 }

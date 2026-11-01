@@ -111,12 +111,13 @@ material out of the repository. Ringo creates them with owner-only permissions.
 
 ### The `ringo` shell
 
-`cargo install --path cli`, then type `ringo`: Ringo's own terminal session, in which you route work to Codex, Claude
-Code, Google's Antigravity CLI (agy), Grok or an agent you add, run Ringo's pipelines with them, and watch every job and subagent in a live panel. The first start
-connects and signs in your agents. A plain line that is a task starts it; one switch (`/mode ask|auto|read`,
-Shift-Tab) sets how far every agent may act before it asks you, and the shell answers Claude's permission requests
-with your y / a / n. Start with the step-by-step [user guide](docs/USER-GUIDE.md) (`/usrman` in the shell); the
-full reference is [docs/SHELL.md](docs/SHELL.md).
+`cargo install --path cli`, then type `ringo`: Ringo's own full-screen session. You say what you want in plain words
+and the agent you are talking to (Claude Code, Codex, Google's Antigravity CLI (agy), Grok or an agent you add) does
+it in that folder, asking before it runs a command; `/undo` takes a turn's change back. You can also give a task to
+several agents at once, each in its own copy, run Ringo's pipelines with them, and watch every job and subagent as it
+runs. The first start finds the agents installed on your computer and signs you in. One switch (`/mode
+ask|auto|read`, Shift-Tab) sets how far every agent may act before it asks you. Start with the step-by-step
+[user guide](docs/USER-GUIDE.md) (`/help` in the shell); the full reference is [docs/SHELL.md](docs/SHELL.md).
 
 ### The native runtime, and why it moved to Rust
 

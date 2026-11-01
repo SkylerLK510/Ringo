@@ -1,9 +1,10 @@
 # The `ringo` shell
 
-Type `ringo` in a terminal and Ringo opens its own session, the way `claude` opens Claude Code. From that one
-terminal you route work to the coding agents you already use (OpenAI Codex CLI, Claude Code, Google Antigravity CLI,
-xAI Grok Build, or one you add), run
-Ringo's own pipelines with them, and watch every job and subagent in a live panel.
+Type `ringo` in a terminal and Ringo opens its own full-screen session, the way `codex` opens Codex. You say what
+you want in plain words and the agent you are talking to (Claude Code, OpenAI Codex CLI, Google Antigravity CLI, xAI
+Grok Build, or one you add) does it in that folder, asking before it runs a command; `/undo` takes a turn's change
+back. From the same screen you give a task to several agents at once, each in its own copy, run Ringo's own
+pipelines with them, and watch every job and subagent as it runs.
 
 The shell is a small Rust program (`cli/`). Its `/review`, `/design` and `/work` start the same binary, which runs
 Ringo's pipelines natively, sending the same requests as the Python runtime (see the
@@ -63,8 +64,8 @@ Ringo never runs a program to find out what it is. A name that is not a program 
 "`tle` is not an agent: nothing called tle is installed." An installed program Ringo has no entry for gets
 "`git` is a program, but not an agent Ringo knows.", then the offer to add it: you give the command that runs one
 prompt and prints the answer, with `{prompt}` where the prompt goes and `{cwd}` for the folder (without `{prompt}`,
-the prompt goes on stdin; quotes group words, as in a shell, but no shell runs it). An agent you add takes `@name!` write turns in its own worktree, with its reply read as
-plain text; it has no read turns, because Ringo cannot verify a read-only mode for it.
+the prompt goes on stdin; quotes group words, as in a shell, but no shell runs it). An agent you add works only in its own copy of the folder (a line for it goes there), with its reply read as plain
+text, because Ringo cannot verify a sandbox for it in your folder.
 
 Your entries live in `agents.json` in Ringo's state folder, beside the list of agents you set up, and you can edit
 them there:
@@ -78,27 +79,30 @@ them there:
 Fields: `name` (letters, digits, `-`, `_`, `.`), `program` (default: the name; a path works), `args`, `company`,
 `install`, `login` (its sign-in arguments), `npm` (a package to check for updates), and `adapter`: `plain`
 (default), or `codex`, `claude` or `agy` for another install of one of those (say, a second Claude Code at another
-path), which then gets that agent's own write turns, and its read turns with `"read": true`. The agents Ringo ships are the same kind of entry,
+path), which then works in copies as that agent does, and in your folder too with `"read": true`. The agents Ringo ships are the same kind of entry,
 in `cli/src/agents.json`; how each protocol is spoken stays in code.
 
 ### Who takes which turn
 
-Codex owns the abstract work: Ringo's pipelines (`/research`, `/design`, `/review`) and plain asks run on it.
-Claude owns writing and reading code: with `/route on`, an edit line is suggested as `@claude! ...` and a question
-about the files as `@claude ...`. The preference is soft. When Claude is not set up, or a read turn finds its
-conversation busy, the suggestion names Codex, then any other agent that can take the turn; typing `@codex`,
-`@agy` or any `@agent` yourself always picks for you.
+Claude owns writing and reading code: a plain line goes to Claude when it is set up, else to Codex, else to any
+agent that works in the folder. `@codex` (or any `@agent`) switches who you talk to, and later plain lines go there
+too, each agent keeping its own conversation. Codex owns the abstract work: Ringo's pipelines (`/research`,
+`/design`, `/review`) and `/ask` run on it.
 
 ## Using it
 
 ```
- ringo  my-repo (main) · agents: claude, codex (/setup adds another) · mode: ask
-Ask anything, or @claude / @codex for an agent turn. /usrman shows the manual.
+╭──────────────────────────────────────────────────╮
+│ ✻ Welcome to Ringo                               │
+│                                                  │
+│ folder  ~/code/my-repo                           │
+│ agents  claude, codex (/setup adds another)      │
+│ mode    ask (Shift-Tab changes it)               │
+╰──────────────────────────────────────────────────╯
 
-› @claude! add a retry to the HTTP client
+› add a retry to the HTTP client
 
-#1 claude!
-  own worktree from HEAD 3f2a91c (/show 1: its path); your uncommitted changes are not in it
+#1 claude
   • Grep fn send in src · Found 2 files
   • Read client.rs · 214 lines
   • Edit client.rs
@@ -106,77 +110,78 @@ Ask anything, or @claude / @codex for an agent turn. /usrman shows the manual.
 
   Added a retry with backoff to `send` in **client.rs**, and a test for it.
 
-✓ #1 claude! done · 0:41 · 34.8k tokens · change ready: /diff 1, /apply 1
+✓ #1 claude done · 0:41 · 34.8k tokens · changed client.rs (/undo takes it back)
 
-› /re
-╭ / commands · @ agents · Shift-Enter new line ─────────────────────────────╮
-│/re                                                                        │
-╰───────────────────────────────────────────────────────────────────────────╯
- › /review #N          review job N's change
-   /review BASE [HEAD] review BASE...HEAD of this repository
-   /research TOPIC     live web search, every quoted source checked
- ringo  my-repo (main) · mode: ask · 0 running · 34.8k tokens
+╭──────────────────────────────────────────────────────────────────────────╮
+│ › tell claude what you want, in your own words · / commands · ? keys     │
+╰──────────────────────────────────────────────────────────────────────────╯
+ ringo  my-repo (main) · ask mode · talking to claude · 34.8k tokens   ? keys
 ```
 
-The conversation prints into the terminal's own scrollback, as Claude Code's and Codex's do: your lines, every
-reply, and what each agent does under its job number: one `•` row per tool call or command once it has run, with
-what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit code;
-a step too long for the row loses the end of its pattern or command to `…`, and `/show N` has it whole), then one
-line when a job ends with its time, tokens and Ringo model calls. A write job that changed nothing says `no change`
-instead of `change ready`; its worktree stays until `/drop N`, as a file git ignores that the agent wrote is not in
-the diff. Replies render their markdown: headings,
-emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned columns (a long last column wraps under itself), or,
-when even that does not fit, as one block per row with each cell under its column's name. Scroll it with the mouse wheel and select from it as in any
-other program; the shell never captures the mouse. Below it, a live area holds one row per running job and
-subagent, any permission request, the input box and a status line. The manual, the step-by-step
-[user guide](USER-GUIDE.md), is not on screen until you ask for it: `/usrman` (or `/instructions`, `/help`) prints it
-into the conversation, followed by the settings in force.
+The shell fills the terminal (the alternate screen, as Codex's does). The conversation takes the top: your lines,
+every reply, and what each agent does under its job number: one `•` row per tool call or command once it has run,
+with what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit
+code; a step too long for the row loses the end of its pattern or command to `…`, and `/show N` has it whole), then
+one line when a job ends with its time, tokens and Ringo model calls, and the files it changed. Replies render their
+markdown: headings, emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned
+columns (a long last column wraps under itself), or, when even that does not fit, as one block per row with each cell
+under its column's name. Everything is fitted again when the window's width changes. The mouse wheel and PgUp/PgDn
+scroll it, and it stays where you scrolled while new lines arrive below; typing goes back to the end. A drag over
+the conversation selects its text alone (never the input or the status line) and copies it when you let go, with
+the system's own clipboard tool (`pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip`) or, where there is none, such as a
+server over ssh, by asking the terminal (OSC 52). `/copy` copies the last answer. Below the conversation are the
+running jobs, the lines queued behind the current turn, a permission request or the input box, and a status line.
+When you quit, the conversation is saved as `conversation.txt` in the session's state folder and the shell prints
+where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on screen until you ask for it: `/help` (or
+`/usrman`) prints it into the conversation, followed by the settings in force, and `?` prints just its keys.
 
 | You type | What happens |
 |---|---|
-| `TEXT` (no `/` or `@`) | a question: one tool-free call with your last few questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell starts the task: an agent turn (claude, or codex when claude is not set up) or `/research`; a review is put in the input line for you to say what to review. Live: "fix the off-by-one in counter.py and add a test for it" came back `ROUTE: edit` in 3.2 s for 892 tokens |
+| `TEXT` (no `/` or `@`) | a turn of the agent you are talking to, in this folder, continuing its conversation: it reads, changes files there, and asks before anything else (in `ask` mode). One turn at a time works in the folder: a line typed while one runs waits under the input and goes when it ends (Esc stops the turn and gives the waiting lines back to the input) |
+| `/undo` | the files the latest turn here changed go back as they were before it; each `/undo` goes one turn further back. A file you edited since makes it refuse and touch nothing |
+| `/ask TEXT` | a quick answer: one tool-free call with your last few `/ask` questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell gives it to the agent you are talking to, or to `/research`; a review is put in the input line for you to say what to review |
+| `/clear` | a new conversation: each agent's next turn starts fresh |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` toggles auto and ask, Shift-Tab cycles ask, auto, read. Remembered for next time |
-| `/review #N` | Ringo reviews job N's change, with its task as the change description |
+| `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
 | `/research TOPIC` | Ringo's research role: one live web search call, every quoted source fetched and its quote checked in code, one write call that cites only verified evidence ([details](RESEARCH-ROLE.md)). Measured once at about 68,000 tokens, most of them search results |
 | `/work SPEC.json` | Ringo's checked work loop on a task spec |
-| `@codex TASK` | an agent turn that may read the repository but not change it; the agent's conversation continues across these turns |
-| `@codex! TASK` | an agent turn that may edit, in a private git worktree from `HEAD`; nothing reaches your tree until `/apply` |
-| `@codex @claude TASK`, `@all TASK` | the same task to several agents at once |
+| `@codex TASK` | talk to Codex from now on: this turn and later plain lines go to it, in this folder |
+| `@codex! TASK` | Codex in its own copy of the folder (a git worktree of it as it is now, uncommitted changes included); nothing reaches your files until `/apply` |
+| `@codex @claude TASK`, `@all TASK` | the same task to several agents at once, each in its own copy, to compare |
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
-| `/diff N`, `/apply N`, `/drop N` | see a write job's change, apply it to your clean tree (uncommitted), remove its worktree |
-| `/route on` | route suggestions: a line that reads like a research, design, review or edit task, or a question about this folder's files, is not sent; the matching command (`/research ...`, `/design ...`, `/review ...`, `@claude! ...`, or `@claude ...` for a read-only look at the files; see "Who takes which turn") appears in the input line with what it costs, for you to send with Enter, change, or ask as a plain question with Esc. Word rules only, no model call; an agent turn is only ever suggested. On 100 held-out lines the suggestions were acceptable 35 times in 38 and covered about half of the tasks; the rest are asked as plain questions. `/route off` turns it off |
-| `/show N`, `/kill N`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's log (its last 2,000 lines; the whole stream is in its folder), stop it with everything it started, set the backend for questions and pipelines, change colours, add an agent, quit |
+| `/diff N`, `/apply N`, `/drop N` | see a copy's change, apply it to your files (uncommitted, onto what is there now), remove the copy |
+| `/show N`, `/kill N`, `/copy`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's log (its last 2,000 lines; the whole stream is in its folder), stop it with everything it started, copy the last answer, set the backend for `/ask` and pipelines, change colours, add an agent, quit |
 
-Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git project the agents can also edit
-(`@agent!`, in a worktree) and `/review BASE` reviews its commits; in any other folder, a repository that holds your
-home folder (a dotfiles repository) included, they read and answer, and Ringo says why an edit needs a project.
-Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
+Start `ringo` in any folder, as you would `claude` or `codex`. In a git project each turn's change can be undone,
+copies work and `/review BASE` reviews its commits; in any other folder, a repository that holds your home folder (a
+dotfiles repository) included, the agents still work in the folder, and Ringo says that `/undo` and copies need a git
+project. Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
 
-Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 12,000 to 15,000 tokens
-before it starts (measured under [Modes and permissions](#modes-and-permissions)), and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends;
-Shift-Enter (in terminals with the kitty keyboard protocol: kitty, Ghostty, WezTerm, foot, iTerm2 with "Report keys
-using CSI u" on), Ctrl-J, Alt-Enter or `\` then Enter starts a new line, and the input box says which of the first two
-works. A paste goes into the input box with its lines kept, and nothing is sent until you press Enter (in a terminal
-without bracketed paste, keys that arrive together, as a paste's do, are kept the same way, its last newline too).
-Typing `/` at the start of a line, or `@` at the start of a word, opens a menu under the input of the commands or
-agents that match: Up and Down choose, Tab or Enter completes (Enter sends a command that takes nothing more). Up
-and Down otherwise move between the lines of a message, then through earlier messages, which are kept between
-sessions (the last 1,000, in `shell-history.jsonl` in Ringo's private state); Shift-Tab changes the mode, Esc clears
-the input, and Ctrl-C twice quits, stopping running jobs. The line-editing keys are a shell's: Ctrl-A and Ctrl-E
-(or Home and End) go to the start or end of the line, Ctrl-U and Ctrl-K cut to either, Alt-Left and Alt-Right (or
-Alt-B and Alt-F, Ctrl-Left and Ctrl-Right) move a word, and Ctrl-W or Alt-Backspace cuts the word before the cursor
-(Alt-D the one after).
+A turn costs about 12,000 to 15,000 tokens before the agent starts (measured under
+[Modes and permissions](#modes-and-permissions); Claude Code's own first turn measured about 50,000), and a vague
+request can send it searching (one such follow-up cost about 450,000); `/ask` answers a question that needs none of
+your files for about 1,300. Enter sends; Shift-Enter (in terminals with the kitty keyboard protocol: kitty, Ghostty,
+WezTerm, foot, iTerm2 with "Report keys using CSI u" on), Ctrl-J, Alt-Enter or `\` then Enter starts a new line. A
+paste goes into the input box with its lines kept, and nothing is sent until you press Enter (in a terminal without
+bracketed paste, keys that arrive together, as a paste's do, are kept the same way, its last newline too). Typing
+`/` at the start of a line, or `@` at the start of a word, opens a menu under the input of the commands or agents
+that match: Up and Down choose, Tab or Enter completes (Enter sends a command that takes nothing more). Up and Down
+otherwise move between the lines of a message, then through earlier messages, which are kept between sessions (the
+last 1,000, in `shell-history.jsonl` in Ringo's private state). Shift-Tab changes the mode. Esc clears the input,
+and with the input empty stops the turn running here. Ctrl-C clears the input, then stops the turn, then (twice)
+quits, stopping running jobs. The line-editing keys are a shell's: Ctrl-A and Ctrl-E (or Home and End) go to the
+start or end of the line, Ctrl-U and Ctrl-K cut to either, Alt-Left and Alt-Right (or Alt-B and Alt-F, Ctrl-Left and
+Ctrl-Right) move a word, and Ctrl-W or Alt-Backspace cuts the word before the cursor (Alt-D the one after).
 
-The live area shows each running job's time, tokens, Ringo model calls and what it is doing now, with one row per
-subagent: Claude Code's Task subagents and Codex's spawned agents. A Claude turn's tokens count up as its messages
-report them, so a turn that searches far shows it while it runs; on a real 452.9k-token turn the running count reached
-93% of the turn's own total, which replaces it at the end (a message's output is counted before it is written).
-Codex reports its tokens only when a turn ends. When two unapplied write jobs edit the same
-file, the running job's row and the line it ends with say so (`⚠ same files as #2 client.rs`) before you apply
-either. That check costs no tokens: it
-compares the agents' own edit events as they arrive.
+The rows above the input show each running job's time, tokens, Ringo model calls and what it is doing now, with one
+row per subagent: Claude Code's Task subagents and Codex's spawned agents. A Claude turn's tokens count up as its
+messages report them, so a turn that searches far shows it while it runs; on a real 452.9k-token turn the running
+count reached 93% of the turn's own total, which replaces it at the end (a message's output is counted before it is
+written). Codex reports its tokens only when a turn ends. When two unapplied copies edit the same file, the running
+job's row and the line it ends with say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs
+no tokens: it compares the agents' own edit events as they arrive.
 
 ## Modes and permissions
 
@@ -184,16 +189,19 @@ One switch sets how far every agent may act without asking; it applies to the tu
 
 | Mode | Claude | Codex |
 |---|---|---|
-| `ask` (the default) | reads, and edits its worktree, freely (Claude Code's own rules: plain file commands such as `mkdir` in the worktree run without asking); every other action waits for you: a command such as `curl`, `gh` or `npm` in a write turn, a connector call, a file outside its folder. Read turns (`@claude`) run in your own tree, so they never run commands; give a task that needs them to `@claude!` | works inside its sandbox (read-only for read turns, its worktree for write turns, no network); it cannot stop to ask, so what the sandbox refuses fails |
-| `auto` | Claude Code's auto mode: it acts on its own and its safety review blocks what is dangerous; what that review blocks repeatedly, and what an always-ask rule names, waits for you | write turns run with `--approve-for-me` (Codex's own reviewer answers its approval requests) and the network on in the sandbox, for git, gh and installs |
+| `ask` (the default) | reads, and edits files in its folder (yours, or its copy), freely: Claude Code's accept-edits mode, in which plain file commands such as `mkdir` there run without asking; every other action waits for you: a command such as `curl`, `gh` or `npm`, a connector call, a file outside its folder | works inside its sandbox (`workspace-write`: edits in its folder, no network); it cannot stop to ask, so what the sandbox refuses fails |
+| `auto` | Claude Code's auto mode: it acts on its own and its safety review blocks what is dangerous; what that review blocks repeatedly, and what an always-ask rule names, waits for you | a new conversation runs with `--approve-for-me` (Codex's own reviewer answers its approval requests), and every turn has the network on in the sandbox, for git, gh and installs (`exec resume` takes no `--approve-for-me`) |
 | `read` | no edits, no commands, no connectors; `@agent!` is refused | read-only sandbox; `@agent!` is refused |
 
-When an agent waits, a box above the input line shows the whole action, every line of a command included, and
-`y` allows it once, `a` allows it and the same rule for the rest of the session (in every later Claude turn too, as
-`--allowedTools`; an always-ask action is allowed once only, whichever key), `n` or Esc declines it and the agent
-carries on without it. A request longer than its box shows its first lines and how many more there are; all of it
-is also in the conversation above, where it printed when it arrived. The keys answer only when the input line is
-empty and not in the first 0.3 s after the box appears, so a word you are typing never answers by accident.
+When an agent waits, a box takes the place of the input and says in plain words what it wants (to run a command,
+open a web page, use a connector), shows the whole action, every line of a command included, and offers the answers:
+`1. Yes` (`y` or Enter) allows it once, `2. Yes, and allow ... for the rest of this session` (`a`) allows it and the
+same rule in every later Claude turn too, as `--allowedTools` (an always-ask action offers only once and no), and
+`3. No` (`n` or Esc) declines it and the agent carries on without it; Up and Down move between them. A request longer
+than its box shows its first lines and how many more there are; all of it is also in the conversation above, where it
+printed when it arrived. The keys answer only when the input line is empty (a line being typed keeps the input box,
+under the request) and not in the first 0.3 s after the box appears, so a word you are typing never answers by
+accident.
 Every answer is kept in `actions.jsonl` in the session's
 state folder, with the job, agent, action, rule and mode.
 
@@ -228,8 +236,8 @@ and answered correctly (5 model calls, 18.5 s, 167,291 tokens, most of them cach
 
 | Turn | Before | Ask mode | Auto mode |
 |---|---|---|---|
-| read turn (`@claude`) | 16,547 | 16,547 | 16,547 |
-| write turn (`@claude!`) | 17,139 | 17,133 | |
+| read-only turn (now read mode) | 16,547 | 16,547 | 16,547 |
+| turn that edits (now a plain line, or `@claude!`) | 17,139 | 17,133 | |
 
 The first version cost 18,113 for the read turn: with a permission host, Claude Code also offers `AskUserQuestion`,
 `EnterPlanMode` and `ExitPlanMode`, which Ringo does not serve, so the shell denies them. The always-ask rules add
@@ -247,9 +255,9 @@ sandbox). One trivial turn each (2026-10-31, Claude Code 2.1.316, codex-cli 0.16
 
 | Turn | Before | After |
 |---|---|---|
-| Claude read turn (`@claude`) | 16,547 | 11,984 |
-| Claude write turn (`@claude!`) | 17,133 | 12,570 |
-| Codex turn (`@codex`), per call | 17,133 | 14,350 |
+| Claude read-only turn (now read mode) | 16,547 | 11,984 |
+| Claude turn that edits (now a plain line, or `@claude!`) | 17,133 | 12,570 |
+| Codex turn, per call | 17,133 | 14,350 |
 
 Not yet: Codex cannot stop to ask, so it does not take ask mode's prompts. Its app-server protocol has the same
 three answers (`accept`, `acceptForSession`, `decline` for command, file-change and permission approvals) and could
@@ -339,30 +347,38 @@ or for the spinner while a job runs.
   result: Claude Code sends each permission request to Ringo (`--permission-prompt-tool stdio`, the channel the
   Agent SDK uses; `--permission-prompts host` alone denies them) and Ringo writes your answer back. A request Ringo
   does not serve is refused at once, so a turn never waits on it. Codex and agy cannot ask.
-- **Read turns:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
-  and `NotebookEdit`, which win over any allow rules in your own settings (it works in your own tree with no sandbox,
-  and a command could write files there); its connector calls go through the mode, and in read mode nothing may
-  prompt (`--permission-prompts none`). agy runs
-  with session-only deny rules for `write_file(*)`, `command(*)`, `unsandboxed(*)`, `mcp(*)` and
-  `execute_url(*)`, which win over its accept rules; asked to edit, it gets an error it can see and answers anyway
-  (checked live with agy 1.4.11: no file appeared). Grok and agents you add have
-  no read-only mode Ringo has verified, so they only run write jobs. Checked live: asked in a read turn to create a
-  file, both refused and no file appeared, but trying cost Claude 98k tokens and Codex 40k. Use `@agent!` when you
-  want edits.
-- **Write turns** run in a worktree under Ringo's private state folder: Codex with `workspace-write` (its sandbox allows commands in
-  the worktree; in auto mode `--approve-for-me` and the network), Claude with `acceptEdits` in ask mode and auto mode
-  in auto mode (edits allowed; any other command waits for you, or for its review), agy with `--mode accept-edits` and the same deny rules minus `write_file` (edits allowed;
-  commands, MCP tools and browser actions refused, as for Claude), Grok with `--always-approve` (every tool call approved, so
-  it is not contained; its flags come from xAI's documentation and are untested here). A worktree keeps parallel
-  edits apart; it is not a security boundary.
-- **Applying:** `/apply` needs a finished job and a clean tree, checks the patch first, and applies it with
-  `git apply --3way` without committing. A conflict leaves your tree and the job untouched.
+- **Turns in your folder** run where you started `ringo`, continuing the agent's conversation, one at a time: Codex
+  with `workspace-write` (edits and commands inside the folder, no network; in auto mode the network and, for a new
+  conversation, `--approve-for-me`), Claude with `acceptEdits` in ask mode and auto mode in auto mode (edits in the
+  folder allowed; any other command waits for you, or for its review), agy with `--mode accept-edits` and
+  session-only deny rules for `command(*)`, `unsandboxed(*)`, `mcp(*)` and `execute_url(*)` (edits allowed;
+  commands, MCP tools and browser actions refused, as it cannot ask). Grok and agents you add have no sandbox Ringo
+  has verified, so they only work in a copy, and a line for one goes there.
+- **Undo:** in a git project, Ringo takes the folder's files (every file git does not ignore, untracked ones too) as
+  a git tree before a turn that may edit and again when it ends, with a private copy of the index: your index, stash
+  and HEAD are never touched. The files that differ are the turn's change. `/undo` first compares those files with
+  how the turn left them, and any difference (an edit of yours anywhere in one, even far from the turn's lines) makes
+  it refuse and change nothing; then it applies the reverse patch with `git apply`. Neither `/undo` nor `/apply` runs
+  while a turn works in the folder, whose own after would take them in. Outside a git project there is no undo.
+- **Read mode:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
+  and `NotebookEdit`, which win over any allow rules in your own settings, and nothing may prompt
+  (`--permission-prompts none`). agy adds `write_file(*)` to its deny rules; asked to edit, it gets an error it can
+  see and answers anyway (checked live with agy 1.4.11: no file appeared). Checked live: asked in a read-only turn to
+  create a file, Claude and Codex both refused and no file appeared, but trying cost Claude 98k tokens and Codex 40k.
+- **Copies** (`@agent!`, or several agents at once) run in a worktree under Ringo's private state folder, made from
+  the folder as it is (its files as a commit no branch points at), with the same settings as a turn in the folder,
+  and Grok with `--always-approve` (every tool call approved, so it is not contained; its flags come from xAI's
+  documentation and are untested here). A worktree keeps parallel edits apart; it is not a security boundary.
+- **Applying:** `/apply` needs a finished job, checks the patch first, and applies it with `git apply` onto your
+  files as they are, without staging or committing; where that does not apply and your tree is clean (you committed
+  since), with `git apply --3way`. A conflict leaves your files and the job untouched.
 - **Stopping:** `/kill` stops the job's whole process group. A Ringo pipeline is interrupted first, so Python's own
   cleanup ends its model calls, which run in sessions of their own.
 - **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.
-- **Limits:** three jobs at a time, and one turn at a time per agent conversation; more is refused, not queued.
+- **Limits:** three jobs at a time, and one turn at a time in your folder; the shell queues the lines for the folder,
+  and refuses a fourth job.
 - **State:** `~/.local/share/ringo/shell/` (or under `RINGO_RELEASE_HOME`), owner-only. Each job folder keeps its
   task, raw events, reply, stderr and patch. Logs can contain your code: delete them yourself when done.
 
@@ -374,5 +390,9 @@ events into `Job` records (status, activity, tokens, subagents, touched files), 
 
 ## Not yet
 
-A JSON-lines mode for a non-Rust front end, line editing beyond the basics, a model-chosen router, and measured
-repository-level comparisons of agent turns against the pipelines.
+A JSON-lines mode for a non-Rust front end, an edit's diff shown in the conversation as it lands, undo outside a
+git project, and measured repository-level comparisons of agent turns against the pipelines.
+
+Route suggestions (`/route on`: word rules that put the matching command in the input for a line that read like a
+task; acceptable 35 times in 38 on 100 held-out lines, covering about half of the tasks) were removed when a plain
+line became an agent turn in the folder: there was nothing left for them to suggest.
