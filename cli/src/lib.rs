@@ -621,22 +621,40 @@ impl Session {
         git(&self.repo, &args)
     }
 
+    /// Refuses a change to the owner's folder while an agent turn works in it: the turn's own after would take it in.
+    fn idle(&self, what: &str) -> Result<(), String> {
+        match self.busy() {
+            Some(id) => Err(format!("#{id} is working in this folder: {what} when it ends (Esc stops it)")),
+            None => Ok(()),
+        }
+    }
+
     /// `/undo`: the files the latest agent turn in this folder changed go back to how they were before it (each
-    /// /undo goes one turn further back). A file edited since that turn makes it refuse, leaving everything as is.
+    /// /undo goes one turn further back). Any of them edited since that turn, anywhere in it, makes it refuse,
+    /// leaving everything as is.
     pub fn undo(&mut self) -> Result<String, String> {
         if !self.git {
             return Err("/undo needs a git project: Ringo keeps each turn's before and after with git (run `git init` \
                         here once, and later turns can be undone)".into());
         }
+        self.idle("/undo")?;
         let job = self.jobs.iter().rev()
             .find(|j| !j.running() && !j.undone && j.after.is_some() && !j.changed.is_empty())
             .ok_or("nothing to undo: no agent turn has changed files here yet")?;
         let (id, before, after) = (job.id, job.before.clone().unwrap_or_default(), job.after.clone().unwrap_or_default());
-        let file = job.dir.join("undo.patch");
+        let (file, index, changed) = (job.dir.join("undo.patch"), job.dir.join("index"), job.changed.clone());
+        // git apply alone would also take back a turn's lines in a file edited elsewhere since: compare first
+        let now = self.snapshot(&index)?;
+        let mut args = vec!["diff", "--name-only", after.as_str(), now.as_str(), "--"];
+        args.extend(changed.iter().map(String::as_str));
+        let edited = git(&self.repo, &args)?;
+        if !edited.is_empty() {
+            return Err(format!("{} changed after #{id}, so nothing was undone", edited.lines().collect::<Vec<_>>().join(", ")));
+        }
         fs::write(&file, git_raw(&self.repo, &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
         let file = file.to_string_lossy().into_owned();
         git(&self.repo, &["apply", "--check", &file])
-            .map_err(|e| format!("files #{id} changed were edited after it, so nothing was undone ({e})"))?;
+            .map_err(|e| format!("#{id}'s files no longer match it, so nothing was undone ({e})"))?;
         git(&self.repo, &["apply", &file])?;
         let job = &mut self.jobs[id - 1];
         job.undone = true;
@@ -726,9 +744,11 @@ impl Session {
                 cmd.args(["exec"]);
                 if let Some(thread) = &resume {
                     cmd.args(["resume", thread]).arg("-c").arg(format!("sandbox_mode=\"{sandbox}\""));
-                    if edits && self.mode == Mode::Auto {
-                        // `exec resume` takes no --approve-for-me (codex-cli 0.165.0): the sandbox keeps its network
-                        cmd.args(["-c", "sandbox_workspace_write.network_access=true"]);
+                    if edits {
+                        // `exec resume` takes no --approve-for-me (codex-cli 0.165.0): in auto mode the sandbox keeps
+                        // its network; in ask mode it is off, said outright, whatever an earlier turn had
+                        let net = self.mode == Mode::Auto;
+                        cmd.args(["-c", &format!("sandbox_workspace_write.network_access={net}")]);
                     }
                 } else if edits && self.mode == Mode::Auto {
                     // Auto: Codex's own reviewer answers its approval requests (--approve-for-me implies the
@@ -1360,6 +1380,7 @@ impl Session {
         if job.status != Status::Done {
             return Err(format!("#{id} has not finished successfully"));
         }
+        self.idle(&format!("/apply {id}"))?;
         let patch = self.diff(id)?;
         if patch.is_empty() {
             return Err(format!("#{id} changed nothing"));

@@ -112,7 +112,7 @@ echo '{"type":"turn.completed""#;
     let third = s.launch_agent(agent("codex"), false, "once more").unwrap();
     assert_eq!(wait(&mut s, third), Status::Done);
     fs::write(r.join("made.txt"), "mine\n").unwrap();
-    assert!(s.undo().unwrap_err().contains("edited after it"));
+    assert!(s.undo().unwrap_err().contains("made.txt changed after #3"));
     assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "mine\n");
     assert!(r.join("c.bin").exists());
     // Read mode: the same agent only looks.
@@ -122,6 +122,40 @@ echo '{"type":"turn.completed""#;
     let args = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
     assert!(args.lines().last().unwrap().contains("sandbox_mode=\"read-only\""));
     assert!(s.job(looked).unwrap().before.is_none(), "a turn that cannot edit keeps no before");
+}
+
+#[test]
+fn undo_refuses_after_any_later_edit_and_while_a_turn_runs() {
+    let r = repo("undo");
+    let lines: String = (1..=12).map(|i| format!("line {i}\n")).collect();
+    fs::write(r.join("long.txt"), &lines).unwrap();
+    git(&r, &["add", "."]);
+    git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "long"]);
+    // An agent that changes the first line, and waits first when asked to.
+    let codex = fake(&root(), "codex-undo", "#!/bin/sh
+cat > \"$0.stdin\"
+        case \"$(cat \"$0.stdin\")\" in *slow*) sleep 1 ;; esac
+        { echo changed; tail -n +2 long.txt; } > t && mv t long.txt
+        echo '{\"type\":\"thread.started\",\"thread_id\":\"t-u\"}'
+        echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}'
+        echo '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'
+");
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "change it").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert_eq!(s.job(id).unwrap().changed, ["long.txt"]);
+    // The owner's own line at the end, far from the turn's: git apply would take the turn's back anyway.
+    fs::write(r.join("long.txt"), format!("changed\n{}mine\n", &lines["line 1\n".len()..])).unwrap();
+    assert!(s.undo().unwrap_err().contains("long.txt changed after #1"));
+    assert!(fs::read_to_string(r.join("long.txt")).unwrap().ends_with("mine\n"), "nothing was undone");
+    fs::write(r.join("long.txt"), format!("changed\n{}", &lines["line 1\n".len()..])).unwrap();
+    // While a turn works in the folder, neither /undo nor /apply touches it.
+    let slow = s.launch_agent(agent("codex"), false, "slow").unwrap();
+    assert!(s.undo().unwrap_err().contains(&format!("#{slow} is working in this folder")));
+    assert_eq!(wait(&mut s, slow), Status::Done);
+    assert!(s.job(slow).unwrap().changed.is_empty(), "the first line was already changed");
+    assert!(s.undo().unwrap().contains("undid #1"));
+    assert_eq!(fs::read_to_string(r.join("long.txt")).unwrap(), lines);
 }
 
 #[test]
@@ -403,7 +437,9 @@ fn agent_commands_are_pinned() {
     assert_eq!(turn(agent("codex"), false, &codex),
                (want(&["exec", "-s", "workspace-write", "-C", "REPO"], &tail), "the task".into()));
     assert_eq!(turn(agent("codex"), false, &codex),
-               (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"workspace-write\""], &tail), "the task".into()));
+               (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"workspace-write\"", "-c",
+                       "sandbox_workspace_write.network_access=false"], &tail), "the task".into()),
+               "a resumed turn in ask mode says the network is off, whatever an earlier turn had");
     assert_eq!(turn(agent("codex"), true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
     // Ask mode (the default): edits go through, every permission prompt comes to Ringo, the always-ask rules ride
     // along; the prompt is one stream-json message on stdin, which stays open for the answers.

@@ -356,9 +356,10 @@ or for the spinner while a job runs.
   has verified, so they only work in a copy, and a line for one goes there.
 - **Undo:** in a git project, Ringo takes the folder's files (every file git does not ignore, untracked ones too) as
   a git tree before a turn that may edit and again when it ends, with a private copy of the index: your index, stash
-  and HEAD are never touched. The files that differ are the turn's change; `/undo` applies the reverse patch with
-  `git apply`, which checks every file first, so a file you edited since makes it refuse and change nothing. Outside
-  a git project there is no undo.
+  and HEAD are never touched. The files that differ are the turn's change. `/undo` first compares those files with
+  how the turn left them, and any difference (an edit of yours anywhere in one, even far from the turn's lines) makes
+  it refuse and change nothing; then it applies the reverse patch with `git apply`. Neither `/undo` nor `/apply` runs
+  while a turn works in the folder, whose own after would take them in. Outside a git project there is no undo.
 - **Read mode:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
   and `NotebookEdit`, which win over any allow rules in your own settings, and nothing may prompt
   (`--permission-prompts none`). agy adds `write_file(*)` to its deny rules; asked to edit, it gets an error it can

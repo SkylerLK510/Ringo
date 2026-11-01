@@ -1173,11 +1173,17 @@ impl App {
             let id = self.s.launch_agent(agent, true, &expanded)?;
             return Ok(Some(format!("  #{id}: {} works only in its own copy; /apply {id} keeps its change", agent.name())));
         }
-        if self.s.busy().is_some() || !self.queue.is_empty() {
+        if self.must_wait() {
             self.queue.push_back((agent, task, line));
             return Ok(None);
         }
         self.turn(agent, &task)
+    }
+
+    /// Whether a turn in this folder has to wait: one runs here, lines wait before it, every job slot is taken, or an
+    /// agent update holds the session.
+    fn must_wait(&self) -> bool {
+        self.s.busy().is_some() || !self.queue.is_empty() || self.s.running() >= self.s.max_jobs || self.s.hold.is_some()
     }
 
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
@@ -1206,7 +1212,7 @@ impl App {
             Ok(Cmd::Agents(agents, _)) => matches!(agents[..], [(a, false)] if a.spec().read),
             _ => false,
         };
-        here && (self.s.busy().is_some() || !self.queue.is_empty())
+        here && self.must_wait()
     }
 
     fn submit(&mut self) {
@@ -1994,7 +2000,8 @@ pub fn run() -> ExitCode {
             app.start_routed(ask, &route);
             dirty = true;
         }
-        if app.s.busy().is_none() && let Some((agent, task, line)) = app.queue.pop_front() {
+        let free = app.s.busy().is_none() && app.s.running() < app.s.max_jobs && app.s.hold.is_none();
+        if free && let Some((agent, task, line)) = app.queue.pop_front() {
             app.echo(&line);
             match app.turn(agent, &task) {
                 Ok(Some(text)) => app.say(text),
@@ -2174,6 +2181,17 @@ mod tests {
             assert!(cols(&row) <= 40, "{row:?}");
         }
         assert_eq!(first_choice(&[Agent::from_name("grok").unwrap(), Agent::from_name("codex").unwrap()]).name(), "codex");
+    }
+
+    #[test]
+    fn a_line_waits_while_it_cannot_start() {
+        let mut a = app(&["claude"]);
+        a.s.max_jobs = 0; // every job slot taken
+        assert_eq!(a.talk(a.main, "fix it".into(), "fix it".into()), Ok(None));
+        assert_eq!(a.queue.len(), 1, "it waits instead of being refused");
+        assert!(a.waits(&Ok(Cmd::Talk("and this".into()))), "and the next line shows when it starts, not now");
+        let rows = screen(&mut a, 60, 12);
+        assert!(rows.iter().any(|r| r.contains("↳ next: fix it")), "{rows:#?}");
     }
 
     #[test]

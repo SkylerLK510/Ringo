@@ -35,7 +35,7 @@ add a dark mode switch to the settings page
 
 When a turn changes files, its last line says which ones, for example `changed app.py (/undo takes it back)`.
 Type `/undo` to put those files back as they were before that turn. Each `/undo` goes one turn further back. If you
-edited the same files yourself since then, Ringo leaves everything as it is and says so.
+edited any of those files yourself since then, Ringo leaves everything as it is and says so.
 
 `/undo` needs the folder to be a git project, because that is where Ringo keeps each turn's before and after. Most
 code folders already are; for one that is not, type `git init` in a terminal there once.
@@ -149,7 +149,8 @@ file and Ringo prints where.
 | You see | Do this |
 |---|---|
 | `nothing to undo` | no turn has changed files here yet |
-| `files #N changed were edited after it` | you changed those files since; undo them by hand |
+| `FILE changed after #N, so nothing was undone` | you changed that file since; undo it by hand |
+| `#N is working in this folder` | wait for it to end, or press Esc to stop it |
 | `/undo needs a git project` | type `git init` in a terminal in this folder once |
 | `your files changed where #N edits them` | `/diff N` shows the change; apply it by hand, or commit yours and `/apply N` again |
 | `needs a git project` | copies and `/review` work only in a git project |
