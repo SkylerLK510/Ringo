@@ -122,11 +122,12 @@ The conversation prints into the terminal's own scrollback, as Claude Code's and
 reply, and what each agent does under its job number: one `•` line per tool call or command once it has run, with
 what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit code),
 then one line when a job ends with its time, tokens and Ringo model calls. Replies render their markdown: headings,
-emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned columns, or, when a
-table is wider than the terminal, as one block per row with each cell under its column's name. Scroll it with the mouse wheel and select from it as in any
+emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned columns (a long last column wraps under itself), or,
+when even that does not fit, as one block per row with each cell under its column's name. Scroll it with the mouse wheel and select from it as in any
 other program; the shell never captures the mouse. Below it, a live area holds one row per running job and
-subagent, any permission request, the input box and a status line. The manual is not on screen until you ask for
-it: `/usrman` (or `/instructions`, `/help`) prints it into the conversation.
+subagent, any permission request, the input box and a status line. The manual, the step-by-step
+[user guide](USER-GUIDE.md), is not on screen until you ask for it: `/usrman` (or `/instructions`, `/help`) prints it
+into the conversation, followed by the settings in force.
 
 | You type | What happens |
 |---|---|
@@ -150,8 +151,8 @@ Start `ringo` in any folder, as you would `claude` or `codex`. Inside a git proj
 home folder (a dotfiles repository) included, they read and answer, and Ringo says why an edit needs a project.
 Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
 
-Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 17,000 tokens before it
-starts, and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends;
+Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 12,000 to 15,000 tokens
+before it starts (measured under [Modes and permissions](#modes-and-permissions)), and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends;
 Shift-Enter (in terminals with the kitty keyboard protocol: kitty, Ghostty, WezTerm, foot, iTerm2 with "Report keys
 using CSI u" on), Ctrl-J, Alt-Enter or `\` then Enter starts a new line, and the input box says which of the first two
 works. A paste goes into the input box with its lines kept, and nothing is sent until you press Enter (in a terminal

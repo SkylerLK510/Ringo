@@ -24,78 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
-const HELP: &str = "\
-Ringo's manual (/usrman, /instructions or /help shows it again).
-Private state: {state}
-
-A line without / or @ is a question: one tool-free call, with your last few
-questions and answers as context. It costs a few thousand tokens and cannot
-see your files (pipelines backend: {backend}). When that call reads the line
-as a task (files to change, read or review, or live sources), Ringo starts it:
-claude takes code turns (codex when claude is not set up), /research takes
-sources.
-
-Mode (now: {mode}), one switch for every agent: Shift-Tab cycles it,
-/mode ask|auto|read sets it, /auto toggles auto.
-  ask   agents read, and edit their own worktree, freely; anything else (a
-        command in a write turn, a connector such as Jira, the network, a push
-        or a PR) waits for you: y allow, a allow for this session, n decline.
-        Read turns (@claude) never run commands: they work in your own tree
-  auto  agents act on their own; only what their safety review flags, or an
-        always-ask rule names (sudo, disk tools, force pushes, publishing,
-        agent settings), waits for you. Codex works in its sandbox with the
-        network and its own reviewer; it cannot stop to ask
-  read  agents look but do not touch: no edits, no commands, no connectors
-
-Ringo's pipelines run the models as tool-free workers with executable checks
-and one review:
-  /review #N           job N's change (its task as the change description)
-  /review BASE [HEAD]  BASE...HEAD of this repository
-  /design TEXT         the one-call design pipeline on TEXT
-  /research TOPIC      one live web search call, every quoted source fetched
-                       and checked in code, one write call that cites only
-                       what was verified (about 70k tokens, mostly search
-                       results)
-  /work SPEC.json      the checked work loop on a task spec
-  /backend SPEC        backend for those pipelines (now: {backend})
-
-Agents (full agent turns: about 17,000 tokens before they start, far more when
-they search your files; each job's line counts them), for questions about
-your code and for changes:
-  @codex TASK          ask an agent; it can read the repository but not
-                       change it (the conversation continues)
-  @codex! TASK         let it edit, in a private worktree from HEAD; nothing
-                       lands until you /apply
-  @codex @claude TASK  the same task to several agents at once; @all means
-                       every agent set up (read turns skip the ones with no
-                       read-only mode, such as grok)
-  @agy TASK            Google's Antigravity CLI, set up with /setup; agents
-                       you add yourself take @name! turns
-  {#N} in a TASK       hands job N's reply (and change) to the agent, shown
-                       before it is sent
-  /setup               add another agent and sign in to it
-  /update              update the agents the opening check found out of date,
-                       in this terminal (no tokens); /update auto on|off: do
-                       it by itself when the shell opens
-  /route on|off        suggest a command for a line that reads like a
-                       research, design, review or edit task or a question
-                       about this folder's files, for you to send (Enter),
-                       change, or ask as a plain question (Esc); no model call
-                       (now: {route})
-  /theme [NAME]        colours: siamese, siamese-light, pink, midnight or mono
-                       (now: {theme})
-
-Jobs: /show N (its log)  /diff N  /apply N  /drop N (remove its
-worktree)  /kill N  /quit
-
-Keys: Enter sends. Shift-Enter (in terminals that report it: kitty, Ghostty,
-WezTerm, iTerm2 with CSI u on), Ctrl-J, Alt-Enter or \\ then Enter starts a new
-line; a paste keeps its lines and is not sent. Typing / or @ opens a menu
-under the input: Up / Down choose, Tab or Enter completes. Otherwise Up / Down
-move between lines, then through earlier messages (kept between sessions).
-Shift-Tab changes the mode, Esc clears, Ctrl-C twice quits. The conversation
-is in the terminal's scrollback: scroll it and select from it as in any other
-program.";
+/// The user guide, printed by /usrman as markdown: the same file as docs/USER-GUIDE.md, so the two never differ.
+const MANUAL: &str = include_str!("../../docs/USER-GUIDE.md");
 
 /// What the menu offers as a line starts with `/`: each command as it reads, and what it does.
 const COMMANDS: &[(&str, &str)] = &[
@@ -439,7 +369,8 @@ fn fit(line: &Line<'static>, width: usize, indent: usize) -> Vec<Line<'static>> 
 
 /// An agent's markdown reply as rows of at most `width` columns: headings, emphasis and code styled, list items and
 /// quotes indented with their wrapped rows under their text, code blocks as they are, and a table as aligned columns
-/// when it fits (else one block per row: its first cell, then each other cell under its column's name).
+/// when it fits, or when all but its last column fit in half the row, the last one wrapping under itself (else one
+/// block per row: its first cell, then each other cell under its column's name).
 fn markdown(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     use pulldown_cmark::{Options, Parser};
     let mut md = Md { t: *theme, width: width.max(8), out: Vec::new(), spans: Vec::new(), style: Vec::new(),
@@ -585,7 +516,7 @@ impl Md {
             T::CodeBlock => {
                 let code = self.code.take().unwrap_or_default();
                 for line in code.strip_suffix('\n').unwrap_or(&code).split('\n') {
-                    self.emit(vec![Span::styled(format!("  {line}"), self.t.ringo)]);
+                    self.emit_under(vec![Span::styled(format!("  {line}"), self.t.ringo)], 2);
                 }
                 if self.lists.is_empty() {
                     self.blank();
@@ -651,11 +582,16 @@ impl Md {
 
     /// Rows for one line of a block, under the open quotes and list items (the item's marker on its first row).
     fn emit(&mut self, spans: Vec<Span<'static>>) {
+        self.emit_under(spans, 0);
+    }
+
+    /// `emit`, with wrapped rows `extra` columns further in (a table's last column wraps under itself).
+    fn emit_under(&mut self, spans: Vec<Span<'static>>, extra: usize) {
         let depth: usize = self.lists.iter().map(|(_, w)| *w).sum();
         let mark_w = self.lists.last().map_or(0, |(_, w)| *w);
         let marker = self.marker.take().unwrap_or_else(|| " ".repeat(mark_w));
         let quote = "│ ".repeat(self.quote);
-        let hang = cols(&quote) + depth;
+        let hang = cols(&quote) + depth + extra;
         let mut line = vec![Span::styled(quote.clone(), self.t.dim), Span::raw(" ".repeat(depth - mark_w)),
                             Span::styled(marker, self.t.dim)];
         line.extend(spans);
@@ -691,23 +627,27 @@ impl Md {
         let total = widths.iter().sum::<usize>() + 2 * n.saturating_sub(1);
         let depth: usize = self.lists.iter().map(|(_, w)| *w).sum::<usize>() + cols(&"│ ".repeat(self.quote));
         let bold = Style::new().add_modifier(Modifier::BOLD);
-        if total + depth <= self.width {
+        // The columns before the last, with their gaps: when they take at most half the row, the last column wraps
+        // under itself (`fit` hangs a wrapped row at most half the width in).
+        let before = total - widths.last().copied().unwrap_or(0);
+        if total + depth <= self.width || (n > 1 && depth + before <= self.width / 2) {
             let line = |row: &[Vec<Span<'static>>], head: bool| -> Vec<Span<'static>> {
                 let mut spans = Vec::new();
                 for (c, w) in widths.iter().enumerate() {
                     let cell = row.get(c).cloned().unwrap_or_default();
-                    let pad = w - width(&cell) + if c + 1 < n { 2 } else { 0 };
+                    let pad = if c + 1 < n { w - width(&cell) + 2 } else { 0 };
                     spans.extend(cell.into_iter().map(|s| if head { s.patch_style(bold) } else { s }));
                     spans.push(Span::raw(" ".repeat(pad)));
                 }
                 spans
             };
-            let (head, rule) = (line(&table.head, true), vec![Span::styled("─".repeat(total), self.t.dim)]);
-            self.emit(head);
+            let rule = total.min(self.width - depth);
+            let (head, rule) = (line(&table.head, true), vec![Span::styled("─".repeat(rule), self.t.dim)]);
+            self.emit_under(head, before);
             self.emit(rule);
             for row in &table.rows {
                 let spans = line(row, false);
-                self.emit(spans);
+                self.emit_under(spans, before);
             }
             return;
         }
@@ -989,9 +929,18 @@ impl App {
         self.last = 0;
     }
 
-    fn help_text(&self) -> String {
-        HELP.replace("{backend}", &self.s.backend).replace("{theme}", self.theme.name).replace("{mode}", self.s.mode.name())
-            .replace("{route}", if self.route { "on" } else { "off" }).replace("{state}", &self.s.dir.display().to_string())
+    /// The settings in force, printed under the manual.
+    fn settings(&self) -> String {
+        format!("  now: mode {} · questions and pipelines on {} · theme {} · route suggestions {}\n  private state: {}",
+                self.s.mode.name(), self.s.backend, self.theme.name, if self.route { "on" } else { "off" },
+                self.s.dir.display())
+    }
+
+    /// An agent's reply, or the manual: markdown, between blank lines.
+    fn reply(&mut self, text: &str) {
+        self.gap();
+        self.out.push(Out::Reply(clean(text)));
+        self.gap();
     }
 
     fn agent_style(&self, agent: Agent) -> Style {
@@ -1027,11 +976,7 @@ impl App {
             }
             for said in fresh {
                 match said {
-                    Said::Reply(text) => {
-                        self.gap();
-                        self.out.push(Out::Reply(clean(&text)));
-                        self.gap();
-                    }
+                    Said::Reply(text) => self.reply(&text),
                     Said::Step(text) => {
                         let text = clean(&text);
                         self.out.push(Out::Line(Line::from(vec![Span::styled("  • ", style),
@@ -1185,7 +1130,10 @@ impl App {
     /// Runs a command; Some(text) goes to the conversation. A started job's own lines follow there as they come.
     fn run(&mut self, cmd: Cmd) -> Result<Option<String>, String> {
         Ok(match cmd {
-            Cmd::Help => Some(self.help_text()),
+            Cmd::Help => {
+                self.reply(MANUAL);
+                Some(self.settings())
+            }
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
             Cmd::Auto => {
@@ -1861,6 +1809,22 @@ mod tests {
     }
 
     #[test]
+    fn the_manual_covers_every_command_and_fits_the_terminal() {
+        for (command, _) in COMMANDS {
+            let head = command.split(' ').next().unwrap();
+            assert!(MANUAL.contains(&format!("`{head}")), "the manual does not explain {head}");
+        }
+        let theme = Theme::named("mono", crate::theme::Depth::Mono).unwrap();
+        for width in [50, 80, 120] {
+            let lines = markdown(MANUAL, width, &theme);
+            assert!(lines.len() > 50);
+            for line in plain(&lines) {
+                assert!(cols(&line) <= width, "{width} columns: {line:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_reply_reads_as_markdown() {
         let theme = Theme::named("mono", crate::theme::Depth::Mono).unwrap();
         let md = |text: &str, width: usize| plain(&markdown(text, width, &theme));
@@ -1871,7 +1835,10 @@ mod tests {
         let wide = "| name | status |\n|---|---|\n| LangGraph | yes it is there |\n";
         assert_eq!(md(wide, 20), ["• LangGraph", "  status: yes it is", "  there"]);
         assert_eq!(md(wide, 40), ["name       status", "──────────────────────────", "LangGraph  yes it is there"]);
+        assert_eq!(md(wide, 24), ["name       status", &"─".repeat(24), "LangGraph  yes it is", "           there"],
+                   "when the first column takes half the row or less, the last one wraps under itself");
         assert_eq!(md("```\nlet x = 1;\n```", 20), ["  let x = 1;"]);
+        assert_eq!(md("```\nlet x = 1 + 2;\n```", 10), ["  let x =", "  1 + 2;"], "wrapped code stays in its block");
         assert_eq!(md("> aaa bbb ccc", 8), ["│ aaa", "│ bbb", "│ ccc"], "a quote's wrapped rows keep its bar");
         assert_eq!(md("1. a\n2. b\n   - c", 20), ["1. a", "2. b", "   • c"]);
         assert_eq!(md("see [the docs](https://x.dev) and [a.rs](src/a.rs)", 60), ["see the docs (https://x.dev) and a.rs"]);
