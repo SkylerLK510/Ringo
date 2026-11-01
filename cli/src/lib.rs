@@ -374,9 +374,6 @@ pub struct Session {
     store: Option<PathBuf>,
     /// Why /undo is off here, when it is.
     pub no_undo: Option<String>,
-    /// The folder's tree as the last turn in it ended, and when: a turn starting right behind it (one from the queue,
-    /// in the same pass of the shell's loop) begins from it instead of hashing the folder again.
-    last_after: Option<(String, Instant)>,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -487,10 +484,11 @@ const STORE_IGNORES: &[&str] = &["node_modules", ".venv", "venv", "__pycache__",
 const STORE_FILES: u64 = 5_000;
 const STORE_BYTES: u64 = 200 << 20;
 
-/// Whether `dir` holds at most `files` files and `bytes` bytes, not counting what the undo store ignores. Stops
-/// counting at the first limit it passes; symlinks are not followed.
-fn small(dir: &Path, files: u64, bytes: u64) -> bool {
-    let ignored = |name: &str| name == ".git" || STORE_IGNORES.iter().any(|i| match i.strip_prefix('*') {
+/// Ok when `dir` suits the undo store: at most `files` files and `bytes` bytes, not counting what the store ignores,
+/// and no git project inside it (git would keep only a link to its commit, not the files a turn edits there). Stops
+/// at the first limit it passes; symlinks are not followed.
+fn fits_store(dir: &Path, files: u64, bytes: u64) -> Result<(), String> {
+    let ignored = |name: &str| STORE_IGNORES.iter().any(|i| match i.strip_prefix('*') {
         Some(ext) => name.ends_with(ext),
         None => name == *i,
     });
@@ -498,6 +496,10 @@ fn small(dir: &Path, files: u64, bytes: u64) -> bool {
     while let Some(d) = todo.pop() {
         for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
             let (Ok(kind), name) = (entry.file_type(), entry.file_name()) else { continue };
+            if name == ".git" {
+                let inner = d.strip_prefix(dir).unwrap_or(&d).display().to_string();
+                return Err(format!("{inner} is a git project of its own; start ringo in it, where /undo works"));
+            }
             if ignored(&name.to_string_lossy()) {
                 continue;
             }
@@ -507,12 +509,13 @@ fn small(dir: &Path, files: u64, bytes: u64) -> bool {
                 seen += 1;
                 size += entry.metadata().map(|m| m.len()).unwrap_or(0);
                 if seen > files || size > bytes {
-                    return false;
+                    return Err(format!("this folder holds more than {files} files or {} MB; run `git init` here once \
+                                        to turn /undo on", bytes >> 20));
                 }
             }
         }
     }
-    true
+    Ok(())
 }
 
 /// Outside a git project, each turn's before and after for /undo live in a git store of Ringo's own, one for each
@@ -523,13 +526,11 @@ fn undo_store(root: &Path, folder: &Path, home: &Path) -> Result<PathBuf, String
     if folder.parent().is_none() || (!home.as_os_str().is_empty() && home.starts_with(folder)) {
         return Err("Ringo keeps no /undo for your whole home folder; start ringo in the folder you work on".into());
     }
-    if resolved(root).starts_with(folder) {
+    let root = resolved(root); // the store is used from the folder: a relative root would point elsewhere there
+    if root.starts_with(folder) {
         return Err("Ringo's own state is inside this folder".into());
     }
-    if !small(folder, STORE_FILES, STORE_BYTES) {
-        return Err(format!("this folder holds more than {STORE_FILES} files or {} MB; run `git init` here once to \
-                            turn /undo on", STORE_BYTES >> 20));
-    }
+    fits_store(folder, STORE_FILES, STORE_BYTES)?;
     let hash = folder.as_os_str().as_encoded_bytes().iter()
         .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)); // FNV-1a
     let store = root.join("undo").join(format!("{hash:016x}"));
@@ -672,8 +673,7 @@ impl Session {
                 Err(why) => (None, Some(why)),
             },
         };
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, last_after: None, dir, jobs: Vec::new(),
-                     max_jobs: 3,
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
                      usage_so_far: HashMap::new(), mode: Mode::Ask, always_ask, allowed: BTreeSet::new(),
@@ -873,10 +873,9 @@ impl Session {
             wt
         } else {
             if edits && self.undoable() {
-                // Kept for /undo; a turn whose before cannot be taken still runs, without an undo.
-                // ceiling: an edit in the 50 ms after a turn ends would count as the next queued turn's.
-                let fresh = self.last_after.take().filter(|(_, at)| at.elapsed() < Duration::from_millis(50));
-                match fresh.map(|(tree, _)| Ok(tree)).unwrap_or_else(|| self.snapshot(&dir.join("index"))) {
+                // Kept for /undo; a turn whose before cannot be taken still runs, without an undo. Taken anew even
+                // right behind another turn: an /undo or an edit of yours in between belongs to neither.
+                match self.snapshot(&dir.join("index")) {
                     Ok(tree) => self.jobs[id - 1].before = Some(tree),
                     Err(e) => self.jobs[id - 1].push_log(format!("no /undo for this turn: {e}")),
                 }
@@ -1339,7 +1338,6 @@ impl Session {
         if let Some(before) = self.jobs[id - 1].before.clone()
             && let Ok(after) = self.snapshot(&self.jobs[id - 1].dir.join("index")) {
             let changed = self.folder_git(&["diff", "--name-only", &before, &after]).unwrap_or_default();
-            self.last_after = Some((after.clone(), Instant::now()));
             let job = &mut self.jobs[id - 1];
             job.changed = changed.lines().map(str::to_string).collect();
             job.after = Some(after);
@@ -1810,8 +1808,18 @@ mod tests {
         for (name, text) in [("a.txt", "12345"), ("b.txt", "12345"), ("node_modules/pkg/x.js", "ignored"), ("c.pyc", "ignored")] {
             fs::write(dir.join(name), text).unwrap();
         }
-        assert!(small(&dir, 2, 10), "two files of five bytes; what the store ignores is not counted");
-        assert!(!small(&dir, 1, 10) && !small(&dir, 2, 9));
+        assert_eq!(fits_store(&dir, 2, 10), Ok(()), "two files of five bytes; what the store ignores is not counted");
+        assert!(fits_store(&dir, 1, 10).unwrap_err().contains("more than 1 files") && fits_store(&dir, 2, 9).is_err());
+        // a git project inside: its files would be one link in the store, so the store is refused
+        fs::create_dir_all(dir.join("CSC133/.git")).unwrap();
+        assert!(fits_store(&dir, 9, 99).unwrap_err().contains("CSC133 is a git project of its own"));
+        // a relative state root (taken from the current folder) still names the same store from the folder
+        let folder = dir.join("class");
+        fs::create_dir_all(&folder).unwrap();
+        let relative = Path::new("target").join(format!("ringo-relative-state-{}", std::process::id()));
+        let store = undo_store(&relative, &resolved(&folder), Path::new("")).unwrap();
+        assert!(store.is_absolute() && store.join("HEAD").is_file(), "{}", store.display());
+        let _ = fs::remove_dir_all(&relative);
         let _ = fs::remove_dir_all(dir);
     }
 }

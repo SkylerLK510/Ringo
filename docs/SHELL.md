@@ -367,8 +367,9 @@ or for the spinner while a job runs.
   into a git store of Ringo's own, one per folder, under its state folder (`undo/`), run with `--git-dir` and
   `--work-tree`: the folder gets no repository, and an enclosing dotfiles repository never sees the store. The store
   keeps its own index, so only new or changed files are hashed. It ignores the folder's `.gitignore` entries and
-  `node_modules`, virtualenvs and caches. Left out: the home folder itself, a folder holding Ringo's state, and a
-  folder with more than 5,000 files or 200 MB (Ringo says so when it opens; `git init` there turns undo on). A
+  `node_modules`, virtualenvs and caches. Left out: the home folder itself, a folder holding Ringo's state, a folder
+  with a git project inside it (git would keep a link to that project's commit, not the files a turn edits there),
+  and a folder with more than 5,000 files or 200 MB (`git init` there turns undo on); Ringo says which when it opens. A
   folder moved or renamed starts a new store, and stores are never pruned; deleting `undo/` reclaims the space.
 - **Commits and PRs** a turn makes are yours, as ones made by hand are: Claude turns pass `"attribution":
   {"commit": "", "pr": ""}`, so no co-author trailer and no "Generated with" line (Claude Code 2.1.316; it also drops

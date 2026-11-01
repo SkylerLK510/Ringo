@@ -39,10 +39,10 @@ Type `/undo` to put those files back as they were before that turn. Each `/undo`
 edited any of those files yourself since then, Ringo leaves everything as it is and says so.
 
 `/undo` works in any folder. In a git project Ringo keeps each turn's before and after with git; anywhere else,
-such as a class folder, it keeps them in a store of its own, and your folder is left as it is. Two places are left
-out: your whole home folder, and a folder with more than 5,000 files or 200 MB in it (not counting installed packages
-and caches). There, Ringo says `/undo` is off when it starts; typing `git init` in a terminal in that folder once turns
-it on.
+such as a class folder, it keeps them in a store of its own, and your folder is left as it is. A few places are left
+out: your whole home folder; a folder with a git project inside it (start Ringo in that project instead, where
+`/undo` works); and a folder with more than 5,000 files or 200 MB in it (not counting installed packages and caches),
+where typing `git init` in a terminal there once turns `/undo` on. In those, Ringo says `/undo` is off when it starts.
 
 ## Answer when an agent asks
 
@@ -155,7 +155,7 @@ file and Ringo prints where.
 | `nothing to undo` | no turn has changed files here yet |
 | `FILE changed after #N, so nothing was undone` | you changed that file since; undo it by hand |
 | `#N is working in this folder` | wait for it to end, or press Esc to stop it |
-| `/undo is off here: ...` | start Ringo in the folder you work on, not your home folder; for a very large folder, type `git init` in a terminal there once |
+| `/undo is off here: ...` | start Ringo in the folder you work on (not your home folder, and inside a git project when it names one); for a very large folder, type `git init` in a terminal there once |
 | `your files changed where #N edits them` | `/diff N` shows the change; apply it by hand, or commit yours and `/apply N` again |
 | `needs a git project` | copies and `/review` work only in a git project |
 | `no agent NAME` | add it with `/setup` |
