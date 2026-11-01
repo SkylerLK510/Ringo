@@ -96,22 +96,34 @@ conversation busy, the suggestion names Codex, then any other agent that can tak
 Ask anything, or @claude / @codex for an agent turn. /usrman shows the manual.
 
 › @claude! add a retry to the HTTP client
+
 #1 claude!
-  worktree ... from HEAD 3f2a91c; uncommitted changes in your tree are not in it
-  I'll add the retry in client.rs and a test for it.
+  own worktree from HEAD 3f2a91c (/show 1: its path); your uncommitted changes are not in it
+  • Grep fn send in src · Found 2 files
+  • Read client.rs · 214 lines
+  • Edit client.rs
+  • $ cargo test retry
+
+  Added a retry with backoff to `send` in **client.rs**, and a test for it.
+
 ✓ #1 claude! done · 0:41 · 34.8k tokens · change ready: /diff 1, /apply 1
 
-› /review #1
- ⠼ #2 ringo review  0:05 0 1c  review: calling codex-chatgpt
-╭ @claude or @codex for an agent · Ctrl-J new line · /usrman ───────────────╮
-│                                                                           │
+› /re
+╭ / commands · @ agents · Shift-Enter new line ─────────────────────────────╮
+│/re                                                                        │
 ╰───────────────────────────────────────────────────────────────────────────╯
- ringo  my-repo (main) · mode: ask · 1 running · 34.8k tokens
+ › /review #N          review job N's change
+   /review BASE [HEAD] review BASE...HEAD of this repository
+   /research TOPIC     live web search, every quoted source checked
+ ringo  my-repo (main) · mode: ask · 0 running · 34.8k tokens
 ```
 
 The conversation prints into the terminal's own scrollback, as Claude Code's and Codex's do: your lines, every
-reply, and what each agent does (its commands, edits and messages, under its job number), then one line when a
-job ends with its time, tokens and Ringo model calls. Scroll it with the mouse wheel and select from it as in any
+reply, and what each agent does under its job number: one `•` line per tool call or command once it has run, with
+what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit code),
+then one line when a job ends with its time, tokens and Ringo model calls. Replies render their markdown: headings,
+emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned columns, or, when a
+table is wider than the terminal, as one block per row with each cell under its column's name. Scroll it with the mouse wheel and select from it as in any
 other program; the shell never captures the mouse. Below it, a live area holds one row per running job and
 subagent, any permission request, the input box and a status line. The manual is not on screen until you ask for
 it: `/usrman` (or `/instructions`, `/help`) prints it into the conversation.
@@ -139,11 +151,16 @@ home folder (a dotfiles repository) included, they read and answer, and Ringo sa
 Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
 
 Use `@codex` or `@claude` when the answer needs your files: an agent turn costs about 17,000 tokens before it
-starts, and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends; Ctrl-J,
-Alt-Enter or `\` then Enter starts a new line. A paste goes into the input box with its lines kept, and nothing is
-sent until you press Enter (in a terminal without bracketed paste, keys that arrive together, as a paste's do, are kept the
-same way, its last newline too). Up and Down move between the lines of a message, then through earlier messages; Shift-Tab changes the mode,
-Esc clears the input, and Ctrl-C twice quits, stopping running jobs.
+starts, and a vague question can send it searching (one such follow-up cost about 450,000). Enter sends;
+Shift-Enter (in terminals with the kitty keyboard protocol: kitty, Ghostty, WezTerm, foot, iTerm2 with "Report keys
+using CSI u" on), Ctrl-J, Alt-Enter or `\` then Enter starts a new line, and the input box says which of the first two
+works. A paste goes into the input box with its lines kept, and nothing is sent until you press Enter (in a terminal
+without bracketed paste, keys that arrive together, as a paste's do, are kept the same way, its last newline too).
+Typing `/` at the start of a line, or `@` at the start of a word, opens a menu under the input of the commands or
+agents that match: Up and Down choose, Tab or Enter completes (Enter sends a command that takes nothing more). Up
+and Down otherwise move between the lines of a message, then through earlier messages, which are kept between
+sessions (the last 1,000, in `shell-history.jsonl` in Ringo's private state); Shift-Tab changes the mode, Esc clears
+the input, and Ctrl-C twice quits, stopping running jobs.
 
 The live area shows each running job's time, tokens, Ringo model calls and what it is doing now, with one row per
 subagent: Claude Code's Task subagents and Codex's spawned agents. When two unapplied write jobs edit the same

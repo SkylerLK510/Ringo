@@ -281,9 +281,9 @@ pub struct Job {
     pub calls: u32,
     pub subs: Vec<Sub>,
     pub log: VecDeque<String>,
-    /// Lines added to `log` that the shell has not printed yet; it takes them as it prints them (`log` keeps only
-    /// the last LOG_LINES, and a long reply arrives at once).
-    pub fresh: Vec<String>,
+    /// What the job added to `log` that the shell has not printed yet; it takes these as it prints them (`log` keeps
+    /// only the last LOG_LINES, and a long reply arrives at once).
+    pub fresh: Vec<Said>,
     pub dir: PathBuf,
     pub worktree: Option<PathBuf>,
     pub base: Option<String>,
@@ -310,13 +310,31 @@ impl Job {
     }
     fn push_log(&mut self, line: String) {
         for l in line.lines() {
+            self.push(Said::Line(l.to_string()));
+        }
+    }
+
+    fn push(&mut self, said: Said) {
+        let (Said::Reply(text) | Said::Step(text) | Said::Line(text)) = &said;
+        for l in text.lines() {
             if self.log.len() == LOG_LINES {
                 self.log.pop_front();
             }
             self.log.push_back(l.to_string());
-            self.fresh.push(l.to_string());
         }
+        self.fresh.push(said);
     }
+}
+
+/// Something a job adds to the conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Said {
+    /// The agent's reply, as markdown.
+    Reply(String),
+    /// A step it took (a tool call or a command) and what came of it.
+    Step(String),
+    /// A line shown as it is: a plain agent's output, or Ringo's note about the job.
+    Line(String),
 }
 
 pub enum Event {
@@ -600,8 +618,8 @@ impl Session {
                 let job = &mut self.jobs[id - 1];
                 job.worktree = Some(wt.clone());
                 job.base = Some(base.clone());
-                job.push_log(format!("worktree {} from HEAD {}; uncommitted changes in your tree are not in it",
-                                     wt.display(), &base[..12.min(base.len())]));
+                job.push_log(format!("own worktree from HEAD {} (/show {id}: its path); your uncommitted changes \
+                                      are not in it", &base[..7.min(base.len())]));
                 wt
             }
             None => self.repo.clone(),
@@ -1017,7 +1035,7 @@ impl Session {
                         let report = job.dir.join("work").join("report.json");
                         let reply = job.reply();
                         if !reply.is_empty() {
-                            job.push_log(reply);
+                            job.push(Said::Reply(reply));
                         } else if let Ok(text) = fs::read_to_string(&report) {
                             let state = serde_json::from_str::<serde_json::Value>(&text).ok()
                                 .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
@@ -1058,6 +1076,8 @@ impl Session {
                             }
                         }
                         Note::Log(line) => job.push_log(line),
+                        Note::Reply(text) => job.push(Said::Reply(text)),
+                        Note::Step(text) => job.push(Said::Step(text)),
                         Note::Subagent { id: sub, label } => {
                             job.activity = format!("started subagent {label}");
                             job.subs.push(Sub { id: sub, label, activity: "starting".into(), ended: None });
