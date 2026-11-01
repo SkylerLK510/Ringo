@@ -2184,14 +2184,15 @@ pub fn run() -> ExitCode {
     };
     let name = session.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let label = match &session.branch { Some(b) => format!("{name} ({b})"), None => name };
-    let mut app = App::new(session, agents, label, Theme::load(), load_history());
-    if let Some(mode) = crate::theme::setting("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
+    let saved = crate::theme::settings_all(); // read once, for the theme, the mode and auto updates
+    let mut app = App::new(session, agents, label, Theme::load_from(&saved), load_history());
+    if let Some(mode) = saved.get("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
     }
     app.welcome();
     let (notes, news) = std::sync::mpsc::channel();
     let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
-    let auto = crate::theme::setting("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
+    let auto = saved.get("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
     let check = notes.clone();
     std::thread::spawn(move || {
         let _ = check.send((false, crate::updates::check(&agents, &state)));

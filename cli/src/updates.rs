@@ -122,7 +122,7 @@ fn now_s() -> u64 {
 fn load(state: &Path) -> serde_json::Value {
     let mut memo: serde_json::Value = fs::read(state).ok().and_then(|b| serde_json::from_slice(&b).ok())
         .filter(serde_json::Value::is_object).unwrap_or_else(|| serde_json::json!({}));
-    for key in ["installed", "latest"] {
+    for key in ["installed", "latest", "stamp"] {
         if !memo[key].is_object() {
             memo[key] = serde_json::json!({}); // a damaged file starts over instead of failing
         }
@@ -138,6 +138,19 @@ fn save(state: &Path, memo: &serde_json::Value) {
     }
 }
 
+/// The program's version, from `--version` only when the program changed since the last check: a new path
+/// (Homebrew and Claude keep each version in a folder of its own) or a new modification time (an install over it).
+/// Otherwise the last answer in `memo` stands, and no process starts.
+fn version_of(memo: &mut serde_json::Value, name: &str, path: &Path) -> Option<String> {
+    let stamp = fs::metadata(path).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|t| format!("{}\t{}", path.display(), t.as_nanos()));
+    let known = memo["installed"][name].as_str().filter(|_| stamp.is_some() && memo["stamp"][name].as_str() == stamp.as_deref());
+    let have = known.map(str::to_string).or_else(|| installed_version(path))?;
+    memo["stamp"][name] = stamp.into();
+    memo["installed"][name] = have.clone().into();
+    Some(have)
+}
+
 /// One line per agent that changed since the last session or has a newer release, and the updates that would bring
 /// each outdated agent up to date. `state` holds the installed versions and each feed's last answer; it is rewritten.
 pub fn check(agents: &[Agent], state: &Path) -> (Vec<String>, Vec<Update>) {
@@ -148,12 +161,12 @@ pub fn check(agents: &[Agent], state: &Path) -> (Vec<String>, Vec<Update>) {
     for &agent in agents {
         let name = agent.name();
         let Some(path) = locate(&agent.spec().program) else { continue };
-        let Some(have) = installed_version(&path) else { continue };
-        if let Some(before) = memo["installed"][name].as_str().filter(|b| *b != have) {
+        let before = memo["installed"][name].as_str().map(str::to_string);
+        let Some(have) = version_of(&mut memo, name, &path) else { continue };
+        if let Some(before) = before.filter(|b| *b != have) {
             lines.push(format!("  {name} changed {before} -> {have} since the last session; answers and token use \
                                 can change with it"));
         }
-        memo["installed"][name] = have.clone().into();
         let Some((feed, update)) = source(agent, &path).filter(|_| releases) else { continue };
         if memo["latest"][&feed]["checked"].as_u64().is_none_or(|t| now.saturating_sub(t) >= DAY_S) {
             match fetch_version(&feed) {
@@ -280,6 +293,30 @@ mod tests {
         assert!(memo["installed"].is_object() && memo["latest"].is_object());
         fs::write(&state, "[1, 2]").unwrap();
         assert_eq!(check(&[], &state), (vec![], vec![]));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_version_is_asked_again_only_when_the_program_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ringo-stamp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (bin, calls) = (dir.join("codex"), dir.join("calls"));
+        let write = |version: &str| {
+            fs::write(&bin, format!("#!/bin/sh\necho x >> '{}'\necho 'codex-cli {version}'\n", calls.display())).unwrap();
+            fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        let probes = || fs::read_to_string(&calls).map(|t| t.lines().count()).unwrap_or(0);
+        let mut memo = load(&dir.join("none.json"));
+        write("0.165.0");
+        assert_eq!(version_of(&mut memo, "codex", &bin).as_deref(), Some("0.165.0"));
+        assert_eq!(version_of(&mut memo, "codex", &bin).as_deref(), Some("0.165.0"));
+        assert_eq!(probes(), 1, "an unchanged program is not asked again");
+        std::thread::sleep(Duration::from_millis(20));
+        write("0.166.0"); // installed over it: a new modification time
+        assert_eq!(version_of(&mut memo, "codex", &bin).as_deref(), Some("0.166.0"));
+        assert_eq!(probes(), 2);
         let _ = fs::remove_dir_all(dir);
     }
 

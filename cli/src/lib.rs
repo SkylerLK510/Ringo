@@ -374,6 +374,9 @@ pub struct Session {
     store: Option<PathBuf>,
     /// Why /undo is off here, when it is.
     pub no_undo: Option<String>,
+    /// The folder's tree as the last turn in it ended, and when: a turn starting right behind it (one from the queue,
+    /// in the same pass of the shell's loop) begins from it instead of hashing the folder again.
+    last_after: Option<(String, Instant)>,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -531,11 +534,19 @@ fn undo_store(root: &Path, folder: &Path, home: &Path) -> Result<PathBuf, String
         .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)); // FNV-1a
     let store = root.join("undo").join(format!("{hash:016x}"));
     if !store.join("HEAD").is_file() {
-        private_dir(&store)?;
-        git(&store, &["init", "--bare", "-q", "."])?;
+        // Made beside it and renamed into place, so two sessions opening the folder at once never meet halfway.
+        let new = store.with_extension(format!("new-{}-{:?}", std::process::id(), thread::current().id()));
+        private_dir(&new)?;
+        git(&new, &["init", "--bare", "-q", "."])?;
         let ignores: String = STORE_IGNORES.iter().map(|i| format!("{i}\n")).collect();
-        fs::write(store.join("info").join("exclude"), ignores).map_err(|e| e.to_string())?;
-        fs::write(store.join("folder"), folder.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        fs::write(new.join("info").join("exclude"), ignores).map_err(|e| e.to_string())?;
+        fs::write(new.join("folder"), folder.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        if fs::rename(&new, &store).is_err() {
+            let _ = fs::remove_dir_all(&new); // another session's store is there first
+            if !store.join("HEAD").is_file() {
+                return Err(format!("cannot make the undo store {}", store.display()));
+            }
+        }
     }
     Ok(store)
 }
@@ -661,7 +672,8 @@ impl Session {
                 Err(why) => (None, Some(why)),
             },
         };
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, dir, jobs: Vec::new(), max_jobs: 3,
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, last_after: None, dir, jobs: Vec::new(),
+                     max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
                      usage_so_far: HashMap::new(), mode: Mode::Ask, always_ask, allowed: BTreeSet::new(),
@@ -862,7 +874,9 @@ impl Session {
         } else {
             if edits && self.undoable() {
                 // Kept for /undo; a turn whose before cannot be taken still runs, without an undo.
-                match self.snapshot(&dir.join("index")) {
+                // ceiling: an edit in the 50 ms after a turn ends would count as the next queued turn's.
+                let fresh = self.last_after.take().filter(|(_, at)| at.elapsed() < Duration::from_millis(50));
+                match fresh.map(|(tree, _)| Ok(tree)).unwrap_or_else(|| self.snapshot(&dir.join("index"))) {
                     Ok(tree) => self.jobs[id - 1].before = Some(tree),
                     Err(e) => self.jobs[id - 1].push_log(format!("no /undo for this turn: {e}")),
                 }
@@ -1123,9 +1137,11 @@ impl Session {
         const ROOM: usize = 12_000; // characters of them at most, the newest kept first
         let mut earlier: Vec<String> = Vec::new();
         let mut used = 0;
-        for job in self.jobs.iter().rev().filter(|j| matches!(&j.kind, Kind::Ringo { command } if command == "ask") && j.status == Status::Done
-                                                     && !j.reply().trim_start().starts_with("ROUTE:")) {
-            let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, job.reply().trim());
+        let asked = self.jobs.iter().rev()
+            .filter(|j| matches!(&j.kind, Kind::Ringo { command } if command == "ask") && j.status == Status::Done)
+            .map(|j| (j, j.reply())).filter(|(_, reply)| !reply.trim_start().starts_with("ROUTE:"));
+        for (job, reply) in asked {
+            let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, reply.trim());
             if earlier.len() == KEEP || used + text.len() > ROOM {
                 break;
             }
@@ -1289,10 +1305,16 @@ impl Session {
     }
 
     fn end(&mut self, id: usize, status: Status) {
+        let reply = (status == Status::Done).then(|| self.jobs[id - 1].reply());
+        self.end_with(id, status, reply.unwrap_or_default());
+    }
+
+    /// `end` with the job's reply already read.
+    fn end_with(&mut self, id: usize, status: Status, reply: String) {
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
         job.activity = match &status {
-            Status::Done => parse::short(&job.reply(), 80),
+            Status::Done => parse::short(&reply, 80),
             Status::Failed(reason) => reason.clone(),
             _ => String::new(),
         };
@@ -1306,15 +1328,18 @@ impl Session {
             sub.ended = Some(false);
             sub.activity = "stopped with its parent".into();
         }
-        // A write job that changed nothing has nothing to apply. Its worktree stays for /drop: removing it here would
-        // also remove what the diff cannot see (a file git ignores that the agent wrote).
-        if job.status == Status::Done && job.worktree.is_some() && self.diff(id).is_ok_and(|p| p.is_empty()) {
+        // A write job that changed nothing has nothing to apply (git's exit code says so; no patch is written). Its
+        // worktree stays for /drop: removing it here would also remove what the diff cannot see (a file git ignores
+        // that the agent wrote).
+        if job.status == Status::Done && let (Some(wt), Some(base)) = (job.worktree.clone(), job.base.clone())
+            && git(&wt, &["add", "-A"]).is_ok() && git(&wt, &["diff", "--cached", "--quiet", &base]).is_ok() {
             self.jobs[id - 1].unchanged = true;
         }
         // A turn in the owner's folder, stopped or not: what it changed there, for its last line and /undo.
         if let Some(before) = self.jobs[id - 1].before.clone()
             && let Ok(after) = self.snapshot(&self.jobs[id - 1].dir.join("index")) {
             let changed = self.folder_git(&["diff", "--name-only", &before, &after]).unwrap_or_default();
+            self.last_after = Some((after.clone(), Instant::now()));
             let job = &mut self.jobs[id - 1];
             job.changed = changed.lines().map(str::to_string).collect();
             job.after = Some(after);
@@ -1329,9 +1354,10 @@ impl Session {
             match event {
                 Event::Ended(id, status) => {
                     let job = &mut self.jobs[id - 1];
+                    let reply = job.reply(); // read once, for the route, the conversation and the job's last line
                     if matches!(&job.kind, Kind::Ringo { command } if command == "ask") && status == Status::Done {
                         // The ask prompt answers a task with one line, `ROUTE: edit|read|review|research`.
-                        if let Some(route) = job.reply().trim().strip_prefix("ROUTE:") {
+                        if let Some(route) = reply.trim().strip_prefix("ROUTE:") {
                             // the route word alone: "ROUTE: edit." or a line of reasons after it still starts the task
                             let word = route.split(|c: char| !c.is_ascii_alphabetic()).find(|w| !w.is_empty());
                             self.routed.push_back((id, word.unwrap_or("").to_lowercase()));
@@ -1339,16 +1365,15 @@ impl Session {
                     }
                     if matches!(job.kind, Kind::Ringo { .. }) {
                         let report = job.dir.join("work").join("report.json");
-                        let reply = job.reply();
                         if !reply.is_empty() {
-                            job.push(Said::Reply(reply));
+                            job.push(Said::Reply(reply.clone()));
                         } else if let Ok(text) = fs::read_to_string(&report) {
                             let state = serde_json::from_str::<serde_json::Value>(&text).ok()
                                 .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
                             job.push_log(format!("work {}: {}", state.unwrap_or_default(), report.display()));
                         }
                     }
-                    self.end(id, status);
+                    self.end_with(id, status, reply);
                 }
                 Event::Note(id, Note::Session(session)) => {
                     if let Kind::Agent { agent, write: false } = self.jobs[id - 1].kind {
@@ -1679,7 +1704,10 @@ fn write_agents_file(root: &Path, value: &serde_json::Value) -> Result<(), Strin
 
 /// Registers the owner's own entries from `root`/agents.json; the reason for each one that cannot run.
 pub fn load_custom_agents(root: &Path) -> Vec<String> {
-    let file = read_agents_file(root);
+    register_custom(&read_agents_file(root))
+}
+
+fn register_custom(file: &serde_json::Value) -> Vec<String> {
     let mut problems = Vec::new();
     for entry in file.get("custom").and_then(|c| c.as_array()).into_iter().flatten() {
         match Spec::from_json(entry, true) {
@@ -1715,9 +1743,8 @@ pub fn add_custom_agent(root: &Path, entry: serde_json::Value) -> Result<Agent, 
 /// The agents set up with `ringo setup` (state_root()/agents.json), the owner's own entries registered first;
 /// None before the first setup.
 pub fn configured_agents() -> Option<Vec<Agent>> {
-    let root = state_root();
-    load_custom_agents(&root);
-    let file = read_agents_file(&root);
+    let file = read_agents_file(&state_root());
+    register_custom(&file);
     let agents: Vec<Agent> = file.get("agents")?.as_array()?.iter()
         .filter_map(|a| a.as_str().and_then(Agent::from_name)).collect();
     Some(agents)
