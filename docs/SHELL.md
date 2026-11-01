@@ -113,7 +113,7 @@ too, each agent keeping its own conversation. Codex owns the abstract work: Ring
 ✓ #1 claude done · 0:41 · 34.8k tokens · changed client.rs (/undo takes it back)
 
 ╭──────────────────────────────────────────────────────────────────────────╮
-│ › tell claude what you want, in your own words · / commands · ? keys     │
+│ › Tell Ringo what you want to do · / commands · ? keys                   │
 ╰──────────────────────────────────────────────────────────────────────────╯
  ringo  my-repo (main) · ask mode · talking to claude · 34.8k tokens   ? keys
 ```

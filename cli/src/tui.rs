@@ -2096,7 +2096,7 @@ impl App {
             let mut rows: Vec<Line> = if self.input.is_empty() {
                 let ask = match self.s.busy() {
                     Some(_) => "type what comes next; it waits for this turn".to_string(),
-                    None => format!("tell {} what you want", self.main.name()),
+                    None => "Tell Ringo what you want to do".to_string(),
                 };
                 vec![Line::from(vec![Span::styled(" ❯ ", t.focus), Span::styled(ask, t.dim)])]
             } else {
@@ -2439,7 +2439,7 @@ mod tests {
         assert_eq!(rows[2], " Welcome to Ringo");
         let words = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(words.contains("so /undo is off here"), "outside git, the opening lines say so: {rows:#?}");
-        assert!(rows[23].starts_with(" ❯ tell claude what you want") && rows[23].ends_with("⇧⇥ mode · ? keys"),
+        assert!(rows[23].starts_with(" ❯ Tell Ringo what you want to do") && rows[23].ends_with("⇧⇥ mode · ? keys"),
                 "{rows:#?}");
         let narrow = screen(&mut a, 30, 24);
         for row in &narrow {
