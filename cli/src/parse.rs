@@ -50,8 +50,12 @@ pub enum Note {
     Session(String),
     /// What the agent (node None) or one of its subagents is doing now.
     Activity { node: Option<String>, text: String },
-    /// A line for the job's log.
+    /// A line for the job's log, shown as it is.
     Log(String),
+    /// The agent's own words: its reply, as markdown.
+    Reply(String),
+    /// A step the agent took (a tool call or a command) and, once known, what came of it.
+    Step(String),
     Subagent { id: String, label: String },
     SubagentEnd { id: String, ok: bool },
     Tokens(Tokens),
@@ -87,6 +91,9 @@ pub struct Parser {
     failure: Option<String>,
     completed: u32,
     subagents: Vec<String>,
+    /// Claude's tool calls waiting for their result (tool_use id, tool, how the call reads): each is shown once,
+    /// with what came of it.
+    calls: Vec<(String, String, String)>,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -110,13 +117,33 @@ pub fn short(text: &str, n: usize) -> String {
     }
 }
 
+/// What a tool call came to, for its line: an error's first line; how much a search or a read found.
+fn outcome(tool: &str, result: &Value, ok: bool) -> String {
+    let text = match result.get("content") {
+        Some(Value::String(t)) => t.clone(),
+        Some(Value::Array(parts)) => parts.iter().map(|p| s(p, "text")).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    };
+    let text = text.replace("<tool_use_error>", "").replace("</tool_use_error>", "");
+    let (first, n) = (text.trim().lines().next().unwrap_or(""), text.trim().lines().count());
+    let lines = |what: &str| format!(" · {n} {what}{}", if n == 1 { "" } else { "s" });
+    match tool {
+        _ if !ok => format!(" · {}", short(&text, 120)),
+        "Grep" | "Glob" if first.starts_with("Found ") || first.starts_with("No ") => format!(" · {}", short(first, 60)),
+        "Grep" => lines("line"),
+        "Glob" => lines("file"),
+        "Read" => lines("line"),
+        _ => String::new(),
+    }
+}
+
 fn base_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 impl Parser {
     pub fn new(style: Style) -> Parser {
-        Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new() }
+        Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new() }
     }
 
     /// The final reply text so far.
@@ -186,20 +213,25 @@ impl Parser {
         match item_type {
             "agent_message" if done => {
                 self.reply = s(item, "text").to_string();
-                notes.push(Note::Log(self.reply.clone()));
+                notes.push(Note::Reply(self.reply.clone()));
             }
             "reasoning" => notes.push(activity("thinking".into())),
-            "command_execution" if !done => {
-                let command = s(item, "command");
-                notes.push(activity(format!("$ {}", short(command, 80))));
-                notes.push(Note::Log(format!("$ {command}")));
+            "command_execution" if !done => notes.push(activity(format!("$ {}", short(s(item, "command"), 80)))),
+            "command_execution" => {
+                // One line once it ran: the command, and its exit code when it failed.
+                let how = match (item.get("exit_code").and_then(Value::as_i64), s(item, "status")) {
+                    (Some(0), _) => String::new(),
+                    (Some(code), _) => format!(" · exit {code}"),
+                    (None, "" | "completed") => String::new(),
+                    (None, status) => format!(" · {status}"),
+                };
+                notes.push(Note::Step(format!("$ {}{how}", short(s(item, "command"), 300))));
             }
-            "command_execution" => notes.push(Note::Log(format!("  exit {}", item.get("exit_code").unwrap_or(&Value::Null)))),
             "file_change" if !done => {
                 let paths: Vec<&str> = item.get("changes").and_then(Value::as_array).into_iter().flatten()
                     .map(|c| base_name(s(c, "path"))).collect();
                 notes.push(activity(format!("editing {}", paths.join(", "))));
-                notes.push(Note::Log(format!("edit {}", paths.join(", "))));
+                notes.push(Note::Step(format!("edit {}", paths.join(", "))));
                 for c in item.get("changes").and_then(Value::as_array).into_iter().flatten() {
                     notes.push(Note::Touched(s(c, "path").to_string()));
                 }
@@ -255,7 +287,7 @@ impl Parser {
             ("assistant", _) => {
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     match s(block, "type") {
-                        "text" if parent.is_none() => notes.push(Note::Log(s(block, "text").to_string())),
+                        "text" if parent.is_none() => notes.push(Note::Reply(s(block, "text").to_string())),
                         "text" => notes.push(Note::Activity { node: parent.clone(), text: short(s(block, "text"), 60) }),
                         "thinking" => notes.push(Note::Activity { node: parent.clone(), text: "thinking".into() }),
                         "tool_use" => notes.extend(self.claude_tool(block, &parent)),
@@ -266,14 +298,22 @@ impl Parser {
             ("user", _) => {
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     let id = s(block, "tool_use_id");
-                    if s(block, "type") == "tool_result" && self.subagents.iter().any(|a| a == id) {
-                        let ok = block.get("is_error") != Some(&Value::Bool(true));
+                    if s(block, "type") != "tool_result" {
+                        continue;
+                    }
+                    let ok = block.get("is_error") != Some(&Value::Bool(true));
+                    if self.subagents.iter().any(|a| a == id) {
                         notes.push(Note::SubagentEnd { id: id.to_string(), ok });
+                    } else if let Some(at) = self.calls.iter().position(|(call, ..)| call == id) {
+                        let (_, tool, text) = self.calls.remove(at);
+                        notes.push(Note::Step(format!("{text}{}", outcome(&tool, block, ok))));
                     }
                 }
             }
             ("result", subtype) => {
                 self.completed += 1;
+                // calls whose result never came (the turn stopped first) are shown as they were made
+                notes.extend(self.calls.drain(..).map(|(_, _, text)| Note::Step(text)));
                 notes.push(Note::Tokens(claude_tokens(e)));
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
@@ -323,13 +363,22 @@ impl Parser {
         let target = ["command", "file_path", "pattern", "path", "url", "query"].iter()
             .map(|k| s(input, k)).find(|v| !v.is_empty()).unwrap_or("");
         let target = if input.get("file_path").is_some() { base_name(target) } else { target };
-        let text = format!("{name} {}", short(target, 70));
-        let mut notes = vec![Note::Activity { node: parent.clone(), text: text.clone() }];
+        let mut notes = vec![Note::Activity { node: parent.clone(), text: format!("{name} {}", short(target, 70)) }];
         if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
             notes.push(Note::Touched(s(input, "file_path").to_string()));
         }
         if parent.is_none() {
-            notes.push(Note::Log(text));
+            // A search names where it looked: five greps for one pattern in five folders read as five lines.
+            let place = match s(input, "path") {
+                "" => String::new(),
+                path if !s(input, "pattern").is_empty() => format!(" in {}", base_name(path.trim_end_matches('/'))),
+                _ => String::new(),
+            };
+            let text = match name {
+                "Bash" => format!("$ {}", short(target, 300)),
+                _ => format!("{name} {}{place}", short(target, 120)),
+            };
+            self.calls.push((s(block, "id").to_string(), name.to_string(), text));
         }
         notes
     }
@@ -351,7 +400,7 @@ impl Parser {
                         let shown = if params.get("CommandLine").is_some() { target } else { base_name(target) };
                         let text = format!("{tool} {}", short(shown, 70));
                         notes.push(Note::Activity { node: None, text: text.clone() });
-                        notes.push(Note::Log(text));
+                        notes.push(Note::Step(text));
                         let reads = tool.starts_with("view") || tool.starts_with("read");
                         if tool.contains("file") && !reads && !target.is_empty() {
                             notes.push(Note::Touched(target.to_string()));
@@ -359,7 +408,7 @@ impl Parser {
                     }
                     ("tool", "ERROR") => {
                         let why = step.pointer("/tool_info/error/message").and_then(Value::as_str).unwrap_or("");
-                        notes.push(Note::Log(format!("  {tool} refused: {}", short(why, 160))));
+                        notes.push(Note::Step(format!("{tool} refused: {}", short(why, 160))));
                     }
                     ("agent_response", "ACTIVE") => notes.push(Note::Activity { node: None, text: "writing".into() }),
                     _ => {}
@@ -382,6 +431,8 @@ impl Parser {
                     notes.extend(self.fail(why));
                 } else if self.reply.trim().is_empty() && !denied.is_empty() {
                     notes.extend(self.fail(format!("agy stopped: it needed permission for {}", denied.join(", "))));
+                } else {
+                    notes.push(Note::Reply(self.reply.clone()));
                 }
             }
             "error" => return self.fail(format!("agy: {}", short(&e.to_string(), 200))),
@@ -481,6 +532,37 @@ mod tests {
         assert!(notes.contains(&Note::Activity { node: None, text: "editing solution.py".into() }));
         assert!(notes.contains(&Note::Touched("/w/solution.py".into())));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 3396, cache_read: 35456, cache_write: 0, output: 671 })));
+        assert!(notes.contains(&Note::Reply("Done: fixed it.".into())));
+        // a command is one line once it ran; its exit code only when it failed
+        assert!(notes.contains(&Note::Step("$ /bin/zsh -lc 'ls'".into())));
+        let failed = r#"{"type":"item.completed","item":{"type":"command_execution","command":"make test","exit_code":2,"status":"failed"}}"#;
+        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("$ make test · exit 2".into())]);
+    }
+
+    #[test]
+    fn claude_tool_calls_show_once_with_what_came_of_them() {
+        let call = |id: &str, name: &str, input: &str| format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"{name}","input":{input}}}]}},"parent_tool_use_id":null}}"#);
+        let result = |id: &str, content: &str, error: bool| format!(
+            r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":{content},"is_error":{error}}}]}},"parent_tool_use_id":null}}"#);
+        let lines = [
+            call("g", "Grep", r#"{"pattern":"fn parse","path":"/w/src/"}"#),
+            call("r", "Read", r#"{"file_path":"/w/src/a.rs"}"#),
+            call("b", "Bash", r#"{"command":"cargo test"}"#),
+            call("e", "Edit", r#"{"file_path":"/w/src/a.rs"}"#),
+            result("r", r#""1\tuse x;\n2\tfn a() {}""#, false),
+            result("g", r#"[{"type":"text","text":"Found 3 files\nsrc/a.rs"}]"#, false),
+            result("b", r#""<tool_use_error>Permission to use Bash has been denied.</tool_use_error>""#, true),
+            CLAUDE[6].to_string(),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let steps: Vec<Note> = run(Style::Claude, &lines).1.into_iter().filter(|n| matches!(n, Note::Step(_))).collect();
+        assert_eq!(steps, [
+            Note::Step("Read a.rs · 2 lines".into()),
+            Note::Step("Grep fn parse in src · Found 3 files".into()),
+            Note::Step("$ cargo test · Permission to use Bash has been denied.".into()),
+            Note::Step("Edit a.rs".into()), // no result before the turn ended
+        ]);
     }
 
     #[test]
@@ -556,7 +638,8 @@ mod tests {
         assert!(notes.contains(&Note::Session("bb23".into())));
         assert!(notes.contains(&Note::Activity { node: None, text: "edit_file calc.py".into() }));
         assert_eq!(notes.iter().filter(|n| matches!(n, Note::Touched(_))).collect::<Vec<_>>(), [&Note::Touched("/w/calc.py".into())]);
-        assert!(notes.iter().any(|n| matches!(n, Note::Log(l) if l.contains("run_command refused"))));
+        assert!(notes.iter().any(|n| matches!(n, Note::Step(l) if l.contains("run_command refused"))));
+        assert!(notes.contains(&Note::Reply("Fixed calc.py.".into())), "the reply is in the conversation");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
     }
 
