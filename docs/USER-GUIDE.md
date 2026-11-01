@@ -1,156 +1,158 @@
-# How to use the `ringo` shell
+# How to use Ringo
 
-Type `/usrman` (or `/help`) in the shell to see this guide again. The full reference, with what each mode allows
-and what it was measured to cost, is [docs/SHELL.md](SHELL.md).
+Type `/help` in Ringo to see this guide again, or `?` for just the keys. The full reference, with what each mode
+allows and what it was measured to cost, is [docs/SHELL.md](SHELL.md).
 
 ## Start
 
-1. Open a terminal in your project. Agents can edit only inside a git repository; anywhere else they can read and
-   answer.
+1. Open a terminal in the folder you want to work on.
 2. Type `ringo`.
-3. The first time, Ringo asks which agents you use. Type the command you start each one with (`claude`, `codex`,
-   `agy`, `grok`) and sign in when it asks. Ringo uses your subscription logins, never API keys.
-4. The line at the bottom shows the folder, the branch, the mode, how many jobs are running and the tokens used.
+3. The first time, Ringo looks for the AI coding agents on your computer (Claude Code, Codex, Antigravity) and helps
+   you sign in to them. It uses your own subscription logins, never API keys.
+4. Ringo fills the window. The conversation is at the top, you type in the box at the bottom, and the line under the
+   box shows the folder, the mode, which agent you are talking to, and how many tokens you have used.
 
-To add an agent later, type `/setup`.
+## Ask for what you want
 
-## Ask a question
-
-Type it and press Enter, with no `/` or `@` in front.
-
-- It is one quick model call, with your last few questions and answers as context. It cannot see your files.
-- When the line is really a task (change files, review code, look something up online), Ringo starts the job for
-  you: Claude for code (Codex when Claude is not set up), `/research` for sources.
-
-## Ask an agent about your code
-
-Put the agent's name first:
+Type it in your own words and press Enter. For example:
 
 ```
-@claude where do we retry failed requests?
-@codex what does parse_args return on bad input?
+explain what this project does
+fix the failing test
+add a dark mode switch to the settings page
 ```
 
-The agent reads the repository but cannot change it. Later `@claude` lines continue the same conversation.
+- The agent you are talking to (Claude, or Codex when Claude is not set up) reads the files in this folder, changes
+  them if that is what you asked for, and answers.
+- Each step it takes shows as a `•` line, with what came of it.
+- While it works, the row above the box shows its time, the tokens it has used and what it is doing now. Press Esc
+  to stop it.
+- You can type the next message while it works. It waits under the box and goes when the turn ends.
+- The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
+  `/clear` starts a new conversation.
 
-## Have an agent change code
+## Take back a change
 
-1. Add `!` to the name: `@claude! add a retry to the HTTP client`.
-2. The agent works in its own copy of the repository, a git worktree made from your last commit. Your uncommitted
-   changes are not in it, and nothing touches your files yet.
-3. Each step it takes prints as a `•` line, with what came of it. When it finishes you see
-   `✓ #1 claude! done · … · change ready: /diff 1, /apply 1`. If it changed nothing, the line says `no change`
-   instead; `/drop 1` removes its worktree.
-4. Read the change with `/diff 1`. For a second opinion, `/review #1`.
-5. Commit or stash your own changes, then `/apply 1`. The change lands in your tree, uncommitted, for you to check
-   and commit.
-6. `/drop 1` removes the job's worktree; its log stays.
+When a turn changes files, its last line says which ones, for example `changed app.py (/undo takes it back)`.
+Type `/undo` to put those files back as they were before that turn. Each `/undo` goes one turn further back. If you
+edited the same files yourself since then, Ringo leaves everything as it is and says so.
 
-## Use several agents at once
+`/undo` needs the folder to be a git project, because that is where Ringo keeps each turn's before and after. Most
+code folders already are; for one that is not, type `git init` in a terminal there once.
 
-- `@claude! @codex! TASK` gives the same task to both, each in its own worktree. Compare `/diff 1` with `/diff 2`
-  and apply the one you prefer.
-- `@all TASK` asks every agent you set up; `@all! TASK` lets them all edit.
-- When two unapplied jobs edit the same file, their lines say so (`⚠ same files as #2 client.rs`) before you apply
-  either.
-- To hand one job's answer and change to another agent, write `{#1}` in the task:
-  `@codex check this change: {#1}`. The shell shows what it adds before it is sent.
+## Answer when an agent asks
 
-## Approve what an agent wants to do
+In `ask` mode (the default), the agent changes files in this folder on its own, but asks you before anything else:
+running a command, using the network, a connector such as Jira, a push or a PR. A box takes the place of the input
+and shows exactly what it wants to do:
 
-In `ask` mode (the default), Claude waits for you before anything beyond reading and editing its own worktree: a
-command in an edit turn, the network, a connector such as Jira, a push or a PR. A box above the input shows the
-whole action:
-
-| Key | Answer |
+| Answer | Key |
 |---|---|
-| `y` | allow it once |
-| `a` | allow it, and the same rule for the rest of the session |
-| `n` or Esc | decline; the agent carries on without it |
+| Yes, this once | `1`, `y` or Enter |
+| Yes, and the same for the rest of this session | `2` or `a` |
+| No; it carries on without it | `3`, `n` or Esc |
 
-The keys answer only while the input line is empty. Codex cannot stop to ask: in `ask` mode its sandbox (no
-network, writes only in its worktree) refuses the rest. Even in `auto` mode, Claude always waits before `sudo`,
-disk tools, force pushes, publishing a release, or editing an agent's settings.
+Up and Down move between the answers too. If you were typing when the box appeared, send or clear your line first.
+Some actions always ask, even in `auto` mode: `sudo`, disk tools, force pushes, publishing a release, and editing an
+agent's settings.
 
 ## Choose how much agents may do
 
 | Mode | Agents may, without asking |
 |---|---|
-| `ask` | read, and edit their own worktree |
+| `ask` | read, and change files in this folder |
 | `auto` | act on their own; only what their safety review flags waits |
-| `read` | look only: no edits, no commands; `@agent!` is refused |
+| `read` | look only: no changes, no commands |
 
 Shift-Tab cycles the modes, `/mode ask|auto|read` sets one, and `/auto` switches between auto and ask. A new mode
-applies to the turns started after it and is remembered for next time.
+applies to the turns started after it and is remembered for next time. Codex cannot stop to ask, so in `ask` mode it
+changes files in this folder but has no network.
+
+## Talk to a different agent
+
+Put its name first: `@codex why is this slow?`. The rest of the conversation goes to Codex too, until you pick another
+with `@claude`. Each agent keeps its own conversation.
+
+## Compare agents
+
+- `@claude! TASK` gives the task to Claude in its own copy of the folder, so your files are not touched.
+- `@claude @codex TASK` gives the same task to both, each in its own copy, and `@all TASK` to every agent you set up.
+- When a copy is done, its line says `change ready`. `/diff 2` shows what it changed and `/apply 2` puts that change
+  into your folder. `/drop 2` throws the copy away.
+- When two copies change the same file, their lines say so before you apply either.
+- To hand one job's answer and change to another agent, write `{#1}` in the message: `@codex check this: {#1}`.
+
+Copies need a git project.
 
 ## Run Ringo's pipelines
 
-These run the models as workers, with executable checks and one review:
+These run the models as workers, with checks Ringo runs itself, and one review:
 
 | Command | What it does |
 |---|---|
-| `/review #N` | review job N's change |
+| `/review #N` | a second opinion on job N's change |
 | `/review BASE [HEAD]` | review `BASE...HEAD` of this repository |
 | `/design TEXT` | a design for `TEXT`, in one call |
 | `/research TOPIC` | a web search; every quoted source is checked, and the answer cites only those |
+| `/ask TEXT` | a quick answer from one cheap call that cannot see your files |
 | `/work SPEC.json` | the checked work loop on a task spec |
-| `/backend SPEC` | the backend for questions and these pipelines |
+| `/backend SPEC` | the backend for `/ask` and these pipelines |
 
 ## Keep track of jobs
 
+Every turn and pipeline is a numbered job.
+
 | Command | What it does |
 |---|---|
-| `/show N` | print job N's log and where its files are |
-| `/diff N` | show job N's change |
-| `/apply N` | put job N's change in your tree, uncommitted |
-| `/drop N` | remove job N's worktree |
+| `/show N` | job N's log, and where its files are |
 | `/kill N` | stop job N and everything it started |
-
-While jobs run, the area above the input shows one row for each, and for each of its subagents, with its time,
-the tokens it has used so far and what it is doing now. A turn that runs away shows it there: `/kill` it.
+| `/copy` | copy the last answer |
 
 ## Keys
 
 | Key | What it does |
 |---|---|
 | Enter | send |
-| Shift-Enter, Ctrl-J | new line (so do Alt-Enter, and `\` then Enter); the input box says which works here |
+| Shift-Enter, Ctrl-J | new line (so does `\` then Enter) |
+| Esc | clear the input; with it empty, stop the turn |
+| Up, Down | move between lines, then through earlier messages |
 | `/` or `@` | a menu of commands or agents: Up and Down choose, Tab or Enter completes |
-| Up, Down | move between lines, then through earlier messages, kept between sessions |
+| PgUp, PgDn | scroll the conversation (the mouse wheel does too) |
+| drag | select text in the conversation and copy it |
 | Ctrl-A, Ctrl-E | the start or end of the line; Ctrl-U and Ctrl-K cut to either |
-| Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W or Alt-Backspace cuts the word before |
+| Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W cuts the word before |
 | Shift-Tab | change the mode |
-| Esc | clear the input |
-| Ctrl-C twice | quit, stopping running jobs |
+| Ctrl-C | stop the turn; with nothing running, twice to quit |
 
-A paste keeps its lines and is not sent until you press Enter. The conversation is in your terminal's scrollback:
-scroll it and select from it as in any other program.
+A paste keeps its lines and is not sent until you press Enter. Shift-Enter works where the terminal can report it
+(iTerm2, kitty, WezTerm, Ghostty); in macOS Terminal use Ctrl-J. When you quit, the conversation is saved as a text
+file and Ringo prints where.
 
 ## Settings
 
 | Command | What it does |
 |---|---|
 | `/setup` | add an agent and sign in to it |
-| `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when the shell opens |
-| `/route on` | when a line reads like a task, put the matching command in the input for you to send, change, or ask as it is with Esc |
+| `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens |
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
 | `/quit` | leave |
 
 ## What it costs
 
-- A question: one small call, about 1,300 tokens when measured.
-- An agent turn: about 12,000 to 15,000 tokens before the agent starts, and far more when it searches many files.
-  Each job's line shows its count; a narrow question keeps it low.
+- A message: one agent turn, about 12,000 to 15,000 tokens before the agent starts, and far more when it searches
+  many files. Claude Code measured about 50,000 for the same first turn. A narrow request keeps it low.
+- `/ask`: one small call, about 1,300 tokens when measured, for a question that needs none of your files.
 - `/research`: about 70,000 tokens, most of them search results.
 
 ## When something goes wrong
 
 | You see | Do this |
 |---|---|
-| `your tree has uncommitted changes` | commit or stash them, then `/apply N` again |
-| `#N is untouched; inspect it with /diff N` | the change did not apply cleanly and your tree is unchanged; read it with `/diff N` |
-| `needs a git project` | quit, `cd` into a git repository, and start `ringo` there |
-| `has no verified read-only mode` | that agent only takes edit turns: use `@name!` |
+| `nothing to undo` | no turn has changed files here yet |
+| `files #N changed were edited after it` | you changed those files since; undo them by hand |
+| `/undo needs a git project` | type `git init` in a terminal in this folder once |
+| `your files changed where #N edits them` | `/diff N` shows the change; apply it by hand, or commit yours and `/apply N` again |
+| `needs a git project` | copies and `/review` work only in a git project |
 | `no agent NAME` | add it with `/setup` |
 | `#N is running; /kill it first` | `/kill N`, then try again |
-| a job that seems stuck | `/show N` to read its log, `/kill N` to stop it |
+| a turn that seems stuck | Esc stops it; `/show N` reads its log |

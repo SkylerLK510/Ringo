@@ -1,7 +1,9 @@
-//! First-run setup: the owner types the command they start each agent with; Ringo checks it is installed and
-//! signed in, runs the agent's own sign-in when it is not, and asks whether to add another. A name Ringo has no entry
-//! for is never run to find out what it is: no program by that name means it is not an agent; a program Ringo does
-//! not know can be added by the owner, with the command that runs one prompt.
+//! Setup. The first time, Ringo looks for the agents it knows on PATH, lists what it found and how to install the
+//! rest, and on Enter signs in to the ones found (each agent's own sign-in, when it is not signed in yet). Later
+//! (`/setup`), or when the owner types names instead, they type the command they start each agent with; Ringo checks
+//! it is installed and signed in, and asks whether to add another. A name Ringo has no entry for is never run to find
+//! out what it is: no program by that name means it is not an agent; a program Ringo does not know can be added by
+//! the owner, with the command that runs one prompt.
 
 use crate::theme::Theme;
 use ringo_cli::{Agent, SignIn};
@@ -132,13 +134,58 @@ fn unknown(typed: &str, answer: &str) -> Option<Agent> {
     }
 }
 
+/// The first start: the agents Ringo knows that are installed here, signed in on Enter. None when none is installed;
+/// empty when the owner would rather type names.
+fn found(t: &Theme) -> Option<Vec<Agent>> {
+    println!("{}", t.paint(t.title.patch(t.running), "Welcome to Ringo."));
+    println!("Ringo works with the AI coding agents already on this computer, on your own subscription logins.\n");
+    let known: Vec<Agent> = Agent::all().into_iter().filter(|a| !a.spec().custom).collect();
+    let here: Vec<Agent> = known.iter().copied().filter(|a| ringo_cli::installed(&PathBuf::from(&a.spec().program))).collect();
+    for agent in &known {
+        let spec = agent.spec();
+        if here.contains(agent) {
+            println!("  {} {:<7} {}", t.paint(t.ok, "✓"), agent.name(), spec.company);
+        } else {
+            println!("  · {:<7} {} is not installed; to add it: {}", agent.name(), spec.company, spec.install);
+        }
+    }
+    if here.is_empty() {
+        println!("\nNone is installed yet. Install one with the command after its name (Claude Code is the one Ringo \
+                  uses for code), then type ringo again.");
+        return None;
+    }
+    let names: Vec<&str> = here.iter().map(|a| a.name()).collect();
+    let answer = ask(&format!("\nPress Enter to use {} (Ringo signs you in where needed), or type n to choose: ",
+                              names.join(" and "))).unwrap_or_default();
+    if !answer.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut agents = Vec::new();
+    for agent in here {
+        if connect(agent, t) {
+            agents.push(agent);
+        }
+    }
+    if let Err(e) = ringo_cli::save_agents(&agents) {
+        println!("  could not save the setup: {e}");
+    }
+    Some(agents)
+}
+
 /// Adds agents to the owner's setup. Returns the agents now set up.
 pub fn run() -> Vec<Agent> {
     let t = Theme::load();
     let mut agents = ringo_cli::configured_agents().unwrap_or_default();
     if agents.is_empty() {
-        println!("{}", t.paint(t.title.patch(t.running), "Welcome to Ringo."));
-        println!("Ringo routes your work to the coding agents you already use, and runs its own cheap pipelines with them.");
+        agents = match found(&t) {
+            Some(agents) => agents,
+            None => return Vec::new(),
+        };
+        if !agents.is_empty() {
+            let names: Vec<&str> = agents.iter().map(|a| a.name()).collect();
+            println!("Ready: {}. Next time just type ringo; /setup adds another agent.", names.join(", "));
+            return agents;
+        }
     } else {
         let names: Vec<&str> = agents.iter().map(|a| a.name()).collect();
         println!("Agents set up: {}.", names.join(", "));

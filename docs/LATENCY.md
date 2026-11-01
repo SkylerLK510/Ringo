@@ -1,7 +1,8 @@
 # Where a shell answer's time goes
 
 Measured 2026-10-30 on macOS (arm64), Codex CLI 0.165, `codex-chatgpt` backend (GPT-6.1-Sol at its default effort,
-low). A plain line in the shell is one tool-free call through the design pipeline with `plans/ask.json`. The timings
+low). `/ask` in the shell (a plain line until 2026-11-01) is one tool-free call through the design pipeline with
+`plans/ask.json`. The timings
 come from a pass-through `codex` on PATH that stamps each `--json` event. Calls ran one at a time, 12 per variant
 over 6 questions from a one-line fact to a long design answer. The samples are small and the network decides the
 tails, so read the numbers as sizes, not guarantees.
