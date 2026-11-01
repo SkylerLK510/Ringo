@@ -1,0 +1,41 @@
+Ringo's cat, drawn as text, at the top of the shell's side panel. This file is compiled in: replace the art below,
+keep the headings, and rebuild. Everything above the first heading is ignored.
+
+- Each "== STATE" line starts a state: idle, working, asking (an agent waits for an answer), done and failed (for a
+  few seconds after a job ends).
+- Under a state, frames are separated by a line holding only "--"; the shell shows them in turn, one every 240 ms.
+- Give every frame the same number of rows, at most 28 columns wide. The whole cat takes the state's colour.
+- A missing state shows idle.
+
+== idle
+ /\_/\
+( •.• )
+ > ^ <
+== working
+ /\_/\
+( ◐.◐ )
+ > ^ <
+--
+ /\_/\
+( ◓.◓ )
+ > ^ <
+--
+ /\_/\
+( ◑.◑ )
+ > ^ <
+--
+ /\_/\
+( ◒.◒ )
+ > ^ <
+== asking
+ /\_/\
+( °o° ) ?
+ > ^ <
+== done
+ /\_/\
+( ^.^ )
+ > ^ <
+== failed
+ /\_/\
+( ×.× )
+ > ^ <

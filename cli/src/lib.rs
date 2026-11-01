@@ -593,6 +593,11 @@ impl Session {
         self.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })).map(|j| j.id)
     }
 
+    /// Whether the agent has a conversation to continue (a turn of it in the folder has started one).
+    pub fn has_conversation(&self, agent: Agent) -> bool {
+        self.threads.contains_key(&agent)
+    }
+
     /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
     pub fn forget(&mut self) {
         self.threads.clear();

@@ -124,6 +124,11 @@ pub fn short(text: &str, n: usize) -> String {
     }
 }
 
+/// How a step's text starts when it failed, and when the turn ended before its result came: the shell marks it, and
+/// a job's log reads the same.
+pub const FAILED: &str = "✗ ";
+pub const UNFINISHED: &str = "◌ ";
+
 /// What a tool call came to, for its line: an error's first line; how much a search or a read found.
 fn outcome(tool: &str, result: &Value, ok: bool) -> String {
     let text = match result.get("content") {
@@ -237,7 +242,8 @@ impl Parser {
                     (None, "" | "completed") => String::new(),
                     (None, status) => format!(" · {status}"),
                 };
-                notes.push(Note::Step(format!("$ {}{how}", short(s(item, "command"), 300))));
+                let mark = if how.is_empty() { "" } else { FAILED };
+                notes.push(Note::Step(format!("{mark}$ {}{how}", short(s(item, "command"), 300))));
             }
             "file_change" if !done => {
                 let paths: Vec<&str> = item.get("changes").and_then(Value::as_array).into_iter().flatten()
@@ -296,6 +302,10 @@ impl Parser {
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
             }
+            ("system", "compact_boundary") => {
+                let before = e.pointer("/compact_metadata/pre_tokens").and_then(Value::as_u64).unwrap_or(0);
+                notes.push(Note::Log(format!("compacted the conversation (it held {before} tokens)")));
+            }
             ("assistant", _) => {
                 if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
                     let t = Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
@@ -330,14 +340,15 @@ impl Parser {
                         notes.push(Note::SubagentEnd { id: id.to_string(), ok });
                     } else if let Some(at) = self.calls.iter().position(|(call, ..)| call == id) {
                         let (_, tool, text) = self.calls.remove(at);
-                        notes.push(Note::Step(format!("{text}{}", outcome(&tool, block, ok))));
+                        let mark = if ok { "" } else { FAILED };
+                        notes.push(Note::Step(format!("{mark}{text}{}", outcome(&tool, block, ok))));
                     }
                 }
             }
             ("result", subtype) => {
                 self.completed += 1;
                 // calls whose result never came (the turn stopped first) are shown as they were made
-                notes.extend(self.calls.drain(..).map(|(_, _, text)| Note::Step(text)));
+                notes.extend(self.calls.drain(..).map(|(_, _, text)| Note::Step(format!("{UNFINISHED}{text}"))));
                 notes.push(Note::Tokens(claude_tokens(e)));
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
@@ -432,7 +443,7 @@ impl Parser {
                     }
                     ("tool", "ERROR") => {
                         let why = step.pointer("/tool_info/error/message").and_then(Value::as_str).unwrap_or("");
-                        notes.push(Note::Step(format!("{tool} refused: {}", short(why, 160))));
+                        notes.push(Note::Step(format!("{FAILED}{tool} refused: {}", short(why, 160))));
                     }
                     ("agent_response", "ACTIVE") => notes.push(Note::Activity { node: None, text: "writing".into() }),
                     _ => {}
@@ -560,7 +571,7 @@ mod tests {
         // a command is one line once it ran; its exit code only when it failed
         assert!(notes.contains(&Note::Step("$ /bin/zsh -lc 'ls'".into())));
         let failed = r#"{"type":"item.completed","item":{"type":"command_execution","command":"make test","exit_code":2,"status":"failed"}}"#;
-        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("$ make test · exit 2".into())]);
+        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("✗ $ make test · exit 2".into())]);
     }
 
     #[test]
@@ -584,8 +595,8 @@ mod tests {
         assert_eq!(steps, [
             Note::Step("Read a.rs · 2 lines".into()),
             Note::Step("Grep fn parse in src · Found 3 files".into()),
-            Note::Step("$ cargo test · Permission to use Bash has been denied.".into()),
-            Note::Step("Edit a.rs".into()), // no result before the turn ended
+            Note::Step("✗ $ cargo test · Permission to use Bash has been denied.".into()),
+            Note::Step("◌ Edit a.rs".into()), // no result before the turn ended
         ]);
         let limited = [call("l", "Grep", r#"{"pattern":"x"}"#),
                        result("l", r#""Found 50 files limit: 50, offset: 0\na.rs""#, false)];
@@ -647,6 +658,13 @@ mod tests {
         assert!(notes.contains(&Note::Activity { node: Some("tu1".into()), text: "Grep fn parse".into() }));
         assert!(notes.contains(&Note::SubagentEnd { id: "tu1".into(), ok: true }));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 2, cache_write: 5181, cache_read: 11382, output: 4 })));
+    }
+
+    #[test]
+    fn a_compaction_is_logged() {
+        // The shape the Agent SDK documents for `/compact` on a resumed session.
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":41230}}"#;
+        assert_eq!(run(Style::Claude, &[boundary]).1, [Note::Log("compacted the conversation (it held 41230 tokens)".into())]);
     }
 
     #[test]
