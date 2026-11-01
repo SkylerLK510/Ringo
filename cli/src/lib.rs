@@ -748,39 +748,50 @@ impl Session {
         let mut cmd = Command::new(self.program(agent));
         let resume = if write { None } else { self.threads.get(&agent).cloned() };
         let sandbox = if edits { "workspace-write" } else { "read-only" };
-        let mut input = Some(prompt.to_string());
+        let (mut input, mut turn) = (Some(prompt.to_string()), None);
         let style = match spec.adapter {
             Adapter::Codex => {
-                cmd.args(["exec"]);
-                if let Some(thread) = &resume {
-                    cmd.args(["resume", thread]).arg("-c").arg(format!("sandbox_mode=\"{sandbox}\""));
-                    if edits {
-                        // `exec resume` takes no --approve-for-me (codex-cli 0.165.0): in auto mode the sandbox keeps
-                        // its network; in ask mode it is off, said outright, whatever an earlier turn had
-                        let net = self.mode == Mode::Auto;
-                        cmd.args(["-c", &format!("sandbox_workspace_write.network_access={net}")]);
-                    }
-                } else if edits && self.mode == Mode::Auto {
-                    // Auto: Codex's own reviewer answers its approval requests (--approve-for-me implies the
-                    // workspace-write sandbox), and the sandbox has the network, for git, gh and package installs.
-                    // Verified with codex-cli 0.165.0: the sandbox alone has no network.
-                    cmd.args(["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]).arg(&cwd);
-                } else {
-                    cmd.args(["-s", sandbox, "-C"]).arg(&cwd);
+                // One `codex app-server` per turn, so the reply streams as it is written: the same agent and settings
+                // as `codex exec`, and the same model input, compared request for request against a local stand-in
+                // for the API (codex-cli 0.165.0: a new turn in each mode, and a resumed one). The thread's settings
+                // go in thread/start or thread/resume; turn/start follows once the thread's id is known.
+                cmd.arg("app-server");
+                let auto = edits && self.mode == Mode::Auto;
+                if edits {
+                    // Auto: the sandbox has the network, for git, gh and package installs, and Codex's own reviewer
+                    // answers its approval requests. Ask: no network, said outright, whatever an earlier turn had.
+                    cmd.args(["-c", &format!("sandbox_workspace_write.network_access={auto}")]);
                 }
-                cmd.args(["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"",
-                          "-c", "model_provider=\"openai\""]);
+                cmd.args(["-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\""]);
                 // Codex cannot stop to ask here, so the ask tool and its mode instructions go, and analytics (its
                 // upload delays the exit by about 0.33 s). Plugins and apps (documents, browser and computer-use
                 // skills, a computer-use tool that acts outside the sandbox) load only for a task that names a
                 // connector, as Claude's do. A trivial read turn: 17,133 tokens a call before, 14,350 after
-                // (codex-cli 0.165.0). The same settings work after `exec resume`.
+                // (codex-cli 0.165.0).
                 cmd.args(["-c", "features.default_mode_request_user_input=false", "-c",
                           "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false"]);
                 if !names_connector(prompt) {
                     cmd.args(["-c", "features.plugins=false", "-c", "features.apps=false"]);
                 }
-                cmd.arg("-");
+                let mut thread = serde_json::json!({"cwd": cwd, "sandbox": sandbox,
+                                                    "approvalPolicy": if auto { "on-request" } else { "never" }});
+                if auto {
+                    thread["approvalsReviewer"] = "auto_review".into();
+                }
+                let method = match &resume {
+                    Some(id) => {
+                        thread["threadId"] = id.clone().into();
+                        thread["excludeTurns"] = true.into(); // the answer leaves out the conversation so far
+                        "thread/resume"
+                    }
+                    None => "thread/start",
+                };
+                let hello = serde_json::json!({"id": 1, "method": "initialize",
+                                               "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
+                input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
+                                     serde_json::json!({"id": 2, "method": method, "params": thread})));
+                turn = Some(serde_json::json!({"id": 3, "method": "turn/start",
+                                               "params": {"input": [{"type": "text", "text": prompt}]}}));
                 Style::Codex
             }
             Adapter::Claude => {
@@ -827,7 +838,14 @@ impl Session {
                 }
                 cmd.arg("--disallowed-tools").args(deny);
                 if self.mode != Mode::Read {
-                    cmd.arg("--settings").arg(serde_json::json!({"permissions": {"ask": self.always_ask}}).to_string());
+                    // A commit or a PR is the owner's, as one made by hand is: no co-author trailer and no "Generated
+                    // with" line (an empty string turns each off, Claude Code 2.1.316). Safe mode drops the owner's
+                    // CLAUDE.md, where such a rule would otherwise live. It also drops Claude Code's attribution reminder
+                    // from every turn: 626 bytes less a request (measured against a local capture server).
+                    // Codex 0.165.0 adds none (codex_git_commit is removed and off) and agy has no such line.
+                    let settings = serde_json::json!({"permissions": {"ask": self.always_ask},
+                                                      "attribution": {"commit": "", "pr": ""}});
+                    cmd.arg("--settings").arg(settings.to_string());
                     if !self.allowed.is_empty() {
                         cmd.arg("--allowedTools").args(&self.allowed);
                     }
@@ -876,7 +894,11 @@ impl Session {
         };
         cmd.current_dir(&cwd);
         agent_env(&mut cmd);
-        self.spawn(id, cmd, style, input, None)?;
+        let parser = match turn {
+            Some(turn) => Parser::new(style).with_turn(turn),
+            None => Parser::new(style),
+        };
+        self.spawn(id, cmd, parser, input, None)?;
         Ok(id)
     }
 
@@ -892,7 +914,7 @@ impl Session {
         let prefix = self.pipeline.clone().unwrap_or_else(|| vec![python(), self.ringo_home.join("ringo.py").into()]);
         let mut cmd = Command::new(&prefix[0]);
         cmd.args(&prefix[1..]).args(args).current_dir(&self.repo);
-        self.spawn(id, cmd, Style::Trace, None, Some(trace))?;
+        self.spawn(id, cmd, Parser::new(Style::Trace), None, Some(trace))?;
         Ok(id)
     }
 
@@ -1019,8 +1041,9 @@ impl Session {
         self.launch_ringo(&format!("work {}", spec.display()), args, dir.join("work"))
     }
 
-    fn spawn(&mut self, id: usize, mut cmd: Command, style: Style, stdin: Option<String>, trace: Option<PathBuf>)
+    fn spawn(&mut self, id: usize, mut cmd: Command, mut parser: Parser, stdin: Option<String>, trace: Option<PathBuf>)
              -> Result<(), String> {
+        let style = parser.style();
         let dir = self.jobs[id - 1].dir.clone();
         let stderr = fs::File::create(dir.join("stderr.txt")).map_err(|e| e.to_string())?;
         cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stderr(stderr);
@@ -1039,9 +1062,10 @@ impl Session {
             }
         };
         self.jobs[id - 1].pid = Some(child.id());
-        // The stdin text, then for Claude the owner's answers until the turn's result; None closes the pipe.
+        // The stdin text, then until the turn's result Claude's answers from the owner and Codex's turn request;
+        // None closes the pipe.
         let (lines, queued) = channel::<Option<String>>();
-        let keep_open = style == Style::Claude;
+        let keep_open = matches!(style, Style::Claude | Style::Codex);
         let mut closer = None;
         if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
             let _ = lines.send(Some(text));
@@ -1062,7 +1086,6 @@ impl Session {
         let (tx, cancel, pid) = (self.tx.clone(), self.jobs[id - 1].cancel.clone(), child.id());
         let stdout = child.stdout.take();
         thread::spawn(move || {
-            let mut parser = Parser::new(style);
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
             let mut events = (style != Style::Trace).then(|| fs::OpenOptions::new().create(true).append(true)
                 .open(dir.join("events.jsonl")).ok()).flatten();
@@ -1075,6 +1098,11 @@ impl Session {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
                     }
                     let _ = tx.send(Event::Note(id, note));
+                }
+                for line in parser.take_writes() {
+                    if let Some(pipe) = &closer {
+                        let _ = pipe.send(Some(format!("{line}\n")));
+                    }
                 }
                 if parser.completed() && let Some(close) = closer.take() {
                     let _ = close.send(None); // the result is in: nothing more will be asked, so the agent may exit

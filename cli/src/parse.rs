@@ -78,7 +78,7 @@ pub enum Note {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Style {
-    /// `codex exec --json` events.
+    /// `codex app-server` JSON-RPC messages.
     Codex,
     /// `claude -p --output-format stream-json --verbose` events.
     Claude,
@@ -105,6 +105,12 @@ pub struct Parser {
     seen: Vec<(String, Tokens)>,
     /// Claude reported a compaction (`/compact`), whose result may carry no text.
     compacted: bool,
+    /// Codex: the turn/start request, sent once the thread's id is known; the thread; its usage so far.
+    turn: Option<Value>,
+    thread: String,
+    usage: Value,
+    /// Lines for the agent's stdin, written as soon as they are taken.
+    writes: Vec<String>,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -166,7 +172,23 @@ fn base_name(path: &str) -> &str {
 impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new(), compacted: false }
+                 seen: Vec::new(), compacted: false, turn: None, thread: String::new(), usage: Value::Null,
+                 writes: Vec::new() }
+    }
+
+    /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
+    pub fn with_turn(mut self, turn: Value) -> Parser {
+        self.turn = Some(turn);
+        self
+    }
+
+    pub fn style(&self) -> Style {
+        self.style
+    }
+
+    /// What the agent must be sent now, one JSON message a line.
+    pub fn take_writes(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.writes)
     }
 
     /// The final reply text so far.
@@ -206,43 +228,49 @@ impl Parser {
         vec![Note::Fail(reason)]
     }
 
-    fn codex(&mut self, e: &Value) -> Vec<Note> {
-        let kind = s(e, "type");
-        let item = e.get("item").unwrap_or(&NULL);
-        let item_type = s(item, "type");
-        let done = kind == "item.completed";
-        let mut notes = Vec::new();
-        match kind {
-            "thread.started" => notes.push(Note::Session(s(e, "thread_id").to_string())),
-            "turn.completed" => {
-                self.completed += 1;
-                let usage = e.get("usage").unwrap_or(&NULL);
-                let cached = u(usage, "cached_input_tokens").min(u(usage, "input_tokens"));
-                notes.push(Note::Tokens(Tokens {
-                    input: u(usage, "input_tokens") - cached,
-                    cache_read: cached,
-                    cache_write: u(usage, "cache_write_input_tokens"),
-                    output: u(usage, "output_tokens"),
-                }));
+    /// `codex app-server` messages (JSON-RPC over stdio): the answers to Ringo's requests (1 initialize, 2 the
+    /// thread, 3 the turn), the thread's notifications, and requests of the server's own, refused at once so the turn
+    /// never waits on them (none come with approvals "never"; the auto reviewer answers its own).
+    fn codex(&mut self, m: &Value) -> Vec<Note> {
+        let method = s(m, "method");
+        if let Some(id) = m.get("id") {
+            if !method.is_empty() {
+                self.writes.push(serde_json::json!({"id": id, "error": {"code": -32601,
+                    "message": "Ringo does not serve this request"}}).to_string());
+                return vec![Note::Log(format!("refused codex's {method} request"))];
             }
-            "turn.failed" | "error" => {
-                let detail = e.get("error").map(|v| v.get("message").unwrap_or(v).to_string());
-                let detail = detail.unwrap_or_else(|| s(e, "message").to_string());
-                return self.fail(format!("{kind}: {}", short(&detail, 200)));
+            if let Some(e) = m.get("error") {
+                return self.fail(format!("codex: {}", short(e.get("message").and_then(Value::as_str).unwrap_or("an error"), 200)));
             }
-            _ => {}
+            if id.as_u64() == Some(2) {
+                self.thread = m.pointer("/result/thread/id").and_then(Value::as_str).unwrap_or("").to_string();
+                if let Some(mut turn) = self.turn.take() {
+                    turn["params"]["threadId"] = self.thread.clone().into();
+                    self.writes.push(turn.to_string());
+                }
+                return vec![Note::Session(self.thread.clone())];
+            }
+            return Vec::new();
         }
+        let p = m.get("params").unwrap_or(&NULL);
+        // The main thread's own: a subagent's thread reports through its parent's collab items.
+        if !self.thread.is_empty() && p.get("threadId").and_then(Value::as_str).is_some_and(|t| t != self.thread) {
+            return Vec::new();
+        }
+        let item = p.get("item").unwrap_or(&NULL);
         let activity = |text: String| Note::Activity { node: None, text };
-        match item_type {
-            "agent_message" if done => {
+        let mut notes = Vec::new();
+        match (method, s(item, "type")) {
+            ("item/agentMessage/delta", _) => notes.push(Note::Partial(s(p, "delta").to_string())),
+            ("item/completed", "agentMessage") => {
                 self.reply = s(item, "text").to_string();
                 notes.push(Note::Reply(self.reply.clone()));
             }
-            "reasoning" => notes.push(activity("thinking".into())),
-            "command_execution" if !done => notes.push(activity(format!("$ {}", short(s(item, "command"), 80)))),
-            "command_execution" => {
+            ("item/started", "reasoning") | ("item/reasoning/summaryTextDelta", _) => notes.push(activity("thinking".into())),
+            ("item/started", "commandExecution") => notes.push(activity(format!("$ {}", short(s(item, "command"), 80)))),
+            ("item/completed", "commandExecution") => {
                 // One line once it ran: the command, and its exit code when it failed.
-                let how = match (item.get("exit_code").and_then(Value::as_i64), s(item, "status")) {
+                let how = match (item.get("exitCode").and_then(Value::as_i64), s(item, "status")) {
                     (Some(0), _) => String::new(),
                     (Some(code), _) => format!(" · exit {code}"),
                     (None, "" | "completed") => String::new(),
@@ -251,24 +279,57 @@ impl Parser {
                 let mark = if how.is_empty() { "" } else { FAILED };
                 notes.push(Note::Step(format!("{mark}$ {}{how}", short(s(item, "command"), 300))));
             }
-            "file_change" if !done => {
-                let paths: Vec<&str> = item.get("changes").and_then(Value::as_array).into_iter().flatten()
-                    .map(|c| base_name(s(c, "path"))).collect();
-                notes.push(activity(format!("editing {}", paths.join(", "))));
-                notes.push(Note::Step(format!("{STARTED}edit {}", paths.join(", "))));
-                for c in item.get("changes").and_then(Value::as_array).into_iter().flatten() {
-                    notes.push(Note::Touched(s(c, "path").to_string()));
+            ("item/started" | "item/completed", "fileChange") => {
+                let changes = item.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
+                let names = changes.iter().map(|c| base_name(s(c, "path"))).collect::<Vec<_>>().join(", ");
+                if method == "item/started" {
+                    notes.push(activity(format!("editing {names}")));
+                    notes.extend(changes.iter().map(|c| Note::Touched(s(c, "path").to_string())));
+                } else {
+                    let mark = if matches!(s(item, "status"), "failed" | "declined") { FAILED } else { "" };
+                    notes.push(Note::Step(format!("{mark}edit {names}")));
                 }
             }
-            "mcp_tool_call" if !done => notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool")))),
-            "web_search" if !done => notes.push(activity(format!("search {}", short(s(item, "query"), 60)))),
-            "todo_list" => {
-                let items = item.get("items").and_then(Value::as_array).cloned().unwrap_or_default();
-                let finished = items.iter().filter(|i| i.get("completed") == Some(&Value::Bool(true))).count();
-                notes.push(activity(format!("plan {finished}/{} done", items.len())));
+            ("item/started", "mcpToolCall") => notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool")))),
+            ("item/completed", "mcpToolCall") => {
+                let mark = if s(item, "status") == "failed" { FAILED } else { "" };
+                notes.push(Note::Step(format!("{mark}{}.{}", s(item, "server"), s(item, "tool"))));
             }
-            "collab_tool_call" => notes.extend(self.codex_subagents(item)),
-            "error" if done => notes.push(Note::Log(format!("warning: {}", short(s(item, "message"), 200)))),
+            ("item/started", "webSearch") => notes.push(activity(format!("search {}", short(s(item, "query"), 60)))),
+            ("item/completed", "webSearch") => notes.push(Note::Step(format!("search {}", short(s(item, "query"), 120)))),
+            ("item/completed", "collabAgentToolCall") => notes.extend(self.codex_subagents(item)),
+            ("item/completed", "contextCompaction") => notes.push(Note::Log("compacted the conversation".into())),
+            ("turn/plan/updated", _) => {
+                let plan = p.get("plan").and_then(Value::as_array).cloned().unwrap_or_default();
+                let finished = plan.iter().filter(|step| s(step, "status") == "completed").count();
+                notes.push(activity(format!("plan {finished}/{} done", plan.len())));
+            }
+            // The thread's usage so far; a resumed thread's counts its earlier turns too, as `codex exec` did.
+            ("thread/tokenUsage/updated", _) => self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default(),
+            ("turn/completed", _) => {
+                self.completed += 1;
+                let turn = p.get("turn").unwrap_or(&NULL);
+                if s(turn, "status") == "failed" {
+                    let why = turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("the turn failed");
+                    return self.fail(format!("codex: {}", short(why, 200)));
+                }
+                let usage = &self.usage;
+                let cached = u(usage, "cachedInputTokens").min(u(usage, "inputTokens"));
+                notes.push(Note::Tokens(Tokens { input: u(usage, "inputTokens") - cached, cache_read: cached,
+                                                 cache_write: u(usage, "cacheWriteInputTokens"),
+                                                 output: u(usage, "outputTokens") }));
+            }
+            ("error", _) if p.get("willRetry").and_then(Value::as_bool) == Some(true) => {
+                notes.push(Note::Log(format!("retrying: {}", short(p.pointer("/error/message").and_then(Value::as_str).unwrap_or(""), 200))));
+            }
+            ("error", _) => {
+                let why = p.pointer("/error/message").and_then(Value::as_str).unwrap_or("an error");
+                return self.fail(format!("codex: {}", short(why, 200)));
+            }
+            ("warning" | "configWarning", _) => {
+                let text = p.get("message").or_else(|| p.get("summary")).and_then(Value::as_str).unwrap_or("");
+                notes.push(Note::Log(format!("warning: {}", short(text, 200))));
+            }
             _ => {}
         }
         notes
@@ -277,19 +338,19 @@ impl Parser {
     /// Codex's multi-agent tool calls: spawned agents become subagent nodes, their states update them.
     fn codex_subagents(&mut self, item: &Value) -> Vec<Note> {
         let mut notes = Vec::new();
-        for id in item.get("receiver_thread_ids").and_then(Value::as_array).into_iter().flatten() {
+        for id in item.get("receiverThreadIds").and_then(Value::as_array).into_iter().flatten() {
             let id = id.as_str().unwrap_or("").to_string();
             if !id.is_empty() && !self.subagents.contains(&id) {
                 self.subagents.push(id.clone());
                 notes.push(Note::Subagent { id, label: short(s(item, "prompt"), 50) });
             }
         }
-        if let Some(states) = item.get("agents_states").and_then(Value::as_object) {
+        if let Some(states) = item.get("agentsStates").and_then(Value::as_object) {
             for (id, state) in states {
                 let status = s(state, "status");
                 match status {
                     "completed" | "shutdown" => notes.push(Note::SubagentEnd { id: id.clone(), ok: true }),
-                    "errored" | "not_found" => notes.push(Note::SubagentEnd { id: id.clone(), ok: false }),
+                    "errored" | "notFound" | "interrupted" => notes.push(Note::SubagentEnd { id: id.clone(), ok: false }),
                     _ => notes.push(Note::Activity { node: Some(id.clone()), text: status.to_string() }),
                 }
             }
@@ -521,7 +582,7 @@ impl Parser {
             return Err(reason.clone());
         }
         match self.style {
-            Style::Codex if self.completed != 1 => Err(format!("{} turn.completed events", self.completed)),
+            Style::Codex if self.completed != 1 => Err(format!("{} turn/completed messages", self.completed)),
             Style::Claude | Style::Agy if self.completed != 1 => Err("no result event".into()),
             Style::Codex | Style::Claude | Style::Agy | Style::Plain if self.reply.trim().is_empty() => Err("no final reply".into()),
             _ => Ok(()),
@@ -571,31 +632,55 @@ mod tests {
         assert!(notes.contains(&Note::Unserved("r4".into())));
     }
 
-    // Shapes taken from real codex-cli 0.164 `exec --json` output.
+    // Shapes taken from real codex-cli 0.165.0 `app-server` output (ids shortened, fields trimmed).
     const CODEX: &[&str] = &[
-        r#"{"type":"thread.started","thread_id":"01a1"}"#,
-        r#"{"type":"turn.started"}"#,
-        r#"{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'ls'","aggregated_output":"","exit_code":null,"status":"in_progress"}}"#,
-        r#"{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'ls'","aggregated_output":"a\n","exit_code":0,"status":"completed"}}"#,
-        r#"{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"/w/solution.py","kind":"update"}],"status":"in_progress"}}"#,
-        r#"{"type":"item.completed","item":{"id":"item_3","type":"agent_message","text":"Done: fixed it."}}"#,
-        r#"{"type":"turn.completed","usage":{"input_tokens":38852,"cached_input_tokens":35456,"cache_write_input_tokens":0,"output_tokens":671}}"#,
+        r#"{"id":1,"result":{"userAgent":"ringo/0.165.0"}}"#,
+        r#"{"method":"configWarning","params":{"summary":"Ignored unsupported project-local config keys"}}"#,
+        r#"{"id":2,"result":{"thread":{"id":"01a1"},"sandbox":{"type":"workspaceWrite"}}}"#,
+        r#"{"id":3,"result":{"turn":{"id":"u1","items":[],"status":"inProgress"}}}"#,
+        r#"{"method":"item/started","params":{"threadId":"01a1","turnId":"u1","item":{"type":"commandExecution","id":"c1","command":"/bin/zsh -lc 'ls'","status":"inProgress","exitCode":null}}}"#,
+        r#"{"method":"item/completed","params":{"threadId":"01a1","turnId":"u1","item":{"type":"commandExecution","id":"c1","command":"/bin/zsh -lc 'ls'","status":"completed","exitCode":0}}}"#,
+        r#"{"method":"item/started","params":{"threadId":"01a1","turnId":"u1","item":{"type":"fileChange","id":"f1","changes":[{"path":"/w/solution.py","kind":{"type":"update"},"diff":""}],"status":"inProgress"}}}"#,
+        r#"{"method":"item/completed","params":{"threadId":"01a1","turnId":"u1","item":{"type":"fileChange","id":"f1","changes":[{"path":"/w/solution.py","kind":{"type":"update"},"diff":""}],"status":"completed"}}}"#,
+        r#"{"method":"item/agentMessage/delta","params":{"threadId":"01a1","turnId":"u1","itemId":"m1","delta":"Done: "}}"#,
+        r#"{"method":"item/agentMessage/delta","params":{"threadId":"02b2","turnId":"u9","itemId":"m9","delta":"a subagent's words"}}"#,
+        r#"{"method":"item/agentMessage/delta","params":{"threadId":"01a1","turnId":"u1","itemId":"m1","delta":"fixed it."}}"#,
+        r#"{"method":"item/completed","params":{"threadId":"01a1","turnId":"u1","item":{"type":"agentMessage","id":"m1","text":"Done: fixed it.","phase":null}}}"#,
+        r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"01a1","turnId":"u1","tokenUsage":{"total":{"totalTokens":39523,"inputTokens":38852,"cachedInputTokens":35456,"cacheWriteInputTokens":0,"outputTokens":671,"reasoningOutputTokens":0},"last":{"totalTokens":39523,"inputTokens":38852,"cachedInputTokens":35456,"cacheWriteInputTokens":0,"outputTokens":671,"reasoningOutputTokens":0}}}}"#,
+        r#"{"method":"turn/completed","params":{"threadId":"01a1","turn":{"id":"u1","items":[],"status":"completed","error":null}}}"#,
     ];
 
     #[test]
     fn codex_turn() {
-        let (p, notes) = run(Style::Codex, CODEX);
+        let mut p = Parser::new(Style::Codex).with_turn(serde_json::json!({"id": 3, "method": "turn/start",
+            "params": {"input": [{"type": "text", "text": "fix it"}]}}));
+        let mut notes = Vec::new();
+        let mut writes = Vec::new();
+        for line in CODEX {
+            notes.extend(p.line(line));
+            writes.extend(p.take_writes());
+        }
         assert_eq!(p.finish(), Ok(()));
         assert_eq!(p.reply(), "Done: fixed it.");
+        // the turn goes in once the thread is known
+        assert_eq!(writes, [r#"{"id":3,"method":"turn/start","params":{"input":[{"type":"text","text":"fix it"}],"threadId":"01a1"}}"#]);
         assert!(notes.contains(&Note::Session("01a1".into())));
         assert!(notes.contains(&Note::Activity { node: None, text: "editing solution.py".into() }));
         assert!(notes.contains(&Note::Touched("/w/solution.py".into())));
+        assert!(notes.contains(&Note::Step("edit solution.py".into())));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 3396, cache_read: 35456, cache_write: 0, output: 671 })));
-        assert!(notes.contains(&Note::Reply("Done: fixed it.".into())));
+        // the reply streams, the subagent's words stay out of it, and the whole reply replaces the pieces
+        let said: Vec<&Note> = notes.iter().filter(|n| matches!(n, Note::Partial(_) | Note::Reply(_))).collect();
+        assert_eq!(said, [&Note::Partial("Done: ".into()), &Note::Partial("fixed it.".into()), &Note::Reply("Done: fixed it.".into())]);
+        assert!(notes.contains(&Note::Log("warning: Ignored unsupported project-local config keys".into())));
         // a command is one line once it ran; its exit code only when it failed
         assert!(notes.contains(&Note::Step("$ /bin/zsh -lc 'ls'".into())));
-        let failed = r#"{"type":"item.completed","item":{"type":"command_execution","command":"make test","exit_code":2,"status":"failed"}}"#;
+        let failed = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"make test","exitCode":2,"status":"failed"}}}"#;
         assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("✗ $ make test · exit 2".into())]);
+        // a request of the server's own is refused at once, so the turn never waits on it
+        let mut p = Parser::new(Style::Codex);
+        p.line(r#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"01a1"}}"#);
+        assert_eq!(p.take_writes(), [r#"{"id":7,"error":{"code":-32601,"message":"Ringo does not serve this request"}}"#]);
     }
 
     #[test]
@@ -643,18 +728,27 @@ mod tests {
 
     #[test]
     fn codex_fails_closed() {
-        let (p, _) = run(Style::Codex, &CODEX[..6]); // no turn.completed
+        let (p, _) = run(Style::Codex, &CODEX[..13]); // no turn/completed
         assert!(p.finish().is_err());
-        let (p, notes) = run(Style::Codex, &[CODEX[0], "not json", CODEX[5], CODEX[6]]);
+        let (p, notes) = run(Style::Codex, &[CODEX[2], "not json", CODEX[11], CODEX[13]]);
         assert!(p.finish().is_err() && notes.iter().any(|n| matches!(n, Note::Fail(_))));
-        let (p, _) = run(Style::Codex, &[CODEX[0], r#"{"type":"turn.failed","error":{"message":"usage limit"}}"#]);
-        assert!(p.finish().unwrap_err().contains("usage limit"));
+        let failed = r#"{"method":"turn/completed","params":{"threadId":"01a1","turn":{"id":"u1","items":[],"status":"failed","error":{"message":"usage limit"}}}}"#;
+        assert!(run(Style::Codex, &[CODEX[2], failed]).0.finish().unwrap_err().contains("usage limit"));
+        let refused = r#"{"id":2,"error":{"code":-32603,"message":"thread/resume failed: no rollout"}}"#;
+        assert!(run(Style::Codex, &[refused]).0.finish().unwrap_err().contains("no rollout"));
+        // a retried stream error is only logged; one that is not retried ends the turn
+        let retry = r#"{"method":"error","params":{"threadId":"01a1","willRetry":true,"error":{"message":"stream disconnected"}}}"#;
+        let (p, notes) = run(Style::Codex, &[CODEX[2], retry, CODEX[11], CODEX[13]]);
+        assert_eq!(p.finish(), Ok(()));
+        assert!(notes.contains(&Note::Log("retrying: stream disconnected".into())));
+        let fatal = retry.replace("true", "false");
+        assert!(run(Style::Codex, &[CODEX[2], &fatal]).0.finish().unwrap_err().contains("stream disconnected"));
     }
 
     #[test]
     fn codex_subagents() {
-        let spawn = r#"{"type":"item.completed","item":{"type":"collab_tool_call","tool":"spawn_agent","prompt":"audit parser","receiver_thread_ids":["t2"],"agents_states":{"t2":{"status":"running"}}}}"#;
-        let end = r#"{"type":"item.completed","item":{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["t2"],"agents_states":{"t2":{"status":"completed"}}}}"#;
+        let spawn = r#"{"method":"item/completed","params":{"item":{"type":"collabAgentToolCall","tool":"spawnAgent","prompt":"audit parser","receiverThreadIds":["t2"],"agentsStates":{"t2":{"status":"running"}}}}}"#;
+        let end = r#"{"method":"item/completed","params":{"item":{"type":"collabAgentToolCall","tool":"wait","receiverThreadIds":["t2"],"agentsStates":{"t2":{"status":"completed"}}}}}"#;
         let (_, notes) = run(Style::Codex, &[spawn, end]);
         assert_eq!(notes.iter().filter(|n| matches!(n, Note::Subagent { .. })).count(), 1);
         assert!(notes.contains(&Note::Subagent { id: "t2".into(), label: "audit parser".into() }));

@@ -13,17 +13,51 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::{Duration, Instant};
 
-const CODEX_OK: &str = r#"#!/bin/sh
+/// A fake `codex app-server`: records its arguments (`.argv`, one a line; `.args`, one line a run), environment,
+/// thread request (`.thread`, one line a run) and turn request (`.turn`), runs `act` (shell, with $thread and $turn
+/// set) and prints `events`. Thread "t-1".
+fn codex_script(act: &str, events: &str) -> String {
+    format!(r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
 echo "$@" >> "$0.args"
 env > "$0.env"
-cat > "$0.stdin"
-case "$*" in *workspace-write*) echo made > made.txt; printf 'y\nx\n\n' > b.txt; printf '\000\001\002binary' > c.bin
-  echo "{\"type\":\"item.started\",\"item\":{\"type\":\"file_change\",\"changes\":[{\"path\":\"$PWD/made.txt\",\"kind\":\"add\"}]}}" ;; esac
-echo '{"type":"thread.started","thread_id":"t-1"}'
-echo '{"type":"item.started","item":{"type":"command_execution","command":"ls"}}'
-echo '{"type":"item.completed","item":{"type":"agent_message","text":"all done"}}'
-echo '{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":2}}'
-"#;
+read -r hello; read -r ready; read -r thread
+printf '%s\n' "$thread" >> "$0.thread"
+echo '{{"id":1,"result":{{}}}}'
+echo '{{"id":2,"result":{{"thread":{{"id":"t-1"}}}}}}'
+read -r turn
+printf '%s\n' "$turn" > "$0.turn"
+{act}
+{events}
+"#)
+}
+
+/// A turn's reply, its usage so far (input, cached, output) and its end.
+fn codex_done(reply: &str, usage: (u64, u64, u64)) -> String {
+    format!(r#"echo '{{"method":"item/started","params":{{"threadId":"t-1","item":{{"type":"commandExecution","command":"ls"}}}}}}'
+echo '{{"method":"item/completed","params":{{"threadId":"t-1","item":{{"type":"agentMessage","text":"{reply}"}}}}}}'
+echo '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"t-1","tokenUsage":{{"total":{{"inputTokens":{},"cachedInputTokens":{},"outputTokens":{}}}}}}}}}'
+echo '{{"method":"turn/completed","params":{{"threadId":"t-1","turn":{{"status":"completed"}}}}}}'"#, usage.0, usage.1, usage.2)
+}
+
+/// Edits when its sandbox lets it.
+const CODEX_EDITS: &str = r#"case "$thread" in *workspace-write*) echo made > made.txt; printf 'y\nx\n\n' > b.txt; printf '\000\001\002binary' > c.bin
+  echo "{\"method\":\"item/started\",\"params\":{\"threadId\":\"t-1\",\"item\":{\"type\":\"fileChange\",\"changes\":[{\"path\":\"$PWD/made.txt\"}]}}}" ;; esac"#;
+
+fn codex_ok() -> String {
+    codex_script(CODEX_EDITS, &codex_done("all done", (10, 4, 2)))
+}
+
+/// What the fake codex was last asked to do, in its turn request.
+fn turn_text(codex: &Path) -> String {
+    let turn: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.turn", codex.display())).unwrap()).unwrap();
+    turn["params"]["input"][0]["text"].as_str().unwrap().to_string()
+}
+
+fn threads(codex: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(format!("{}.thread", codex.display())).unwrap().lines()
+        .map(|l| serde_json::from_str(l).unwrap()).collect()
+}
 
 fn root() -> PathBuf {
     static ONCE: Once = Once::new();
@@ -78,10 +112,9 @@ fn session(repo: &Path, agent: Agent, program: &Path) -> Session {
 fn turns_in_the_folder_continue_one_conversation_one_at_a_time_and_undo() {
     let r = repo("read");
     // A resumed thread reports its usage so far, as the real Codex does.
-    let so_far = r#"case "$*" in *resume*) echo '{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":8,"output_tokens":4}}'; exit ;; esac
-echo '{"type":"turn.completed""#;
-    let codex = fake(&root(), "codex-read", &CODEX_OK.replace("cat >", "sleep 0.3; cat >")
-        .replace(r#"echo '{"type":"turn.completed""#, so_far));
+    let events = format!("case \"$thread\" in *thread/resume*)\n{}\n;; *)\n{}\n;; esac",
+                         codex_done("all done", (20, 8, 4)), codex_done("all done", (10, 4, 2)));
+    let codex = fake(&root(), "codex-read", &codex_script(&format!("sleep 0.3\n{CODEX_EDITS}"), &events));
     let mut s = session(&r, agent("codex"), &codex);
     assert!(!s.dir.starts_with(&r), "state is outside the repository");
     assert_eq!(fs::metadata(&s.dir).unwrap().permissions().mode() & 0o777, 0o700);
@@ -91,14 +124,16 @@ echo '{"type":"turn.completed""#;
     let job = s.job(first).unwrap();
     assert_eq!(job.reply(), "all done");
     assert_eq!(job.tokens.total(), 12);
-    assert_eq!(fs::read_to_string(codex.with_extension("stdin")).unwrap(), "what is a.txt?");
+    assert_eq!(turn_text(&codex), "what is a.txt?");
     let second = s.launch_agent(agent("codex"), false, "and then?").unwrap();
     assert_eq!(wait(&mut s, second), Status::Done);
     assert_eq!(s.job(second).unwrap().tokens.total(), 12, "only what the resumed turn added (24 so far)");
-    let args = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
-    let lines: Vec<&str> = args.lines().collect();
-    assert!(lines[0].contains("-s workspace-write") && lines[0].contains("forced_login_method"), "ask mode edits here");
-    assert!(lines[1].starts_with("exec resume t-1") && lines[1].contains("sandbox_mode=\"workspace-write\""));
+    let (args, sent) = (fs::read_to_string(format!("{}.args", codex.display())).unwrap(), threads(&codex));
+    assert!(args.lines().all(|l| l.starts_with("app-server") && l.contains("forced_login_method")));
+    assert_eq!((sent[0]["method"].as_str(), sent[0]["params"]["sandbox"].as_str()), (Some("thread/start"), Some("workspace-write")),
+               "ask mode edits here");
+    assert_eq!((sent[1]["method"].as_str(), sent[1]["params"]["threadId"].as_str(), sent[1]["params"]["sandbox"].as_str()),
+               (Some("thread/resume"), Some("t-1"), Some("workspace-write")));
     // The first turn's edits landed in the folder and are known; the second wrote the same again, so changed nothing.
     assert_eq!(fs::read_to_string(r.join("made.txt")).unwrap(), "made\n");
     assert_eq!(s.job(first).unwrap().changed, ["b.txt", "c.bin", "made.txt"]);
@@ -119,8 +154,7 @@ echo '{"type":"turn.completed""#;
     s.mode = Mode::Read;
     let looked = s.launch_agent(agent("codex"), false, "just look").unwrap();
     assert_eq!(wait(&mut s, looked), Status::Done);
-    let args = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
-    assert!(args.lines().last().unwrap().contains("sandbox_mode=\"read-only\""));
+    assert_eq!(threads(&codex).last().unwrap()["params"]["sandbox"], "read-only");
     assert!(s.job(looked).unwrap().before.is_none(), "a turn that cannot edit keeps no before");
 }
 
@@ -132,14 +166,8 @@ fn undo_refuses_after_any_later_edit_and_while_a_turn_runs() {
     git(&r, &["add", "."]);
     git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "long"]);
     // An agent that changes the first line, and waits first when asked to.
-    let codex = fake(&root(), "codex-undo", "#!/bin/sh
-cat > \"$0.stdin\"
-        case \"$(cat \"$0.stdin\")\" in *slow*) sleep 1 ;; esac
-        { echo changed; tail -n +2 long.txt; } > t && mv t long.txt
-        echo '{\"type\":\"thread.started\",\"thread_id\":\"t-u\"}'
-        echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"done\"}}'
-        echo '{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'
-");
+    let codex = fake(&root(), "codex-undo", &codex_script("case \"$turn\" in *slow*) sleep 1 ;; esac
+{ echo changed; tail -n +2 long.txt; } > t && mv t long.txt", &codex_done("done", (1, 0, 1))));
     let mut s = session(&r, agent("codex"), &codex);
     let id = s.launch_agent(agent("codex"), false, "change it").unwrap();
     assert_eq!(wait(&mut s, id), Status::Done);
@@ -161,7 +189,7 @@ cat > \"$0.stdin\"
 #[test]
 fn agents_get_no_api_keys_and_cannot_start_ringo() {
     let r = repo("env");
-    let codex = fake(&root(), "codex-env", CODEX_OK);
+    let codex = fake(&root(), "codex-env", &codex_ok());
     let mut s = session(&r, agent("codex"), &codex);
     // SAFETY: only this test's child reads these.
     unsafe {
@@ -186,7 +214,7 @@ fn write_jobs_stay_in_their_worktree_until_applied() {
     fs::write(r.join("b.txt"), "x\n\n").unwrap(); // ends in a blank line: patch context that trimming would break
     git(&r, &["add", "."]);
     git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "b"]);
-    let codex = fake(&root(), "codex-write", CODEX_OK);
+    let codex = fake(&root(), "codex-write", &codex_ok());
     let mut s = session(&r, agent("codex"), &codex);
     let (one, two) = (s.launch_agent(agent("codex"), true, "make it").unwrap(),
                       s.launch_agent(agent("codex"), true, "make it too").unwrap());
@@ -241,7 +269,7 @@ fn kill_stops_the_whole_process_group() {
 #[test]
 fn malformed_output_and_api_key_logins_fail_closed() {
     let r = repo("fail");
-    let garbage = fake(&root(), "codex-garbage", "#!/bin/sh\ncat >/dev/null\necho 'not json'\n");
+    let garbage = fake(&root(), "codex-garbage", "#!/bin/sh\nread -r hello\necho 'not json'\nsleep 5\n");
     let mut s = session(&r, agent("codex"), &garbage);
     let id = s.launch_agent(agent("codex"), false, "x").unwrap();
     assert!(matches!(wait(&mut s, id), Status::Failed(_)));
@@ -404,10 +432,7 @@ fn agent_commands_are_pinned() {
     git(&r, &["add", "."]);
     git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rules"]);
     const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n";
-    let codex = fake(&root(), "codex-golden", &format!("#!/bin/sh\n{RECORD}cat > \"$0.stdin\"\n\
-        echo '{{\"type\":\"thread.started\",\"thread_id\":\"t-1\"}}'\n\
-        echo '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n\
-        echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n"));
+    let codex = fake(&root(), "codex-golden", &codex_script("", &codex_done("done", (1, 0, 1))));
     let claude = fake(&root(), "claude-golden", &format!("#!/bin/sh\n{RECORD}head -n 1 > \"$0.stdin\"\n\
         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\",\"apiKeySource\":\"none\"}}'\n\
         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
@@ -430,23 +455,37 @@ fn agent_commands_are_pinned() {
         (argv, stdin)
     };
     // Codex cannot ask, so the ask tool, its mode text and analytics go; plugins and apps only for a connector task.
-    let tail = ["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"",
-                "-c", "features.default_mode_request_user_input=false", "-c", "include_collaboration_mode_instructions=false",
-                "-c", "analytics.enabled=false", "-c", "features.plugins=false", "-c", "features.apps=false", "-"];
+    // The thread's settings and the task go in as JSON-RPC requests.
+    let argv = ["app-server", "-c", "sandbox_workspace_write.network_access=false", "-c", "forced_login_method=\"chatgpt\"",
+                "-c", "model_provider=\"openai\"", "-c", "features.default_mode_request_user_input=false",
+                "-c", "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false",
+                "-c", "features.plugins=false", "-c", "features.apps=false"].map(String::from).to_vec();
+    let mut codex_turn = |write: bool| -> (Vec<String>, String, String) {
+        let (argv, _) = turn(agent("codex"), write, &codex);
+        let thread = threads(&codex).pop().unwrap().to_string();
+        let ask = fs::read_to_string(format!("{}.turn", codex.display())).unwrap();
+        (argv, thread.replace(&repo, "REPO"), ask.trim_end().to_string())
+    };
+    let ask = r#"{"id":3,"method":"turn/start","params":{"input":[{"type":"text","text":"the task"}],"threadId":"t-1"}}"#;
+    assert_eq!(codex_turn(false), (argv.clone(),
+        r#"{"id":2,"method":"thread/start","params":{"cwd":"REPO","sandbox":"workspace-write","approvalPolicy":"never"}}"#.into(), ask.into()));
+    assert_eq!(codex_turn(false), (argv.clone(),
+        r#"{"id":2,"method":"thread/resume","params":{"cwd":"REPO","sandbox":"workspace-write","approvalPolicy":"never","threadId":"t-1","excludeTurns":true}}"#.into(),
+        ask.into()), "a resumed turn in ask mode says the network is off, whatever an earlier turn had");
+    let (copy_argv, copy_thread, copy_ask) = codex_turn(true);
+    assert_eq!((copy_argv, copy_ask), (argv.clone(), ask.into()));
+    assert!(copy_thread.contains(r#""method":"thread/start""#) && copy_thread.contains(r#""sandbox":"workspace-write""#)
+            && !copy_thread.contains("REPO\""), "a copy starts fresh in its own worktree: {copy_thread}");
+    let hello = fs::read_to_string(format!("{}.args", codex.display())).unwrap();
+    assert!(!hello.contains("exec"), "{hello}");
     let want = |head: &[&str], rest: &[&str]| -> Vec<String> { head.iter().chain(rest).map(|a| a.to_string()).collect() };
-    assert_eq!(turn(agent("codex"), false, &codex),
-               (want(&["exec", "-s", "workspace-write", "-C", "REPO"], &tail), "the task".into()));
-    assert_eq!(turn(agent("codex"), false, &codex),
-               (want(&["exec", "resume", "t-1", "-c", "sandbox_mode=\"workspace-write\"", "-c",
-                       "sandbox_workspace_write.network_access=false"], &tail), "the task".into()),
-               "a resumed turn in ask mode says the network is off, whatever an earlier turn had");
-    assert_eq!(turn(agent("codex"), true, &codex), (want(&["exec", "-s", "workspace-write", "-C", "WT"], &tail), "the task".into()));
     // Ask mode (the default): edits go through, every permission prompt comes to Ringo, the always-ask rules ride
     // along; the prompt is one stream-json message on stdin, which stays open for the answers.
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                 "--include-partial-messages", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
-    let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK}}).to_string();
+    let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK},
+                                   "attribution": {"commit": "", "pr": ""}}).to_string();
     let deny = |extra: &[&'static str]| -> Vec<&'static str> {
         ["--disallowed-tools"].into_iter().chain(extra.iter().copied()).chain(ringo_cli::OUT_OF_TURN_TOOLS)
             .chain(["AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]).collect()
@@ -630,10 +669,7 @@ fn modes_change_what_each_agent_may_do() {
     let claude = fake(&root(), "claude-modes", &format!("#!/bin/sh\n{RECORD}head -n 1 >/dev/null\n\
         echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-m\",\"apiKeySource\":\"none\"}}'\n\
         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
-    let codex = fake(&root(), "codex-modes", &format!("#!/bin/sh\n{RECORD}cat >/dev/null\n\
-        echo '{{\"type\":\"thread.started\",\"thread_id\":\"t-m\"}}'\n\
-        echo '{{\"type\":\"item.completed\",\"item\":{{\"type\":\"agent_message\",\"text\":\"done\"}}}}'\n\
-        echo '{{\"type\":\"turn.completed\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}'\n"));
+    let codex = fake(&root(), "codex-modes", &codex_script("", &codex_done("done", (1, 0, 1))));
     let mut s = session(&r, agent("claude"), &claude);
     s.programs.insert(agent("codex"), codex.clone());
     let read = |p: &Path, ext: &str| fs::read_to_string(format!("{}.{ext}", p.display())).unwrap();
@@ -655,8 +691,11 @@ fn modes_change_what_each_agent_may_do() {
              denied, and the always-ask rules ride along: {argv}");
     turn(&mut s, "codex", true, "fix the retry loop");
     let argv = read(&codex, "argv");
-    assert!(has(&argv, &["exec", "--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]), "{argv}");
-    assert!(!argv.lines().any(|a| a == "-s"), "--approve-for-me picks the sandbox itself: {argv}");
+    assert!(has(&argv, &["app-server", "-c", "sandbox_workspace_write.network_access=true"]), "{argv}");
+    let thread = threads(&codex).pop().unwrap();
+    assert_eq!((thread["params"]["sandbox"].as_str(), thread["params"]["approvalPolicy"].as_str(),
+                thread["params"]["approvalsReviewer"].as_str()), (Some("workspace-write"), Some("on-request"), Some("auto_review")),
+               "auto: Codex's own reviewer answers its approval requests, as --approve-for-me did");
     assert!(argv.contains("features.plugins=false"), "no connector named: no plugins: {argv}");
     turn(&mut s, "codex", true, "summarise my unread Gmail");
     let argv = read(&codex, "argv");
