@@ -275,6 +275,24 @@ fn input_rows(input: &[char], cursor: usize, width: usize) -> (Vec<String>, (usi
     (rows, at)
 }
 
+/// Where the word before `at` starts (Ctrl-W, Alt-B), and where the one after it ends (Alt-D, Alt-F): words are runs
+/// of anything but white space, as in a shell.
+fn word_start(input: &[char], at: usize) -> usize {
+    let blank = input[..at].iter().rposition(|c| !c.is_whitespace()).map_or(0, |i| i + 1);
+    input[..blank].iter().rposition(|c| c.is_whitespace()).map_or(0, |i| i + 1)
+}
+
+fn word_end(input: &[char], at: usize) -> usize {
+    let word = input[at..].iter().position(|c| !c.is_whitespace()).map_or(input.len(), |i| at + i);
+    input[word..].iter().position(|c| c.is_whitespace()).map_or(input.len(), |i| word + i)
+}
+
+/// The start and end of the line the cursor is on, in a message of several lines.
+fn line_bounds(input: &[char], at: usize) -> (usize, usize) {
+    (input[..at].iter().rposition(|c| *c == '\n').map_or(0, |i| i + 1),
+     input[at..].iter().position(|c| *c == '\n').map_or(input.len(), |i| at + i))
+}
+
 /// Where Up or Down moves the cursor in a message of several lines, keeping its column; None on the first line (for
 /// Up) or the last (for Down), where the key goes through earlier messages instead.
 fn vertical(input: &[char], cursor: usize, up: bool) -> Option<usize> {
@@ -765,6 +783,8 @@ enum Out {
     Line(Line<'static>, usize),
     /// An agent's reply, as markdown, two columns in.
     Reply(String),
+    /// A step an agent took, on one row under its job: its bullet's style and the text.
+    Step(Style, String),
 }
 
 impl Out {
@@ -777,6 +797,8 @@ impl Out {
                     line
                 })
                 .collect(),
+            Out::Step(bullet, text) => vec![Line::from(vec![Span::styled("  • ", *bullet),
+                                                            Span::styled(one_row(text, width.saturating_sub(4)), theme.dim)])],
         }
     }
 
@@ -787,6 +809,29 @@ impl Out {
 
     fn blank(&self) -> bool {
         matches!(self, Out::Line(line, _) if line.width() == 0)
+    }
+}
+
+/// A step as one row of at most `width` columns: a long one loses the end of what it did (a search pattern, a
+/// command) to "…", and keeps what came of it (after the last " · "); the whole step is in the job's log.
+fn one_row(text: &str, width: usize) -> String {
+    if cols(text) <= width {
+        return text.to_string();
+    }
+    let cut = |t: &str, room: usize| {
+        let (mut out, mut used) = (String::new(), 0);
+        for c in t.chars() {
+            used += c.width().unwrap_or(0);
+            if used + 1 > room {
+                break;
+            }
+            out.push(c);
+        }
+        format!("{}…", out.trim_end())
+    };
+    match text.rsplit_once(" · ") {
+        Some((what, came)) if cols(came) + 3 <= width / 2 => format!("{} · {came}", cut(what, width - cols(came) - 3)),
+        _ => cut(text, width),
     }
 }
 
@@ -978,9 +1023,7 @@ impl App {
                 match said {
                     Said::Reply(text) => self.reply(&text),
                     Said::Step(text) => {
-                        let text = clean(&text);
-                        self.out.push(Out::Line(Line::from(vec![Span::styled("  • ", style),
-                                                                Span::styled(text, self.theme.dim)]), 4));
+                        self.out.push(Out::Step(style, clean(&text)));
                     }
                     Said::Line(text) => {
                         for line in clean(&text).lines() {
@@ -1010,8 +1053,10 @@ impl App {
         };
         let (who, who_style) = self.who(job);
         let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
-        let mut tail = format!(" {what} · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens.total()));
-        if job.worktree.is_some() && job.status == Status::Done {
+        let mut tail = format!(" {what} · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
+        if job.unchanged {
+            tail += &format!(" · no change; /drop {} removes its worktree", job.id);
+        } else if job.worktree.is_some() && job.status == Status::Done {
             tail += &format!(" · change ready: /diff {0}, /apply {0}", job.id);
         }
         let mut lines = vec![Line::from(vec![Span::styled(format!("{mark} "), style), Span::styled(format!("#{} ", job.id), t.dim),
@@ -1264,6 +1309,13 @@ impl App {
     }
 
     /// The word before the cursor becomes a menu entry.
+    /// Ctrl-W, Alt-Backspace: the word before the cursor goes, with the spaces after it.
+    fn cut_word_back(&mut self) {
+        let start = word_start(&self.input, self.cursor);
+        self.input.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
     fn complete(&mut self, with: &str) {
         let start = self.input[..self.cursor].iter().rposition(|c| matches!(c, ' ' | '\n')).map_or(0, |i| i + 1);
         let chars: Vec<char> = with.chars().collect();
@@ -1353,12 +1405,30 @@ impl App {
                     self.quit = true;
                 }
             }
+            // the line-editing keys of a shell: to the line's start or end, a word back or on, and cutting either way
             KeyCode::Char('u') if ctrl => {
-                self.input.clear();
-                self.cursor = 0;
+                let start = line_bounds(&self.input, self.cursor).0;
+                self.input.drain(start..self.cursor);
+                self.cursor = start;
             }
-            KeyCode::Char('a') if ctrl => self.cursor = 0,
-            KeyCode::Char('e') if ctrl => self.cursor = self.input.len(),
+            KeyCode::Char('k') if ctrl => {
+                let end = line_bounds(&self.input, self.cursor).1;
+                self.input.drain(self.cursor..end);
+            }
+            KeyCode::Char('w') if ctrl => self.cut_word_back(),
+            KeyCode::Backspace if alt || ctrl => self.cut_word_back(),
+            KeyCode::Char('d') if alt => {
+                let end = word_end(&self.input, self.cursor);
+                self.input.drain(self.cursor..end);
+            }
+            KeyCode::Char('a') if ctrl => self.cursor = line_bounds(&self.input, self.cursor).0,
+            KeyCode::Char('e') if ctrl => self.cursor = line_bounds(&self.input, self.cursor).1,
+            KeyCode::Home => self.cursor = line_bounds(&self.input, self.cursor).0,
+            KeyCode::End => self.cursor = line_bounds(&self.input, self.cursor).1,
+            KeyCode::Char('b') if alt => self.cursor = word_start(&self.input, self.cursor),
+            KeyCode::Char('f') if alt => self.cursor = word_end(&self.input, self.cursor),
+            KeyCode::Left if alt || ctrl => self.cursor = word_start(&self.input, self.cursor),
+            KeyCode::Right if alt || ctrl => self.cursor = word_end(&self.input, self.cursor),
             KeyCode::Char('j') if ctrl => self.insert("\n"),
             KeyCode::Char(c) if !ctrl => self.insert(c.encode_utf8(&mut [0; 4])),
             KeyCode::Enter if alt || shift => self.insert("\n"),
@@ -1376,8 +1446,6 @@ impl App {
             }
             KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
-            KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Up => match vertical(&self.input, self.cursor, true) {
                 Some(at) => self.cursor = at,
                 None if self.hist > 0 => {
@@ -1424,7 +1492,7 @@ impl App {
             let head = format!(" {} ", self.spinner());
             let id = format!("#{} ", job.id);
             let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
-            let tokens = match job.tokens.total() { 0 => String::new(), n => format!(" · {} tokens", fmt_tokens(n)) };
+            let tokens = match job.tokens_so_far() { 0 => String::new(), n => format!(" · {} tokens", fmt_tokens(n)) };
             let stats = format!(" · {}{tokens}{calls} · ", fmt_age(job.age()));
             let room = width.saturating_sub(head.chars().count() + id.len() + who.chars().count() + stats.chars().count());
             let overlaps: Vec<String> = self.s.overlaps(job.id).into_iter()
@@ -1842,6 +1910,29 @@ mod tests {
         assert_eq!(md("> aaa bbb ccc", 8), ["│ aaa", "│ bbb", "│ ccc"], "a quote's wrapped rows keep its bar");
         assert_eq!(md("1. a\n2. b\n   - c", 20), ["1. a", "2. b", "   • c"]);
         assert_eq!(md("see [the docs](https://x.dev) and [a.rs](src/a.rs)", 60), ["see the docs (https://x.dev) and a.rs"]);
+    }
+
+    #[test]
+    fn the_line_editing_keys_find_words_and_lines() {
+        let text: Vec<char> = "fix  the bug\nin parse.rs".chars().collect();
+        assert_eq!(word_start(&text, 12), 9, "back over the word the cursor ends");
+        assert_eq!(word_start(&text, 5), 0, "spaces before the cursor go with the word before them");
+        assert_eq!(word_start(&text, 0), 0);
+        assert_eq!(word_end(&text, 3), 8, "on over spaces, then the word");
+        assert_eq!(word_end(&text, 20), text.len());
+        assert_eq!(line_bounds(&text, 4), (0, 12));
+        assert_eq!(line_bounds(&text, 15), (13, text.len()));
+        assert_eq!(line_bounds(&text, 12), (0, 12), "at the line's end, before its newline");
+    }
+
+    #[test]
+    fn a_step_stays_on_one_row_and_keeps_what_came_of_it() {
+        assert_eq!(one_row("Read a.rs · 2 lines", 40), "Read a.rs · 2 lines");
+        assert_eq!(one_row("Grep langgraph|deepagents|langchain in exovra-platform · 2 lines", 30),
+                   "Grep langgraph|deep… · 2 lines", "exactly 30 columns");
+        assert_eq!(one_row("$ cargo test --workspace --all-features", 20), "$ cargo test --work…");
+        let long_result = format!("$ make · {}", "x".repeat(30));
+        assert_eq!(cols(&one_row(&long_result, 20)), 20, "a result too long to keep whole is cut with the rest");
     }
 
     #[test]

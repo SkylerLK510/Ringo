@@ -119,9 +119,12 @@ Ask anything, or @claude / @codex for an agent turn. /usrman shows the manual.
 ```
 
 The conversation prints into the terminal's own scrollback, as Claude Code's and Codex's do: your lines, every
-reply, and what each agent does under its job number: one `•` line per tool call or command once it has run, with
-what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit code),
-then one line when a job ends with its time, tokens and Ringo model calls. Replies render their markdown: headings,
+reply, and what each agent does under its job number: one `•` row per tool call or command once it has run, with
+what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit code;
+a step too long for the row loses the end of its pattern or command to `…`, and `/show N` has it whole), then one
+line when a job ends with its time, tokens and Ringo model calls. A write job that changed nothing says `no change`
+instead of `change ready`; its worktree stays until `/drop N`, as a file git ignores that the agent wrote is not in
+the diff. Replies render their markdown: headings,
 emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned columns (a long last column wraps under itself), or,
 when even that does not fit, as one block per row with each cell under its column's name. Scroll it with the mouse wheel and select from it as in any
 other program; the shell never captures the mouse. Below it, a live area holds one row per running job and
@@ -161,10 +164,16 @@ Typing `/` at the start of a line, or `@` at the start of a word, opens a menu u
 agents that match: Up and Down choose, Tab or Enter completes (Enter sends a command that takes nothing more). Up
 and Down otherwise move between the lines of a message, then through earlier messages, which are kept between
 sessions (the last 1,000, in `shell-history.jsonl` in Ringo's private state); Shift-Tab changes the mode, Esc clears
-the input, and Ctrl-C twice quits, stopping running jobs.
+the input, and Ctrl-C twice quits, stopping running jobs. The line-editing keys are a shell's: Ctrl-A and Ctrl-E
+(or Home and End) go to the start or end of the line, Ctrl-U and Ctrl-K cut to either, Alt-Left and Alt-Right (or
+Alt-B and Alt-F, Ctrl-Left and Ctrl-Right) move a word, and Ctrl-W or Alt-Backspace cuts the word before the cursor
+(Alt-D the one after).
 
 The live area shows each running job's time, tokens, Ringo model calls and what it is doing now, with one row per
-subagent: Claude Code's Task subagents and Codex's spawned agents. When two unapplied write jobs edit the same
+subagent: Claude Code's Task subagents and Codex's spawned agents. A Claude turn's tokens count up as its messages
+report them, so a turn that searches far shows it while it runs; on a real 452.9k-token turn the running count reached
+93% of the turn's own total, which replaces it at the end (a message's output is counted before it is written).
+Codex reports its tokens only when a turn ends. When two unapplied write jobs edit the same
 file, the running job's row and the line it ends with say so (`⚠ same files as #2 client.rs`) before you apply
 either. That check costs no tokens: it
 compares the agents' own edit events as they arrive.

@@ -358,7 +358,9 @@ fn agent_commands_are_pinned() {
     let mut turn = |agent: Agent, write: bool, program: &Path| -> (Vec<String>, String) {
         let id = s.launch_agent(agent, write, "the task").unwrap();
         assert_eq!(wait(&mut s, id), Status::Done);
-        let wt = s.job(id).unwrap().worktree.clone().map(|w| w.to_string_lossy().into_owned());
+        let job = s.job(id).unwrap();
+        assert_eq!(job.unchanged, write, "the fakes change nothing");
+        let wt = job.worktree.clone().map(|w| w.to_string_lossy().into_owned());
         let argv = fs::read_to_string(format!("{}.argv", program.display())).unwrap_or_default();
         let stdin = fs::read_to_string(format!("{}.stdin", program.display())).unwrap_or_default();
         let _ = fs::remove_file(format!("{}.stdin", program.display()));
@@ -464,7 +466,10 @@ fn an_agent_the_owner_adds() {
     assert!(s.launch_agent(added, false, "x").unwrap_err().contains("no verified read-only mode"));
     let id = s.launch_agent(added, true, "fix {cwd} please").unwrap();
     assert_eq!(wait(&mut s, id), Status::Done);
-    let wt = s.job(id).unwrap().worktree.clone().unwrap();
+    let job = s.job(id).unwrap();
+    assert!(job.unchanged, "a write job that changed nothing says so");
+    let wt = job.worktree.clone().expect("and keeps its worktree, for /drop: an ignored file is not in the diff");
+    assert_eq!(s.diff(id), Ok(String::new()));
     let argv = fs::read_to_string(format!("{}.argv", tool.display())).unwrap();
     assert_eq!(argv.lines().collect::<Vec<_>>(), ["run", "--in", &*wt.to_string_lossy()]);
     assert_eq!(fs::read_to_string(format!("{}.stdin", tool.display())).unwrap(), "fix {cwd} please");
@@ -684,4 +689,24 @@ fn quitting_waits_only_until_the_jobs_are_gone() {
     let started = Instant::now();
     s.shutdown();
     assert!(started.elapsed() < Duration::from_secs(2), "{:?}: TERM ends the fake at once", started.elapsed());
+}
+
+/// A Claude turn's tokens count up from its messages' usage; the turn's own count replaces them at the end, and a
+/// result without one (an error result has none) keeps them.
+#[test]
+fn a_claude_turn_keeps_its_running_count_until_its_own() {
+    let r = repo("live-tokens");
+    let init = r#"{"type":"system","subtype":"init","session_id":"s-live","apiKeySource":"none"}"#;
+    let message = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}],"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":90,"output_tokens":5}},"parent_tool_use_id":null}"#;
+    let without = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"result":"stopped"}"#;
+    let with = r#"{"type":"result","subtype":"success","is_error":false,"result":"hi","usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":90,"output_tokens":7}}"#;
+    for (n, (result, want)) in [(without, 105), (with, 117)].into_iter().enumerate() {
+        let claude = fake(&root(), &format!("claude-live-{n}"),
+                          &format!("#!/bin/sh\nhead -n 1 > /dev/null\necho '{init}'\necho '{message}'\necho '{result}'\n"));
+        let mut s = session(&r, agent("claude"), &claude);
+        let id = s.launch_agent(agent("claude"), false, "x").unwrap();
+        wait(&mut s, id);
+        assert_eq!(s.job(id).unwrap().tokens_so_far(), want, "{result}");
+        assert_eq!(s.tokens(), want);
+    }
 }

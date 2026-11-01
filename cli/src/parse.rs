@@ -59,6 +59,9 @@ pub enum Note {
     Subagent { id: String, label: String },
     SubagentEnd { id: String, ok: bool },
     Tokens(Tokens),
+    /// What a running turn has used so far, as its messages report it (Claude): shown until the turn's own count
+    /// (`Tokens`) arrives, and kept if it never does (a stopped turn).
+    Live(Tokens),
     /// One model call finished (Ringo pipelines report these).
     Call,
     /// The agent is editing this file (as the agent reported it, usually an absolute path).
@@ -94,6 +97,10 @@ pub struct Parser {
     /// Claude's tool calls waiting for their result (tool_use id, tool, how the call reads): each is shown once,
     /// with what came of it.
     calls: Vec<(String, String, String)>,
+    /// Claude's usage per API message so far (message id, usage): one message comes as several events, each with its
+    /// usage, so each id counts once. The sum is 93% of the turn's own count on a real 452.9k-token turn (a message's
+    /// output tokens are reported before it is written).
+    seen: Vec<(String, Tokens)>,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -129,7 +136,11 @@ fn outcome(tool: &str, result: &Value, ok: bool) -> String {
     let lines = |what: &str| format!(" · {n} {what}{}", if n == 1 { "" } else { "s" });
     match tool {
         _ if !ok => format!(" · {}", short(&text, 120)),
-        "Grep" | "Glob" if first.starts_with("Found ") || first.starts_with("No ") => format!(" · {}", short(first, 60)),
+        "Grep" | "Glob" if first.starts_with("Found ") || first.starts_with("No ") => match first.split_once(" limit: ") {
+            // "Found 50 files limit: 50, offset: 0": the search stopped at its limit
+            Some((found, limit)) => format!(" · {found} (limit {})", limit.split(',').next().unwrap_or(limit)),
+            None => format!(" · {}", short(first, 60)),
+        },
         "Grep" => lines("line"),
         "Glob" => lines("file"),
         "Read" => lines("line"),
@@ -143,7 +154,8 @@ fn base_name(path: &str) -> &str {
 
 impl Parser {
     pub fn new(style: Style) -> Parser {
-        Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new() }
+        Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
+                 seen: Vec::new() }
     }
 
     /// The final reply text so far.
@@ -285,6 +297,18 @@ impl Parser {
                 notes.push(Note::Session(s(e, "session_id").to_string()));
             }
             ("assistant", _) => {
+                if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
+                    let t = Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
+                                     cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") };
+                    match self.seen.iter_mut().find(|(seen, _)| seen == id) {
+                        Some((_, before)) if t.total() > before.total() => *before = t,
+                        Some(_) => {}
+                        None => self.seen.push((id.to_string(), t)),
+                    }
+                    let mut so_far = Tokens::default();
+                    self.seen.iter().for_each(|(_, t)| so_far.add(*t));
+                    notes.push(Note::Live(so_far));
+                }
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     match s(block, "type") {
                         "text" if parent.is_none() => notes.push(Note::Reply(s(block, "text").to_string())),
@@ -563,6 +587,23 @@ mod tests {
             Note::Step("$ cargo test · Permission to use Bash has been denied.".into()),
             Note::Step("Edit a.rs".into()), // no result before the turn ended
         ]);
+        let limited = [call("l", "Grep", r#"{"pattern":"x"}"#),
+                       result("l", r#""Found 50 files limit: 50, offset: 0\na.rs""#, false)];
+        let limited: Vec<&str> = limited.iter().map(String::as_str).collect();
+        let steps: Vec<Note> = run(Style::Claude, &limited).1.into_iter().filter(|n| matches!(n, Note::Step(_))).collect();
+        assert_eq!(steps, [Note::Step("Grep x · Found 50 files (limit 50)".into())]);
+    }
+
+    #[test]
+    fn a_claude_turn_counts_its_tokens_as_it_goes() {
+        // One API message arrives as one event per content block, each carrying the message's usage: it counts once.
+        let event = |id: &str, out: u64| format!(
+            r#"{{"type":"assistant","message":{{"id":"{id}","content":[],"usage":{{"input_tokens":2,"cache_creation_input_tokens":100,"cache_read_input_tokens":1000,"output_tokens":{out}}}}},"parent_tool_use_id":null}}"#);
+        let lines = [event("m1", 5), event("m1", 5), event("m2", 3), event("m2", 9)];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let live: Vec<u64> = run(Style::Claude, &lines).1.into_iter()
+            .filter_map(|n| if let Note::Live(t) = n { Some(t.total()) } else { None }).collect();
+        assert_eq!(live, [1107, 1107, 2212, 2218]);
     }
 
     #[test]
