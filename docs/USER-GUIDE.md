@@ -38,8 +38,9 @@ The agent reads the repository but cannot change it. Later `@claude` lines conti
 1. Add `!` to the name: `@claude! add a retry to the HTTP client`.
 2. The agent works in its own copy of the repository, a git worktree made from your last commit. Your uncommitted
    changes are not in it, and nothing touches your files yet.
-3. Each step it takes prints as a `•` line. When it finishes you see
-   `✓ #1 claude! done · … · change ready: /diff 1, /apply 1`.
+3. Each step it takes prints as a `•` line, with what came of it. When it finishes you see
+   `✓ #1 claude! done · … · change ready: /diff 1, /apply 1`. If it changed nothing, the line ends `no change`
+   instead and its worktree is removed.
 4. Read the change with `/diff 1`. For a second opinion, `/review #1`.
 5. Commit or stash your own changes, then `/apply 1`. The change lands in your tree, uncommitted, for you to check
    and commit.
@@ -106,7 +107,7 @@ These run the models as workers, with executable checks and one review:
 | `/kill N` | stop job N and everything it started |
 
 While jobs run, the area above the input shows one row for each, and for each of its subagents, with its time,
-tokens and what it is doing now.
+the tokens it has used so far and what it is doing now. A turn that runs away shows it there: `/kill` it.
 
 ## Keys
 
@@ -116,6 +117,8 @@ tokens and what it is doing now.
 | Shift-Enter, Ctrl-J | new line (so do Alt-Enter, and `\` then Enter); the input box says which works here |
 | `/` or `@` | a menu of commands or agents: Up and Down choose, Tab or Enter completes |
 | Up, Down | move between lines, then through earlier messages, kept between sessions |
+| Ctrl-A, Ctrl-E | the start or end of the line; Ctrl-U and Ctrl-K cut to either |
+| Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W or Alt-Backspace cuts the word before |
 | Shift-Tab | change the mode |
 | Esc | clear the input |
 | Ctrl-C twice | quit, stopping running jobs |

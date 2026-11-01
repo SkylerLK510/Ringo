@@ -358,7 +358,10 @@ fn agent_commands_are_pinned() {
     let mut turn = |agent: Agent, write: bool, program: &Path| -> (Vec<String>, String) {
         let id = s.launch_agent(agent, write, "the task").unwrap();
         assert_eq!(wait(&mut s, id), Status::Done);
-        let wt = s.job(id).unwrap().worktree.clone().map(|w| w.to_string_lossy().into_owned());
+        // a write turn that changed nothing has its worktree removed when it ends; it was the job's own wt folder
+        let job = s.job(id).unwrap();
+        assert_eq!(job.unchanged, write, "the fakes change nothing");
+        let wt = write.then(|| job.dir.join("wt").to_string_lossy().into_owned());
         let argv = fs::read_to_string(format!("{}.argv", program.display())).unwrap_or_default();
         let stdin = fs::read_to_string(format!("{}.stdin", program.display())).unwrap_or_default();
         let _ = fs::remove_file(format!("{}.stdin", program.display()));
@@ -464,7 +467,10 @@ fn an_agent_the_owner_adds() {
     assert!(s.launch_agent(added, false, "x").unwrap_err().contains("no verified read-only mode"));
     let id = s.launch_agent(added, true, "fix {cwd} please").unwrap();
     assert_eq!(wait(&mut s, id), Status::Done);
-    let wt = s.job(id).unwrap().worktree.clone().unwrap();
+    let job = s.job(id).unwrap();
+    assert!(job.unchanged && job.worktree.is_none(), "a write job that changed nothing loses its worktree");
+    assert_eq!(s.diff(id), Ok(String::new()), "and /diff says it changed nothing");
+    let wt = s.job(id).unwrap().dir.join("wt");
     let argv = fs::read_to_string(format!("{}.argv", tool.display())).unwrap();
     assert_eq!(argv.lines().collect::<Vec<_>>(), ["run", "--in", &*wt.to_string_lossy()]);
     assert_eq!(fs::read_to_string(format!("{}.stdin", tool.display())).unwrap(), "fix {cwd} please");

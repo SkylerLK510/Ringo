@@ -278,6 +278,8 @@ pub struct Job {
     pub elapsed: Option<Duration>,
     pub activity: String,
     pub tokens: Tokens,
+    /// What the running turn has used so far by its own messages' counts, until its final count is in `tokens`.
+    pub live: Tokens,
     pub calls: u32,
     pub subs: Vec<Sub>,
     pub log: VecDeque<String>,
@@ -288,6 +290,8 @@ pub struct Job {
     pub worktree: Option<PathBuf>,
     pub base: Option<String>,
     pub applied: bool,
+    /// A write job that finished without changing anything: its worktree was removed.
+    pub unchanged: bool,
     /// Files the job edited, relative to its working folder.
     pub touched: BTreeSet<String>,
     /// What the agent waits for the owner to allow, oldest first.
@@ -299,6 +303,11 @@ pub struct Job {
 }
 
 impl Job {
+    /// Tokens used so far: the final counts, plus what a running (or stopped) turn's messages reported.
+    pub fn tokens_so_far(&self) -> u64 {
+        self.tokens.total() + self.live.total()
+    }
+
     pub fn running(&self) -> bool {
         self.status == Status::Running
     }
@@ -544,7 +553,7 @@ impl Session {
     }
 
     pub fn tokens(&self) -> u64 {
-        self.jobs.iter().map(|j| j.tokens.total()).sum()
+        self.jobs.iter().map(Job::tokens_so_far).sum()
     }
 
     pub fn job(&self, id: usize) -> Result<&Job, String> {
@@ -577,8 +586,8 @@ impl Session {
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
-                             elapsed: None, activity: "starting".into(), tokens: Tokens::default(), calls: 0,
-                             subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false,
+                             elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
+                             subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), asks: VecDeque::new(), input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)) });
         Ok(id)
@@ -1013,6 +1022,11 @@ impl Session {
             sub.ended = Some(false);
             sub.activity = "stopped with its parent".into();
         }
+        // A write job that changed nothing leaves nothing to see or apply: its worktree goes, its log stays.
+        if job.status == Status::Done && job.worktree.is_some() && self.diff(id).is_ok_and(|p| p.is_empty())
+            && self.drop_worktree(id).is_ok() {
+            self.jobs[id - 1].unchanged = true;
+        }
     }
 
     /// Folds pending events into the jobs; true when anything changed.
@@ -1105,8 +1119,10 @@ impl Session {
                                 }
                                 _ => t,
                             };
-                            job.tokens.add(t)
+                            job.tokens.add(t);
+                            job.live = Tokens::default(); // the turn's own count replaces what its messages said
                         }
+                        Note::Live(t) => job.live = t,
                         Note::Call => job.calls += 1,
                         Note::Touched(path) => {
                             let cwd = job.worktree.clone().unwrap_or_else(|| self.repo.clone());
@@ -1217,6 +1233,9 @@ impl Session {
     /// folder).
     pub fn diff(&self, id: usize) -> Result<String, String> {
         let job = self.job(id)?;
+        if job.unchanged {
+            return Ok(String::new());
+        }
         let (Some(wt), Some(base)) = (&job.worktree, &job.base) else {
             return Err(format!("#{id} is not a write job with a worktree"));
         };
