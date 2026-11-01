@@ -308,6 +308,7 @@ mod tests {
             fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
         };
         let probes = || fs::read_to_string(&calls).map(|t| t.lines().count()).unwrap_or(0);
+        fs::create_dir_all(ringo_cli::state_root()).unwrap(); // the probe's output goes there, as the shell has made it
         let mut memo = load(&dir.join("none.json"));
         write("0.165.0");
         assert_eq!(version_of(&mut memo, "codex", &bin).as_deref(), Some("0.165.0"));
