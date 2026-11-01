@@ -933,8 +933,8 @@ struct App {
     /// How the last job ended (true: done) and when, for the cat; and the cat's look last drawn.
     ended_at: Option<(bool, Instant)>,
     drawn_look: (&'static str, usize),
-    /// Each job's reply being written, by its place in `out`.
-    streams: std::collections::HashMap<usize, usize>,
+    /// Each job's reply being written: its place in `out`, and its pieces as they came.
+    streams: std::collections::HashMap<usize, (usize, String)>,
     /// The agent plain lines go to, and lines waiting for the turn running in this folder: (agent, task, as typed).
     main: Agent,
     queue: VecDeque<(Agent, String, String)>,
@@ -1132,21 +1132,21 @@ impl App {
                 match said {
                     // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
                     // ceiling: the growing reply is fitted again (its markdown parsed) for each frame it grows in.
-                    Said::Partial(text) => match self.streams.get(&id).copied() {
-                        Some(at) if at < self.out.len() => {
-                            if let Out::Reply(open) = &mut self.out[at] {
-                                open.push_str(&clean(&text));
-                            }
-                            self.fitted.truncate(at);
+                    // The raw pieces are kept and cleaned whole, so a line end split across two pieces stays one.
+                    Said::Partial(text) => match self.streams.get_mut(&id) {
+                        Some((at, raw)) if *at < self.out.len() => {
+                            raw.push_str(&text);
+                            self.out[*at] = Out::Reply(clean(raw));
+                            self.fitted.truncate(*at);
                         }
                         _ => {
                             self.gap();
                             self.out.push(Out::Reply(clean(&text)));
-                            self.streams.insert(id, self.out.len() - 1);
+                            self.streams.insert(id, (self.out.len() - 1, text));
                         }
                     },
                     Said::Reply(text) => match self.streams.remove(&id) {
-                        Some(at) if at < self.out.len() => {
+                        Some((at, _)) if at < self.out.len() => {
                             self.out[at] = Out::Reply(clean(&text));
                             self.fitted.truncate(at);
                             self.gap();
@@ -1789,7 +1789,7 @@ impl App {
             let extra = self.out.len() - KEEP;
             self.out.drain(..extra);
             self.fitted.drain(..extra.min(self.fitted.len()));
-            self.streams.retain(|_, at| at.checked_sub(extra).map(|n| *at = n).is_some());
+            self.streams.retain(|_, (at, _)| at.checked_sub(extra).map(|n| *at = n).is_some());
         }
         let same = width == self.fitted_w;
         if !same {
@@ -2513,6 +2513,9 @@ mod tests {
         a.s.jobs[0].fresh = vec![Said::Partial(", wor".into())];
         a.feed();
         assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"), "and it shows as it grows");
+        a.s.jobs[0].fresh = vec![Said::Partial("ld\r".into()), Said::Partial("\nmore".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world\nmore"], "a line end split across pieces stays one");
         a.s.jobs[0].fresh = vec![Said::Reply("Hello, world.".into()), Said::Step("Read a.rs · 2 lines".into()),
                                  Said::Partial("Next".into())];
         a.feed();
