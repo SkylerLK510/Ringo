@@ -171,9 +171,15 @@ impl Theme {
 
     /// RINGO_THEME, else the saved choice, else `siamese`; an unknown name falls back to `siamese`.
     pub fn load() -> Theme {
+        Theme::load_from(&settings_all())
+    }
+
+    /// `load`, with the saved settings already read.
+    pub fn load_from(saved: &serde_json::Value) -> Theme {
         let var = |k: &str| std::env::var(k).ok();
         let depth = depth(var);
-        let chosen = std::env::var("RINGO_THEME").ok().or_else(saved).unwrap_or_else(|| "siamese".into());
+        let saved = saved.get("theme").and_then(|v| v.as_str()).map(str::to_string);
+        let chosen = std::env::var("RINGO_THEME").ok().or(saved).unwrap_or_else(|| "siamese".into());
         Theme::named(&chosen, depth).unwrap_or_else(|| Theme::named("siamese", depth).unwrap())
     }
 
@@ -198,11 +204,9 @@ fn settings() -> std::path::PathBuf {
     ringo_cli::state_root().join("shell-settings.json")
 }
 
-/// A remembered shell setting (shell-settings.json in Ringo's state folder).
-pub fn setting(key: &str) -> Option<serde_json::Value> {
-    let text = std::fs::read_to_string(settings()).ok()?;
-    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    value.get(key).cloned()
+/// Every remembered shell setting (shell-settings.json in Ringo's state folder), or none.
+pub fn settings_all() -> serde_json::Value {
+    std::fs::read_to_string(settings()).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default()
 }
 
 /// Remembers a shell setting for the next start, keeping the others.
@@ -214,10 +218,6 @@ pub fn set_setting(key: &str, value: serde_json::Value) -> Result<(), String> {
     all[key] = value;
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&path, format!("{all}\n")).map_err(|e| e.to_string())
-}
-
-fn saved() -> Option<String> {
-    setting("theme")?.as_str().map(str::to_string)
 }
 
 /// Remembers the theme for the next start.

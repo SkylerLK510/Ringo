@@ -113,7 +113,7 @@ too, each agent keeping its own conversation. Codex owns the abstract work: Ring
 ✓ #1 claude done · 0:41 · 34.8k tokens · changed client.rs (/undo takes it back)
 
 ╭──────────────────────────────────────────────────────────────────────────╮
-│ › tell claude what you want, in your own words · / commands · ? keys     │
+│ › Tell Ringo what you want to do · / commands · ? keys                   │
 ╰──────────────────────────────────────────────────────────────────────────╯
  ringo  my-repo (main) · ask mode · talking to claude · 34.8k tokens   ? keys
 ```
@@ -122,7 +122,9 @@ The shell fills the terminal (the alternate screen, as Codex's does). The conver
 every reply, and what each agent does under its job number: one `•` row per tool call or command once it has run,
 with what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit
 code; a step too long for the row loses the end of its pattern or command to `…`, and `/show N` has it whole), then
-one line when a job ends with its time, tokens and Ringo model calls, and the files it changed. Replies render their
+one line when a job ends with its time, tokens and Ringo model calls, and the files it changed. A reply appears as it
+is written (Claude's and agy's text deltas, Codex's `item/agentMessage/delta`), and the whole reply replaces the
+pieces when it is complete. Replies render their
 markdown: headings, emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned
 columns (a long last column wraps under itself), or, when even that does not fit, as one block per row with each cell
 under its column's name. Everything is fitted again when the window's width changes. The mouse wheel and PgUp/PgDn
@@ -156,8 +158,9 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 
 Start `ringo` in any folder, as you would `claude` or `codex`. In a git project each turn's change can be undone,
 copies work and `/review BASE` reviews its commits; in any other folder, a repository that holds your home folder (a
-dotfiles repository) included, the agents still work in the folder, and Ringo says that `/undo` and copies need a git
-project. Ringo's private state stays out of every repository; its folder carries a `.gitignore` of its own.
+dotfiles repository) included, the agents still work in the folder and `/undo` works from Ringo's own store (see the
+safety model), while copies and `/review` need a git project. Ringo's private state stays out of every repository;
+its folder carries a `.gitignore` of its own.
 
 A turn costs about 12,000 to 15,000 tokens before the agent starts (measured under
 [Modes and permissions](#modes-and-permissions); Claude Code's own first turn measured about 50,000), and a vague
@@ -190,7 +193,7 @@ One switch sets how far every agent may act without asking; it applies to the tu
 | Mode | Claude | Codex |
 |---|---|---|
 | `ask` (the default) | reads, and edits files in its folder (yours, or its copy), freely: Claude Code's accept-edits mode, in which plain file commands such as `mkdir` there run without asking; every other action waits for you: a command such as `curl`, `gh` or `npm`, a connector call, a file outside its folder | works inside its sandbox (`workspace-write`: edits in its folder, no network); it cannot stop to ask, so what the sandbox refuses fails |
-| `auto` | Claude Code's auto mode: it acts on its own and its safety review blocks what is dangerous; what that review blocks repeatedly, and what an always-ask rule names, waits for you | a new conversation runs with `--approve-for-me` (Codex's own reviewer answers its approval requests), and every turn has the network on in the sandbox, for git, gh and installs (`exec resume` takes no `--approve-for-me`) |
+| `auto` | Claude Code's auto mode: it acts on its own and its safety review blocks what is dangerous; what that review blocks repeatedly, and what an always-ask rule names, waits for you | approvals `on-request` with Codex's own reviewer answering them (`approvalsReviewer: auto_review`, what `--approve-for-me` sets), and the network on in the sandbox, for git, gh and installs, on every turn, a resumed one too |
 | `read` | no edits, no commands, no connectors; `@agent!` is refused | read-only sandbox; `@agent!` is refused |
 
 When an agent waits, a box takes the place of the input and says in plain words what it wants (to run a command,
@@ -346,10 +349,11 @@ or for the spinner while a job runs.
 - **Permission prompts:** Claude's prompt is one stream-json message on stdin, which stays open until the turn's
   result: Claude Code sends each permission request to Ringo (`--permission-prompt-tool stdio`, the channel the
   Agent SDK uses; `--permission-prompts host` alone denies them) and Ringo writes your answer back. A request Ringo
-  does not serve is refused at once, so a turn never waits on it. Codex and agy cannot ask.
+  does not serve is refused at once, so a turn never waits on it. Codex and agy cannot ask; a request Codex's
+  app-server sends anyway is refused at once in the same way.
 - **Turns in your folder** run where you started `ringo`, continuing the agent's conversation, one at a time: Codex
-  with `workspace-write` (edits and commands inside the folder, no network; in auto mode the network and, for a new
-  conversation, `--approve-for-me`), Claude with `acceptEdits` in ask mode and auto mode in auto mode (edits in the
+  with `workspace-write` (edits and commands inside the folder, no network; in auto mode the network and Codex's own
+  reviewer for its approval requests), Claude with `acceptEdits` in ask mode and auto mode in auto mode (edits in the
   folder allowed; any other command waits for you, or for its review), agy with `--mode accept-edits` and
   session-only deny rules for `command(*)`, `unsandboxed(*)`, `mcp(*)` and `execute_url(*)` (edits allowed;
   commands, MCP tools and browser actions refused, as it cannot ask). Grok and agents you add have no sandbox Ringo
@@ -359,7 +363,18 @@ or for the spinner while a job runs.
   and HEAD are never touched. The files that differ are the turn's change. `/undo` first compares those files with
   how the turn left them, and any difference (an edit of yours anywhere in one, even far from the turn's lines) makes
   it refuse and change nothing; then it applies the reverse patch with `git apply`. Neither `/undo` nor `/apply` runs
-  while a turn works in the folder, whose own after would take them in. Outside a git project there is no undo.
+  while a turn works in the folder, whose own after would take them in. Outside a git project the same trees go
+  into a git store of Ringo's own, one per folder, under its state folder (`undo/`), run with `--git-dir` and
+  `--work-tree`: the folder gets no repository, and an enclosing dotfiles repository never sees the store. The store
+  keeps its own index, so only new or changed files are hashed. It ignores the folder's `.gitignore` entries and
+  `node_modules`, virtualenvs and caches. Left out: the home folder itself, a folder holding Ringo's state, a folder
+  with a git project inside it (git would keep a link to that project's commit, not the files a turn edits there),
+  and a folder with more than 5,000 files or 200 MB (`git init` there turns undo on); Ringo says which when it opens. A
+  folder moved or renamed starts a new store, and stores are never pruned; deleting `undo/` reclaims the space.
+- **Commits and PRs** a turn makes are yours, as ones made by hand are: Claude turns pass `"attribution":
+  {"commit": "", "pr": ""}`, so no co-author trailer and no "Generated with" line (Claude Code 2.1.316; it also drops
+  the attribution reminder from every request, 626 bytes). Codex 0.165.0 adds none (`codex_git_commit` is removed),
+  and agy has none.
 - **Read mode:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
   and `NotebookEdit`, which win over any allow rules in your own settings, and nothing may prompt
   (`--permission-prompts none`). agy adds `write_file(*)` to its deny rules; asked to edit, it gets an error it can
@@ -390,8 +405,8 @@ events into `Job` records (status, activity, tokens, subagents, touched files), 
 
 ## Not yet
 
-A JSON-lines mode for a non-Rust front end, an edit's diff shown in the conversation as it lands, undo outside a
-git project, and measured repository-level comparisons of agent turns against the pipelines.
+A JSON-lines mode for a non-Rust front end, an edit's diff shown in the conversation as it lands, and measured
+repository-level comparisons of agent turns against the pipelines.
 
 Route suggestions (`/route on`: word rules that put the matching command in the input for a line that read like a
 task; acceptable 35 times in 38 on 100 held-out lines, covering about half of the tasks) were removed when a plain

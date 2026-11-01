@@ -367,6 +367,13 @@ pub struct Session {
     pub repo: PathBuf,
     /// Whether `repo` is a git project; outside one, agents can read and answer but not edit in a worktree.
     pub git: bool,
+    /// The project's own index file and the branch it is on, read once when the session opens.
+    index: Option<PathBuf>,
+    pub branch: Option<String>,
+    /// Outside a git project: Ringo's own undo store for the folder (see `undo_store`).
+    store: Option<PathBuf>,
+    /// Why /undo is off here, when it is.
+    pub no_undo: Option<String>,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -435,28 +442,114 @@ fn private_dir(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// git's stdout exactly as written (a patch must stay byte-for-byte intact).
-fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| format!("git: {e}"))?;
+/// The git command's stdout exactly as written (a patch must stay byte-for-byte intact).
+fn run_git(mut cmd: Command, args: &[&str]) -> Result<Vec<u8>, String> {
+    let out = cmd.args(args).output().map_err(|e| format!("git: {e}"))?;
     if !out.status.success() {
         return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok(out.stdout)
 }
 
+fn trimmed(out: Vec<u8>) -> String {
+    String::from_utf8_lossy(&out).trim_end().to_string()
+}
+
+fn git_in(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    cmd
+}
+
+fn git_raw(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    run_git(git_in(dir), args)
+}
+
 /// git's stdout as a trimmed value (an id, a path, a status).
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    Ok(String::from_utf8_lossy(&git_raw(dir, args)?).trim_end().to_string())
+    git_raw(dir, args).map(trimmed)
 }
 
 /// `git` with a private index file in place of the repository's own.
 fn git_index(dir: &Path, index: &Path, args: &[&str]) -> Result<String, String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).env("GIT_INDEX_FILE", index).output()
-        .map_err(|e| format!("git: {e}"))?;
-    if !out.status.success() {
-        return Err(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim()));
+    let mut cmd = git_in(dir);
+    cmd.env("GIT_INDEX_FILE", index);
+    run_git(cmd, args).map(trimmed)
+}
+
+/// What Ringo's undo store ignores, past the folder's own .gitignore files: tools' caches and installed packages.
+const STORE_IGNORES: &[&str] = &["node_modules", ".venv", "venv", "__pycache__", "*.pyc", ".DS_Store", ".gradle"];
+/// The most a folder outside git may hold for Ringo's undo store, past what it ignores: each turn's start and end
+/// hash every new or changed file in it.
+const STORE_FILES: u64 = 5_000;
+const STORE_BYTES: u64 = 200 << 20;
+
+/// Ok when `dir` suits the undo store: at most `files` files and `bytes` bytes, not counting what the store ignores,
+/// and no git project inside it (git would keep only a link to its commit, not the files a turn edits there). Stops
+/// at the first limit it passes; symlinks are not followed.
+fn fits_store(dir: &Path, files: u64, bytes: u64) -> Result<(), String> {
+    let ignored = |name: &str| STORE_IGNORES.iter().any(|i| match i.strip_prefix('*') {
+        Some(ext) => name.ends_with(ext),
+        None => name == *i,
+    });
+    let (mut seen, mut size, mut todo) = (0, 0, vec![dir.to_path_buf()]);
+    while let Some(d) = todo.pop() {
+        for entry in fs::read_dir(&d).into_iter().flatten().flatten() {
+            let (Ok(kind), name) = (entry.file_type(), entry.file_name()) else { continue };
+            if name == ".git" {
+                let inner = d.strip_prefix(dir).unwrap_or(&d).display().to_string();
+                return Err(format!("{inner} is a git project of its own; start ringo in it, where /undo works"));
+            }
+            if ignored(&name.to_string_lossy()) {
+                continue;
+            }
+            if kind.is_dir() {
+                todo.push(entry.path());
+            } else if kind.is_file() {
+                seen += 1;
+                size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if seen > files || size > bytes {
+                    return Err(format!("this folder holds more than {files} files or {} MB; run `git init` here once \
+                                        to turn /undo on", bytes >> 20));
+                }
+            }
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(())
+}
+
+/// Outside a git project, each turn's before and after for /undo live in a git store of Ringo's own, one for each
+/// folder, under its state folder (`root`/undo); the folder itself gets no repository. Not for the home folder or
+/// one holding it or Ringo's state, and not for a folder too big to hash at every turn.
+// ceiling: a store is never pruned, and a folder moved or renamed starts a new one; delete `root`/undo to reclaim it.
+fn undo_store(root: &Path, folder: &Path, home: &Path) -> Result<PathBuf, String> {
+    if folder.parent().is_none() || (!home.as_os_str().is_empty() && home.starts_with(folder)) {
+        return Err("Ringo keeps no /undo for your whole home folder; start ringo in the folder you work on".into());
+    }
+    let root = resolved(root); // the store is used from the folder: a relative root would point elsewhere there
+    if root.starts_with(folder) {
+        return Err("Ringo's own state is inside this folder".into());
+    }
+    fits_store(folder, STORE_FILES, STORE_BYTES)?;
+    let hash = folder.as_os_str().as_encoded_bytes().iter()
+        .fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3)); // FNV-1a
+    let store = root.join("undo").join(format!("{hash:016x}"));
+    if !store.join("HEAD").is_file() {
+        // Made beside it and renamed into place, so two sessions opening the folder at once never meet halfway.
+        let new = store.with_extension(format!("new-{}-{:?}", std::process::id(), thread::current().id()));
+        private_dir(&new)?;
+        git(&new, &["init", "--bare", "-q", "."])?;
+        let ignores: String = STORE_IGNORES.iter().map(|i| format!("{i}\n")).collect();
+        fs::write(new.join("info").join("exclude"), ignores).map_err(|e| e.to_string())?;
+        fs::write(new.join("folder"), folder.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?;
+        if fs::rename(&new, &store).is_err() {
+            let _ = fs::remove_dir_all(&new); // another session's store is there first
+            if !store.join("HEAD").is_file() {
+                return Err(format!("cannot make the undo store {}", store.display()));
+            }
+        }
+    }
+    Ok(store)
 }
 
 /// An absolute path with symlinks resolved, for a path whose tail may not exist yet.
@@ -535,9 +628,18 @@ impl Session {
     /// current folder, as claude and codex do, and only `@agent!` and `/review` (which need a project) are refused.
     pub fn with_state_home(cwd: &Path, root: &Path, home: &Path) -> Result<Session, String> {
         let home = resolved(home);
-        let top = git(cwd, &["rev-parse", "--show-toplevel"]).ok().map(|t| resolved(Path::new(&t)));
+        // One git call: the project's top, its index file and its HEAD file (paths relative to `cwd`)
+        let found = git(cwd, &["rev-parse", "--show-toplevel", "--git-path", "index", "--git-path", "HEAD"]).unwrap_or_default();
+        let mut found = found.lines();
+        let (top, index, head) = (found.next().map(|t| resolved(Path::new(t))), found.next(), found.next());
         let project = top.filter(|t| home.as_os_str().is_empty() || !home.starts_with(t));
         let repo = project.clone().unwrap_or_else(|| resolved(cwd));
+        let index = project.as_ref().and(index).map(|i| cwd.join(i));
+        // `ref: refs/heads/NAME` on a branch; a commit id when detached, shown as HEAD as git does
+        let branch = project.as_ref().and(head).map(|h| match fs::read_to_string(cwd.join(h)) {
+            Ok(text) => text.trim().strip_prefix("ref: refs/heads/").unwrap_or("HEAD").to_string(),
+            Err(_) => "HEAD".into(),
+        });
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         if root.is_symlink() {
             return Err(format!("the state folder {} cannot be a symlink", root.display()));
@@ -564,7 +666,15 @@ impl Session {
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
         always_ask.extend(own.iter().filter_map(|v| v.get("ask")?.as_array()).flatten()
             .filter_map(|r| r.as_str()).map(str::to_string).filter(|r| !always_ask.contains(r)).collect::<Vec<_>>());
-        Ok(Session { repo, git: project.is_some(), dir, jobs: Vec::new(), max_jobs: 3, backend: "codex-chatgpt".into(),
+        let (store, no_undo) = match project {
+            Some(_) => (None, None),
+            None => match undo_store(root, &repo, &home) {
+                Ok(store) => (Some(store), None),
+                Err(why) => (None, Some(why)),
+            },
+        };
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, dir, jobs: Vec::new(), max_jobs: 3,
+                     backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
                      usage_so_far: HashMap::new(), mode: Mode::Ask, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
@@ -612,13 +722,40 @@ impl Session {
     /// private copy of the index (`index`) stages them, so the owner's index, stash and HEAD are never touched.
     /// ceiling: hashes each new or changed file every call; a large file git does not ignore slows a turn's start.
     fn snapshot(&self, index: &Path) -> Result<String, String> {
-        let own = self.repo.join(git(&self.repo, &["rev-parse", "--git-path", "index"])?);
+        if self.store.is_some() {
+            // the store keeps its own index: each file's stat stays in it, so only new or changed files are hashed
+            self.folder_git(&["add", "-A"])?;
+            return self.folder_git(&["write-tree"]);
+        }
+        let own = self.index.clone().ok_or("not a git project")?;
         match own.is_file() {
             true => fs::copy(&own, index).map(|_| ()).map_err(|e| format!("{}: {e}", own.display()))?,
             false => { let _ = fs::remove_file(index); } // a repository with nothing staged yet has no index
         }
         git_index(&self.repo, index, &["add", "-A"])?;
         git_index(&self.repo, index, &["write-tree"])
+    }
+
+    /// git on the owner's folder as /undo keeps it: the project's repository, or outside one Ringo's undo store,
+    /// run from the folder's top (a patch applied from below it would skip the files outside it).
+    fn folder(&self) -> Command {
+        match &self.store {
+            Some(store) => {
+                let mut cmd = Command::new("git");
+                cmd.arg("--git-dir").arg(store).arg("--work-tree").arg(&self.repo).current_dir(&self.repo);
+                cmd
+            }
+            None => git_in(&self.repo),
+        }
+    }
+
+    fn folder_git(&self, args: &[&str]) -> Result<String, String> {
+        run_git(self.folder(), args).map(trimmed)
+    }
+
+    /// Whether /undo works here: a git project, or Ringo's own store for the folder.
+    pub fn undoable(&self) -> bool {
+        self.git || self.store.is_some()
     }
 
     /// A commit holding `tree`, on `parent` when there is one; no branch points at it.
@@ -643,9 +780,8 @@ impl Session {
     /// /undo goes one turn further back). Any of them edited since that turn, anywhere in it, makes it refuse,
     /// leaving everything as is.
     pub fn undo(&mut self) -> Result<String, String> {
-        if !self.git {
-            return Err("/undo needs a git project: Ringo keeps each turn's before and after with git (run `git init` \
-                        here once, and later turns can be undone)".into());
+        if let Some(why) = &self.no_undo {
+            return Err(format!("/undo is off here: {why}"));
         }
         self.idle("/undo")?;
         let job = self.jobs.iter().rev()
@@ -657,15 +793,15 @@ impl Session {
         let now = self.snapshot(&index)?;
         let mut args = vec!["diff", "--name-only", after.as_str(), now.as_str(), "--"];
         args.extend(changed.iter().map(String::as_str));
-        let edited = git(&self.repo, &args)?;
+        let edited = self.folder_git(&args)?;
         if !edited.is_empty() {
             return Err(format!("{} changed after #{id}, so nothing was undone", edited.lines().collect::<Vec<_>>().join(", ")));
         }
-        fs::write(&file, git_raw(&self.repo, &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
+        fs::write(&file, run_git(self.folder(), &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
         let file = file.to_string_lossy().into_owned();
-        git(&self.repo, &["apply", "--check", &file])
+        self.folder_git(&["apply", "--check", &file])
             .map_err(|e| format!("#{id}'s files no longer match it, so nothing was undone ({e})"))?;
-        git(&self.repo, &["apply", &file])?;
+        self.folder_git(&["apply", &file])?;
         let job = &mut self.jobs[id - 1];
         job.undone = true;
         Ok(format!("undid #{id}: {} back as before", job.changed.join(", ")))
@@ -736,8 +872,9 @@ impl Session {
             job.push_log(format!("its own copy of this folder as it is now (/show {id}: where)"));
             wt
         } else {
-            if edits && self.git {
-                // Kept for /undo; a turn whose before cannot be taken still runs, without an undo.
+            if edits && self.undoable() {
+                // Kept for /undo; a turn whose before cannot be taken still runs, without an undo. Taken anew even
+                // right behind another turn: an /undo or an edit of yours in between belongs to neither.
                 match self.snapshot(&dir.join("index")) {
                     Ok(tree) => self.jobs[id - 1].before = Some(tree),
                     Err(e) => self.jobs[id - 1].push_log(format!("no /undo for this turn: {e}")),
@@ -748,39 +885,50 @@ impl Session {
         let mut cmd = Command::new(self.program(agent));
         let resume = if write { None } else { self.threads.get(&agent).cloned() };
         let sandbox = if edits { "workspace-write" } else { "read-only" };
-        let mut input = Some(prompt.to_string());
+        let (mut input, mut turn) = (Some(prompt.to_string()), None);
         let style = match spec.adapter {
             Adapter::Codex => {
-                cmd.args(["exec"]);
-                if let Some(thread) = &resume {
-                    cmd.args(["resume", thread]).arg("-c").arg(format!("sandbox_mode=\"{sandbox}\""));
-                    if edits {
-                        // `exec resume` takes no --approve-for-me (codex-cli 0.165.0): in auto mode the sandbox keeps
-                        // its network; in ask mode it is off, said outright, whatever an earlier turn had
-                        let net = self.mode == Mode::Auto;
-                        cmd.args(["-c", &format!("sandbox_workspace_write.network_access={net}")]);
-                    }
-                } else if edits && self.mode == Mode::Auto {
-                    // Auto: Codex's own reviewer answers its approval requests (--approve-for-me implies the
-                    // workspace-write sandbox), and the sandbox has the network, for git, gh and package installs.
-                    // Verified with codex-cli 0.165.0: the sandbox alone has no network.
-                    cmd.args(["--approve-for-me", "-c", "sandbox_workspace_write.network_access=true", "-C"]).arg(&cwd);
-                } else {
-                    cmd.args(["-s", sandbox, "-C"]).arg(&cwd);
+                // One `codex app-server` per turn, so the reply streams as it is written: the same agent and settings
+                // as `codex exec`, and the same model input, compared request for request against a local stand-in
+                // for the API (codex-cli 0.165.0: a new turn in each mode, and a resumed one). The thread's settings
+                // go in thread/start or thread/resume; turn/start follows once the thread's id is known.
+                cmd.arg("app-server");
+                let auto = edits && self.mode == Mode::Auto;
+                if edits {
+                    // Auto: the sandbox has the network, for git, gh and package installs, and Codex's own reviewer
+                    // answers its approval requests. Ask: no network, said outright, whatever an earlier turn had.
+                    cmd.args(["-c", &format!("sandbox_workspace_write.network_access={auto}")]);
                 }
-                cmd.args(["--json", "--skip-git-repo-check", "-c", "forced_login_method=\"chatgpt\"",
-                          "-c", "model_provider=\"openai\""]);
+                cmd.args(["-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\""]);
                 // Codex cannot stop to ask here, so the ask tool and its mode instructions go, and analytics (its
                 // upload delays the exit by about 0.33 s). Plugins and apps (documents, browser and computer-use
                 // skills, a computer-use tool that acts outside the sandbox) load only for a task that names a
                 // connector, as Claude's do. A trivial read turn: 17,133 tokens a call before, 14,350 after
-                // (codex-cli 0.165.0). The same settings work after `exec resume`.
+                // (codex-cli 0.165.0).
                 cmd.args(["-c", "features.default_mode_request_user_input=false", "-c",
                           "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false"]);
                 if !names_connector(prompt) {
                     cmd.args(["-c", "features.plugins=false", "-c", "features.apps=false"]);
                 }
-                cmd.arg("-");
+                let mut thread = serde_json::json!({"cwd": cwd, "sandbox": sandbox,
+                                                    "approvalPolicy": if auto { "on-request" } else { "never" }});
+                if auto {
+                    thread["approvalsReviewer"] = "auto_review".into();
+                }
+                let method = match &resume {
+                    Some(id) => {
+                        thread["threadId"] = id.clone().into();
+                        thread["excludeTurns"] = true.into(); // the answer leaves out the conversation so far
+                        "thread/resume"
+                    }
+                    None => "thread/start",
+                };
+                let hello = serde_json::json!({"id": 1, "method": "initialize",
+                                               "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
+                input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
+                                     serde_json::json!({"id": 2, "method": method, "params": thread})));
+                turn = Some(serde_json::json!({"id": 3, "method": "turn/start",
+                                               "params": {"input": [{"type": "text", "text": prompt}]}}));
                 Style::Codex
             }
             Adapter::Claude => {
@@ -827,7 +975,14 @@ impl Session {
                 }
                 cmd.arg("--disallowed-tools").args(deny);
                 if self.mode != Mode::Read {
-                    cmd.arg("--settings").arg(serde_json::json!({"permissions": {"ask": self.always_ask}}).to_string());
+                    // A commit or a PR is the owner's, as one made by hand is: no co-author trailer and no "Generated
+                    // with" line (an empty string turns each off, Claude Code 2.1.316). Safe mode drops the owner's
+                    // CLAUDE.md, where such a rule would otherwise live. It also drops Claude Code's attribution reminder
+                    // from every turn: 626 bytes less a request (measured against a local capture server).
+                    // Codex 0.165.0 adds none (codex_git_commit is removed and off) and agy has no such line.
+                    let settings = serde_json::json!({"permissions": {"ask": self.always_ask},
+                                                      "attribution": {"commit": "", "pr": ""}});
+                    cmd.arg("--settings").arg(settings.to_string());
                     if !self.allowed.is_empty() {
                         cmd.arg("--allowedTools").args(&self.allowed);
                     }
@@ -876,7 +1031,11 @@ impl Session {
         };
         cmd.current_dir(&cwd);
         agent_env(&mut cmd);
-        self.spawn(id, cmd, style, input, None)?;
+        let parser = match turn {
+            Some(turn) => Parser::new(style).with_turn(turn),
+            None => Parser::new(style),
+        };
+        self.spawn(id, cmd, parser, input, None)?;
         Ok(id)
     }
 
@@ -892,7 +1051,7 @@ impl Session {
         let prefix = self.pipeline.clone().unwrap_or_else(|| vec![python(), self.ringo_home.join("ringo.py").into()]);
         let mut cmd = Command::new(&prefix[0]);
         cmd.args(&prefix[1..]).args(args).current_dir(&self.repo);
-        self.spawn(id, cmd, Style::Trace, None, Some(trace))?;
+        self.spawn(id, cmd, Parser::new(Style::Trace), None, Some(trace))?;
         Ok(id)
     }
 
@@ -910,6 +1069,9 @@ impl Session {
                 let tree = git(&wt, &["write-tree"])?;
                 let head = self.commit(&tree, Some(&base), &format!("ringo job {of}"))?;
                 (wt, base, head)
+            }
+            (_, _, Some(_), Some(_)) if !self.git && !job.changed.is_empty() => {
+                return Err(format!("/review #{of} needs a git project"));
             }
             (_, _, Some(before), Some(after)) if !job.changed.is_empty() => {
                 let base = self.commit(&before, None, &format!("ringo job {of}: before"))?;
@@ -974,9 +1136,11 @@ impl Session {
         const ROOM: usize = 12_000; // characters of them at most, the newest kept first
         let mut earlier: Vec<String> = Vec::new();
         let mut used = 0;
-        for job in self.jobs.iter().rev().filter(|j| matches!(&j.kind, Kind::Ringo { command } if command == "ask") && j.status == Status::Done
-                                                     && !j.reply().trim_start().starts_with("ROUTE:")) {
-            let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, job.reply().trim());
+        let asked = self.jobs.iter().rev()
+            .filter(|j| matches!(&j.kind, Kind::Ringo { command } if command == "ask") && j.status == Status::Done)
+            .map(|j| (j, j.reply())).filter(|(_, reply)| !reply.trim_start().starts_with("ROUTE:"));
+        for (job, reply) in asked {
+            let text = format!("Question: {}\n\nAnswer:\n{}\n", job.title_full, reply.trim());
             if earlier.len() == KEEP || used + text.len() > ROOM {
                 break;
             }
@@ -1019,8 +1183,9 @@ impl Session {
         self.launch_ringo(&format!("work {}", spec.display()), args, dir.join("work"))
     }
 
-    fn spawn(&mut self, id: usize, mut cmd: Command, style: Style, stdin: Option<String>, trace: Option<PathBuf>)
+    fn spawn(&mut self, id: usize, mut cmd: Command, mut parser: Parser, stdin: Option<String>, trace: Option<PathBuf>)
              -> Result<(), String> {
+        let style = parser.style();
         let dir = self.jobs[id - 1].dir.clone();
         let stderr = fs::File::create(dir.join("stderr.txt")).map_err(|e| e.to_string())?;
         cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stderr(stderr);
@@ -1039,9 +1204,10 @@ impl Session {
             }
         };
         self.jobs[id - 1].pid = Some(child.id());
-        // The stdin text, then for Claude the owner's answers until the turn's result; None closes the pipe.
+        // The stdin text, then until the turn's result Claude's answers from the owner and Codex's turn request;
+        // None closes the pipe.
         let (lines, queued) = channel::<Option<String>>();
-        let keep_open = style == Style::Claude;
+        let keep_open = matches!(style, Style::Claude | Style::Codex);
         let mut closer = None;
         if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
             let _ = lines.send(Some(text));
@@ -1062,7 +1228,6 @@ impl Session {
         let (tx, cancel, pid) = (self.tx.clone(), self.jobs[id - 1].cancel.clone(), child.id());
         let stdout = child.stdout.take();
         thread::spawn(move || {
-            let mut parser = Parser::new(style);
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
             let mut events = (style != Style::Trace).then(|| fs::OpenOptions::new().create(true).append(true)
                 .open(dir.join("events.jsonl")).ok()).flatten();
@@ -1075,6 +1240,11 @@ impl Session {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
                     }
                     let _ = tx.send(Event::Note(id, note));
+                }
+                for line in parser.take_writes() {
+                    if let Some(pipe) = &closer {
+                        let _ = pipe.send(Some(format!("{line}\n")));
+                    }
                 }
                 if parser.completed() && let Some(close) = closer.take() {
                     let _ = close.send(None); // the result is in: nothing more will be asked, so the agent may exit
@@ -1134,10 +1304,16 @@ impl Session {
     }
 
     fn end(&mut self, id: usize, status: Status) {
+        let reply = (status == Status::Done).then(|| self.jobs[id - 1].reply());
+        self.end_with(id, status, reply.unwrap_or_default());
+    }
+
+    /// `end` with the job's reply already read.
+    fn end_with(&mut self, id: usize, status: Status, reply: String) {
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
         job.activity = match &status {
-            Status::Done => parse::short(&job.reply(), 80),
+            Status::Done => parse::short(&reply, 80),
             Status::Failed(reason) => reason.clone(),
             _ => String::new(),
         };
@@ -1151,15 +1327,17 @@ impl Session {
             sub.ended = Some(false);
             sub.activity = "stopped with its parent".into();
         }
-        // A write job that changed nothing has nothing to apply. Its worktree stays for /drop: removing it here would
-        // also remove what the diff cannot see (a file git ignores that the agent wrote).
-        if job.status == Status::Done && job.worktree.is_some() && self.diff(id).is_ok_and(|p| p.is_empty()) {
+        // A write job that changed nothing has nothing to apply (git's exit code says so; no patch is written). Its
+        // worktree stays for /drop: removing it here would also remove what the diff cannot see (a file git ignores
+        // that the agent wrote).
+        if job.status == Status::Done && let (Some(wt), Some(base)) = (job.worktree.clone(), job.base.clone())
+            && git(&wt, &["add", "-A"]).is_ok() && git(&wt, &["diff", "--cached", "--quiet", &base]).is_ok() {
             self.jobs[id - 1].unchanged = true;
         }
         // A turn in the owner's folder, stopped or not: what it changed there, for its last line and /undo.
         if let Some(before) = self.jobs[id - 1].before.clone()
             && let Ok(after) = self.snapshot(&self.jobs[id - 1].dir.join("index")) {
-            let changed = git(&self.repo, &["diff", "--name-only", &before, &after]).unwrap_or_default();
+            let changed = self.folder_git(&["diff", "--name-only", &before, &after]).unwrap_or_default();
             let job = &mut self.jobs[id - 1];
             job.changed = changed.lines().map(str::to_string).collect();
             job.after = Some(after);
@@ -1174,9 +1352,10 @@ impl Session {
             match event {
                 Event::Ended(id, status) => {
                     let job = &mut self.jobs[id - 1];
+                    let reply = job.reply(); // read once, for the route, the conversation and the job's last line
                     if matches!(&job.kind, Kind::Ringo { command } if command == "ask") && status == Status::Done {
                         // The ask prompt answers a task with one line, `ROUTE: edit|read|review|research`.
-                        if let Some(route) = job.reply().trim().strip_prefix("ROUTE:") {
+                        if let Some(route) = reply.trim().strip_prefix("ROUTE:") {
                             // the route word alone: "ROUTE: edit." or a line of reasons after it still starts the task
                             let word = route.split(|c: char| !c.is_ascii_alphabetic()).find(|w| !w.is_empty());
                             self.routed.push_back((id, word.unwrap_or("").to_lowercase()));
@@ -1184,16 +1363,15 @@ impl Session {
                     }
                     if matches!(job.kind, Kind::Ringo { .. }) {
                         let report = job.dir.join("work").join("report.json");
-                        let reply = job.reply();
                         if !reply.is_empty() {
-                            job.push(Said::Reply(reply));
+                            job.push(Said::Reply(reply.clone()));
                         } else if let Ok(text) = fs::read_to_string(&report) {
                             let state = serde_json::from_str::<serde_json::Value>(&text).ok()
                                 .and_then(|v| v.get("status").and_then(|s| s.as_str()).map(str::to_string));
                             job.push_log(format!("work {}: {}", state.unwrap_or_default(), report.display()));
                         }
                     }
-                    self.end(id, status);
+                    self.end_with(id, status, reply);
                 }
                 Event::Note(id, Note::Session(session)) => {
                     if let Kind::Agent { agent, write: false } = self.jobs[id - 1].kind {
@@ -1452,7 +1630,7 @@ impl Session {
                     git(wt, &["add", "-A"])?;
                     Some(git_raw(wt, &["diff", "--cached", base])?)
                 }
-                (_, _, Some(before), Some(after)) => Some(git_raw(&self.repo, &["diff", before, after])?),
+                (_, _, Some(before), Some(after)) => Some(run_git(self.folder(), &["diff", before, after])?),
                 _ => None,
             };
             if let Some(patch) = patch.filter(|p| !p.is_empty()) {
@@ -1524,7 +1702,10 @@ fn write_agents_file(root: &Path, value: &serde_json::Value) -> Result<(), Strin
 
 /// Registers the owner's own entries from `root`/agents.json; the reason for each one that cannot run.
 pub fn load_custom_agents(root: &Path) -> Vec<String> {
-    let file = read_agents_file(root);
+    register_custom(&read_agents_file(root))
+}
+
+fn register_custom(file: &serde_json::Value) -> Vec<String> {
     let mut problems = Vec::new();
     for entry in file.get("custom").and_then(|c| c.as_array()).into_iter().flatten() {
         match Spec::from_json(entry, true) {
@@ -1560,9 +1741,8 @@ pub fn add_custom_agent(root: &Path, entry: serde_json::Value) -> Result<Agent, 
 /// The agents set up with `ringo setup` (state_root()/agents.json), the owner's own entries registered first;
 /// None before the first setup.
 pub fn configured_agents() -> Option<Vec<Agent>> {
-    let root = state_root();
-    load_custom_agents(&root);
-    let file = read_agents_file(&root);
+    let file = read_agents_file(&state_root());
+    register_custom(&file);
     let agents: Vec<Agent> = file.get("agents")?.as_array()?.iter()
         .filter_map(|a| a.as_str().and_then(Agent::from_name)).collect();
     Some(agents)
@@ -1614,5 +1794,32 @@ pub fn sign_in(agent: Agent, program: &Path) -> SignIn {
             }
         }
         _ => SignIn::No(parse::short(&text, 120)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_undo_store_takes_only_a_small_folder() {
+        let dir = std::env::temp_dir().join(format!("ringo-small-{}", std::process::id()));
+        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        for (name, text) in [("a.txt", "12345"), ("b.txt", "12345"), ("node_modules/pkg/x.js", "ignored"), ("c.pyc", "ignored")] {
+            fs::write(dir.join(name), text).unwrap();
+        }
+        assert_eq!(fits_store(&dir, 2, 10), Ok(()), "two files of five bytes; what the store ignores is not counted");
+        assert!(fits_store(&dir, 1, 10).unwrap_err().contains("more than 1 files") && fits_store(&dir, 2, 9).is_err());
+        // a git project inside: its files would be one link in the store, so the store is refused
+        fs::create_dir_all(dir.join("CSC133/.git")).unwrap();
+        assert!(fits_store(&dir, 9, 99).unwrap_err().contains("CSC133 is a git project of its own"));
+        // a relative state root (taken from the current folder) still names the same store from the folder
+        let folder = dir.join("class");
+        fs::create_dir_all(&folder).unwrap();
+        let relative = Path::new("target").join(format!("ringo-relative-state-{}", std::process::id()));
+        let store = undo_store(&relative, &resolved(&folder), Path::new("")).unwrap();
+        assert!(store.is_absolute() && store.join("HEAD").is_file(), "{}", store.display());
+        let _ = fs::remove_dir_all(&relative);
+        let _ = fs::remove_dir_all(dir);
     }
 }

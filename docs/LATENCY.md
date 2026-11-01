@@ -33,7 +33,7 @@ together.
 |---|---|---|
 | `-c analytics.enabled=false` on lean calls | exit 0.35 s to 0.015 s in 6 of 6 paired asks; usage still reported | adopted |
 | shell trace poll 300 ms to 50 ms | up to 0.25 s sooner, 0.125 s on average | adopted |
-| one long-lived `codex app-server` per session, streaming | a new thread in ~10 ms and its turn in ~2 ms on a warm process; first text at 2.2-2.9 s (short and medium answers) and 4.2-5.7 s (a long design answer) instead of when the answer is complete (3-25 s) | not built: the next step, with the reply shown as it streams |
+| one long-lived `codex app-server` per session, streaming | a new thread in ~10 ms and its turn in ~2 ms on a warm process; first text at 2.2-2.9 s (short and medium answers) and 4.2-5.7 s (a long design answer) instead of when the answer is complete (3-25 s) | shell turns stream since 11/01, through one `codex app-server` per turn (the same model input as `exec`, compared request for request); one kept for the whole session is not built |
 | Fast service tier (`service_tier="fast"`) | model time 28% lower (median), 30-44% lower on the long answer | not adopted: Codex bills it at 2.5x the usage of a standard call; a candidate opt-in |
 | GPT-6-Luna (smaller model), effort low | model time about half | rejected: a blind judge preferred the default model's answer in 12 of 12 pairs, and Luna's answers had factual errors in 3 |
 | effort high | short asks about the same (the model mostly skips reasoning); the long design answer 20-23 s against 15-20 s, with about 100 reasoning tokens | the default stays (low) |
