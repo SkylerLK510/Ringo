@@ -933,6 +933,8 @@ struct App {
     /// How the last job ended (true: done) and when, for the cat; and the cat's look last drawn.
     ended_at: Option<(bool, Instant)>,
     drawn_look: (&'static str, usize),
+    /// Each job's reply being written, by its place in `out`.
+    streams: std::collections::HashMap<usize, usize>,
     /// The agent plain lines go to, and lines waiting for the turn running in this folder: (agent, task, as typed).
     main: Agent,
     queue: VecDeque<(Agent, String, String)>,
@@ -1028,7 +1030,7 @@ impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
         App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, out: Vec::new(), fitted: Vec::new(),
               fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
-              ended_at: None, drawn_look: ("", 0),
+              ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false }
@@ -1128,7 +1130,29 @@ impl App {
             }
             for said in fresh {
                 match said {
-                    Said::Reply(text) => self.reply(&text),
+                    // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
+                    // ceiling: the growing reply is fitted again (its markdown parsed) for each frame it grows in.
+                    Said::Partial(text) => match self.streams.get(&id).copied() {
+                        Some(at) if at < self.out.len() => {
+                            if let Out::Reply(open) = &mut self.out[at] {
+                                open.push_str(&clean(&text));
+                            }
+                            self.fitted.truncate(at);
+                        }
+                        _ => {
+                            self.gap();
+                            self.out.push(Out::Reply(clean(&text)));
+                            self.streams.insert(id, self.out.len() - 1);
+                        }
+                    },
+                    Said::Reply(text) => match self.streams.remove(&id) {
+                        Some(at) if at < self.out.len() => {
+                            self.out[at] = Out::Reply(clean(&text));
+                            self.fitted.truncate(at);
+                            self.gap();
+                        }
+                        _ => self.reply(&text),
+                    },
                     Said::Step(text) => {
                         self.out.push(Out::Step(clean(&text)));
                     }
@@ -1141,6 +1165,7 @@ impl App {
                 self.last = id;
             }
             if ends {
+                self.streams.remove(&id); // a reply cut off stays as far as it got
                 self.ended_at = match self.s.jobs[i].status {
                     Status::Done => Some((true, Instant::now())),
                     Status::Failed(_) => Some((false, Instant::now())),
@@ -1333,6 +1358,7 @@ impl App {
                 self.s.forget();
                 self.out.clear();
                 self.fitted.clear();
+                self.streams.clear();
                 self.scroll = 0;
                 self.sel = None;
                 Some("  a new conversation: each agent's next turn starts fresh".into())
@@ -1763,6 +1789,7 @@ impl App {
             let extra = self.out.len() - KEEP;
             self.out.drain(..extra);
             self.fitted.drain(..extra.min(self.fitted.len()));
+            self.streams.retain(|_, at| at.checked_sub(extra).map(|n| *at = n).is_some());
         }
         let same = width == self.fitted_w;
         if !same {
@@ -2465,6 +2492,32 @@ mod tests {
         assert_eq!(row("◌ Edit a.rs", 40), "  ◌ edit a.rs");
         assert_eq!(row("· view_file a.rs", 40), "  · view_file a.rs", "only started: no claim about the outcome");
         assert_eq!(cols(&row(&format!("Grep {} · Found 3 files", "x".repeat(80)), 30)), 30, "a long step keeps to one row");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_grows_as_it_is_written_and_the_whole_one_replaces_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app(&["claude"]);
+        let fake = std::env::temp_dir().join(format!("ringo-tui-fake-claude-{}", std::process::id()));
+        std::fs::write(&fake, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(a.main, fake);
+        a.talk(a.main, "hi".into(), "hi".into()).unwrap();
+        let replies = |a: &App| a.out.iter().filter_map(|o| match o { Out::Reply(t) => Some(t.clone()), _ => None })
+            .collect::<Vec<_>>();
+        a.s.jobs[0].fresh = vec![Said::Partial("Hel".into()), Said::Partial("lo".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello"], "the pieces grow one reply");
+        screen(&mut a, 60, 12);
+        a.s.jobs[0].fresh = vec![Said::Partial(", wor".into())];
+        a.feed();
+        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"), "and it shows as it grows");
+        a.s.jobs[0].fresh = vec![Said::Reply("Hello, world.".into()), Said::Step("Read a.rs · 2 lines".into()),
+                                 Said::Partial("Next".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world.", "Next"], "the whole reply replaces its pieces; the next block opens anew");
+        a.s.shutdown();
     }
 
     #[test]

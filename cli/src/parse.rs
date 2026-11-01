@@ -53,6 +53,8 @@ pub enum Note {
     /// A line for the job's log, shown as it is.
     Log(String),
     /// The agent's own words: its reply, as markdown.
+    /// A piece of the reply as it is written (Claude's text deltas, agy's); the whole Reply replaces them.
+    Partial(String),
     Reply(String),
     /// A step the agent took (a tool call or a command) and, once known, what came of it.
     Step(String),
@@ -306,6 +308,15 @@ impl Parser {
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
             }
+            ("stream_event", _) => {
+                // --include-partial-messages: the reply's text as it is written. Claude Code sends these for the main
+                // conversation only; each text block's whole Reply follows them.
+                let event = e.get("event").unwrap_or(&NULL);
+                if s(event, "type") == "content_block_delta" && event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                    && parent.is_none() {
+                    notes.push(Note::Partial(event.pointer("/delta/text").and_then(Value::as_str).unwrap_or("").to_string()));
+                }
+            }
             ("system", "compact_boundary") => {
                 let before = e.pointer("/compact_metadata/pre_tokens").and_then(Value::as_u64).unwrap_or(0);
                 notes.push(Note::Log(format!("compacted the conversation (it held {before} tokens)")));
@@ -453,7 +464,12 @@ impl Parser {
                         let why = step.pointer("/tool_info/error/message").and_then(Value::as_str).unwrap_or("");
                         notes.push(Note::Step(format!("{FAILED}{tool} refused: {}", short(why, 160))));
                     }
-                    ("agent_response", "ACTIVE") => notes.push(Note::Activity { node: None, text: "writing".into() }),
+                    ("agent_response", "ACTIVE") => {
+                        notes.push(Note::Activity { node: None, text: "writing".into() });
+                        if let Some(delta) = step.get("text_delta").and_then(Value::as_str).filter(|d| !d.is_empty()) {
+                            notes.push(Note::Partial(delta.to_string()));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -666,6 +682,21 @@ mod tests {
         assert!(notes.contains(&Note::Activity { node: Some("tu1".into()), text: "Grep fn parse".into() }));
         assert!(notes.contains(&Note::SubagentEnd { id: "tu1".into(), ok: true }));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 2, cache_write: 5181, cache_read: 11382, output: 4 })));
+    }
+
+    #[test]
+    fn replies_stream_as_they_are_written() {
+        // Shapes from the Agent SDK's streaming docs: text deltas of the main conversation, then the whole block.
+        let delta = |text: &str, parent: &str| format!(r#"{{"type":"stream_event","event":{{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":"{text}"}}}},"parent_tool_use_id":{parent}}}"#);
+        let input = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{"}}}"#;
+        let whole = r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"Hello"}]},"parent_tool_use_id":null}"#;
+        let lines = [delta("Hel", "null"), delta("lo", "null"), input.to_string(), delta("x", "\"tu1\""), whole.to_string()];
+        let notes = run(Style::Claude, &lines.iter().map(String::as_str).collect::<Vec<_>>()).1;
+        let shown: Vec<&Note> = notes.iter().filter(|n| matches!(n, Note::Partial(_) | Note::Reply(_))).collect();
+        assert_eq!(shown, [&Note::Partial("Hel".into()), &Note::Partial("lo".into()), &Note::Reply("Hello".into())],
+                   "tool input and a subagent's text are not the reply");
+        let agy = r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"Fix"}}"#;
+        assert!(run(Style::Agy, &[agy]).1.contains(&Note::Partial("Fix".into())));
     }
 
     #[test]
