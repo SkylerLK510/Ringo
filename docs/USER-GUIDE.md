@@ -25,7 +25,9 @@ add a dark mode switch to the settings page
 
 - The agent you are talking to (Claude, or Codex when Claude is not set up) reads the files in this folder, changes
   them if that is what you asked for, and answers.
-- Its reply appears as it is written. Each step it takes shows as its own line, with what came of it.
+- Its reply appears as it is written. Each step it takes shows as a line in plain words ("run the tests"), and each
+  edit shows the lines it changed: removed in red, added in green. Reading and searching files are counted on one
+  line ("read 6 files, searched 4 times"); `/show N` lists each one.
 - While it works, the row above the box shows its time, the tokens it has used and what it is doing now. Press Esc
   to stop it.
 - You can type the next message while it works. It waits under the box and goes when the turn ends.

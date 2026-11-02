@@ -56,8 +56,12 @@ pub enum Note {
     /// A piece of the reply as it is written (Claude's text deltas, agy's); the whole Reply replaces them.
     Partial(String),
     Reply(String),
-    /// A step the agent took (a tool call or a command) and, once known, what came of it.
+    /// A step the agent took (a tool call or a command) and, once known, what came of it. An edit's step carries its
+    /// changed lines after the first line, each starting with `-` or `+` (see `preview`).
     Step(String),
+    /// A step that only looked (read a file, searched, listed a folder) and went through: the shell counts these
+    /// instead of giving each a line. `kind` is read, search or list; `text` is the step as a log line.
+    Looked { kind: &'static str, text: String },
     Subagent { id: String, label: String },
     SubagentEnd { id: String, ok: bool },
     Tokens(Tokens),
@@ -98,9 +102,9 @@ pub struct Parser {
     failure: Option<String>,
     completed: u32,
     subagents: Vec<String>,
-    /// Claude's tool calls waiting for their result (tool_use id, tool, how the call reads): each is shown once,
-    /// with what came of it.
-    calls: Vec<(String, String, String)>,
+    /// Claude's tool calls waiting for their result (tool_use id, tool, how the call reads, an edit's changed lines):
+    /// each is shown once, with what came of it.
+    calls: Vec<(String, String, String, String)>,
     /// Claude's usage per API message so far (message id, usage): one message comes as several events, each with its
     /// usage, so each id counts once. The sum is 93% of the turn's own count on a real 452.9k-token turn (a message's
     /// output tokens are reported before it is written).
@@ -164,6 +168,9 @@ fn outcome(tool: &str, result: &Value, ok: bool) -> String {
         },
         "Grep" => lines("line"),
         "Glob" => lines("file"),
+        "Read" if result.get("content").and_then(Value::as_array).is_some_and(|p| p.iter().any(|p| s(p, "type") == "image")) => {
+            " · image".into()
+        }
         "Read" => lines("line"),
         _ => String::new(),
     }
@@ -171,6 +178,79 @@ fn outcome(tool: &str, result: &Value, ok: bool) -> String {
 
 fn base_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// The kind of looking a tool does, for a step the shell counts instead of showing (`Note::Looked`).
+fn looked(tool: &str) -> Option<&'static str> {
+    match tool {
+        "Read" | "NotebookRead" => Some("read"),
+        "Grep" | "Glob" | "ToolSearch" => Some("search"),
+        "LS" => Some("list"),
+        _ => None,
+    }
+}
+
+/// How many changed lines an edit's step shows under it, and a new file's; the rest are counted.
+const PREVIEW: usize = 8;
+const NEW_FILE_PREVIEW: usize = 4;
+
+/// An edit's changed lines as the rows under its step: `-` removed, `+` added, the indentation they share taken off,
+/// at most `limit` of them and a count of the rest.
+fn preview(rows: &[(char, String)], limit: usize) -> String {
+    let shown = &rows[..rows.len().min(limit)];
+    let indent = shown.iter().filter(|(_, l)| !l.trim().is_empty())
+        .map(|(_, l)| l.len() - l.trim_start().len()).min().unwrap_or(0);
+    let mut out: String = shown.iter().map(|(sign, l)| format!("\n{sign} {}", l.get(indent..).unwrap_or(l.trim_start())))
+        .collect();
+    if rows.len() > limit {
+        out += &format!("\n… {} more line{}", rows.len() - limit, if rows.len() - limit == 1 { "" } else { "s" });
+    }
+    out
+}
+
+/// What an edit changed: the lines of `old` and `new` past what they share at their start and at their end.
+// ceiling: one block of removed lines, then the added ones; a long edit that changes two places far apart shows the
+// lines between them as removed and added again.
+fn edit_rows(old: &str, new: &str) -> Vec<(char, String)> {
+    let (o, n): (Vec<&str>, Vec<&str>) = (old.lines().collect(), new.lines().collect());
+    let head = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let tail = o[head..].iter().rev().zip(n[head..].iter().rev()).take_while(|(a, b)| a == b).count();
+    o[head..o.len() - tail].iter().map(|l| ('-', l.to_string()))
+        .chain(n[head..n.len() - tail].iter().map(|l| ('+', l.to_string()))).collect()
+}
+
+/// A unified diff's changed lines (Codex's file changes): its `---`/`+++` file lines are skipped only before the first
+/// hunk, so a changed line whose text starts with `--` or `++` (a SQL comment, `++i`) still counts.
+fn diff_rows(diff: &str) -> Vec<(char, String)> {
+    let mut in_hunk = false;
+    diff.lines().filter_map(|l| {
+        in_hunk |= l.starts_with("@@");
+        match l.as_bytes().first() {
+            _ if !in_hunk && (l.starts_with("+++") || l.starts_with("---")) => None,
+            Some(b'+') => Some(('+', l[1..].to_string())),
+            Some(b'-') => Some(('-', l[1..].to_string())),
+            _ => None,
+        }
+    }).collect()
+}
+
+/// An edit's step: its file and how many lines went and came (`+3 −1`), with the changed lines under it.
+fn edit_step(file: &str, rows: &[(char, String)]) -> (String, String) {
+    if rows.is_empty() {
+        return (format!("Edit {file}"), String::new()); // an agent that does not say what changed
+    }
+    let added = rows.iter().filter(|(sign, _)| *sign == '+').count();
+    (format!("Edit {file} · +{added} −{}", rows.len() - added), preview(rows, PREVIEW))
+}
+
+/// A shell command as Codex runs it (`/bin/zsh -lc 'ls'`), without the shell around it.
+fn bare_command(command: &str) -> &str {
+    let inner = ["/bin/zsh -lc ", "/bin/bash -lc ", "/bin/sh -c ", "bash -lc ", "zsh -lc "].iter()
+        .find_map(|shell| command.strip_prefix(shell)).unwrap_or(command);
+    match (inner.strip_prefix('\''), inner.strip_suffix('\'')) {
+        (Some(_), Some(_)) if inner.len() >= 2 => &inner[1..inner.len() - 1],
+        _ => inner,
+    }
 }
 
 impl Parser {
@@ -271,7 +351,7 @@ impl Parser {
                 notes.push(Note::Reply(self.reply.clone()));
             }
             ("item/started", "reasoning") | ("item/reasoning/summaryTextDelta", _) => notes.push(activity("thinking".into())),
-            ("item/started", "commandExecution") => notes.push(activity(format!("$ {}", short(s(item, "command"), 80)))),
+            ("item/started", "commandExecution") => notes.push(activity(format!("$ {}", short(bare_command(s(item, "command")), 80)))),
             ("item/completed", "commandExecution") => {
                 // One line once it ran: the command, and its exit code when it failed.
                 let how = match (item.get("exitCode").and_then(Value::as_i64), s(item, "status")) {
@@ -280,8 +360,24 @@ impl Parser {
                     (None, "" | "completed") => String::new(),
                     (None, status) => format!(" · {status}"),
                 };
-                let mark = if how.is_empty() { "" } else { FAILED };
-                notes.push(Note::Step(format!("{mark}$ {}{how}", short(s(item, "command"), 300))));
+                // Codex says what a command did (read a file, searched, listed a folder): a command that only looked,
+                // and went through, is counted as Claude's reads and searches are.
+                let actions = item.get("commandActions").and_then(Value::as_array).cloned().unwrap_or_default();
+                let looks: Vec<Note> = actions.iter().filter_map(|a| {
+                    let (kind, what) = match s(a, "type") {
+                        "read" => ("read", s(a, "name")),
+                        "search" => ("search", s(a, "query")),
+                        "listFiles" => ("list", s(a, "path")),
+                        _ => return None,
+                    };
+                    Some(Note::Looked { kind, text: format!("{kind} {}", short(what, 120)) })
+                }).collect();
+                if how.is_empty() && !actions.is_empty() && looks.len() == actions.len() {
+                    notes.extend(looks);
+                } else {
+                    let mark = if how.is_empty() { "" } else { FAILED };
+                    notes.push(Note::Step(format!("{mark}$ {}{how}", short(bare_command(s(item, "command")), 300))));
+                }
             }
             ("item/started" | "item/completed", "fileChange") => {
                 let changes = item.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -289,9 +385,28 @@ impl Parser {
                 if method == "item/started" {
                     notes.push(activity(format!("editing {names}")));
                     notes.extend(changes.iter().map(|c| Note::Touched(s(c, "path").to_string())));
-                } else {
+                } else if matches!(s(item, "status"), "failed" | "declined") || changes.is_empty() {
                     let mark = if matches!(s(item, "status"), "failed" | "declined") { FAILED } else { "" };
-                    notes.push(Note::Step(format!("{mark}edit {names}")));
+                    notes.push(Note::Step(format!("{mark}edit {names}").trim_end().to_string()));
+                } else {
+                    // each file's step with its changed lines, from the change's diff
+                    for c in &changes {
+                        let (name, diff) = (base_name(s(c, "path")), s(c, "diff"));
+                        let (text, rows) = match c.pointer("/kind/type").and_then(Value::as_str) {
+                            Some("delete") => (format!("Delete {name}"), String::new()),
+                            Some("add") => {
+                                // a new file's content as it is, unless it opens as a diff does
+                                let rows: Vec<(char, String)> = match diff.starts_with("--- ") || diff.starts_with("@@") {
+                                    true => diff_rows(diff),
+                                    false => diff.lines().map(|l| ('+', l.to_string())).collect(),
+                                };
+                                (format!("Write {name} · {} line{}", rows.len(), if rows.len() == 1 { "" } else { "s" }),
+                                 preview(&rows, NEW_FILE_PREVIEW))
+                            }
+                            _ => edit_step(name, &diff_rows(diff)),
+                        };
+                        notes.push(Note::Step(format!("{text}{rows}")));
+                    }
                 }
             }
             ("item/started", "mcpToolCall") => notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool")))),
@@ -439,16 +554,20 @@ impl Parser {
                     if self.subagents.iter().any(|a| a == id) {
                         notes.push(Note::SubagentEnd { id: id.to_string(), ok });
                     } else if let Some(at) = self.calls.iter().position(|(call, ..)| call == id) {
-                        let (_, tool, text) = self.calls.remove(at);
-                        let mark = if ok { "" } else { FAILED };
-                        notes.push(Note::Step(format!("{mark}{text}{}", outcome(&tool, block, ok))));
+                        let (_, tool, text, rows) = self.calls.remove(at);
+                        let text = format!("{text}{}", outcome(&tool, block, ok));
+                        notes.push(match (ok, looked(&tool)) {
+                            (true, Some(kind)) => Note::Looked { kind, text },
+                            (true, None) => Note::Step(format!("{text}{rows}")),
+                            (false, _) => Note::Step(format!("{FAILED}{text}")),
+                        });
                     }
                 }
             }
             ("result", subtype) => {
                 self.completed += 1;
                 // calls whose result never came (the turn stopped first) are shown as they were made
-                notes.extend(self.calls.drain(..).map(|(_, _, text)| Note::Step(format!("{UNFINISHED}{text}"))));
+                notes.extend(self.calls.drain(..).map(|(_, _, text, _)| Note::Step(format!("{UNFINISHED}{text}"))));
                 notes.push(Note::Tokens(claude_tokens(e)));
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
@@ -512,11 +631,25 @@ impl Parser {
                 path if !s(input, "pattern").is_empty() => format!(" in {}", base_name(path.trim_end_matches('/'))),
                 _ => String::new(),
             };
-            let text = match name {
-                "Bash" => format!("$ {}", short(target, 300)),
-                _ => format!("{name} {}{place}", short(target, 120)),
+            // A command reads as Claude described it ("Run the facility tests"), not as the shell line it runs.
+            let (text, rows) = match name {
+                "Bash" if !s(input, "description").is_empty() => (short(s(input, "description"), 120), String::new()),
+                "Bash" => (format!("$ {}", short(target, 300)), String::new()),
+                "Edit" => edit_step(target, &edit_rows(s(input, "old_string"), s(input, "new_string"))),
+                "MultiEdit" => {
+                    let edits = input.get("edits").and_then(Value::as_array).cloned().unwrap_or_default();
+                    let rows: Vec<(char, String)> = edits.iter()
+                        .flat_map(|e| edit_rows(s(e, "old_string"), s(e, "new_string"))).collect();
+                    edit_step(target, &rows)
+                }
+                "Write" => {
+                    let rows: Vec<(char, String)> = s(input, "content").lines().map(|l| ('+', l.to_string())).collect();
+                    (format!("Write {target} · {} line{}", rows.len(), if rows.len() == 1 { "" } else { "s" }),
+                     preview(&rows, NEW_FILE_PREVIEW))
+                }
+                _ => (format!("{name} {}{place}", short(target, 120)), String::new()),
             };
-            self.calls.push((s(block, "id").to_string(), name.to_string(), text));
+            self.calls.push((s(block, "id").to_string(), name.to_string(), text, rows));
         }
         notes
     }
@@ -697,14 +830,14 @@ mod tests {
         assert!(notes.contains(&Note::Session("01a1".into())));
         assert!(notes.contains(&Note::Activity { node: None, text: "editing solution.py".into() }));
         assert!(notes.contains(&Note::Touched("/w/solution.py".into())));
-        assert!(notes.contains(&Note::Step("edit solution.py".into())));
+        assert!(notes.contains(&Note::Step("Edit solution.py".into())), "a change without a diff names its file");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 3396, cache_read: 35456, cache_write: 0, output: 671 })));
         // the reply streams, the subagent's words stay out of it, and the whole reply replaces the pieces
         let said: Vec<&Note> = notes.iter().filter(|n| matches!(n, Note::Partial(_) | Note::Reply(_))).collect();
         assert_eq!(said, [&Note::Partial("Done: ".into()), &Note::Partial("fixed it.".into()), &Note::Reply("Done: fixed it.".into())]);
         assert!(notes.contains(&Note::Log("warning: Ignored unsupported project-local config keys".into())));
         // a command is one line once it ran; its exit code only when it failed
-        assert!(notes.contains(&Note::Step("$ /bin/zsh -lc 'ls'".into())));
+        assert!(notes.contains(&Note::Step("$ ls".into())), "without the shell Codex runs it in");
         let failed = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"make test","exitCode":2,"status":"failed"}}}"#;
         assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("✗ $ make test · exit 2".into())]);
         // a request of the server's own is refused at once, so the turn never waits on it
@@ -730,18 +863,74 @@ mod tests {
             CLAUDE[6].to_string(),
         ];
         let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-        let steps: Vec<Note> = run(Style::Claude, &lines).1.into_iter().filter(|n| matches!(n, Note::Step(_))).collect();
-        assert_eq!(steps, [
-            Note::Step("Read a.rs · 2 lines".into()),
-            Note::Step("Grep fn parse in src · Found 3 files".into()),
+        let shown: Vec<Note> = run(Style::Claude, &lines).1.into_iter()
+            .filter(|n| matches!(n, Note::Step(_) | Note::Looked { .. })).collect();
+        assert_eq!(shown, [
+            // a read and a search that went through are counted, each with its log line
+            Note::Looked { kind: "read", text: "Read a.rs · 2 lines".into() },
+            Note::Looked { kind: "search", text: "Grep fn parse in src · Found 3 files".into() },
             Note::Step("✗ $ cargo test · Permission to use Bash has been denied.".into()),
             Note::Step("◌ Edit a.rs".into()), // no result before the turn ended
         ]);
         let limited = [call("l", "Grep", r#"{"pattern":"x"}"#),
                        result("l", r#""Found 50 files limit: 50, offset: 0\na.rs""#, false)];
         let limited: Vec<&str> = limited.iter().map(String::as_str).collect();
-        let steps: Vec<Note> = run(Style::Claude, &limited).1.into_iter().filter(|n| matches!(n, Note::Step(_))).collect();
-        assert_eq!(steps, [Note::Step("Grep x · Found 50 files (limit 50)".into())]);
+        let shown: Vec<Note> = run(Style::Claude, &limited).1.into_iter().filter(|n| matches!(n, Note::Looked { .. })).collect();
+        assert_eq!(shown, [Note::Looked { kind: "search", text: "Grep x · Found 50 files (limit 50)".into() }]);
+    }
+
+    #[test]
+    fn steps_read_as_what_they_did_and_edits_show_their_lines() {
+        let call = |id: &str, name: &str, input: serde_json::Value| serde_json::json!({"type": "assistant",
+            "message": {"content": [{"type": "tool_use", "id": id, "name": name, "input": input}]},
+            "parent_tool_use_id": null}).to_string();
+        let done = |id: &str, content: serde_json::Value| serde_json::json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": content, "is_error": false}]}, "parent_tool_use_id": null}).to_string();
+        let lines = [
+            call("b", "Bash", serde_json::json!({"command": "cd /w && npm test -- --run 2>&1 | tail -5", "description": "Run the tests"})),
+            done("b", "ok".into()),
+            call("e", "Edit", serde_json::json!({"file_path": "/w/a.rs", "old_string": "fn a() {\n    let x = 1;\n    x\n}",
+                                                 "new_string": "fn a() {\n    let x = 2;\n    x\n}"})),
+            done("e", "ok".into()),
+            call("w", "Write", serde_json::json!({"file_path": "/w/b.rs", "content": "1\n2\n3\n4\n5\n6"})),
+            done("w", "ok".into()),
+            call("i", "Read", serde_json::json!({"file_path": "/w/shot.png"})),
+            done("i", serde_json::json!([{"type": "image", "source": {}}])),
+            CLAUDE[6].to_string(),
+        ];
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let shown: Vec<Note> = run(Style::Claude, &lines).1.into_iter()
+            .filter(|n| matches!(n, Note::Step(_) | Note::Looked { .. })).collect();
+        assert_eq!(shown, [
+            Note::Step("Run the tests".into()), // Claude's own words for the command, not the shell line
+            Note::Step("Edit a.rs · +1 −1\n- let x = 1;\n+ let x = 2;".into()), // the lines it changed, without their shared indent
+            Note::Step("Write b.rs · 6 lines\n+ 1\n+ 2\n+ 3\n+ 4\n… 2 more lines".into()),
+            Note::Looked { kind: "read", text: "Read shot.png · image".into() },
+        ]);
+        // Codex: a command that only looked is counted; another reads without its shell; a change shows its diff
+        let codex = [
+            r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"/bin/zsh -lc 'sed -n 1,40p a.rs'","exitCode":0,"status":"completed","commandActions":[{"type":"read","command":"sed -n 1,40p a.rs","name":"a.rs","path":"/w/a.rs"}]}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"/bin/zsh -lc 'cargo test'","exitCode":0,"status":"completed","commandActions":[{"type":"unknown","command":"cargo test"}]}}}"#,
+            r#"{"method":"item/completed","params":{"item":{"type":"fileChange","id":"f","status":"completed","changes":[{"path":"/w/a.rs","kind":{"type":"update","move_path":null},"diff":"--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,3 @@\n fn a() {\n-    1\n+    2\n }\n"},{"path":"/w/n.rs","kind":{"type":"add"},"diff":"one\ntwo\n"}]}}}"#,
+        ];
+        let notes: Vec<Note> = codex.iter().flat_map(|l| Parser::new(Style::Codex).line(l)).collect();
+        assert_eq!(notes, [
+            Note::Looked { kind: "read", text: "read a.rs".into() },
+            Note::Step("$ cargo test".into()),
+            Note::Step("Edit a.rs · +1 −1\n- 1\n+ 2".into()),
+            Note::Step("Write n.rs · 2 lines\n+ one\n+ two".into()),
+        ]);
+        // a changed line whose text starts with -- or ++ counts; a new file with an @@ line is still content; a
+        // failed change is marked failed even when it names no file
+        let change = |kind: &str, diff: &str, status: &str| serde_json::json!({"method": "item/completed", "params": {"item": {
+            "type": "fileChange", "status": status, "changes": if diff.is_empty() { serde_json::json!([]) } else {
+                serde_json::json!([{"path": "/w/q.sql", "kind": {"type": kind}, "diff": diff}]) }}}}).to_string();
+        let step = |line: String| Parser::new(Style::Codex).line(&line);
+        assert_eq!(step(change("update", "--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,2 @@\n--- old note\n+++i;\n select 1;\n", "completed")),
+                   [Note::Step("Edit q.sql · +1 −1\n- -- old note\n+ ++i;".into())]);
+        assert_eq!(step(change("add", "notes\n@@ -1 +1 @@\n-x\n", "completed")),
+                   [Note::Step("Write q.sql · 3 lines\n+ notes\n+ @@ -1 +1 @@\n+ -x".into())]);
+        assert_eq!(step(change("update", "", "failed")), [Note::Step("✗ edit".into())]);
     }
 
     #[test]

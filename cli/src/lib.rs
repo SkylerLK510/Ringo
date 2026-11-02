@@ -377,7 +377,7 @@ impl Job {
     }
 
     fn push(&mut self, said: Said) {
-        let (Said::Reply(text) | Said::Step(text) | Said::Line(text)) = &said else {
+        let (Said::Reply(text) | Said::Step(text) | Said::Line(text) | Said::Looked(_, text)) = &said else {
             self.fresh.push(said); // a piece of the reply: the log takes the whole reply when it comes
             return;
         };
@@ -402,6 +402,8 @@ pub enum Said {
     Step(String),
     /// A line shown as it is: a plain agent's output, or Ringo's note about the job.
     Line(String),
+    /// A step that only looked (see `Note::Looked`): the shell counts these; the log keeps each one.
+    Looked(&'static str, String),
 }
 
 pub enum Event {
@@ -1527,6 +1529,7 @@ impl Session {
                         Note::Reply(text) => job.push(Said::Reply(text)),
                         Note::Partial(text) => job.push(Said::Partial(text)),
                         Note::Step(text) => job.push(Said::Step(text)),
+                        Note::Looked { kind, text } => job.push(Said::Looked(kind, text)),
                         Note::Subagent { id: sub, label } => {
                             job.activity = format!("started subagent {label}");
                             job.subs.push(Sub { id: sub, label, activity: "starting".into(), ended: None });
