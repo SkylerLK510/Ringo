@@ -332,9 +332,20 @@ that number as the turn's own. It now counts only what each turn adds. Claude re
 
 So the shell starts Claude in safe mode (your CLAUDE.md, skills, plugins, hooks and MCP servers are left out; sign-in,
 built-in tools and subagents work as usual), unless the task names a connector (see Modes and permissions), and
-appends the repository's own `CLAUDE.md` or `AGENTS.md`. A follow-up
-re-sends the conversation so far, so it costs a first turn plus that history. A short exchange adds little, but a
-long read conversation grows with every turn, so start a write job (`@codex!`) for an unrelated task. Nothing is
+appends the repository's own `CLAUDE.md` or `AGENTS.md`. Your own rules for every Claude turn can go in `rules.md`
+in Ringo's state folder (`~/.local/share/ringo/rules.md` on macOS and Linux): when that file has text, it is appended
+ahead of the repository's file. Every line in it is read on every call, so keep it short; with no file nothing is
+added. Codex reads your `~/.codex/AGENTS.md` itself.
+
+A follow-up re-sends the conversation so far, so it costs a first turn plus that history, and within a turn every
+call re-reads everything before it. On a subscription login Claude runs Opus with a 1M window, where Claude Code
+compacts a conversation only near 967k tokens: one long turn started in a home folder read 3.9M tokens in all, its
+last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000`, the window Claude Code
+compacts at on a 200k model, and Claude compacts by itself when a conversation passes it, mid-turn as on resuming.
+Compaction keeps the system prompt (with the files appended above) and re-reads the five files last changed; the
+rest of the history becomes Claude's summary. Set the variable yourself to choose another window (100000 to
+1000000). `/compact` still compacts at once. A short exchange adds little, but start a write job (`@codex!`) for an
+unrelated task. Nothing is
 shared between agents unless you write `{#N}`. (`--bare` would cut more, but it signs in with an API key only, so
 the shell does not use it.)
 

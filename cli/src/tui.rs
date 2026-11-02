@@ -1128,6 +1128,14 @@ impl App {
         self.say(format!("  Type what you want done, in your own words, and press Enter. {} works in this folder and \
                           asks before it runs a command{undo}", self.main.name()));
         self.say("  @codex or @claude picks who you talk to · / lists the commands · ? the keys · /help the guide");
+        // Started in the home folder (or above it), a turn has no /undo and no project's instructions, and spends
+        // its first steps finding the project it was asked about: one turn read 3.9M tokens that way.
+        if self.s.at_home {
+            self.say("  Ringo is open in your home folder (or a folder above it). For work on a project, quit (Ctrl-C \
+                      twice), cd into the project and \
+                      start ringo there: /undo works, the project's own instructions load, and the agent does not \
+                      have to search for it.");
+        }
     }
 
     fn say(&mut self, text: impl AsRef<str>) {
@@ -2723,6 +2731,22 @@ mod tests {
         }
         assert!(narrow[0].contains("ringo") && !narrow[0].contains("mode"), "a narrow head drops its right end: {narrow:#?}");
         assert_eq!(first_choice(&[Agent::from_name("grok").unwrap(), Agent::from_name("codex").unwrap()]).name(), "codex");
+    }
+
+    #[test]
+    fn the_home_folder_says_to_start_in_the_project() {
+        let said = |a: &App| a.out.iter().map(|o| format!("{o:?}")).collect::<String>();
+        let mut a = app(&["claude"]);
+        a.welcome();
+        assert!(!a.s.at_home && !said(&a).contains("open in your home folder"));
+        let dir = std::env::temp_dir().join(format!("ringo-tui-home-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Session::with_state_home(&dir, &dir.join("state"), &dir).unwrap();
+        let mut h = App::new(s, vec![Agent::from_name("claude").unwrap()], "~".into(),
+                             Theme::named("mono", crate::theme::Depth::Mono).unwrap(), Vec::new());
+        h.welcome();
+        assert!(h.s.at_home && said(&h).contains("open in your home folder") && said(&h).contains("cd into the project"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -5,7 +5,8 @@ allows and what it was measured to cost, is [docs/SHELL.md](SHELL.md).
 
 ## Start
 
-1. Open a terminal in the folder you want to work on.
+1. Open a terminal in the folder you want to work on: the project itself, not your home folder. In the project,
+   `/undo` works, the project's own instructions load, and the agent does not have to search for what you mean.
 2. Type `ringo`.
 3. The first time, Ringo looks for the AI coding agents on your computer (Claude Code, Codex, Antigravity) and helps
    you sign in to them. It uses your own subscription logins, never API keys.
@@ -29,8 +30,10 @@ add a dark mode switch to the settings page
   to stop it.
 - You can type the next message while it works. It waits under the box and goes when the turn ends.
 - The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
-  `/clear` starts a new conversation. When a long conversation makes each turn cost a lot, `/compact` has Claude
-  shrink it to a summary: one call over the whole conversation, and every turn after it is smaller.
+  `/clear` starts a new conversation. Claude shrinks a long conversation to a summary by itself once it passes
+  200,000 tokens, so later calls stay smaller; `/compact` does it at once.
+- To give every Claude turn your own rules (how you push, what never to do), write them in `rules.md` in Ringo's
+  state folder (`~/.local/share/ringo/rules.md`). Keep it short: every line is read on every call.
 
 ## Take back a change
 
