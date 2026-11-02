@@ -246,9 +246,18 @@ pub const ALWAYS_ASK: [&str; 16] = [
 ];
 
 /// Claude Code tools that act outside the agent's turn, denied in every Claude turn Ringo starts.
-pub const OUT_OF_TURN_TOOLS: [&str; 13] = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger",
+pub const OUT_OF_TURN_TOOLS: [&str; 15] = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger",
     "PushNotification", "SendToProject", "SendToProjectContext", "EnterWorktree", "ExitWorktree", "DesignSync",
-    "ReportFindings", "Workflow"];
+    "ReportFindings", "Workflow", "ListAgents", "SendMessage"];
+
+/// Sent to a Codex turn whose owner's own Codex instructions send it to Ringo: without it, one small task (add a
+/// function and check it) read Ringo's 25 KB guide, started a Ringo review inside the turn and used 283,594 tokens;
+/// with it (and the two tools `launch_agent` turns off), 55,966 for the same result (codex-cli 0.166.0). It promises
+/// no review: only the ultra tier has one. Claude's safe mode drops the owner's CLAUDE.md instead. ceiling: the
+/// owner's file is still sent (3.8 KB here); a private CODEX_HOME would drop it, as the pipelines' calls have, but
+/// turns would lose the owner's settings and threads.
+const CODEX_IN_RINGO: &str = "Ringo launched this conversation, so do not read Ringo's guides or run Ringo inside it, \
+    even where other instructions say to; do the task directly and check it as you normally would.";
 
 /// Words that name a service reached through the owner's connectors (MCP servers). A Claude turn whose task names
 /// one runs with the owner's connectors loaded; any other runs without them (16.6k tokens a trivial turn instead of
@@ -424,6 +433,8 @@ pub struct Session {
     pub no_undo: Option<String>,
     /// Whether the session opened in the owner's home folder (or above it), where no one project is meant.
     pub at_home: bool,
+    /// Codex's own folder ($CODEX_HOME, else ~/.codex), whose AGENTS.md Codex reads into every turn.
+    pub codex_home: PathBuf,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -730,7 +741,8 @@ impl Session {
             },
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, dir, jobs: Vec::new(), max_jobs: 3,
+        let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
@@ -808,6 +820,17 @@ impl Session {
 
     fn folder_git(&self, args: &[&str]) -> Result<String, String> {
         run_git(self.folder(), args).map(trimmed)
+    }
+
+    /// Whether the owner's own Codex instructions (the first of AGENTS.override.md and AGENTS.md with any text in it)
+    /// send Codex to Ringo: a turn Ringo launched is then told it is already in Ringo (see CODEX_IN_RINGO). Not when
+    /// the owner's Codex settings give developer instructions of their own, which the thread's would replace.
+    /// ceiling: the settings are scanned for the key, not parsed; such an owner's turns still follow the file.
+    fn codex_told_to_use_ringo(&self) -> bool {
+        let read = |name: &str| fs::read(self.codex_home.join(name)).map(|b| String::from_utf8_lossy(&b).to_lowercase());
+        let own = read("config.toml").is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
+        !own && ["AGENTS.override.md", "AGENTS.md"].into_iter().filter_map(|f| read(f).ok())
+            .find(|text| !text.trim().is_empty()).is_some_and(|text| text.contains("ringo"))
     }
 
     /// The owner's own rules for every Claude turn: a file they write in Ringo's state folder. With none, a turn is as
@@ -974,6 +997,9 @@ impl Session {
                 if !names_connector(prompt) {
                     cmd.args(["-c", "features.plugins=false", "-c", "features.apps=false"]);
                 }
+                // Image generation, and goals (an aim Codex pursues by itself over many turns), are tools no turn here
+                // uses: 14,733 tokens a trivial turn with them, 13,564 without (codex-cli 0.166.0).
+                cmd.args(["-c", "features.image_generation=false", "-c", "features.goals=false"]);
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
                 }
@@ -981,6 +1007,10 @@ impl Session {
                                                     "approvalPolicy": if auto { "on-request" } else { "never" }});
                 if auto {
                     thread["approvalsReviewer"] = "auto_review".into();
+                }
+                // Kept by the thread once it is given; given on resuming too, for a thread started without it
+                if self.codex_told_to_use_ringo() {
+                    thread["developerInstructions"] = CODEX_IN_RINGO.into();
                 }
                 let method = match &resume {
                     Some(id) => {
@@ -1013,7 +1043,13 @@ impl Session {
                 } else {
                     // --safe-mode drops the owner's CLAUDE.md, skills, plugins, hooks and MCP servers: one trivial
                     // turn measured 16.6k tokens instead of 50.2k, with the subscription login and built-in subagents
-                    // kept. The repository's own instructions are appended instead.
+                    // kept. The repository's own instructions are appended instead. Skills go too: safe mode still lists
+                    // 20 of Claude Code's own (scheduling, loops, sending to other projects, plugin authoring...) in
+                    // every call, 12,432 tokens a trivial turn with them and 9,320 without (Claude Code 2.1.316), and
+                    // no turn in Ringo's record had called one. /compact is one of the commands, so its turn keeps them.
+                    if prompt.trim() != "/compact" {
+                        cmd.arg("--disable-slash-commands");
+                    }
                     cmd.arg("--safe-mode");
                 }
                 // Ask: Claude's default permission checks, every prompt sent to Ringo (`--permission-prompt-tool
