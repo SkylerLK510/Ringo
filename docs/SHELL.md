@@ -91,34 +91,38 @@ too, each agent keeping its own conversation. Codex owns the abstract work: Ring
 
 ## Using it
 
+An empty conversation shows only where to start, in its middle; it goes once you say something, and `/usrman` has the
+rest (where Ringo is, who works here, the guide and the settings in force):
+
 ```
-╭──────────────────────────────────────────────────╮
-│ ✻ Welcome to Ringo                               │
-│                                                  │
-│ folder  ~/code/my-repo                           │
-│ agents  claude, codex (/setup adds another)      │
-│ mode    ask (Shift-Tab changes it)               │
-╰──────────────────────────────────────────────────╯
+ ▲▲ ringo  my-repo (main)                                  ask mode · 0 tokens
+────────────────────────────────────────────────────────────────────────────────
 
-› add a retry to the HTTP client
+                                    ▲▲ ringo
 
-#1 claude
+               Tell Ringo what you want done, in your own words.
+                  /usrman how it works · / commands · ? keys
+
+────────────────────────────────────────────────────────────────────────────────
+ ❯ Tell Ringo what you want to do                             ⇧⇥ mode · ? keys
+```
+
+Then each speaker starts with a chip in their own colour (shown here as plain text):
+
+```
+ you  add a retry to the HTTP client
+
+ claude  #1
   ✓ read 1 file, searched 1 time
   ✓ edit client.rs                                 +3 −1
       - let resp = self.http.send(req)?;
       + let resp = retry(3, || self.http.send(req.clone()))?;
       + // backs off 100 ms, then doubles
-      + ...
   ✓ run the retry tests
 
   Added a retry with backoff to `send` in **client.rs**, and a test for it.
 
-✓ #1 claude done · 0:41 · 34.8k tokens · changed client.rs (/undo takes it back)
-
-╭──────────────────────────────────────────────────────────────────────────╮
-│ › Tell Ringo what you want to do · / commands · ? keys                   │
-╰──────────────────────────────────────────────────────────────────────────╯
- ringo  my-repo (main) · ask mode · talking to claude · 34.8k tokens   ? keys
+  ✓ done · 0:41 · 34.8k tokens · changed client.rs (/undo takes it back)
 ```
 
 The shell fills the terminal (the alternate screen, as Codex's does). The conversation takes the top: your lines,
@@ -415,7 +419,23 @@ review (`{#R}`); no review follows that turn. Where `/undo` is off there is no b
 
 ## Usage
 
-`/usage` adds no tokens. It reports three things:
+`/usage` adds no tokens. It shows the tokens that went through Ringo, then each plan's limits, as gauges:
+
+```
+  tokens through Ringo · this session 0 · last 24 hours 8.64M · last 7 days 8.64M
+    claude ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 8.64M  in 7 days · 8.64M in 24 hours · 0 this session
+    codex  ▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱    0  in 7 days · 0 in 24 hours · 0 this session
+  asking claude and codex for your plan's limits…
+  claude · max plan
+    5 hours       ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  12%  starts over in 3 h 40 min
+    week          ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱  64%  starts over in 2 d 7 h
+  codex · plus plan · 2 full resets left
+    5 hours       ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  14%  starts over in 4 h 0 min
+```
+
+A limit's gauge is green under 60% used, amber to 85% and red past it; an agent's token gauge is its share of the
+week's, in its colour. A wide terminal's side panel keeps a small gauge for every limit (`claude 5h ▰▱▱ 12%`),
+read when the shell opens and again after a turn when the last read is ten minutes old: no tokens either.
 
 - **This session:** the jobs in memory, by agent.
 - **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder. Each finished job that used tokens
