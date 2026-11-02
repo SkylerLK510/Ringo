@@ -802,6 +802,31 @@ fn ask_mode_sends_each_permission_request_to_the_owner() {
     assert!(s.allowed.is_empty() && s.decide(id, Decision::Once).is_err());
 }
 
+/// A follow-up to a turn that called a connector keeps the connectors although it names none ("and the overdue
+/// ones?" after a ClickUp question); the turn after one that did not goes back to running without them.
+#[test]
+fn a_follow_up_keeps_the_connectors_the_turn_before_used() {
+    let r = repo("connector-follow-up");
+    let claude = fake(&root(), "claude-follow-up", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
+        line=$(head -n 1)\nprintf '%s' \"$line\" > \"$0.stdin\"\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-f\",\"apiKeySource\":\"none\"}'\n\
+        case \"$line\" in *ClickUp*) echo '{\"type\":\"assistant\",\"message\":{\"id\":\"a1\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"mcp__claude_ai_ClickUp__clickup_filter_tasks\",\"input\":{}}]},\"parent_tool_use_id\":null}';; esac\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let mut s = session(&r, agent("claude"), &claude);
+    let safe = |s: &mut Session, task: &str| -> bool {
+        let id = s.launch_agent(agent("claude"), false, task).unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        let narrow = fs::read_to_string(format!("{}.stdin", claude.display())).unwrap().contains("(Ringo: this reaches a connector");
+        let safe = fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().any(|a| a == "--safe-mode");
+        assert_eq!(narrow, !safe, "a turn with the connectors is asked to keep them narrow, and only such a turn");
+        safe
+    };
+    assert!(!safe(&mut s, "what ClickUp tasks are mine?"), "it names a connector");
+    assert!(!safe(&mut s, "and the overdue ones?"), "the turn before called one");
+    assert!(safe(&mut s, "now fix the parser"), "the turn before had them but called none");
+    assert!(safe(&mut s, "and its tests"));
+}
+
 #[test]
 fn modes_change_what_each_agent_may_do() {
     let r = repo("modes");

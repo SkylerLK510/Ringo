@@ -254,8 +254,10 @@ in its worktree) and, in auto mode, its own reviewer.
 
 **Connectors.** A Claude turn whose task names a service only your connectors reach (Jira, Confluence, ClickUp,
 Gmail, email, calendar, Google Drive or Docs, Slack, Linear, Notion, Figma, Datadog, Intercom) runs with your MCP
-servers and plugins loaded, but without your CLAUDE.md, memory, skills or main agent; any other turn runs in safe
-mode without them. Measured with Claude Code 2.1.316, one trivial turn each: 16,567 tokens in safe mode, 27,522 with
+servers and plugins loaded, but without your CLAUDE.md, memory, skills or main agent, and so does the turn after one
+that called a connector ("and the overdue ones?" names none); any other turn runs in safe mode without them. Before
+that, the follow-ups to a ClickUp question ran without ClickUp: one read Ringo's own job logs for the earlier answer
+(104k tokens, three minutes, a command to allow) and the other said the data was probably a day old. Measured with Claude Code 2.1.316, one trivial turn each: 16,567 tokens in safe mode, 27,522 with
 the connectors, 57,799 with everything. Without your CLAUDE.md, an instruction in it to use Ringo cannot start Ringo
 again either. Your own hooks do run in these turns, as in your normal Claude Code. Checked live through the same
 flags: a read-only Jira question asked before each of its two Jira calls
@@ -300,7 +302,8 @@ your repository, design sync, review reports, multi-agent `Workflow`, and messag
 and shell tools stay. Claude Code's own skills go too (scheduling, loops, sending to other projects, plugin authoring
 and 16 more were listed in every call, and no turn in Ringo's record had called one); a `/compact` turn keeps them,
 since it is one of the commands. Codex turns lose its ask tool
-and the collaboration-mode text that goes with it, and analytics; unless the task names a connector they also lose
+and the collaboration-mode text that goes with it, and analytics; unless the task names a connector (or follows a
+turn that called one) they also lose
 plugins and apps (13 of the 17 skills listed, recommended plugins, and a computer-use tool that acts outside the
 sandbox), and always image generation and goals (an aim Codex pursues by itself over many turns). One trivial turn
 each (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0; the last two rows 2026-11-02, codex-cli 0.166.0):

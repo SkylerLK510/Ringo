@@ -266,7 +266,7 @@ const CODEX_IN_RINGO: &str = "Ringo launched this conversation, so do not read R
     even where other instructions say to; do the task directly and check it as you normally would.";
 
 /// Words that name a service reached through the owner's connectors (MCP servers). A Claude turn whose task names
-/// one runs with the owner's connectors loaded; any other runs without them (16.6k tokens a trivial turn instead of
+/// one, or that follows a turn that called one, runs with the owner's connectors loaded; any other runs without them (16.6k tokens a trivial turn instead of
 /// 27.5k, measured with Claude Code 2.1.316).
 const CONNECTOR_WORDS: [&str; 18] = ["jira", "confluence", "atlassian", "clickup", "gmail", "email", "emails", "inbox",
     "calendar", "gdrive", "slack", "linear", "notion", "figma", "datadog", "intercom", "connector", "mcp"];
@@ -388,8 +388,10 @@ pub struct Job {
     gate: Arc<Mutex<Gate>>,
     /// Codex: the thread and the running turn, which a line for it names.
     codex_turn: Option<(String, String)>,
-    /// Whether the turn runs with the owner's connectors, which a line that names one needs.
+    /// Whether the turn runs with the owner's connectors, which a line that names one needs, and whether it called
+    /// one (its follow-up keeps them).
     connectors: bool,
+    reached: bool,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
 }
@@ -1139,7 +1141,7 @@ impl Session {
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
-                             codex_turn: None, connectors: false });
+                             codex_turn: None, connectors: false, reached: false });
         Ok(id)
     }
 
@@ -1202,6 +1204,8 @@ impl Session {
         let mut cmd = Command::new(self.program(agent));
         let mut resume = if write { None } else { self.threads.get(&agent).cloned() };
         let mut sent = prompt.to_string();
+        let connectors = prompt.trim() != "/compact"
+            && (names_connector(prompt) || self.lane(agent, id).last().is_some_and(|j| j.reached));
         if !write {
             self.jobs[id - 1].lane = self.separate.then_some(agent);
             if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
@@ -1209,8 +1213,11 @@ impl Session {
                 self.jobs[id - 1].push_log(note);
             }
         }
-        // the connectors load as below: Claude's outside read mode, Codex's in every mode
-        if prompt.trim() != "/compact" && names_connector(prompt) {
+        // The connectors load for a message that names one, and for the turn after one that called one ("and mine?"
+        // after a ClickUp question): without them that follow-up searched Ringo's own logs for the earlier answer,
+        // 104k tokens and three minutes, and said the data was a day old. Claude's load outside read mode, Codex's in
+        // every mode.
+        if connectors {
             self.jobs[id - 1].connectors = spec.adapter == Adapter::Codex || (spec.adapter == Adapter::Claude && self.mode != Mode::Read);
             sent.push_str(match spec.adapter {
                 Adapter::Claude if self.mode != Mode::Read => CLAUDE_CONNECTOR_NOTE,
@@ -1243,7 +1250,7 @@ impl Session {
                 // (codex-cli 0.165.0).
                 cmd.args(["-c", "features.default_mode_request_user_input=false", "-c",
                           "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false"]);
-                if !names_connector(prompt) {
+                if !connectors {
                     cmd.args(["-c", "features.plugins=false", "-c", "features.apps=false"]);
                 }
                 // Image generation, and goals (an aim Codex pursues by itself over many turns), are tools no turn here
@@ -1285,7 +1292,7 @@ impl Session {
                 // The reply streams as it is written (--include-partial-messages); neither changes any tokens.
                 cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                           "--include-partial-messages", "--replay-user-messages"]);
-                if self.mode != Mode::Read && names_connector(prompt) {
+                if self.mode != Mode::Read && connectors {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
                     // Without CLAUDE.md the owner's instruction to use Ringo cannot start Ringo again either.
@@ -1905,6 +1912,7 @@ impl Session {
                             job.touched.insert(rel.to_string_lossy().into_owned());
                         }
                         Note::Ran => job.ran = true,
+                        Note::Connector => job.reached = true,
                         Note::Turn { thread, turn } => job.codex_turn = Some((thread, turn)),
                         Note::Refused(n) => {
                             if let (Some(text), Kind::Agent { agent, .. }) = (job.steered.get(n).cloned(), job.kind.clone()) {

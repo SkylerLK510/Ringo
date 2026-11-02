@@ -77,6 +77,8 @@ pub enum Note {
     Touched(String),
     /// The agent ran a shell command, which may have written files it does not report (see `Session::end_with`).
     Ran,
+    /// The agent called one of the owner's connectors (an MCP tool): the conversation's next turn keeps them.
+    Connector,
     /// The turn cannot succeed; the runner stops the job.
     Fail(String),
     /// The agent waits for the owner's answer before it acts.
@@ -449,7 +451,10 @@ impl Parser {
                     }
                 }
             }
-            ("item/started", "mcpToolCall") => notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool")))),
+            ("item/started", "mcpToolCall") => {
+                notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool"))));
+                notes.push(Note::Connector);
+            }
             ("item/completed", "mcpToolCall") => {
                 let mark = if s(item, "status") == "failed" { FAILED } else { "" };
                 notes.push(Note::Step(format!("{mark}{}.{}", s(item, "server"), s(item, "tool"))));
@@ -686,6 +691,9 @@ impl Parser {
         }
         if name == "Bash" { // a subagent's command writes the same folder
             notes.push(Note::Ran);
+        }
+        if name.starts_with("mcp__") {
+            notes.push(Note::Connector);
         }
         if parent.is_none() {
             // A search names where it looked: five greps for one pattern in five folders read as five lines.
@@ -963,6 +971,11 @@ mod tests {
             Note::Step("✗ $ cargo test · Permission to use Bash has been denied.".into()),
             Note::Step("◌ Edit a.rs".into()), // no result before the turn ended
         ]);
+        // a connector call marks the turn, so its follow-up keeps the connectors; nothing else does
+        let connector = |name: &str| run(Style::Claude, &[&call("m", name, "{}")]).1.contains(&Note::Connector);
+        assert!(connector("mcp__claude_ai_ClickUp__clickup_filter_tasks") && !connector("Read"));
+        let codex_mcp = r#"{"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"m1","server":"codex_apps","tool":"gmail_search"}}}"#;
+        assert!(run(Style::Codex, &[codex_mcp]).1.contains(&Note::Connector));
         let limited = [call("l", "Grep", r#"{"pattern":"x"}"#),
                        result("l", r#""Found 50 files limit: 50, offset: 0\na.rs""#, false)];
         let limited: Vec<&str> = limited.iter().map(String::as_str).collect();
