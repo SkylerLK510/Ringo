@@ -259,17 +259,33 @@ plan's usage is not known.
 
 **Tools a Ringo turn never needs.** Claude Code also gives every turn tools that act outside it: scheduling (`Cron*`,
 `ScheduleWakeup`), `RemoteTrigger`, `PushNotification`, sending to other projects, `EnterWorktree`/`ExitWorktree` on
-your repository, design sync, review reports and multi-agent `Workflow`. Their schemas are sent in full, so the shell
-denies them in every mode; subagents, skills, search and the file and shell tools stay. Codex turns lose its ask tool
+your repository, design sync, review reports, multi-agent `Workflow`, and messages to other sessions (`ListAgents`,
+`SendMessage`). Their schemas are sent in full, so the shell denies them in every mode; subagents, search and the file
+and shell tools stay. Claude Code's own skills go too (scheduling, loops, sending to other projects, plugin authoring
+and 16 more were listed in every call, and no turn in Ringo's record had called one); a `/compact` turn keeps them,
+since it is one of the commands. Codex turns lose its ask tool
 and the collaboration-mode text that goes with it, and analytics; unless the task names a connector they also lose
 plugins and apps (13 of the 17 skills listed, recommended plugins, and a computer-use tool that acts outside the
-sandbox). One trivial turn each (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0):
+sandbox), and always image generation and goals (an aim Codex pursues by itself over many turns). One trivial turn
+each (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0; the last two rows 2026-11-02, codex-cli 0.166.0):
 
 | Turn | Before | After |
 |---|---|---|
 | Claude read-only turn (now read mode) | 16,547 | 11,984 |
 | Claude turn that edits (now a plain line, or `@claude!`) | 17,133 | 12,570 |
 | Codex turn, per call | 17,133 | 14,350 |
+| Claude turn that edits, without Claude Code's skills | 12,432 | 9,320 |
+| Codex turn, per call, without image generation and goals | 14,733 | 13,564 |
+
+**Your own Codex instructions.** Codex reads `~/.codex/AGENTS.md` (or `$CODEX_HOME`'s) into every turn, and Claude's
+safe mode has no counterpart for it. When that file sends Codex to Ringo, as a Ringo user's often does, a turn in the
+shell followed it: asked to add one function to a file and check it, Codex read Ringo's 25 KB guide and its objectives,
+started a Ringo review inside the turn and used 283,594 tokens. So when the file mentions Ringo, the shell tells Codex
+in one sentence that Ringo launched it, so it should not read Ringo's guides or run Ringo, and should check its work
+as it normally would: the same task then took 55,966 tokens, with the same result and none of those steps. Not when
+your Codex settings give `developer_instructions` of their own, which the sentence would replace. The file itself is
+still sent; a private `CODEX_HOME`, as the pipelines' calls have, would drop it, but turns would lose your Codex
+settings and conversations.
 
 Not yet: Codex cannot stop to ask, so it does not take ask mode's prompts. Its app-server protocol has the same
 three answers (`accept`, `acceptForSession`, `decline` for command, file-change and permission approvals) and could

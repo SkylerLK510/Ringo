@@ -496,6 +496,7 @@ fn agent_commands_are_pinned() {
         echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
     let grok = fake(&root(), "grok-golden", &format!("#!/bin/sh\n{RECORD}echo done\n"));
     let mut s = session(&r, agent("codex"), &codex);
+    s.codex_home = root().join("codex-home-golden"); // none: the owner's own Codex instructions add nothing
     s.programs.insert(agent("claude"), claude.clone());
     s.programs.insert(agent("grok"), grok.clone());
     let repo = s.repo.to_string_lossy().into_owned();
@@ -517,7 +518,8 @@ fn agent_commands_are_pinned() {
     let argv = ["app-server", "-c", "sandbox_workspace_write.network_access=false", "-c", "forced_login_method=\"chatgpt\"",
                 "-c", "model_provider=\"openai\"", "-c", "features.default_mode_request_user_input=false",
                 "-c", "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false",
-                "-c", "features.plugins=false", "-c", "features.apps=false"].map(String::from).to_vec();
+                "-c", "features.plugins=false", "-c", "features.apps=false", "-c", "features.image_generation=false",
+                "-c", "features.goals=false"].map(String::from).to_vec();
     let mut codex_turn = |write: bool| -> (Vec<String>, String, String) {
         let (argv, _) = turn(agent("codex"), write, &codex);
         let thread = threads(&codex).pop().unwrap().to_string();
@@ -540,7 +542,7 @@ fn agent_commands_are_pinned() {
     // Ask mode (the default): edits go through, every permission prompt comes to Ringo, the always-ask rules ride
     // along; the prompt is one stream-json message on stdin, which stays open for the answers.
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                "--include-partial-messages", "--safe-mode",
+                "--include-partial-messages", "--disable-slash-commands", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK},
                                    "attribution": {"commit": "", "pr": ""}}).to_string();
@@ -562,6 +564,48 @@ fn agent_commands_are_pinned() {
     assert_eq!(turn(agent("grok"), true, &grok),
                (want(&["-p", "the task", "--output-format", "plain", "--no-auto-update", "--always-approve", "--cwd", "WT"], &[]),
                 String::new()));
+}
+
+/// A Codex turn is told it is already in Ringo when the owner's own Codex instructions send Codex to Ringo (one small
+/// task otherwise read Ringo's guide and started a review inside the turn), and only then; a Claude /compact turn
+/// keeps Claude Code's commands, which every other turn goes without.
+#[test]
+fn codex_is_told_it_is_in_ringo_and_compact_keeps_claudes_commands() {
+    let r = repo("in-ringo");
+    let codex = fake(&root(), "codex-in-ringo", &codex_script("", &codex_done("done", (1, 0, 1))));
+    let claude = fake(&root(), "claude-in-ringo", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
+        head -n 1 > /dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-i\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("claude"), claude.clone());
+    let home = root().join("codex-home-in-ringo");
+    fs::create_dir_all(&home).unwrap();
+    s.codex_home = home.clone();
+    let told = |s: &mut Session| -> Option<String> {
+        let id = s.launch_agent(agent("codex"), false, "the task").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        threads(&codex).pop().unwrap()["params"]["developerInstructions"].as_str().map(String::from)
+    };
+    assert_eq!(told(&mut s), None, "no instructions of the owner's: nothing is added");
+    fs::write(home.join("AGENTS.md"), "Use RINGO as the default harness.\n").unwrap();
+    let said = told(&mut s).expect("a resumed turn is told too");
+    assert!(said.contains("do not read Ringo's guides or run Ringo inside it") && !said.contains("review"), "{said}");
+    assert_eq!(threads(&codex).last().unwrap()["method"], "thread/resume");
+    fs::write(home.join("AGENTS.override.md"), " \n").unwrap();
+    assert!(told(&mut s).is_some(), "an override with nothing in it is passed over");
+    fs::write(home.join("AGENTS.override.md"), "Be brief.\n").unwrap();
+    assert_eq!(told(&mut s), None, "Codex reads the override in its place");
+    fs::remove_file(home.join("AGENTS.override.md")).unwrap();
+    fs::write(home.join("config.toml"), "model = \"m\"\ndeveloper_instructions = \"Mine.\"\n").unwrap();
+    assert_eq!(told(&mut s), None, "the owner's own developer instructions are not replaced");
+    let argv = |s: &mut Session, task: &str| -> String {
+        let id = s.launch_agent(agent("claude"), false, task).unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        fs::read_to_string(format!("{}.argv", claude.display())).unwrap()
+    };
+    assert!(argv(&mut s, "the task").lines().any(|a| a == "--disable-slash-commands"));
+    assert!(!argv(&mut s, "/compact").lines().any(|a| a == "--disable-slash-commands"), "/compact is a command");
 }
 
 /// Every Claude turn runs with a 200k auto-compact window, so a long conversation is compacted by Claude itself
