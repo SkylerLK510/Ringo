@@ -389,7 +389,22 @@ fn turns_outside_git_undo_from_ringos_own_store() {
     let home_status = Command::new("git").arg("-C").arg(&home).args(["status", "--porcelain"]).output().unwrap().stdout;
     assert!(!String::from_utf8_lossy(&home_status).contains(".local"), "the home repository never sees the store");
     assert!(s.expand("check {#1}").unwrap().contains("made.txt"), "a handoff carries the turn's change");
-    assert!(s.review_job(id).unwrap_err().contains("needs a git project"));
+    // a review reads the turn's change from the store: its before and after, committed there and not in the home
+    // repository the folder sits in
+    let review = fake(&root(), "review-school", "#!/bin/sh\necho \"$@\" > \"$0.args\"\n\
+        while [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\necho 'no defects' > \"$out\"\n");
+    s.pipeline = Some(vec![review.clone().into()]);
+    let r = s.review_job(id, "claude").unwrap();
+    assert_eq!(wait(&mut s, r), Status::Done);
+    let args = fs::read_to_string(review.with_extension("args")).unwrap();
+    let arg = |name: &str| args.split_whitespace().skip_while(|a| *a != name).nth(1).unwrap().to_string();
+    let store = PathBuf::from(arg("--repo"));
+    assert!(store.starts_with(state.canonicalize().unwrap()) && arg("--backend") == "claude", "{args}");
+    let names = Command::new("git").arg("-C").arg(&store).args(["diff", "--name-only", &arg("--base"), &arg("--head")])
+        .output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&names.stdout).lines().collect::<Vec<_>>(), ["b.txt", "c.bin", "made.txt"]);
+    let in_home = Command::new("git").arg("-C").arg(&home).args(["cat-file", "-e", &arg("--head")]).status().unwrap();
+    assert!(!in_home.success(), "the home repository gets no commit");
     // the owner edits a changed file: nothing is undone; put back, the turn is undone exactly
     fs::write(class.join("made.txt"), "mine\n").unwrap();
     assert!(s.undo().unwrap_err().contains("made.txt changed after #1"));

@@ -268,6 +268,36 @@ fn plan_line(agent: &str, plan: &ringo_cli::Plan) -> String {
     }
 }
 
+/// Ultra's choice of reviewer: the backend and why it is not the session's (empty when it is), or why none can review.
+type Pick = Result<(String, String), String>;
+
+/// The backend ultra's review runs on, and why it is not the session's `backend` when it is not: that backend, unless
+/// its plan has a limit used up or its agent is not set up; then the other subscription's (codex-chatgpt and claude
+/// stand in for each other) when that one can take it. `read` gives an agent's plan, or None when it is not set up,
+/// and is asked only as far as needed. A plan that could not be read counts as having room: the review then says
+/// itself whether it ran. Err: why neither can review now.
+fn reviewer(backend: &str, read: impl Fn(ringo_cli::Adapter) -> Option<Result<ringo_cli::Plan, String>>, now: u64) -> Pick {
+    use ringo_cli::Adapter::{Claude, Codex};
+    let first = match backend {
+        "codex-chatgpt" | "codex" => Codex,
+        "claude" => Claude,
+        _ => return Ok((backend.to_string(), String::new())), // the owner's own command: which plan it bills is unknown
+    };
+    let (other, preset) = if first == Codex { (Claude, "claude") } else { (Codex, "codex-chatgpt") };
+    let cannot = |adapter| -> Option<String> {
+        let name = if adapter == Codex { "Codex" } else { "Claude" };
+        let Some(plan) = read(adapter) else { return Some(format!("{name} is not set up")) };
+        let full = plan.ok()?.windows.into_iter().find(|w| w.percent >= 100.0 && w.resets.is_none_or(|r| r > now))?;
+        let reset = full.resets.map(|r| format!(", starts over in {}", fmt_until(r - now))).unwrap_or_default();
+        Some(format!("{name} is out ({} {:.0}% used{reset})", full.name, full.percent))
+    };
+    let Some(why) = cannot(first) else { return Ok((backend.to_string(), String::new())) };
+    match cannot(other) {
+        None => Ok((preset.to_string(), why)),
+        Some(also) => Err(format!("{why} and {also}")),
+    }
+}
+
 pub fn fmt_tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
@@ -1001,6 +1031,9 @@ struct App {
     checking: Option<(usize, usize, Agent)>,
     revision: Option<String>,
     revision_id: Option<usize>,
+    /// Ultra: the plan read a turn here started (the turn, the read), then its answer (see `reviewer`).
+    quota: Option<(usize, std::thread::JoinHandle<Pick>)>,
+    reviewer: Option<(usize, Pick)>,
 }
 
 /// What the bottom of the screen holds in one frame: the running jobs' rows, the queued lines, the permission
@@ -1076,7 +1109,7 @@ impl App {
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), checking: None,
-              revision: None, revision_id: None }
+              revision: None, revision_id: None, quota: None, reviewer: None }
     }
 
     /// The box and the three lines the shell opens with.
@@ -1374,18 +1407,26 @@ impl App {
         if job.tier != Tier::Ultra || job.changed.is_empty() || self.revision_id == Some(id) {
             return;
         }
-        if !self.s.git {
-            self.say(format!("  ultra: Ringo's review needs a git project, so #{id} ran at higher effort alone"));
-            return;
-        }
         if let Some((review, ..)) = self.checking {
             self.say(format!("  ultra: #{id} ended while review #{review} runs; /review #{id} checks it"));
             return;
         }
-        match self.s.review_job(id) {
+        self.quota_done();
+        // ceiling: a turn that ends before its plan read answers (a read takes about a second, a turn that edits
+        // several) is reviewed on /backend unchecked.
+        let (backend, why) = match self.reviewer.take_if(|(turn, _)| *turn == id) {
+            Some((_, Ok(chosen))) => chosen,
+            Some((_, Err(why))) => {
+                self.say(format!("  ultra: no review of #{id}: {why}"));
+                return;
+            }
+            None => (self.s.backend.clone(), String::new()),
+        };
+        match self.s.review_job(id, &backend) {
             Ok(review) => {
                 self.checking = Some((review, id, agent));
-                self.say(format!("  ultra: Ringo reviews #{id}'s change as #{review}; lines you send wait for it (Esc stops it)"));
+                let on = if why.is_empty() { String::new() } else { format!(" on {backend}, since {why}") };
+                self.say(format!("  ultra: Ringo reviews #{id}'s change as #{review}{on}; lines you send wait for it (Esc stops it)"));
             }
             Err(e) => self.say(format!("  ultra: no review of #{id}: {e}")),
         }
@@ -1398,10 +1439,15 @@ impl App {
             Tier::Quick => "agents think less (low effort): fewer tokens, for small or plain tasks",
             Tier::Standard => "each agent's own default",
             Tier::Deep => "agents think more (xhigh effort): slower, and more tokens",
-            Tier::Ultra => "xhigh effort, then Ringo reviews each change made here (one Codex call, about 70k tokens) \
-                            and the agent gets one turn to fix what the review finds",
+            Tier::Ultra => "xhigh effort, then Ringo reviews each change made here (one call, about 70k tokens, on \
+                            Codex or, when its plan is out, Claude) and the agent gets one turn to fix what the review \
+                            finds",
         };
-        format!("  tier: {}: {what}; for this session (Ringo starts in standard)", tier.name())
+        let mut text = format!("  tier: {}: {what}; for this session (Ringo starts in standard)", tier.name());
+        if tier == Tier::Ultra && let Some(why) = &self.s.no_undo {
+            text.push_str(&format!("\n  here Ringo cannot see what a turn changes ({why}), so there is nothing to review"));
+        }
+        text
     }
 
     /// `/usage`: this session's tokens, the last day's and week's from Ringo's record, and each plan's limits, asked
@@ -1461,13 +1507,45 @@ impl App {
         self.plans.is_empty()
     }
 
+    /// Ultra's plan read, once it has answered: which backend the turn's review will run on. When no plan has room,
+    /// the owner hears it while the turn still runs, so they can stop it.
+    fn quota_done(&mut self) -> bool {
+        let Some((id, read)) = self.quota.take_if(|(_, read)| read.is_finished()) else { return false };
+        let answer = read.join().unwrap_or_else(|_| Ok((self.s.backend.clone(), String::new())));
+        if let Err(why) = &answer && self.s.job(id).is_ok_and(|j| j.running()) {
+            self.say(format!("  ultra: {why}, so #{id}'s change will not be reviewed (Esc stops the turn)"));
+        }
+        self.reviewer = Some((id, answer));
+        true
+    }
+
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
         // checked again here: a queued /compact can come up after /clear took its conversation away
         if task == "/compact" && !self.s.has_conversation(agent) {
             return Err(format!("{} has no conversation here to compact", agent.name()));
         }
         let expanded = self.s.expand(task)?;
-        self.s.launch_agent(agent, false, &expanded)?;
+        let id = self.s.launch_agent(agent, false, &expanded)?;
+        // Ultra: the plans are read while the turn runs (about a second, no model call), so its review can go to
+        // a plan with room, and when none has any the owner hears it now, not after the turn.
+        if self.s.tier == Tier::Ultra && self.s.mode != Mode::Read && self.s.undoable() && task != "/compact"
+            && self.revision.as_deref() != Some(task) {
+            let set_up: Vec<(Agent, PathBuf)> = self.agents.iter().filter(|a| self.s.installed(**a))
+                .map(|a| (*a, self.s.program(*a))).collect();
+            let (backend, limits) = (self.s.backend.clone(), self.s.claude_limits.clone());
+            self.quota = Some((id, std::thread::spawn(move || {
+                let read = |adapter| {
+                    let (agent, program) = set_up.iter().find(|(a, _)| a.spec().adapter == adapter)?;
+                    // Claude's own answer is experimental: this session's last rate-limit event stands in, as in /usage
+                    Some(ringo_cli::plan(*agent, program).or_else(|e| match &limits {
+                        Some(info) if adapter == ringo_cli::Adapter::Claude => Ok(ringo_cli::claude_plan_from_event(info)),
+                        _ => Err(e),
+                    }))
+                };
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+                reviewer(&backend, read, now)
+            })));
+        }
         Ok((expanded.len() != task.len()).then(|| {
             format!("  the handoff adds {} characters to the task:\n{expanded}", expanded.len() - task.len())
         }))
@@ -1653,7 +1731,8 @@ impl App {
                 Some(format!("  removed #{id}'s copy; its logs stay in {}", self.s.job(id)?.dir.display()))
             }
             Cmd::ReviewJob(of) => {
-                self.s.review_job(of)?;
+                let backend = self.s.backend.clone();
+                self.s.review_job(of, &backend)?;
                 None
             }
             Cmd::ReviewRepo(base, head) => {
@@ -2457,6 +2536,7 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
+        dirty |= app.quota_done();
         // A job that just ended is seen before any waiting line starts: ultra's review holds the folder from there.
         app.feed();
         while let Some((ask, route)) = app.s.routed.pop_front() {
@@ -2728,6 +2808,115 @@ mod tests {
         assert!(b.run(Cmd::Compact, "/compact").unwrap_err().contains("compacts its conversation on its own"));
     }
 
+    /// A fake Claude's answer to Ringo's plan read (`get_usage`): the 5-hour limit at the percent in `$0.pct`, else 20.
+    #[cfg(unix)]
+    const CLAUDE_PLAN: &str = "#!/bin/sh\ncase \"$*\" in *no-session-persistence*) read ask; pct=$(cat \"$0.pct\" 2>/dev/null || echo 20); \
+        echo '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"ringo-usage\",\"response\":\
+        {\"subscription_type\":\"max\",\"rate_limits\":{\"limits\":[{\"kind\":\"session\",\"percent\":'$pct',\
+        \"resets_at\":\"2099-01-01T00:00:00Z\"}]}}}}'; exit 0;; esac\n";
+
+    #[test]
+    fn the_review_goes_to_a_plan_with_room() {
+        use ringo_cli::Adapter::Codex;
+        use ringo_cli::{Plan, Window};
+        let plan = |percent: f64, resets: Option<u64>| Some(Ok(Plan { name: "plus".into(), windows: vec![
+            Window { name: "week".into(), percent: 40.0, resets: Some(2_000_000) },
+            Window { name: "5 hours".into(), percent, resets }], notes: vec![] }));
+        let now = 1_000_000;
+        let (room, out) = (plan(55.0, Some(now + 60)), plan(100.0, Some(now + 2 * 3600 + 600)));
+        let pick = |backend: &str, codex: &Option<Result<Plan, String>>, claude: &Option<Result<Plan, String>>| {
+            reviewer(backend, |a| if a == Codex { codex.clone() } else { claude.clone() }, now)
+        };
+        assert_eq!(pick("codex-chatgpt", &room, &None), Ok(("codex-chatgpt".into(), String::new())));
+        assert_eq!(pick("codex-chatgpt", &out, &room),
+                   Ok(("claude".into(), "Codex is out (5 hours 100% used, starts over in 2 h 10 min)".into())));
+        assert_eq!(pick("claude", &room, &out).unwrap().0, "codex-chatgpt", "either way round");
+        assert_eq!(pick("codex-chatgpt", &None, &room), Ok(("claude".into(), "Codex is not set up".into())));
+        assert_eq!(pick("codex-chatgpt", &out, &None),
+                   Err("Codex is out (5 hours 100% used, starts over in 2 h 10 min) and Claude is not set up".into()));
+        assert!(pick("codex-chatgpt", &out, &out).unwrap_err().contains("and Claude is out (5 hours 100% used"));
+        // a plan that could not be read counts as having room, and a used-up limit whose time has passed is over
+        assert_eq!(pick("codex-chatgpt", &Some(Err("no answer".into())), &out).unwrap().0, "codex-chatgpt");
+        assert_eq!(pick("codex-chatgpt", &plan(100.0, Some(now - 5)), &out).unwrap().0, "codex-chatgpt");
+        // the owner's own backend command is used as it is: no plan is read
+        assert_eq!(reviewer("my-review-cmd", |_| unreachable!(), now), Ok(("my-review-cmd".into(), String::new())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ultra_reviews_outside_git_on_a_plan_with_room_and_says_at_once_when_none_has_any() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ringo-ultra-nogit-{}", std::process::id()));
+        let (class, state) = (dir.join("CSC138"), dir.join("state"));
+        std::fs::create_dir_all(&class).unwrap();
+        std::fs::write(class.join("a.txt"), "one\n").unwrap();
+        let script = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // a Claude whose turns wait while `claude.hold` is there, then add a line; a Codex whose 5 hours are used up;
+        // a review that finds nothing
+        let claude = script("claude", &format!("{CLAUDE_PLAN}while [ -f \"$0.hold\" ]; do sleep 0.05; done\n\
+            head -n 1 > /dev/null\necho more >> a.txt\n\
+            echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-n\",\"apiKeySource\":\"none\"}}'\n\
+            echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
+        let codex = script("codex", "#!/bin/sh\nread a; read b; read c\necho '{\"id\":1,\"result\":{}}'\n\
+            echo '{\"id\":2,\"result\":{\"rateLimits\":{\"planType\":\"plus\",\"primary\":{\"usedPercent\":100,\
+            \"windowDurationMins\":300,\"resetsAt\":4102444800}}}}'\n");
+        let review = script("ringo", "#!/bin/sh\necho \"$@\" >> \"$0.runs\"\n\
+            while [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\necho 'No defects found.' > \"$out\"\n");
+        let s = Session::with_state(&class, &state).unwrap();
+        assert!(!s.git && s.undoable());
+        let (c, x) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
+        let mut a = App::new(s, vec![c, x], "CSC138".into(), Theme::named("mono", crate::theme::Depth::Mono).unwrap(), Vec::new());
+        a.s.programs.insert(c, claude.clone());
+        a.s.programs.insert(x, codex);
+        a.s.pipeline = Some(vec![review.clone().into()]);
+        a.run(Cmd::Tier(Some(Tier::Ultra)), "/tier ultra").unwrap();
+        let turn = |a: &mut App, task: &str| {
+            std::fs::write(claude.with_extension("hold"), "").unwrap();
+            assert_eq!(a.talk(c, task.into(), task.into()), Ok(None));
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while a.reviewer.is_none() { // the plans are read while the turn runs
+                assert!(Instant::now() < deadline, "the plan read did not answer");
+                a.quota_done();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let (id, answer) = a.reviewer.clone().unwrap();
+            std::fs::remove_file(claude.with_extension("hold")).unwrap();
+            while a.ended.get(id - 1) != Some(&true) || a.s.running() > 0 || a.checking.is_some() {
+                assert!(Instant::now() < deadline, "the turn did not finish: {} jobs", a.s.jobs.len());
+                a.s.pump();
+                a.quota_done();
+                a.feed();
+                a.dispatch();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            answer
+        };
+        // Codex is out: the review goes to Claude, and reads the change from Ringo's own store
+        let (backend, why) = turn(&mut a, "add a line").unwrap();
+        assert!(backend == "claude" && why.starts_with("Codex is out (5 hours 100% used, starts over in "), "{why}");
+        assert_eq!(a.s.jobs.len(), 2);
+        let runs = std::fs::read_to_string(review.with_extension("runs")).unwrap();
+        let arg = |name: &str| runs.split_whitespace().skip_while(|w| *w != name).nth(1).unwrap().to_string();
+        assert!(arg("--backend") == "claude" && Path::new(&arg("--repo")).starts_with(state.canonicalize().unwrap()), "{runs}");
+        let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+        assert!(said.contains("Ringo reviews #1's change as #2 on claude, since Codex is out") && said.contains("found no defects"), "{said}");
+        assert!(!said.contains("needs a git project"), "{said}");
+        // both are out: the owner hears it while the turn runs, and no review follows
+        std::fs::write(claude.with_extension("pct"), "100").unwrap();
+        let why = turn(&mut a, "add another").unwrap_err();
+        assert!(why.starts_with("Codex is out") && why.contains(" and Claude is out (5 hours 100% used"), "{why}");
+        assert_eq!(a.s.jobs.len(), 3, "no review job");
+        let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+        assert!(said.contains("so #3's change will not be reviewed (Esc stops the turn)") && said.contains("no review of #3"), "{said}");
+        assert_eq!(std::fs::read_to_string(review.with_extension("runs")).unwrap().lines().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn ultra_reviews_a_change_and_gives_one_turn_to_fix_it_and_no_more() {
@@ -2747,9 +2936,9 @@ mod tests {
             path
         };
         // a Claude that appends a line to a.txt each turn, keeping each prompt; a review pipeline with one finding
-        let claude = script("claude", "#!/bin/sh\nhead -n 1 >> \"$0.prompts\"\necho more >> a.txt\n\
-            echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-u\",\"apiKeySource\":\"none\"}'\n\
-            echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n");
+        let claude = script("claude", &format!("{CLAUDE_PLAN}head -n 1 >> \"$0.prompts\"\necho more >> a.txt\n\
+            echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-u\",\"apiKeySource\":\"none\"}}'\n\
+            echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
         let review = script("ringo", "#!/bin/sh\necho \"$@\" >> \"$0.runs\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\n\
             printf 'What this change does: adds a line.\\n\\n### 1. The new line is wrong (`a.txt:2`)\\n- Problem: it says more.\\n' > \"$out\"\n");
         let s = Session::with_state(&repo, &state).unwrap();
