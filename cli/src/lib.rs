@@ -1205,7 +1205,7 @@ impl Session {
         let mut resume = if write { None } else { self.threads.get(&agent).cloned() };
         let mut sent = prompt.to_string();
         let connectors = prompt.trim() != "/compact"
-            && (names_connector(prompt) || self.lane(agent, id).last().is_some_and(|j| j.reached));
+            && (names_connector(prompt) || (!write && self.lane(agent, id).last().is_some_and(|j| j.reached)));
         if !write {
             self.jobs[id - 1].lane = self.separate.then_some(agent);
             if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
@@ -1213,7 +1213,8 @@ impl Session {
                 self.jobs[id - 1].push_log(note);
             }
         }
-        // The connectors load for a message that names one, and for the turn after one that called one ("and mine?"
+        // The connectors load for a message that names one, and for the conversation's turn after one that called one
+        // (an @agent! turn starts fresh, so it does not continue one) ("and mine?"
         // after a ClickUp question): without them that follow-up searched Ringo's own logs for the earlier answer,
         // 104k tokens and three minutes, and said the data was a day old. Claude's load outside read mode, Codex's in
         // every mode.

@@ -813,16 +813,19 @@ fn a_follow_up_keeps_the_connectors_the_turn_before_used() {
         case \"$line\" in *ClickUp*) echo '{\"type\":\"assistant\",\"message\":{\"id\":\"a1\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"mcp__claude_ai_ClickUp__clickup_filter_tasks\",\"input\":{}}]},\"parent_tool_use_id\":null}';; esac\n\
         echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
     let mut s = session(&r, agent("claude"), &claude);
-    let safe = |s: &mut Session, task: &str| -> bool {
-        let id = s.launch_agent(agent("claude"), false, task).unwrap();
+    let turn = |s: &mut Session, write: bool, task: &str| -> bool {
+        let id = s.launch_agent(agent("claude"), write, task).unwrap();
         assert_eq!(wait(s, id), Status::Done);
         let narrow = fs::read_to_string(format!("{}.stdin", claude.display())).unwrap().contains("(Ringo: this reaches a connector");
         let safe = fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().any(|a| a == "--safe-mode");
         assert_eq!(narrow, !safe, "a turn with the connectors is asked to keep them narrow, and only such a turn");
         safe
     };
+    let safe = |s: &mut Session, task: &str| turn(s, false, task);
     assert!(!safe(&mut s, "what ClickUp tasks are mine?"), "it names a connector");
-    assert!(!safe(&mut s, "and the overdue ones?"), "the turn before called one");
+    assert!(turn(&mut s, true, "fix the parser") && turn(&mut s, true, "fix the parser"),
+            "an @claude! turn starts fresh in its own copy: it continues no conversation");
+    assert!(!safe(&mut s, "and the overdue ones?"), "the conversation's turn before called one");
     assert!(safe(&mut s, "now fix the parser"), "the turn before had them but called none");
     assert!(safe(&mut s, "and its tests"));
 }
