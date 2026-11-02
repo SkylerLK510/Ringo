@@ -30,7 +30,9 @@ add a dark mode switch to the settings page
   line ("read 6 files, searched 4 times"); `/show N` lists each one.
 - While it works, the row above the box shows its time, the tokens it has used and what it is doing now. Press Esc
   to stop it.
-- You can type the next message while it works. It waits under the box and goes when the turn ends.
+- You can write to it while it works: Claude and Codex read your message at their next step, as they do in their
+  own apps, and Ringo says `↳ #3 takes this as it works`. A message that comes as the turn is ending, or one for agy
+  (which cannot take one mid-turn), waits under the box and goes next.
 - The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
   `/clear` starts a new conversation.
 - A long conversation costs more with every call, because the agent reads all of it again each time. Once it passes
@@ -77,7 +79,7 @@ agent's settings.
 | `auto` | act on their own; only what their safety review flags waits |
 | `read` | look only: no changes, no commands |
 
-Shift-Tab cycles the modes, `/mode ask|auto|read` sets one, and `/auto` switches between auto and ask. A new mode
+Shift-Tab cycles the modes, `/mode ask|auto|read` sets one, and `/auto` turns auto on (never off: `/mode ask` does). A new mode
 applies to the turns started after it and is remembered for next time. Codex cannot stop to ask, so in `ask` mode it
 changes files in this folder but has no network.
 
@@ -123,7 +125,7 @@ changed, so `@codex take it from here` carries on the same work.
 
 Type `/separate`, then give each agent its task: `@claude fix the login bug`, then `@codex write the README`. They
 work at the same time, each in its own conversation, and neither is told what the other does. Each still takes one
-turn at a time, and your next message to a busy agent waits for it. The top line says `separate` while it is on.
+turn at a time, and your next message to a busy agent goes into its turn. The top line says `separate` while it is on.
 `/together` puts them back in one conversation. Esc stops the latest turn; `/kill N` stops a given one.
 
 `/undo` still takes back one turn at a time. When two agents worked here at once, a turn's undo leaves out any file

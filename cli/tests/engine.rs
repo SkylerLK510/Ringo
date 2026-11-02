@@ -543,7 +543,7 @@ fn agent_commands_are_pinned() {
     // Ask mode (the default): edits go through, every permission prompt comes to Ringo, the always-ask rules ride
     // along; the prompt is one stream-json message on stdin, which stays open for the answers.
     let head = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                "--include-partial-messages", "--disable-slash-commands", "--safe-mode",
+                "--include-partial-messages", "--replay-user-messages", "--disable-slash-commands", "--safe-mode",
                 "--permission-prompt-tool", "stdio", "--permission-mode"];
     let rules = serde_json::json!({"permissions": {"ask": ringo_cli::ALWAYS_ASK},
                                    "attribution": {"commit": "", "pr": ""}}).to_string();
@@ -802,6 +802,34 @@ fn ask_mode_sends_each_permission_request_to_the_owner() {
     assert!(s.allowed.is_empty() && s.decide(id, Decision::Once).is_err());
 }
 
+/// A follow-up to a turn that called a connector keeps the connectors although it names none ("and the overdue
+/// ones?" after a ClickUp question); the turn after one that did not goes back to running without them.
+#[test]
+fn a_follow_up_keeps_the_connectors_the_turn_before_used() {
+    let r = repo("connector-follow-up");
+    let claude = fake(&root(), "claude-follow-up", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
+        line=$(head -n 1)\nprintf '%s' \"$line\" > \"$0.stdin\"\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-f\",\"apiKeySource\":\"none\"}'\n\
+        case \"$line\" in *ClickUp*) echo '{\"type\":\"assistant\",\"message\":{\"id\":\"a1\",\"content\":[{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"mcp__claude_ai_ClickUp__clickup_filter_tasks\",\"input\":{}}]},\"parent_tool_use_id\":null}';; esac\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let mut s = session(&r, agent("claude"), &claude);
+    let turn = |s: &mut Session, write: bool, task: &str| -> bool {
+        let id = s.launch_agent(agent("claude"), write, task).unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        let narrow = fs::read_to_string(format!("{}.stdin", claude.display())).unwrap().contains("(Ringo: this reaches a connector");
+        let safe = fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().any(|a| a == "--safe-mode");
+        assert_eq!(narrow, !safe, "a turn with the connectors is asked to keep them narrow, and only such a turn");
+        safe
+    };
+    let safe = |s: &mut Session, task: &str| turn(s, false, task);
+    assert!(!safe(&mut s, "what ClickUp tasks are mine?"), "it names a connector");
+    assert!(turn(&mut s, true, "fix the parser") && turn(&mut s, true, "fix the parser"),
+            "an @claude! turn starts fresh in its own copy: it continues no conversation");
+    assert!(!safe(&mut s, "and the overdue ones?"), "the conversation's turn before called one");
+    assert!(safe(&mut s, "now fix the parser"), "the turn before had them but called none");
+    assert!(safe(&mut s, "and its tests"));
+}
+
 #[test]
 fn modes_change_what_each_agent_may_do() {
     let r = repo("modes");
@@ -1044,6 +1072,64 @@ case "$(cat "$0.stdin")" in *'GROW"}}') big=70000 ;; *'HUGE"}}') big=300 ;; *) b
 echo '{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":'$big',"output_tokens":5}},"parent_tool_use_id":null}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
 "#;
+
+/// A claude that takes a second line on stdin while it works (`Session::steer`), as Claude Code 2.1.316 does: with its
+/// next tool result, or, when the message arrived during its final answer (LATE), in a run of its own after its first
+/// result. It writes the line it took to $0.steer and ends when its stdin closes.
+const CLAUDE_STEERED: &str = r#"#!/bin/sh
+read first
+echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'
+echo '{"type":"user","isReplay":true,"message":{"role":"user","content":"x"},"parent_tool_use_id":null}'
+replay='{"type":"user","isReplay":true,"message":{"role":"user","content":"y"},"parent_tool_use_id":null}'
+case "$first" in *QUIT*)
+  sleep 1
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":5}},"parent_tool_use_id":null}'
+  echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+  exit 0 ;;
+*LATE*)
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"first"}],"usage":{"input_tokens":10,"output_tokens":5}},"parent_tool_use_id":null}'
+  echo '{"type":"result","subtype":"success","is_error":false,"result":"first","model_usage_since_last_result":{"m":{"inputTokens":10,"outputTokens":5}}}'
+  read second; printf '%s\n' "$second" > "$0.steer"; echo "$replay"
+  echo '{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"second"}],"usage":{"input_tokens":20,"output_tokens":7}},"parent_tool_use_id":null}'
+  echo '{"type":"result","subtype":"success","is_error":false,"result":"second","model_usage_since_last_result":{"m":{"inputTokens":20,"outputTokens":7}}}' ;;
+*)
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 1"}}],"usage":{"input_tokens":10,"output_tokens":5}},"parent_tool_use_id":null}'
+  read second; printf '%s\n' "$second" > "$0.steer"
+  echo '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"","is_error":false}]},"parent_tool_use_id":null}'
+  echo "$replay"
+  echo '{"type":"result","subtype":"success","is_error":false,"result":"both","model_usage_since_last_result":{"m":{"inputTokens":30,"outputTokens":12}}}' ;;
+esac
+cat > /dev/null
+"#;
+
+#[test]
+fn a_line_sent_while_claude_works_goes_into_its_turn() {
+    let r = repo("steer");
+    let claude = fake(&root(), "claude-steer", CLAUDE_STEERED);
+    let mut s = session(&r, agent("claude"), &claude);
+    for (task, reply) in [("fix it", "both"), ("fix it LATE", "second")] {
+        let id = s.launch_agent(agent("claude"), false, task).unwrap();
+        assert!(!s.steer(id, "also check my clickup tasks"), "a turn started without the connectors cannot use them");
+        assert!(s.steer(id, "and the docs"));
+        // stdin closes only once the line is taken in and answered: the fake ends when it does
+        assert_eq!(wait(&mut s, id), Status::Done, "{task}");
+        let j = s.job(id).unwrap();
+        assert_eq!(j.reply().trim(), reply, "{task}: the last answer, which took the line in");
+        assert_eq!((j.tokens.input, j.tokens.output), (30, 12), "{task}: every run counted once");
+        let heard: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.steer", claude.display())).unwrap()).unwrap();
+        assert_eq!(heard["message"]["content"], "and the docs");
+        assert!(j.title_full.ends_with("fix it\n\nthen, while it worked: and the docs") || j.title_full.ends_with("LATE\n\nthen, while it worked: and the docs"),
+                "the owner's words, for the record: {}", j.title_full);
+        assert!(!s.steer(id, "too late"), "an ended turn takes no more: the line waits for the next");
+    }
+    assert!(s.returned.is_empty());
+    // a turn that ends without taking the line in gives it back, for the next turn, and it is not in this one's record
+    let id = s.launch_agent(agent("claude"), false, "fix it QUIT").unwrap();
+    assert!(s.steer(id, "and the tests"));
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert_eq!(s.returned, [(id, agent("claude"), "and the tests".to_string())]);
+    assert_eq!(s.job(id).unwrap().title_full, "fix it QUIT");
+}
 
 /// What the fake claude was last sent, and whether it resumed a conversation.
 fn claude_heard(claude: &Path) -> (String, bool) {

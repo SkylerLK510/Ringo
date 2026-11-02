@@ -90,6 +90,26 @@ too. It is one conversation: an agent is told what the others did since its last
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)). Codex owns the abstract work: Ringo's pipelines (`/research`,
 `/design`, `/review`) and `/ask` run on it.
 
+### A message while it works
+
+A line you send to the agent whose turn is running in the folder goes into that turn, as Claude Code and Codex take
+a message typed while they work, and the shell says `↳ #N takes this as it works`. Claude gets it as another
+stream-json message on the stdin Ringo already keeps open for permission answers. It reads it with its next tool
+result, or, when the line arrives during its final answer, answers it in a run of its own right after its result;
+both runs count in the turn. Claude echoes each message as it takes it in (`--replay-user-messages`, which adds no
+tokens), and Ringo closes its stdin only once every line has been taken in and answered. Codex gets `turn/steer`,
+which names the running turn and adds the line to it, a final answer included (one `turn/completed`). A line the turn
+never took in (Codex refused it because the turn had just ended, the input had closed, or the agent stopped or failed
+first) goes as the next turn instead, or back in the input if you stopped the turn, so none is lost. agy's stdin closes
+after its prompt and a `/compact` turn takes none, so a line for them waits under the box, as does a line typed behind
+one already waiting, and one that names a connector when the turn was started without them. Your words go into Ringo's
+record of the turn ("then, while it worked: ...") and into what `/review` and ultra's review judge the change by.
+
+Checked live with Claude Code 2.1.316 and codex-cli 0.166.0, with "Also end your reply with the word KIWI." sent
+while each worked. During `sleep 8 && echo first` (sent 4 s in), Claude answered `first … KIWI` in one result. During
+a 250-word story with no tools (3 s in), Claude finished the story, then wrote it again ending in KIWI, as a second
+result. Codex ended both with KIWI, in one turn each.
+
 ## Using it
 
 An empty conversation shows only where to start, in its middle; it goes once you say something, and `/usrman` has the
@@ -155,8 +175,8 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 | `/undo` | the files the latest turn here changed go back as they were before it; each `/undo` goes one turn further back. A file you edited since makes it refuse and touch nothing |
 | `/ask TEXT` | a quick answer: one tool-free call with your last few `/ask` questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell gives it to the agent you are talking to, or to `/research`; a review is put in the input line for you to say what to review |
 | `/clear` | a new conversation: each agent's next turn starts fresh |
-| `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, nothing of one is told to another, and agents take turns in the folder at the same time (one turn each, a line for a busy agent waits for it). `/together`: one conversation again, one turn at a time. The head says `separate` while it is on |
-| `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` toggles auto and ask, Shift-Tab cycles ask, auto, read. Remembered for next time |
+| `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, nothing of one is told to another, and agents take turns in the folder at the same time (one turn each, a line for a busy agent goes into its turn). `/together`: one conversation again, one turn at a time. The head says `separate` while it is on |
+| `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
 | `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |
@@ -234,12 +254,24 @@ in its worktree) and, in auto mode, its own reviewer.
 
 **Connectors.** A Claude turn whose task names a service only your connectors reach (Jira, Confluence, ClickUp,
 Gmail, email, calendar, Google Drive or Docs, Slack, Linear, Notion, Figma, Datadog, Intercom) runs with your MCP
-servers and plugins loaded, but without your CLAUDE.md, memory, skills or main agent; any other turn runs in safe
-mode without them. Measured with Claude Code 2.1.316, one trivial turn each: 16,567 tokens in safe mode, 27,522 with
+servers and plugins loaded, but without your CLAUDE.md, memory, skills or main agent, and so does the turn after one
+that called a connector ("and the overdue ones?" names none); any other turn runs in safe mode without them. Before
+that, the follow-ups to a ClickUp question ran without ClickUp: one read Ringo's own job logs for the earlier answer
+(104k tokens, three minutes, a command to allow) and the other said the data was probably a day old. Measured with Claude Code 2.1.316, one trivial turn each: 16,567 tokens in safe mode, 27,522 with
 the connectors, 57,799 with everything. Without your CLAUDE.md, an instruction in it to use Ringo cannot start Ringo
 again either. Your own hooks do run in these turns, as in your normal Claude Code. Checked live through the same
 flags: a read-only Jira question asked before each of its two Jira calls
 and answered correctly (5 model calls, 18.5 s, 167,291 tokens, most of them cache reads).
+
+Such a turn also gets one note from Ringo after your message: load only the tools it needs (ToolSearch with at most
+5 results, since every loaded tool is re-read by each later call), and ask the service for only what answers it,
+filtered on its side (your own items unless you say otherwise, only the dates and fields needed). A Codex turn gets
+the second half. Without it, "please give me the clickup tasks for the week" loaded 30 ClickUp tools to use 3 and
+read the whole workspace's 156 tasks due that week before asking for yours. Measured the same afternoon, one run each
+(Claude Code 2.1.316, auto mode, read-only): that question 278,928 tokens without the note and 128,191 with it (8
+calls and 6), both listing the same 5 tasks; "what clickup tasks are overdue?" 146,950 and 128,328, the first
+answering for the whole workspace (49 tasks), the second for you (your 6, all in the first list, and one due that
+morning, which the first missed). The note itself is about 70 tokens.
 
 **Checked live** (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0, one run each in a throwaway repository):
 
@@ -270,7 +302,8 @@ your repository, design sync, review reports, multi-agent `Workflow`, and messag
 and shell tools stay. Claude Code's own skills go too (scheduling, loops, sending to other projects, plugin authoring
 and 16 more were listed in every call, and no turn in Ringo's record had called one); a `/compact` turn keeps them,
 since it is one of the commands. Codex turns lose its ask tool
-and the collaboration-mode text that goes with it, and analytics; unless the task names a connector they also lose
+and the collaboration-mode text that goes with it, and analytics; unless the task names a connector (or follows a
+turn that called one) they also lose
 plugins and apps (13 of the 17 skills listed, recommended plugins, and a computer-use tool that acts outside the
 sandbox), and always image generation and goals (an aim Codex pursues by itself over many turns). One trivial turn
 each (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0; the last two rows 2026-11-02, codex-cli 0.166.0):
@@ -546,8 +579,8 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
 - **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.
-- **Limits:** three jobs at a time, and one turn at a time in your folder; the shell queues the lines for the folder,
-  and refuses a fourth job.
+- **Limits:** three jobs at a time, and one turn at a time in your folder; a line for the agent working there goes
+  into its turn (Claude, Codex), the shell queues the others, and it refuses a fourth job.
 - **State:** `~/.local/share/ringo/shell/` (or under `RINGO_RELEASE_HOME`), owner-only. Each job folder keeps its
   task, raw events, reply, stderr and patch. Logs can contain your code: delete them yourself when done.
 

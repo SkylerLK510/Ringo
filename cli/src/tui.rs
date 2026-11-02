@@ -44,7 +44,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
     ("/usage", "what you have used, and how much of your plans is left"),
-    ("/auto", "auto mode on, or back to ask"),
+    ("/auto", "auto mode on"),
     ("/review #N", "review job N's change"),
     ("/review BASE [HEAD]", "review BASE...HEAD of this repository"),
     ("/design TEXT", "the one-call design pipeline"),
@@ -1459,6 +1459,17 @@ impl App {
             return Ok(Some(format!("  #{id}: {} works only in its own copy; /apply {id} keeps its change", agent.name())));
         }
         if self.must_wait(agent) {
+            // A line for the agent working here goes into its turn, which reads it at its next step, as Claude Code
+            // and Codex take a message typed while they work. Behind a line already waiting for it, or for a turn
+            // that cannot take one (agy, /compact), it waits for the next turn.
+            let working = self.s.busy_for(agent).filter(|&id| self.s.jobs[id - 1].kind == Kind::Agent { agent, write: false });
+            if let Some(id) = working && task != "/compact" && !self.queue.iter().any(|(a, ..)| *a == agent) {
+                let expanded = self.s.expand(&task)?;
+                if self.s.steer(id, &expanded) {
+                    self.echo(&line);
+                    return Ok(Some(format!("  ↳ #{id} takes this as it works")));
+                }
+            }
             self.queue.push_back((agent, task, line));
             return Ok(None);
         }
@@ -1858,10 +1869,9 @@ impl App {
             Cmd::Usage => self.usage(),
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
-            Cmd::Auto => {
-                let mode = if self.s.mode == Mode::Auto { Mode::Ask } else { Mode::Auto };
-                Some(self.set_mode(mode))
-            }
+            // on, never a toggle: typed with auto already on (a mode is remembered), it would turn auto off unseen
+            Cmd::Auto if self.s.mode == Mode::Auto => Some("  auto mode is already on (/mode ask: back to asking first)".into()),
+            Cmd::Auto => Some(self.set_mode(Mode::Auto)),
             Cmd::Theme(None) => Some(format!("  theme: {} (also: {})", self.theme.name,
                 crate::theme::NAMES.iter().filter(|n| **n != self.theme.name).copied().collect::<Vec<_>>().join(", "))),
             Cmd::Theme(Some(name)) => {
@@ -2774,6 +2784,17 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
+        // A line a turn ended before taking in goes next, ahead of the lines typed after it; one for a turn you
+        // stopped goes back in the input, as the waiting lines do.
+        for (id, agent, text) in std::mem::take(&mut app.s.returned).into_iter().rev() {
+            if app.s.stopped(id) {
+                let rest: String = app.input.iter().collect();
+                app.input = if rest.is_empty() { text } else { format!("{text}\n{rest}") }.chars().collect();
+                app.cursor = app.input.len();
+            } else {
+                app.queue.push_front((agent, text.clone(), text));
+            }
+        }
         dirty |= app.quota_done();
         // A job that just ended is seen before any waiting line starts: ultra's review holds the folder from there.
         app.feed();
@@ -3354,14 +3375,16 @@ mod tests {
         assert_eq!(a.talk(codex, "docs".into(), "@codex docs".into()), Ok(None), "together: it waits for claude's turn");
         assert!(a.run(Cmd::Separate(true), "/separate").unwrap().unwrap().contains("separate:"));
         assert!(a.dispatch() && a.s.running() == 2, "separate: codex starts beside claude");
-        assert_eq!(a.talk(claude, "more".into(), "more".into()), Ok(None), "claude's next line waits for claude");
+        // a line for claude goes into claude's running turn; codex's has not started one it can take a line in yet
+        assert_eq!(a.talk(claude, "more".into(), "more".into()), Ok(Some("  ↳ #1 takes this as it works".into())));
+        assert_eq!(a.s.jobs[0].steered, ["more"]);
         assert_eq!(a.talk(codex, "and".into(), "@codex and".into()), Ok(None));
         assert!(!a.dispatch(), "both are busy");
         assert!(screen(&mut a, 80, 12)[0].ends_with("ask mode · separate · 0 tokens"), "the head says so");
         // Esc stops the latest turn (codex's); only codex's waiting line comes back to the input
         a.key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(a.input.iter().collect::<String>(), "@codex and");
-        assert!(a.queue.len() == 1 && a.queue[0].0 == claude);
+        assert!(a.queue.is_empty());
         assert!(a.run(Cmd::Separate(true), "/separate").unwrap().unwrap().contains("already"));
         a.s.shutdown();
     }
@@ -3375,6 +3398,10 @@ mod tests {
         assert!(a.waits(&Ok(Cmd::Talk("and this".into()))), "and the next line shows when it starts, not now");
         let rows = screen(&mut a, 60, 12);
         assert!(rows.iter().any(|r| r.contains("↳ next: fix it")), "{rows:#?}");
+        // /auto turns auto on and never off: typed with auto on (remembered from last time) it says so and stays
+        a.s.mode = Mode::Auto;
+        assert!(a.run(Cmd::Auto, "/auto").unwrap().unwrap().contains("already on"));
+        assert_eq!(a.s.mode, Mode::Auto);
     }
 
     #[test]

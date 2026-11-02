@@ -77,12 +77,18 @@ pub enum Note {
     Touched(String),
     /// The agent ran a shell command, which may have written files it does not report (see `Session::end_with`).
     Ran,
+    /// The agent called one of the owner's connectors (an MCP tool): the conversation's next turn keeps them.
+    Connector,
     /// The turn cannot succeed; the runner stops the job.
     Fail(String),
     /// The agent waits for the owner's answer before it acts.
     Permission(Permission),
     /// A control request Ringo does not serve (its id): it is refused at once, so the turn never waits on it.
     Unserved(String),
+    /// Codex: the thread and the turn now running, which a `turn/steer` names.
+    Turn { thread: String, turn: String },
+    /// Codex refused the owner's nth line for the running turn (it had ended): the line goes next instead.
+    Refused(usize),
     /// Claude's `rate_limit_event` (its `rate_limit_info`): how much of the owner's plan is used, for /usage.
     Limits(Value),
 }
@@ -100,6 +106,9 @@ pub enum Style {
     /// A Ringo trace.jsonl, read as it grows.
     Trace,
 }
+
+/// The id of the owner's first `turn/steer` request for a running Codex turn; the nth is STEER_ID + n.
+pub const STEER_ID: u64 = 100;
 
 pub struct Parser {
     style: Style,
@@ -124,6 +133,11 @@ pub struct Parser {
     writes: Vec<String>,
     /// Codex: whether the turn's usage has been reported.
     counted: bool,
+    /// The owner's lines for the running turn taken in so far (Claude: echoed back after its first message; Codex:
+    /// answered, taken or refused), and Claude: whether a result came after the last of them.
+    steered: usize,
+    answered: bool,
+    heard: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -262,7 +276,7 @@ impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, turn: None, thread: String::new(), usage: Value::Null,
-                 writes: Vec::new(), counted: false }
+                 writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -288,6 +302,17 @@ impl Parser {
     /// Whether the turn's completion record has arrived (Claude: then nothing more will be asked).
     pub fn completed(&self) -> bool {
         self.completed > 0
+    }
+
+    /// Whether the turn is over with all `sent` of the owner's lines for it taken in, so its stdin may close. Claude
+    /// takes a line with its next tool result, or, when none comes, answers it in a run of its own after its result.
+    pub fn settled(&self, sent: usize) -> bool {
+        self.completed() && self.steered >= sent && (self.style != Style::Claude || self.answered)
+    }
+
+    /// How many of the owner's lines for the running turn it has taken in (or, Codex, answered).
+    pub fn taken(&self) -> usize {
+        self.steered
     }
 
     pub fn line(&mut self, line: &str) -> Vec<Note> {
@@ -328,6 +353,14 @@ impl Parser {
                     "message": "Ringo does not serve this request"}}).to_string());
                 return vec![Note::Log(format!("refused codex's {method} request"))];
             }
+            if id.as_u64().is_some_and(|id| id >= STEER_ID) {
+                self.steered += 1;
+                let n = (id.as_u64().unwrap_or(0) - STEER_ID) as usize;
+                return match m.get("error") {
+                    Some(_) => vec![Note::Refused(n)], // the turn had ended: no active turn to add it to
+                    None => Vec::new(),
+                };
+            }
             if let Some(e) = m.get("error") {
                 return self.fail(format!("codex: {}", short(e.get("message").and_then(Value::as_str).unwrap_or("an error"), 200)));
             }
@@ -338,6 +371,9 @@ impl Parser {
                     self.writes.push(turn.to_string());
                 }
                 return vec![Note::Session(self.thread.clone())];
+            }
+            if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
+                return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
             }
             return Vec::new();
         }
@@ -415,7 +451,10 @@ impl Parser {
                     }
                 }
             }
-            ("item/started", "mcpToolCall") => notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool")))),
+            ("item/started", "mcpToolCall") => {
+                notes.push(activity(format!("tool {}.{}", s(item, "server"), s(item, "tool"))));
+                notes.push(Note::Connector);
+            }
             ("item/completed", "mcpToolCall") => {
                 let mark = if s(item, "status") == "failed" { FAILED } else { "" };
                 notes.push(Note::Step(format!("{mark}{}.{}", s(item, "server"), s(item, "tool"))));
@@ -558,6 +597,16 @@ impl Parser {
                     }
                 }
             }
+            ("user", _) if e.get("isReplay") == Some(&Value::Bool(true)) => {
+                // --replay-user-messages: a message on stdin, echoed as Claude takes it in, in the order sent: the
+                // turn's own first (as it starts), then the owner's lines, each when it is read, even one sent 0.1 s
+                // after the turn's (Claude Code 2.1.316)
+                if self.heard {
+                    self.steered += 1;
+                    self.answered = false;
+                }
+                self.heard = true;
+            }
             ("user", _) => {
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     let id = s(block, "tool_use_id");
@@ -580,6 +629,8 @@ impl Parser {
             }
             ("result", subtype) => {
                 self.completed += 1;
+                self.answered = true;
+                self.seen.clear(); // a run after this one counts its own messages
                 // calls whose result never came (the turn stopped first) are shown as they were made
                 notes.extend(self.calls.drain(..).map(|(_, _, text, _)| Note::Step(format!("{UNFINISHED}{text}"))));
                 notes.push(Note::Tokens(claude_tokens(e)));
@@ -640,6 +691,9 @@ impl Parser {
         }
         if name == "Bash" { // a subagent's command writes the same folder
             notes.push(Note::Ran);
+        }
+        if name.starts_with("mcp__") {
+            notes.push(Note::Connector);
         }
         if parent.is_none() {
             // A search names where it looked: five greps for one pattern in five folders read as five lines.
@@ -756,7 +810,9 @@ impl Parser {
         }
         match self.style {
             Style::Codex if self.completed != 1 => Err(format!("{} turn/completed messages", self.completed)),
-            Style::Claude | Style::Agy if self.completed != 1 => Err("no result event".into()),
+            // Claude ends with a result of its own for a line of the owner's it took in after its first (`settled`)
+            Style::Claude if self.completed == 0 => Err("no result event".into()),
+            Style::Agy if self.completed != 1 => Err("no result event".into()),
             Style::Codex | Style::Claude | Style::Agy | Style::Plain if self.reply.trim().is_empty() => Err("no final reply".into()),
             _ => Ok(()),
         }
@@ -831,6 +887,31 @@ mod tests {
     ];
 
     #[test]
+    fn lines_sent_while_a_turn_works() {
+        // Claude Code 2.1.316 with --replay-user-messages: the turn's own message echoes first; the owner's line
+        // echoes when Claude takes it in, with its next tool result or, when none comes, after the result
+        let replay = r#"{"type":"user","isReplay":true,"message":{"role":"user","content":[{"type":"text","text":"x"}]},"parent_tool_use_id":null}"#;
+        let call = r#"{"type":"assistant","message":{"id":"a1","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 8"}}]},"parent_tool_use_id":null}"#;
+        let result = r#"{"type":"result","subtype":"success","is_error":false,"result":"first\n\nKIWI"}"#;
+        let (taken, _) = run(Style::Claude, &[replay, call, replay, result]);
+        assert!(taken.settled(1) && !taken.settled(2), "taken with the tool result: one result answers both");
+        let (mut late, _) = run(Style::Claude, &[replay, call, result]);
+        assert!(late.settled(0) && !late.settled(1), "its result is in, but the owner's line is not taken yet");
+        late.line(replay);
+        assert!(!late.settled(1), "taken after the result: a run of its own answers it");
+        late.line(result);
+        assert!(late.settled(1) && late.finish().is_ok(), "two results are one turn");
+        // Codex 0.166.0: turn/start answers with the turn's id, which turn/steer names; a refused steer (the turn
+        // had ended) is not the turn failing
+        let (mut p, notes) = run(Style::Codex, CODEX);
+        assert!(notes.contains(&Note::Turn { thread: "01a1".into(), turn: "u1".into() }));
+        assert!(p.settled(0) && !p.settled(2));
+        assert_eq!(p.line(r#"{"id":100,"result":{"turnId":"u1"}}"#), []);
+        assert_eq!(p.line(r#"{"id":101,"error":{"code":-32600,"message":"no active turn to steer"}}"#), [Note::Refused(1)]);
+        assert!(p.settled(2) && p.finish().is_ok());
+    }
+
+    #[test]
     fn codex_turn() {
         let mut p = Parser::new(Style::Codex).with_turn(serde_json::json!({"id": 3, "method": "turn/start",
             "params": {"input": [{"type": "text", "text": "fix it"}]}}));
@@ -890,6 +971,11 @@ mod tests {
             Note::Step("✗ $ cargo test · Permission to use Bash has been denied.".into()),
             Note::Step("◌ Edit a.rs".into()), // no result before the turn ended
         ]);
+        // a connector call marks the turn, so its follow-up keeps the connectors; nothing else does
+        let connector = |name: &str| run(Style::Claude, &[&call("m", name, "{}")]).1.contains(&Note::Connector);
+        assert!(connector("mcp__claude_ai_ClickUp__clickup_filter_tasks") && !connector("Read"));
+        let codex_mcp = r#"{"method":"item/started","params":{"item":{"type":"mcpToolCall","id":"m1","server":"codex_apps","tool":"gmail_search"}}}"#;
+        assert!(run(Style::Codex, &[codex_mcp]).1.contains(&Note::Connector));
         let limited = [call("l", "Grep", r#"{"pattern":"x"}"#),
                        result("l", r#""Found 50 files limit: 50, offset: 0\na.rs""#, false)];
         let limited: Vec<&str> = limited.iter().map(String::as_str).collect();
