@@ -377,6 +377,14 @@ rest of the history becomes Claude's summary. Set the variable yourself to choos
 unrelated task, or `/separate`. (`--bare` would cut more, but it signs in with an API key only, so the shell does not
 use it.)
 
+agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
+sandbox. Its startup event lists them, and no setting Ringo can pass removes them.
+
+The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
+memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
+(macOS, Apple silicon). It redraws only on an event, a key,
+or for the spinner while a job runs.
+
 ### One conversation, and a fresh start past 64k
 
 Every turn in the folder belongs to one conversation, whichever agent takes it. An agent continuing its own is sent,
@@ -399,25 +407,23 @@ The turns go in newest first, to about 60,000 characters (about 15,000 tokens); 
 only. The record uncut is `record.md` in the turn's job folder, and the turn is told where it is. Inside a long
 turn, each agent's own compaction still applies.
 
-In a private pilot (4 three-turn coding tasks for each agent, hidden checks, every later turn handed off at 12k), see the
-pull request for the numbers. The agents' own compaction summarises with a model call over the whole transcript;
-simple deterministic records have matched or beaten that in published work (observation masking matched LLM
-summaries at about half the cost on SWE-bench Verified, JetBrains 2025), and summaries of summaries lose rules.
+Measured before release, in a pilot of 4 three-turn coding tasks for each agent with hidden checks, against
+resuming as before, with the threshold at 12k so that later turns started fresh (all 8 of Codex's later turns, 3 of
+Claude's 8): every run passed every check either way, 28 of 28 for each agent. Codex's later turns used 15% fewer
+tokens (365k against 431k, fewer in all 8 pairs); Claude's differences were within run-to-run noise (its later
+turns without a handoff varied by up to 29k between the two runs). The sample rules out a large loss of accuracy,
+not a small one, and at 64k the record covers longer histories than the pilot's did.
+
+The agents' own compaction is a model call that summarises the whole transcript. Simple deterministic records have
+matched it in published work (observation masking matched LLM summaries at about half the cost on SWE-bench Verified,
+JetBrains 2025), and summaries of summaries lose rules.
 
 With `/separate`, two agents' turns can change the folder at the same time. A turn's undo then keeps only the
 files it reported editing (Claude's Edit and Write, Codex's file changes) that the other turn did not, and none when
 the other ran a shell command (Claude's Bash, a Codex command that did more than read), which may have written any
-file without saying so; the rest are
-named in its log and stay out of `/undo`, so one agent's undo never takes back the other's work. The limit: a file only
-a command wrote is left out, and an edit the other turn made just before this one ended may not be known yet.
-
-agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
-sandbox. Its startup event lists them, and no setting Ringo can pass removes them.
-
-The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
-memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
-(macOS, Apple silicon). It redraws only on an event, a key,
-or for the spinner while a job runs.
+file without saying so. The rest are named in its log and stay out of `/undo`, so one agent's undo never takes
+back the other's work. The limit: a file only a command wrote is left out, and an edit the other turn made just
+before this one ended may not be known yet.
 
 ## Tiers
 
