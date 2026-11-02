@@ -254,19 +254,43 @@ fn fmt_until(secs: u64) -> String {
 }
 
 /// One plan's line for /usage: each limit, how much of it is used, and when it starts over.
-fn plan_line(agent: &str, plan: &ringo_cli::Plan) -> String {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let windows: Vec<String> = plan.windows.iter().map(|w| {
-        let reset = w.resets.map(|r| format!(", starts over in {}", fmt_until(r.saturating_sub(now)))).unwrap_or_default();
-        format!("{} {:.0}% used{reset}", w.name, w.percent)
-    }).collect();
-    let name = if plan.name.is_empty() { String::new() } else { format!(" ({} plan)", plan.name) };
-    let notes = plan.notes.iter().map(|n| format!(" · {n}")).collect::<String>();
-    match windows.is_empty() {
-        true => format!("  {agent}{name}: no limits reported{notes}"),
-        false => format!("  {agent}{name}: {}{notes}", windows.join(" · ")),
+/// How much of a limit is used, as a colour: calm under 60%, a warning to 85%, then the failure colour.
+/// How old the side panel's plan gauges may get before a turn's end reads them again.
+const LIMITS_FRESH: Duration = Duration::from_secs(600);
+
+fn used_style(percent: f64, t: &Theme) -> Style {
+    match percent {
+        p if p < 60.0 => t.ok,
+        p if p < 85.0 => t.warn,
+        _ => t.fail,
     }
 }
+
+/// An agent's name in its colour, bold, and what follows it, dim: the head of each agent's part of /usage.
+fn agent_head(name: &str, style: Style, rest: &str, t: &Theme) -> Out {
+    Out::Line(Line::from(vec![Span::styled(format!("  {name}"), style.add_modifier(Modifier::BOLD)),
+                              Span::styled(rest.to_string(), t.dim)]), 4)
+}
+
+/// A plan as /usage shows it: the agent and plan name, then a gauge for each limit with when it starts over.
+fn plan_rows(agent: &str, style: Style, plan: &ringo_cli::Plan, t: &Theme) -> Vec<Out> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let name = if plan.name.is_empty() { String::new() } else { format!(" · {} plan", plan.name) };
+    let notes = plan.notes.iter().map(|n| format!(" · {n}")).collect::<String>();
+    let none = if plan.windows.is_empty() { " · no limits reported" } else { "" };
+    let mut rows = vec![agent_head(agent, style, &format!("{name}{none}{notes}"), t)];
+    // one width for every plan's names ("weekly scoped" is the longest seen), so the gauges line up
+    let pad = plan.windows.iter().map(|w| cols(&w.name)).max().unwrap_or(0).clamp(13, 16);
+    rows.extend(plan.windows.iter().map(|w| Out::Meter {
+        label: w.name.clone(), pad, percent: w.percent, value: format!("{:.0}%", w.percent),
+        note: w.resets.map(|r| format!("starts over in {}", fmt_until(r.saturating_sub(now)))).unwrap_or_default(),
+        fill: None,
+    }));
+    rows
+}
+
+/// One agent's plan, as read in the background.
+type PlanRead = (Agent, Result<ringo_cli::Plan, String>);
 
 /// Ultra's choice of reviewer: the backend and why it is not the session's (empty when it is), or why none can review.
 type Pick = Result<(String, String), String>;
@@ -812,8 +836,9 @@ enum Out {
     Step(String),
     /// A run of steps that only looked, counted: files read, searches, folders listed.
     Looked([u32; 3]),
-    /// The box the shell opens with, a line per row (the first is its title).
-    Welcome(Vec<String>),
+    /// A labelled gauge, four columns in: `label` (padded to `pad`), ▰ cells for `percent` of the row's room, then
+    /// `value` and `note`. Its cells take `fill`, else the colour of how much is used (see `used_style`).
+    Meter { label: String, pad: usize, percent: f64, value: String, note: String, fill: Option<Style> },
 }
 
 impl Out {
@@ -846,14 +871,18 @@ impl Out {
                 vec![Line::from(vec![Span::styled("  ✓ ", theme.ok),
                                      Span::styled(cut(&parts.join(", "), width.saturating_sub(4)), theme.dim)])]
             }
-            Out::Welcome(lines) => {
-                // the title in the brand colour, the rest under it, dim
-                let mut rows = Vec::new();
-                for (i, text) in lines.iter().enumerate() {
-                    let style = if i == 0 { theme.brand.add_modifier(Modifier::BOLD) } else { theme.dim };
-                    rows.extend(fit(&Line::from(vec![Span::raw(" "), Span::styled(text.clone(), style)]), width, 1));
-                }
-                rows
+            Out::Meter { label, pad, percent, value, note, fill } => {
+                // the gauge takes what the label, value and note leave, between 8 and 24 cells
+                let cells = width.saturating_sub(4 + pad + 1 + 1 + cols(value).max(4) + 2 + cols(note)).clamp(8, 24);
+                let on = match (percent.clamp(0.0, 100.0) / 100.0 * cells as f64).round() as usize {
+                    0 if *percent > 0.0 => 1, // a little used is not nothing
+                    n => n,
+                };
+                fit(&Line::from(vec![Span::raw(format!("    {label:<pad$} ")),
+                                     Span::styled("▰".repeat(on), fill.unwrap_or_else(|| used_style(*percent, theme))),
+                                     Span::styled("▱".repeat(cells - on), theme.border),
+                                     Span::raw(format!(" {value:>4}")), Span::styled(format!("  {note}"), theme.dim)]),
+                    width, 4)
             }
         }
     }
@@ -1050,8 +1079,14 @@ struct App {
     /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
     pending: Option<Vec<crate::updates::Update>>,
     update: bool,
-    /// `/usage`'s plan checks still under way, one thread an agent.
-    plans: Vec<std::thread::JoinHandle<(Agent, Result<ringo_cli::Plan, String>)>>,
+    /// Plan reads under way, one thread an agent, each with whether its answer goes into the conversation (/usage)
+    /// or only into `limits` (the side panel's gauges).
+    plans: Vec<(bool, std::thread::JoinHandle<PlanRead>)>,
+    /// Each plan's limits as last read, and when the last read began (None: never, as in tests).
+    limits: Vec<(Agent, ringo_cli::Plan)>,
+    limits_at: Option<Instant>,
+    /// Whether the owner has said anything yet: until then the conversation shows where to start (see `splash`).
+    spoke: bool,
     /// Ultra: Ringo's review under way of a turn here (review job, turn, its agent), during which lines wait; the
     /// revision it asked for (its task, while queued) and that revision's job, which no review follows.
     checking: Option<(usize, usize, Agent)>,
@@ -1134,26 +1169,17 @@ impl App {
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), checking: None,
+              started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), limits: Vec::new(),
+              limits_at: None, spoke: false, checking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
 
-    /// The box and the three lines the shell opens with.
+    /// What the shell opens with: only what this session needs said. An empty conversation shows where to start
+    /// (see `splash`); the rest is in /usrman.
     fn welcome(&mut self) {
-        let found: Vec<&str> = self.agents.iter().map(|a| a.name()).collect();
-        self.out.push(Out::Welcome(vec![
-            "Welcome to Ringo".into(),
-            format!("{} · agents {} (/setup adds another) · {} mode (Shift-Tab changes it)", home_short(&self.s.repo),
-                    found.join(", "), self.s.mode.name()),
-        ]));
-        self.gap();
-        let undo = match &self.s.no_undo {
-            None => "; /undo takes back its last change.".to_string(),
-            Some(why) => format!(". /undo is off here: {why}."),
-        };
-        self.say(format!("  Type what you want done, in your own words, and press Enter. {} works in this folder and \
-                          asks before it runs a command{undo}", self.main.name()));
-        self.say("  @codex or @claude picks who you talk to · / lists the commands · ? the keys · /help the guide");
+        if let Some(why) = &self.s.no_undo {
+            self.say(format!("  /undo is off here: {why}."));
+        }
         // Started in the home folder (or above it), a turn has no /undo and no project's instructions, and spends
         // its first steps finding the project it was asked about: one turn read 3.9M tokens that way.
         if self.s.at_home {
@@ -1162,6 +1188,33 @@ impl App {
                       start ringo there: /undo works, the project's own instructions load, and the agent does not \
                       have to search for it.");
         }
+    }
+
+    /// The lines /usrman starts with: where Ringo is, who works here, and how to begin.
+    fn intro(&self) -> String {
+        let found: Vec<&str> = self.agents.iter().map(|a| a.name()).collect();
+        let undo = match &self.s.no_undo {
+            None => "; /undo takes back its last change.".to_string(),
+            Some(why) => format!(". /undo is off here: {why}."),
+        };
+        format!("  Ringo in {} · agents {} (/setup adds another) · {} mode (Shift-Tab changes it)\n  \
+                 Type what you want done, in your own words, and press Enter. {} works in this folder and asks before \
+                 it runs a command{undo}\n  @codex or @claude picks who you talk to · / lists the commands · ? the keys",
+                home_short(&self.s.repo), found.join(", "), self.s.mode.name(), self.main.name())
+    }
+
+    /// An empty conversation's middle: the cat (unless the side panel shows it), the name, and where to start.
+    fn splash(&self, panel: bool) -> Vec<Line<'static>> {
+        let t = &self.theme;
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        if !panel && let Some(cat) = mascot("idle").first() {
+            rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
+        }
+        rows.push(Line::from(vec![Span::styled("▲▲ ", t.brand), Span::styled("ringo", t.brand.add_modifier(Modifier::BOLD))]));
+        rows.push(Line::default());
+        rows.push(Line::styled("Tell Ringo what you want done, in your own words.", t.title));
+        rows.push(Line::styled("/usrman how it works · / commands · ? keys", t.dim));
+        rows
     }
 
     fn say(&mut self, text: impl AsRef<str>) {
@@ -1181,12 +1234,16 @@ impl App {
     /// The owner's own line in the conversation, after a blank line.
     fn echo(&mut self, line: &str) {
         self.gap();
+        // the speaker as a chip in its colour, as each agent's turn starts with one
         for (i, l) in clean(line).lines().enumerate() {
-            let label = if i == 0 { " you  " } else { "      " };
-            self.out.push(Out::Line(Line::from(vec![Span::styled(label, self.theme.focus.add_modifier(Modifier::BOLD)),
-                                                    Span::styled(l.to_string(), self.theme.selected)]), 6));
+            let label = match i {
+                0 => vec![Span::styled(" you ", self.theme.focus.add_modifier(Modifier::BOLD | Modifier::REVERSED)), Span::raw(" ")],
+                _ => vec![Span::raw("      ")],
+            };
+            self.out.push(Out::Line(Line::from([label, vec![Span::styled(l.to_string(), self.theme.selected)]].concat()), 6));
         }
         self.last = 0;
+        self.spoke = true;
     }
 
     fn note(&mut self, text: impl Into<String>) {
@@ -1236,8 +1293,8 @@ impl App {
             let (who, style) = self.who(&self.s.jobs[i]);
             if !fresh.is_empty() && self.last != id {
                 self.gap();
-                self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who}"), style.add_modifier(Modifier::BOLD)),
-                                                        Span::styled(format!("  #{id}"), self.theme.dim)]), 0));
+                self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who} "), style.add_modifier(Modifier::BOLD | Modifier::REVERSED)),
+                                                        Span::styled(format!(" #{id}"), self.theme.dim)]), 0));
             }
             for said in fresh {
                 match said {
@@ -1433,6 +1490,12 @@ impl App {
     /// the task, one Codex call); a review that finds defects gives the same agent one turn to fix them. Nothing
     /// follows that revision, so a turn costs at most one review and one more turn.
     fn after_end(&mut self, id: usize) {
+        // the side panel's gauges, read again after a turn when the last read is ten minutes old
+        // ceiling: a plan used up mid-turn shows at the next turn's end; /usage reads it at once
+        if self.limits_at.is_some_and(|at| at.elapsed() > LIMITS_FRESH) && self.plans.is_empty() {
+            let asked = self.plan_agents();
+            self.read_limits(&asked, false);
+        }
         let job = &self.s.jobs[id - 1];
         if let Some((review, turn, agent)) = self.checking.filter(|(review, ..)| *review == id) {
             self.checking = None;
@@ -1499,59 +1562,117 @@ impl App {
         text
     }
 
-    /// `/usage`: this session's tokens, the last day's and week's from Ringo's record, and each plan's limits, asked
-    /// of the agents in the background (about a second; no model call).
+    /// `/usage`: the tokens that went through Ringo, a gauge an agent (this session, and the last day and week from
+    /// Ringo's record), then each plan's limits as gauges, asked of the agents in the background (about a second;
+    /// no model call).
     fn usage(&mut self) -> Option<String> {
-        let mut by: std::collections::BTreeMap<String, u64> = Default::default();
+        use std::collections::BTreeMap;
+        let mut session: BTreeMap<String, u64> = BTreeMap::new();
         for job in &self.s.jobs {
             let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
-            *by.entry(who).or_default() += job.tokens_so_far();
+            *session.entry(who).or_default() += job.tokens_so_far();
         }
-        let parts = |by: &std::collections::BTreeMap<String, u64>| by.iter().filter(|(_, n)| **n > 0)
-            .map(|(who, n)| format!("{who} {}", fmt_tokens(*n))).collect::<Vec<_>>().join(", ");
-        let total = |by: &std::collections::BTreeMap<String, u64>| fmt_tokens(by.values().sum());
-        self.say(format!("  this session: {} tokens{}", total(&by),
-                         if by.values().any(|n| *n > 0) { format!(" ({})", parts(&by)) } else { String::new() }));
+        let sums = |m: BTreeMap<String, ringo_cli::parse::Tokens>| -> BTreeMap<String, u64> {
+            m.into_iter().map(|(k, t)| (k, t.total())).collect()
+        };
         let (day, first) = self.s.used_since(86_400);
-        let (week, _) = self.s.used_since(7 * 86_400);
-        let sums = |m: std::collections::BTreeMap<String, ringo_cli::parse::Tokens>| m.into_iter().map(|(k, t)| (k, t.total())).collect();
-        let (day, week): (std::collections::BTreeMap<String, u64>, std::collections::BTreeMap<String, u64>) = (sums(day), sums(week));
+        let (day, week) = (sums(day), sums(self.s.used_since(7 * 86_400).0));
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kept = match first {
             Some(at) if now.saturating_sub(at) < 7 * 86_400 => format!(" (Ringo has kept this record for {})", fmt_until(now - at)),
             Some(_) => String::new(),
             None => " (Ringo keeps this record from now on)".into(),
         };
-        self.say(format!("  last 24 hours: {} tokens · last 7 days: {}{kept}", total(&day), total(&week)));
-        let asked: Vec<Agent> = self.agents.iter().copied()
-            .filter(|a| matches!(a.spec().adapter, ringo_cli::Adapter::Claude | ringo_cli::Adapter::Codex) && self.s.installed(*a))
-            .collect();
+        let total = |m: &BTreeMap<String, u64>| fmt_tokens(m.values().sum());
+        let t = self.theme;
+        self.gap();
+        self.out.push(Out::Line(Line::from(vec![
+            Span::styled("  tokens through Ringo", t.title.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" · this session {} · last 24 hours {} · last 7 days {}{kept}", total(&session),
+                                 total(&day), total(&week)), t.dim)]), 4));
+        // a gauge an agent: its share of the week's tokens, in its own colour
+        let mut names: Vec<String> = self.agents.iter().map(|a| a.name().to_string()).collect();
+        for name in week.keys().chain(session.keys()) {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+        let all = week.values().sum::<u64>().max(1);
+        let pad = names.iter().map(|n| cols(n)).max().unwrap_or(0);
+        for name in &names {
+            let got = |m: &BTreeMap<String, u64>| m.get(name).copied().unwrap_or(0);
+            let fill = self.agents.iter().find(|a| a.name() == name.as_str()).map(|a| self.agent_style(*a)).unwrap_or(t.ringo);
+            self.out.push(Out::Meter { label: name.clone(), pad, percent: got(&week) as f64 * 100.0 / all as f64,
+                                       value: fmt_tokens(got(&week)), fill: Some(fill),
+                                       note: format!("in 7 days · {} in 24 hours · {} this session", fmt_tokens(got(&day)),
+                                                     fmt_tokens(got(&session))) });
+        }
+        let asked = self.plan_agents();
+        let others: Vec<Agent> = self.agents.iter().copied().filter(|a| self.s.installed(*a) && !asked.contains(a)).collect();
+        for agent in others {
+            self.out.push(agent_head(agent.name(), self.agent_style(agent), " · its plan's limits cannot be read", &t));
+        }
         if asked.is_empty() {
             return None;
         }
-        for agent in &asked {
-            let (agent, program) = (*agent, self.s.program(*agent));
-            self.plans.push(std::thread::spawn(move || (agent, ringo_cli::plan(agent, &program))));
-        }
+        self.read_limits(&asked, true);
         Some(format!("  asking {} for your plan's limits…", asked.iter().map(|a| a.name()).collect::<Vec<_>>().join(" and ")))
     }
 
-    /// The plan checks that have answered, as lines.
+    /// The agents set up here whose plan's limits can be read: Claude's and Codex's.
+    fn plan_agents(&self) -> Vec<Agent> {
+        self.agents.iter().copied()
+            .filter(|a| matches!(a.spec().adapter, ringo_cli::Adapter::Claude | ringo_cli::Adapter::Codex) && self.s.installed(*a))
+            .collect()
+    }
+
+    /// Reads each agent's plan in the background (about a second each; no model call); `said`: the answers go into
+    /// the conversation, else only into the side panel's gauges.
+    fn read_limits(&mut self, agents: &[Agent], said: bool) {
+        for &agent in agents {
+            let program = self.s.program(agent);
+            self.plans.push((said, std::thread::spawn(move || (agent, ringo_cli::plan(agent, &program)))));
+        }
+        self.limits_at = Some(Instant::now());
+    }
+
+    /// The plan reads that have answered: kept for the side panel, and as gauges in the conversation for /usage.
     fn plans_done(&mut self) -> bool {
-        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.plans).into_iter().partition(|h| h.is_finished());
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.plans).into_iter().partition(|(_, h)| h.is_finished());
         self.plans = running;
-        for handle in &done.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>() {
-            let (agent, result) = handle;
-            let line = match result {
-                Ok(plan) => plan_line(agent.name(), plan),
-                // Claude's own answer is experimental: a turn's last rate-limit event, when there is one, stands in
+        for (said, handle) in done {
+            let Ok((agent, result)) = handle.join() else { continue };
+            let (style, t) = (self.agent_style(agent), self.theme);
+            // Claude's own answer is experimental: a turn's last rate-limit event, when there is one, stands in
+            let (plan, why) = match result {
+                Ok(plan) => (Some(plan), None),
                 Err(e) => match self.s.claude_limits.as_ref().filter(|_| agent.spec().adapter == ringo_cli::Adapter::Claude) {
-                    Some(info) => format!("{} (from this session's last claude turn; its own answer failed: {e})",
-                                          plan_line(agent.name(), &ringo_cli::claude_plan_from_event(info))),
-                    None => format!("  {}: {e}", agent.name()),
+                    Some(info) => (Some(ringo_cli::claude_plan_from_event(info)),
+                                   Some(format!("from this session's last claude turn; its own answer failed: {e}"))),
+                    None => (None, Some(e)),
                 },
             };
-            self.say(line);
+            if let Some(plan) = &plan {
+                self.limits.retain(|(a, _)| *a != agent);
+                self.limits.push((agent, plan.clone()));
+                let order = |a: &Agent| self.agents.iter().position(|x| x == a);
+                let mut limits = std::mem::take(&mut self.limits);
+                limits.sort_by_key(|(a, _)| order(a));
+                self.limits = limits;
+            }
+            if !said {
+                continue;
+            }
+            match (plan, why) {
+                (Some(plan), why) => {
+                    self.out.extend(plan_rows(agent.name(), style, &plan, &t));
+                    if let Some(why) = why {
+                        self.out.push(Out::Line(Line::styled(format!("    {why}"), t.dim), 4));
+                    }
+                }
+                (None, why) => self.out.push(agent_head(agent.name(), style, &format!(" · {}", why.unwrap_or_default()), &t)),
+            }
+            self.last = 0;
         }
         self.plans.is_empty()
     }
@@ -1660,6 +1781,8 @@ impl App {
         Ok(match cmd {
             Cmd::Talk(text) => return self.talk(self.main, text, line.to_string()),
             Cmd::Help => {
+                let intro = self.intro();
+                self.say(intro);
                 self.reply(MANUAL);
                 Some(self.settings())
             }
@@ -2134,13 +2257,23 @@ impl App {
     }
 
     /// The conversation's rows that fit `area`, scrolled as set, with the selection shown.
-    fn conversation(&mut self, f: &mut Frame, area: Rect) {
+    fn conversation(&mut self, f: &mut Frame, area: Rect, panel: bool) {
         let total = self.fit_to(area.width as usize);
         let h = area.height as usize;
         self.scroll = self.scroll.min(total.saturating_sub(h));
         let top = total.saturating_sub(h + self.scroll);
         let shown: Vec<Line<'static>> = self.fitted.iter().flatten().skip(top).take(h).cloned().collect();
         f.render_widget(Paragraph::new(shown), area);
+        // until the owner says something: where to start, centred a third of the way down, under any notes
+        let splash = if self.spoke { Vec::new() } else { self.splash(panel) };
+        let from = (total + 1).max(h.saturating_sub(splash.len()) / 3);
+        if !splash.is_empty() && from + splash.len() <= h && splash.iter().all(|l| l.width() <= area.width as usize) {
+            for (i, line) in splash.into_iter().enumerate() {
+                let w = line.width() as u16;
+                let at = Rect { x: area.x + (area.width - w) / 2, y: area.y + (from + i) as u16, width: w, height: 1 };
+                f.render_widget(Paragraph::new(line), at);
+            }
+        }
         if let Some((a, b)) = self.selection() {
             for y in 0..area.height {
                 let r = top + y as usize;
@@ -2289,6 +2422,27 @@ impl App {
             out.push(Line::from(vec![Span::styled("◉ ", t.running), Span::styled(fit(&who), style),
                                      Span::styled(format!(" {}", fmt_age(job.age())), t.dim)]));
         }
+        // each plan's limits, a gauge a window: "claude 5h ▰▱▱▱▱▱  2%"
+        if !self.limits.is_empty() {
+            out.push(Line::default());
+            out.push(head("LIMITS"));
+            let cells = width.saturating_sub(7 + 3 + 5).clamp(4, 12);
+            for (agent, plan) in &self.limits {
+                for (i, w) in plan.windows.iter().enumerate() {
+                    // "5 hours" 5h, "week" wk, anything else its words' first letters ("weekly scoped" ws)
+                    let short: String = match w.name.as_str() {
+                        "5 hours" => "5h".into(),
+                        "week" => "wk".into(),
+                        n => n.split_whitespace().filter_map(|w| w.chars().next()).take(2).collect(),
+                    };
+                    let on = ((w.percent.clamp(0.0, 100.0) / 100.0 * cells as f64).round() as usize).max((w.percent > 0.0) as usize);
+                    out.push(Line::from(vec![
+                        Span::styled(format!("{:<7}", if i == 0 { one_row(agent.name(), 6) } else { String::new() }), self.agent_style(*agent)),
+                        Span::styled(format!("{short:<3}"), t.dim), Span::styled("▰".repeat(on), used_style(w.percent, t)),
+                        Span::styled("▱".repeat(cells - on), t.border), Span::styled(format!(" {:>3.0}%", w.percent), t.dim)]));
+                }
+            }
+        }
         // the turn in this folder: the running one, else the last
         let turn = self.s.jobs.iter().rev().find(|j| matches!(j.kind, Kind::Agent { write: false, .. }));
         if let Some(job) = turn {
@@ -2393,7 +2547,7 @@ impl App {
         };
         f.render_widget(Paragraph::new(ruled("┬")), rule);
         f.render_widget(Paragraph::new(ruled("┴")), base);
-        self.conversation(f, view);
+        self.conversation(f, view, live.panel);
         let mut rows_below = live.jobs.clone();
         rows_below.extend(live.queue.iter().cloned());
         f.render_widget(Paragraph::new(rows_below), below);
@@ -2519,6 +2673,8 @@ pub fn run() -> ExitCode {
         app.s.mode = mode;
     }
     app.welcome();
+    let asked = app.plan_agents();
+    app.read_limits(&asked, false); // for the side panel's gauges
     let (notes, news) = std::sync::mpsc::channel();
     let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
     let auto = saved.get("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2593,7 +2749,7 @@ pub fn run() -> ExitCode {
             dirty = true;
         }
         dirty |= app.dispatch();
-        if !app.plans.is_empty() && app.plans.iter().any(|h| h.is_finished()) {
+        if app.plans.iter().any(|(_, h)| h.is_finished()) {
             app.plans_done();
             dirty = true;
         }
@@ -2761,11 +2917,19 @@ mod tests {
         let rows = screen(&mut a, 80, 24);
         assert!(rows[0].starts_with(" ▲▲ ringo  folder") && rows[0].ends_with("ask mode · 0 tokens"), "{rows:#?}");
         assert!(rows[1].chars().all(|c| c == '─') && rows[22].chars().all(|c| c == '─'), "no side panel at 80: {rows:#?}");
-        assert_eq!(rows[2], " Welcome to Ringo");
-        let words = rows.join(" ").split_whitespace().collect::<Vec<_>>().join(" ");
-        assert!(words.contains("/undo takes back its last change"), "outside git too, in Ringo's own store: {rows:#?}");
+        // an empty conversation: nothing at the top, the cat and where to start in the middle (no side panel at 80)
+        assert!(a.out.is_empty() && rows[2].is_empty(), "the opening lines are in /usrman now: {rows:#?}");
+        let middle = rows.iter().position(|r| r.trim() == "▲▲ ringo").expect("the name in the middle");
+        assert!(rows[middle - 2].trim() == "( •.• )" && rows[middle + 2].trim() == "Tell Ringo what you want done, in your own words."
+                && rows[middle + 3].trim() == "/usrman how it works · / commands · ? keys", "{rows:#?}");
+        let at = rows[middle].find('▲').unwrap();
+        assert!((at as i32 - (80 - 8) / 2).abs() <= 1, "centred: {rows:#?}");
+        assert!(a.intro().contains("/undo takes back its last change"), "outside git too, in Ringo's own store");
         assert!(rows[23].starts_with(" ❯ Tell Ringo what you want to do") && rows[23].ends_with("⇧⇥ mode · ? keys"),
                 "{rows:#?}");
+        a.echo("hello");
+        assert!(!screen(&mut a, 80, 24).iter().any(|r| r.contains("/usrman how it works")), "it goes once you speak");
+        assert!(screen(&mut a, 80, 24)[2].starts_with(" you  hello"));
         let narrow = screen(&mut a, 30, 24);
         for row in &narrow {
             assert!(cols(row) <= 30, "{row:?}");
@@ -2806,6 +2970,18 @@ mod tests {
         assert!(rows[2..28].iter().all(|r| r.chars().nth(split) == Some('│')), "the bar runs the panel's height");
         let long = a.panel(31, 30).into_iter().find(|l| l.spans.len() == 3 && l.spans[1].content.contains("claude")).unwrap();
         assert!(plain(&[long])[0].ends_with("talking to you"), "the state stays whole");
+        // each plan's limits as last read, a gauge a window, the agent named once; the middle has no second cat
+        let claude = Agent::from_name("claude").unwrap();
+        a.limits = vec![(claude, ringo_cli::Plan { name: "max".into(), windows: vec![
+            ringo_cli::Window { name: "5 hours".into(), percent: 50.0, resets: None },
+            ringo_cli::Window { name: "weekly scoped".into(), percent: 100.0, resets: None }], notes: Vec::new() })];
+        let side = plain(&a.panel(31, 40));
+        let at = side.iter().position(|r| r == "LIMITS").expect("a limits section");
+        assert_eq!(side[at + 1], format!("claude 5h {}{}  50%", "▰".repeat(6), "▱".repeat(6)));
+        assert_eq!(side[at + 2], format!("       ws {} 100%", "▰".repeat(12)));
+        let rows = screen(&mut a, 120, 30);
+        assert!(rows.iter().filter(|r| r.contains("( •.• )")).count() == 1 && rows.iter().any(|r| r.contains("▲▲ ringo  ")
+                || r.trim_start().starts_with("▲▲ ringo")), "{rows:#?}");
     }
 
     #[test]
@@ -3109,10 +3285,23 @@ mod tests {
         a.cursor = 0;
         assert_eq!(a.run(Cmd::Usage, "/usage"), Ok(None));
         let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
-        assert!(said.contains("this session: 0 tokens") && said.contains("last 24 hours"), "{said}");
-        assert!(plan_line("codex", &ringo_cli::Plan { name: "plus".into(), windows: vec![ringo_cli::Window {
-            name: "week".into(), percent: 34.0, resets: None }], notes: vec!["2 full resets left".into()] })
-            .ends_with("codex (plus plan): week 34% used · 2 full resets left"));
+        assert!(said.contains("this session 0") && said.contains("last 24 hours"), "{said}");
+        // a plan is its agent's name and plan, then a gauge a limit: 34% of 24 cells is 8, in the calm colour
+        let t = Theme::named("siamese", crate::theme::Depth::TrueColor).unwrap();
+        let plan = ringo_cli::Plan { name: "plus".into(), windows: vec![ringo_cli::Window {
+            name: "week".into(), percent: 34.0, resets: None }], notes: vec!["2 full resets left".into()] };
+        let rows: Vec<Line> = plan_rows("codex", t.codex, &plan, &t).iter().flat_map(|o| o.rows(80, &t)).collect();
+        let text: Vec<String> = rows.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect();
+        assert_eq!(text[0], "  codex · plus plan · 2 full resets left");
+        assert_eq!(text[1].trim_end(), format!("    week          {}{}  34%", "▰".repeat(8), "▱".repeat(16)));
+        assert_eq!(rows[1].spans[1].style, t.ok);
+        let full = Out::Meter { label: "5 hours".into(), pad: 7, percent: 96.0, value: "96%".into(), note: String::new(), fill: None };
+        assert_eq!(full.rows(80, &t)[0].spans[1].style, t.fail, "nearly used up: the failure colour");
+        let some = Out::Meter { label: "x".into(), pad: 1, percent: 0.4, value: "0%".into(), note: String::new(), fill: None };
+        assert_eq!(some.rows(80, &t)[0].spans[1].content, "▰", "a little used is not nothing");
+        for w in [20, 40, 120] {
+            assert!(full.rows(w, &t).iter().all(|l| l.width() <= w), "a gauge fits its width ({w})");
+        }
         assert_eq!((fmt_until(90), fmt_until(3 * 3600 + 120), fmt_until(2 * 86_400 + 7200)), ("2 min".into(), "3 h 2 min".into(), "2 d 2 h".into()));
     }
 

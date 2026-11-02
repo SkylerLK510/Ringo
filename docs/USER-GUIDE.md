@@ -1,6 +1,6 @@
 # How to use Ringo
 
-Type `/help` in Ringo to see this guide again, or `?` for just the keys. The full reference, with what each mode
+Type `/usrman` (or `/help`) in Ringo to see this guide again, or `?` for just the keys. The full reference, with what each mode
 allows and what it was measured to cost, is [docs/SHELL.md](SHELL.md).
 
 ## Start
@@ -98,13 +98,16 @@ has room it says so then, so you can stop the turn or let it run without a revie
 
 ## See what you have used
 
-`/usage` shows:
+`/usage` shows, as gauges (green, amber past 60% used, red past 85%):
 
 - the tokens this session has used, by agent;
 - the last 24 hours and the last 7 days, from a record Ringo keeps of every job it runs;
 - how much of each plan's limits is used and when each starts over: Claude's five-hour and weekly limits, Codex's
   five-hour and weekly ones and the full resets you have left. Ringo asks Claude and Codex directly; that takes
   about a second and no tokens.
+
+On a wide terminal the side panel keeps a small gauge for each limit too, so you can see how much is left while you
+work.
 
 ## Talk to a different agent
 
