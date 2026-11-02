@@ -860,3 +860,51 @@ fn a_claude_turn_keeps_its_running_count_until_its_own() {
         assert_eq!(s.tokens(), want);
     }
 }
+
+#[test]
+fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
+    let r = repo("tiers");
+    let state = root().join("tiers-state");
+    let _ = fs::remove_dir_all(&state);
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n";
+    let claude = fake(&root(), "claude-tiers", &format!("#!/bin/sh\n{RECORD}head -n 1 >/dev/null\n\
+        echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-t\",\"apiKeySource\":\"none\"}}'\n\
+        echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"usage\":{{\"input_tokens\":3,\"output_tokens\":4}}}}'\n"));
+    let codex = fake(&root(), "codex-tiers", &codex_script("", &codex_done("done", (10, 4, 2))));
+    let agy = fake(&root(), "agy-tiers", &format!("#!/bin/sh\n{RECORD}cat >/dev/null\n\
+        echo '{{\"event\":\"init\",\"conversation_id\":\"c-t\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
+        echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}'\n"));
+    let mut s = Session::with_state(&r, &state).unwrap();
+    for (name, program) in [("claude", &claude), ("codex", &codex), ("agy", &agy)] {
+        s.programs.insert(agent(name), program.clone());
+    }
+    let argv = |p: &Path| fs::read_to_string(format!("{}.argv", p.display())).unwrap();
+    let has = |argv: &str, run: &[&str]| argv.lines().collect::<Vec<_>>().windows(run.len()).any(|w| w == run);
+    let effort = |s: &mut Session, tier: ringo_cli::Tier| -> (String, String, String) {
+        s.tier = tier;
+        for name in ["claude", "codex", "agy"] {
+            s.forget(); // a fresh conversation each time, so every turn reads alike
+            let id = s.launch_agent(agent(name), false, "fix it").unwrap();
+            assert_eq!(wait(s, id), Status::Done, "{name}");
+        }
+        (argv(&claude), argv(&codex), argv(&agy))
+    };
+    // standard: each agent's own default, as before tiers
+    let (c, x, a) = effort(&mut s, ringo_cli::Tier::Standard);
+    assert!(!c.contains("--effort") && !x.contains("model_reasoning_effort") && !a.contains("--effort"), "{c}\n{x}\n{a}");
+    let (c, x, a) = effort(&mut s, ringo_cli::Tier::Quick);
+    assert!(has(&c, &["--effort", "low"]) && has(&x, &["-c", "model_reasoning_effort=\"low\""]) && has(&a, &["--effort", "low"]),
+            "{c}\n{x}\n{a}");
+    for tier in [ringo_cli::Tier::Deep, ringo_cli::Tier::Ultra] {
+        let (c, x, a) = effort(&mut s, tier);
+        assert!(has(&c, &["--effort", "high"]) && has(&x, &["-c", "model_reasoning_effort=\"high\""]) && has(&a, &["--effort", "high"]));
+    }
+    // every job that used tokens is in the record /usage totals. Claude: 7 a turn. Codex and agy count what a turn
+    // added to its thread's total, and these fakes answer with one thread and one total every time, so only their
+    // first turn adds any (12 and 2), and the jobs that added none leave no line.
+    let (day, first) = s.used_since(86_400);
+    let total = |name: &str| day.get(name).map(|t| t.total()).unwrap_or(0);
+    assert_eq!((total("claude"), total("codex"), total("agy")), (28, 12, 2));
+    assert!(first.is_some());
+    assert_eq!(fs::read_to_string(state.join("usage.jsonl")).unwrap().lines().count(), 6);
+}

@@ -19,7 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame, Terminal};
-use ringo_cli::{Agent, Decision, Kind, Mode, Said, Session, Status};
+use ringo_cli::{Agent, Decision, Kind, Mode, Said, Session, Status, Tier};
 use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "shrink a long conversation so later turns cost less"),
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
+    ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
+    ("/usage", "what you have used, and how much of your plans is left"),
     ("/auto", "auto mode on, or back to ask"),
     ("/review #N", "review job N's change"),
     ("/review BASE [HEAD]", "review BASE...HEAD of this repository"),
@@ -152,6 +154,9 @@ pub enum Cmd {
     Mode(Option<Mode>),
     /// `/auto`: auto mode on, or back to ask mode.
     Auto,
+    /// `/tier` (None: show it) or `/tier quick|standard|deep|ultra`.
+    Tier(Option<Tier>),
+    Usage,
     Quit,
 }
 
@@ -180,6 +185,12 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "compact" => Ok(Cmd::Compact),
             "ask" if !tail.is_empty() => Ok(Cmd::Ask(tail.into())),
             "auto" => Ok(Cmd::Auto),
+            "usage" | "cost" => Ok(Cmd::Usage),
+            "tier" | "effort" => match words.next() {
+                None => Ok(Cmd::Tier(None)),
+                Some(t) => Tier::from_name(t).map(|t| Cmd::Tier(Some(t)))
+                    .ok_or("/tier quick, /tier standard, /tier deep or /tier ultra".into()),
+            },
             "mode" => match words.next() {
                 None => Ok(Cmd::Mode(None)),
                 Some(m) => Mode::from_name(m).map(|m| Cmd::Mode(Some(m))).ok_or("/mode ask, /mode auto or /mode read".into()),
@@ -231,6 +242,30 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
         return Err("say what the agent should do".into());
     }
     Ok(Cmd::Agents(agents, rest.to_string()))
+}
+
+/// A time to come, roughly: 40 min, 4 h 49 min, 2 d 13 h.
+fn fmt_until(secs: u64) -> String {
+    match secs {
+        s if s < 3600 => format!("{} min", s.div_ceil(60)),
+        s if s < 86_400 => format!("{} h {} min", s / 3600, s % 3600 / 60),
+        s => format!("{} d {} h", s / 86_400, s % 86_400 / 3600),
+    }
+}
+
+/// One plan's line for /usage: each limit, how much of it is used, and when it starts over.
+fn plan_line(agent: &str, plan: &ringo_cli::Plan) -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let windows: Vec<String> = plan.windows.iter().map(|w| {
+        let reset = w.resets.map(|r| format!(", starts over in {}", fmt_until(r.saturating_sub(now)))).unwrap_or_default();
+        format!("{} {:.0}% used{reset}", w.name, w.percent)
+    }).collect();
+    let name = if plan.name.is_empty() { String::new() } else { format!(" ({} plan)", plan.name) };
+    let notes = plan.notes.iter().map(|n| format!(" · {n}")).collect::<String>();
+    match windows.is_empty() {
+        true => format!("  {agent}{name}: no limits reported{notes}"),
+        false => format!("  {agent}{name}: {}{notes}", windows.join(" · ")),
+    }
 }
 
 pub fn fmt_tokens(n: u64) -> String {
@@ -959,6 +994,13 @@ struct App {
     /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
     pending: Option<Vec<crate::updates::Update>>,
     update: bool,
+    /// `/usage`'s plan checks still under way, one thread an agent.
+    plans: Vec<std::thread::JoinHandle<(Agent, Result<ringo_cli::Plan, String>)>>,
+    /// Ultra: Ringo's review under way of a turn here (review job, turn, its agent), during which lines wait; the
+    /// revision it asked for (its task, while queued) and that revision's job, which no review follows.
+    checking: Option<(usize, usize, Agent)>,
+    revision: Option<String>,
+    revision_id: Option<usize>,
 }
 
 /// What the bottom of the screen holds in one frame: the running jobs' rows, the queued lines, the permission
@@ -1033,7 +1075,8 @@ impl App {
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false }
+              started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), checking: None,
+              revision: None, revision_id: None }
     }
 
     /// The box and the three lines the shell opens with.
@@ -1085,8 +1128,8 @@ impl App {
 
     /// The settings in force, printed under the manual.
     fn settings(&self) -> String {
-        format!("  now: mode {} · talking to {} · questions and pipelines on {} · theme {}\n  private state: {}",
-                self.s.mode.name(), self.main.name(), self.s.backend, self.theme.name, self.s.dir.display())
+        format!("  now: mode {} · tier {} · talking to {} · questions and pipelines on {} · theme {}\n  private state: {}",
+                self.s.mode.name(), self.s.tier.name(), self.main.name(), self.s.backend, self.theme.name, self.s.dir.display())
     }
 
     /// An agent's reply, or the manual: markdown, between blank lines.
@@ -1116,6 +1159,7 @@ impl App {
     /// Queues every job's new log lines for the conversation, each run of one job's lines under its name, and one
     /// line when a job ends.
     fn feed(&mut self) {
+        let mut ended = Vec::new();
         for i in 0..self.s.jobs.len() {
             if self.ended.len() == i {
                 self.ended.push(false);
@@ -1175,7 +1219,11 @@ impl App {
                 self.out.extend(lines.into_iter().map(|l| Out::Line(l, 2)));
                 self.ended[i] = true;
                 self.last = 0;
+                ended.push(id);
             }
+        }
+        for id in ended {
+            self.after_end(id);
         }
     }
 
@@ -1275,6 +1323,136 @@ impl App {
     /// agent update holds the session.
     fn must_wait(&self) -> bool {
         self.s.busy().is_some() || !self.queue.is_empty() || self.s.running() >= self.s.max_jobs || self.s.hold.is_some()
+            || self.checking.is_some()
+    }
+
+    /// Starts the oldest waiting line once the folder is free; true when it did.
+    fn dispatch(&mut self) -> bool {
+        let free = self.s.busy().is_none() && self.s.running() < self.s.max_jobs && self.s.hold.is_none()
+            && self.checking.is_none();
+        let Some((agent, task, line)) = free.then(|| self.queue.pop_front()).flatten() else { return false };
+        let revision = self.revision.as_deref() == Some(task.as_str());
+        self.echo(&line);
+        match self.turn(agent, &task) {
+            Ok(_) if revision => self.revision_id = Some(self.s.jobs.len()), // its handoff is the review shown above
+            Ok(Some(text)) => self.say(text),
+            Ok(None) => {}
+            Err(e) => self.say(format!("  {e}")),
+        }
+        if revision {
+            self.revision = None;
+        }
+        true
+    }
+
+    /// Ultra, after a job ends: a turn here that changed files gets Ringo's review (the change's diff, its files and
+    /// the task, one Codex call); a review that finds defects gives the same agent one turn to fix them. Nothing
+    /// follows that revision, so a turn costs at most one review and one more turn.
+    fn after_end(&mut self, id: usize) {
+        let job = &self.s.jobs[id - 1];
+        if let Some((review, turn, agent)) = self.checking.filter(|(review, ..)| *review == id) {
+            self.checking = None;
+            let found = ringo_cli::rt::pipelines::findings("f", &job.reply()).1.len();
+            match (&job.status, found) {
+                (Status::Done, 0) => self.say(format!("  ✓ review #{review} found no defects in #{turn}")),
+                (Status::Done, n) => {
+                    let task = format!("Ringo's review #{review} of your change in #{turn} found {n} defect{}. Fix the \
+                                        ones that are real, here in this folder, and say for each what you did; if one \
+                                        is wrong, say why and leave it: {{#{review}}}", if n == 1 { "" } else { "s" });
+                    self.say(format!("  ultra: {} gets one turn to fix what review #{review} found", agent.name()));
+                    self.revision = Some(task.clone());
+                    self.queue.push_front((agent, task.clone(), task));
+                }
+                _ => self.say(format!("  review #{review} did not finish, so #{turn}'s change stands unreviewed")),
+            }
+            return;
+        }
+        let (Kind::Agent { agent, write: false }, Status::Done) = (&job.kind, &job.status) else { return };
+        let agent = *agent;
+        if self.s.tier != Tier::Ultra || job.changed.is_empty() || self.revision_id == Some(id) {
+            return;
+        }
+        if !self.s.git {
+            self.say(format!("  ultra: Ringo's review needs a git project, so #{id} ran at high effort alone"));
+            return;
+        }
+        match self.s.review_job(id) {
+            Ok(review) => {
+                self.checking = Some((review, id, agent));
+                self.say(format!("  ultra: Ringo reviews #{id}'s change as #{review}; lines you send wait for it"));
+            }
+            Err(e) => self.say(format!("  ultra: no review of #{id}: {e}")),
+        }
+    }
+
+    /// `/tier`: the effort the turns started from now on run at; it lasts for this session.
+    fn set_tier(&mut self, tier: Tier) -> String {
+        self.s.tier = tier;
+        let what = match tier {
+            Tier::Quick => "agents think less (low effort): fewer tokens, for small or plain tasks",
+            Tier::Standard => "each agent's own default",
+            Tier::Deep => "agents think more (high effort): slower, and more tokens",
+            Tier::Ultra => "high effort, then Ringo reviews each change made here (one Codex call, about 70k tokens) \
+                            and the agent gets one turn to fix what the review finds",
+        };
+        format!("  tier: {}: {what}; for this session (Ringo starts in standard)", tier.name())
+    }
+
+    /// `/usage`: this session's tokens, the last day's and week's from Ringo's record, and each plan's limits, asked
+    /// of the agents in the background (about a second; no model call).
+    fn usage(&mut self) -> Option<String> {
+        let mut by: std::collections::BTreeMap<String, u64> = Default::default();
+        for job in &self.s.jobs {
+            let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
+            *by.entry(who).or_default() += job.tokens_so_far();
+        }
+        let parts = |by: &std::collections::BTreeMap<String, u64>| by.iter().filter(|(_, n)| **n > 0)
+            .map(|(who, n)| format!("{who} {}", fmt_tokens(*n))).collect::<Vec<_>>().join(", ");
+        let total = |by: &std::collections::BTreeMap<String, u64>| fmt_tokens(by.values().sum());
+        self.say(format!("  this session: {} tokens{}", total(&by),
+                         if by.values().any(|n| *n > 0) { format!(" ({})", parts(&by)) } else { String::new() }));
+        let (day, first) = self.s.used_since(86_400);
+        let (week, _) = self.s.used_since(7 * 86_400);
+        let sums = |m: std::collections::BTreeMap<String, ringo_cli::parse::Tokens>| m.into_iter().map(|(k, t)| (k, t.total())).collect();
+        let (day, week): (std::collections::BTreeMap<String, u64>, std::collections::BTreeMap<String, u64>) = (sums(day), sums(week));
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let kept = match first {
+            Some(at) if now.saturating_sub(at) < 7 * 86_400 => format!(" (Ringo has kept this record for {})", fmt_until(now - at)),
+            Some(_) => String::new(),
+            None => " (Ringo keeps this record from now on)".into(),
+        };
+        self.say(format!("  last 24 hours: {} tokens · last 7 days: {}{kept}", total(&day), total(&week)));
+        let asked: Vec<Agent> = self.agents.iter().copied()
+            .filter(|a| matches!(a.spec().adapter, ringo_cli::Adapter::Claude | ringo_cli::Adapter::Codex) && self.s.installed(*a))
+            .collect();
+        if asked.is_empty() {
+            return None;
+        }
+        for agent in &asked {
+            let (agent, program) = (*agent, self.s.program(*agent));
+            self.plans.push(std::thread::spawn(move || (agent, ringo_cli::plan(agent, &program))));
+        }
+        Some(format!("  asking {} for your plan's limits…", asked.iter().map(|a| a.name()).collect::<Vec<_>>().join(" and ")))
+    }
+
+    /// The plan checks that have answered, as lines.
+    fn plans_done(&mut self) -> bool {
+        let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.plans).into_iter().partition(|h| h.is_finished());
+        self.plans = running;
+        for handle in &done.into_iter().filter_map(|h| h.join().ok()).collect::<Vec<_>>() {
+            let (agent, result) = handle;
+            let line = match result {
+                Ok(plan) => plan_line(agent.name(), plan),
+                // Claude's own answer is experimental: a turn's last rate-limit event, when there is one, stands in
+                Err(e) => match self.s.claude_limits.as_ref().filter(|_| agent.spec().adapter == ringo_cli::Adapter::Claude) {
+                    Some(info) => format!("{} (from this session's last claude turn; its own answer failed: {e})",
+                                          plan_line(agent.name(), &ringo_cli::claude_plan_from_event(info))),
+                    None => format!("  {}: {e}", agent.name()),
+                },
+            };
+            self.say(line);
+        }
+        self.plans.is_empty()
     }
 
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
@@ -1377,6 +1555,10 @@ impl App {
                 }
                 return self.talk(agent, "/compact".into(), line.to_string());
             }
+            Cmd::Tier(None) => Some(format!("  tier: {} (also: {})", self.s.tier.name(),
+                Tier::ALL.iter().filter(|t| **t != self.s.tier).map(|t| t.name()).collect::<Vec<_>>().join(", "))),
+            Cmd::Tier(Some(tier)) => Some(self.set_tier(tier)),
+            Cmd::Usage => self.usage(),
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
             Cmd::Auto => {
@@ -2037,7 +2219,8 @@ impl App {
             Constraint::Length(live.menu.len() as u16)]).areas(area);
         // the head: the mark and the folder; the mode and the session's tokens at the right
         let (mode, tokens) = (self.s.mode.name(), fmt_tokens(self.s.tokens()));
-        let right = [format!("{mode} mode · {tokens} tokens "), format!("{mode} · {tokens} "), String::new()].into_iter()
+        let tier = match self.s.tier { Tier::Standard => String::new(), t => format!("{} · ", t.name()) };
+        let right = [format!("{mode} mode · {tier}{tokens} tokens "), format!("{mode} · {tier}{tokens} "), String::new()].into_iter()
             .find(|r| 10 + 8 + cols(r) <= w).unwrap_or_default(); // a narrow head keeps the folder's start
         let left = one_row(&self.label, w.saturating_sub(12 + cols(&right)));
         let pad = w.saturating_sub(10 + cols(&left) + cols(&right));
@@ -2222,7 +2405,7 @@ pub fn run() -> ExitCode {
         // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
         // while jobs run (a pump is a few microseconds; redraws still happen only when something changed). Every event
         // already queued is taken before the next redraw.
-        let wait = if app.s.running() > 0 || app.toast.is_some() { 25 } else { 250 };
+        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             loop {
                 match event::read() {
@@ -2260,14 +2443,9 @@ pub fn run() -> ExitCode {
             app.start_routed(ask, &route);
             dirty = true;
         }
-        let free = app.s.busy().is_none() && app.s.running() < app.s.max_jobs && app.s.hold.is_none();
-        if free && let Some((agent, task, line)) = app.queue.pop_front() {
-            app.echo(&line);
-            match app.turn(agent, &task) {
-                Ok(Some(text)) => app.say(text),
-                Ok(None) => {}
-                Err(e) => app.say(format!("  {e}")),
-            }
+        dirty |= app.dispatch();
+        if !app.plans.is_empty() && app.plans.iter().any(|h| h.is_finished()) {
+            app.plans_done();
             dirty = true;
         }
         let asking = app.s.pending().map(|(_, p)| p.id.clone());
@@ -2528,6 +2706,85 @@ mod tests {
         assert!(a.turn(a.main, "/compact").unwrap_err().contains("no conversation"), "nor when it comes off the queue");
         let mut b = app(&["codex"]);
         assert!(b.run(Cmd::Compact, "/compact").unwrap_err().contains("compacts its conversation on its own"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ultra_reviews_a_change_and_gives_one_turn_to_fix_it_and_no_more() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ringo-ultra-{}", std::process::id()));
+        let (repo, state) = (dir.join("repo"), dir.join("state"));
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).status().unwrap().success());
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"]);
+        let script = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        // a Claude that appends a line to a.txt each turn, keeping each prompt; a review pipeline with one finding
+        let claude = script("claude", "#!/bin/sh\nhead -n 1 >> \"$0.prompts\"\necho more >> a.txt\n\
+            echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-u\",\"apiKeySource\":\"none\"}'\n\
+            echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n");
+        let review = script("ringo", "#!/bin/sh\necho \"$@\" >> \"$0.runs\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && out=$2; shift; done\n\
+            printf 'What this change does: adds a line.\\n\\n### 1. The new line is wrong (`a.txt:2`)\\n- Problem: it says more.\\n' > \"$out\"\n");
+        let s = Session::with_state(&repo, &state).unwrap();
+        let mut a = App::new(s, vec![Agent::from_name("claude").unwrap()], "repo".into(),
+                             Theme::named("mono", crate::theme::Depth::Mono).unwrap(), Vec::new());
+        a.s.programs.insert(a.main, claude.clone());
+        a.s.pipeline = Some(vec![review.clone().into()]);
+        assert!(a.run(Cmd::Tier(Some(Tier::Ultra)), "/tier ultra").unwrap().unwrap().contains("one turn to fix"));
+        assert_eq!(a.talk(a.main, "add a line".into(), "add a line".into()), Ok(None));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while a.s.jobs.len() < 3 || a.s.running() > 0 || !a.queue.is_empty() {
+            assert!(Instant::now() < deadline, "the chain did not finish: {} jobs", a.s.jobs.len());
+            a.s.pump();
+            a.feed();
+            if a.checking.is_some() {
+                assert!(a.must_wait(), "a line sent during the review waits for it");
+            }
+            a.dispatch();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(300)); // anything more would have started by now
+        a.s.pump();
+        a.feed();
+        a.dispatch();
+        // the turn, its review, the one revision: nothing after it, though the revision changed the file too
+        assert_eq!(a.s.jobs.len(), 3, "{:?}", a.s.jobs.iter().map(|j| j.title.clone()).collect::<Vec<_>>());
+        assert!(matches!(a.s.jobs[1].kind, Kind::Ringo { .. }) && !a.s.jobs[2].changed.is_empty());
+        let prompts = std::fs::read_to_string(claude.with_extension("prompts")).unwrap();
+        assert!(prompts.lines().nth(1).unwrap().contains("The new line is wrong"), "the revision gets the review: {prompts}");
+        assert_eq!(std::fs::read_to_string(review.with_extension("runs")).unwrap().lines().count(), 1, "one review");
+        assert!(a.checking.is_none() && a.revision.is_none());
+        let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+        assert!(said.contains("Ringo reviews #1") && said.contains("one turn to fix what review #2 found"), "{said}");
+        // a review with no findings asks for nothing; standard tier reviews nothing
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tiers_and_usage_parse_and_show() {
+        let all = [Agent::from_name("claude").unwrap()];
+        assert_eq!(parse("/tier", &all), Ok(Cmd::Tier(None)));
+        assert_eq!(parse("/tier deep", &all), Ok(Cmd::Tier(Some(Tier::Deep))));
+        assert!(parse("/tier max", &all).is_err());
+        assert_eq!(parse("/usage", &all), Ok(Cmd::Usage));
+        let mut a = app(&["grok"]); // no agent with a plan to ask: /usage answers at once
+        a.s.tier = Tier::Deep;
+        let rows = screen(&mut a, 80, 10);
+        assert!(rows[0].ends_with("ask mode · deep · 0 tokens"), "the head names a tier other than standard: {rows:#?}");
+        assert_eq!(a.run(Cmd::Usage, "/usage"), Ok(None));
+        let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+        assert!(said.contains("this session: 0 tokens") && said.contains("last 24 hours"), "{said}");
+        assert!(plan_line("codex", &ringo_cli::Plan { name: "plus".into(), windows: vec![ringo_cli::Window {
+            name: "week".into(), percent: 34.0, resets: None }], notes: vec!["2 full resets left".into()] })
+            .ends_with("codex (plus plan): week 34% used · 2 full resets left"));
+        assert_eq!((fmt_until(90), fmt_until(3 * 3600 + 120), fmt_until(2 * 86_400 + 7200)), ("2 min".into(), "3 h 2 min".into(), "2 d 2 h".into()));
     }
 
     #[test]

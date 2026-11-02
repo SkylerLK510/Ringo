@@ -144,6 +144,8 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 | `/ask TEXT` | a quick answer: one tool-free call with your last few `/ask` questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell gives it to the agent you are talking to, or to `/research`; a review is put in the input line for you to say what to review |
 | `/clear` | a new conversation: each agent's next turn starts fresh |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` toggles auto and ask, Shift-Tab cycles ask, auto, read. Remembered for next time |
+| `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
+| `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
 | `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
@@ -343,6 +345,49 @@ The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 
 memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
 (macOS, Apple silicon). It redraws only on an event, a key,
 or for the spinner while a job runs.
+
+## Tiers
+
+| Tier | Claude | Codex | agy | and |
+|---|---|---|---|---|
+| `quick` | `--effort low` | `-c model_reasoning_effort="low"` | `--effort low` | |
+| `standard` | nothing: each agent's own default and the owner's settings (a Codex `config.toml` that sets an effort keeps it) | | | |
+| `deep` | `--effort high` | `"high"` | `--effort high` | |
+| `ultra` | `--effort high` | `"high"` | `--effort high` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
+
+A tier changes no prompt: effort is a model setting, not text. The shell starts in `standard` every time, so a tier
+that spends more is never left on from an earlier day.
+
+`ultra` builds on the one extra spend Ringo measured to raise quality. On COMPLEX-01, checks alone passed 3 of 11
+seeded candidates, and one review plus one revision passed 11 of 11. Higher effort alone measured no gain on the
+tasks tried (high at 54,275 tokens against low at 21,754, both 26 of 26), and neither did more reviewers or more
+rounds (see README). So after a turn in the folder that changed files, the shell runs `/review #N` (the review
+pipeline, one call on the session's backend, about 70k tokens of material at the median). Lines sent meanwhile wait.
+A review with findings queues one turn for the same agent, which continues its conversation and is handed the
+review (`{#R}`); no review follows that turn. Outside a git project there is no review, so `ultra` runs as `deep`
+and says so. Claude Code's own `ultracode` setting is not used: it runs Claude Code's dynamic workflows, which
+`--safe-mode` turns off and which Ringo does not measure.
+
+## Usage
+
+`/usage` adds no tokens. It reports three things:
+
+- **This session:** the jobs in memory, by agent.
+- **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder. Each finished job that used tokens
+  appends one line: when, which agent (or `ringo` for a pipeline), and its input, cache-read, cache-write and output
+  counts.
+- **Plans:** asked of each set-up agent in the background, about a second each:
+  - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given
+    a message, so no model call (its answer says cost 0). Claude marks it experimental. When it fails, the last
+    `rate_limit_event` a Claude turn in this session sent stands in.
+  - **Codex:** `account/rateLimits/read` over `codex app-server` (no thread is started): each window's used percent,
+    length and reset time, and the full resets left. `account/rateLimitResetCredit/consume`, which spends one, is never
+    called.
+  - **agy:** it reports no plan usage.
+
+A resumed Claude turn counts its own tokens: `model_usage_since_last_result` comes before `modelUsage`, which on a
+resumed session is the whole session's so far. One second turn was counted at 452,900 tokens before this fix; it used
+433,179.
 
 ## Safety model
 

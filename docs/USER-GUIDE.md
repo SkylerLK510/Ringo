@@ -72,6 +72,31 @@ Shift-Tab cycles the modes, `/mode ask|auto|read` sets one, and `/auto` switches
 applies to the turns started after it and is remembered for next time. Codex cannot stop to ask, so in `ask` mode it
 changes files in this folder but has no network.
 
+## Choose how hard agents think
+
+| Tier | What it does | Tokens |
+|---|---|---|
+| `quick` | agents think less (low effort) | fewer |
+| `standard` | each agent's own default | as before |
+| `deep` | agents think more (high effort) | more, and slower |
+| `ultra` | `deep`, then Ringo reviews each change a turn makes here; when the review finds defects, the agent gets one turn to fix them | one review (about 70,000) and at most one more turn |
+
+`/tier deep` sets one; `/tier` alone shows the one in use. It applies to turns started after it, for this session
+only: Ringo starts in `standard` every time, so a tier that spends more is never left on by accident. The top line
+names the tier when it is not `standard`. In `ultra`, lines you send while the review runs wait for it, and nothing
+follows the one fixing turn. Ringo's own measurements found that higher effort alone did not change results on the
+tasks it was tried on, while one review and one fix did, so `ultra` is the tier for work you want checked.
+
+## See what you have used
+
+`/usage` shows:
+
+- the tokens this session has used, by agent;
+- the last 24 hours and the last 7 days, from a record Ringo keeps of every job it runs;
+- how much of each plan's limits is used and when each starts over: Claude's five-hour and weekly limits, Codex's
+  five-hour and weekly ones and the full resets you have left. Ringo asks Claude and Codex directly; that takes
+  about a second and no tokens.
+
 ## Talk to a different agent
 
 Put its name first: `@codex why is this slow?`. The rest of the conversation goes to Codex too, until you pick another
@@ -138,6 +163,8 @@ file and Ringo prints where.
 |---|---|
 | `/setup` | add an agent and sign in to it |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens |
+| `/tier NAME` | how hard agents think: quick, standard, deep or ultra (above) |
+| `/usage` | what you have used, and how much of your plans is left |
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
 | `/quit` | leave |
 
@@ -147,6 +174,9 @@ file and Ringo prints where.
   many files. Claude Code measured about 50,000 for the same first turn. A narrow request keeps it low.
 - `/ask`: one small call, about 1,300 tokens when measured, for a question that needs none of your files.
 - `/research`: about 70,000 tokens, most of them search results.
+- `/tier ultra`: a turn that changes files adds one review, about 70,000 tokens, and, when the review finds a
+  defect, one more turn.
+- `/usage`: no tokens.
 
 ## When something goes wrong
 
