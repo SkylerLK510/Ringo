@@ -68,6 +68,9 @@ pub enum Note {
     /// What a running turn has used so far, as its messages report it (Claude): shown until the turn's own count
     /// (`Tokens`) arrives, and kept if it never does (a stopped turn).
     Live(Tokens),
+    /// How much of the model's window the conversation fills, as its latest call read and wrote it: past
+    /// `Session::handoff_at`, the agent's next turn starts fresh from Ringo's record of the conversation.
+    Context(u64),
     /// One model call finished (Ringo pipelines report these).
     Call,
     /// The agent is editing this file (as the agent reported it, usually an absolute path).
@@ -424,7 +427,12 @@ impl Parser {
                 notes.push(activity(format!("plan {finished}/{} done", plan.len())));
             }
             // The thread's usage so far; a resumed thread's counts its earlier turns too, as `codex exec` did.
-            ("thread/tokenUsage/updated", _) => self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default(),
+            ("thread/tokenUsage/updated", _) => {
+                self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                if let Some(last) = p.pointer("/tokenUsage/last") { // the latest call alone; its input counts the cached part
+                    notes.push(Note::Context(u(last, "inputTokens") + u(last, "outputTokens")));
+                }
+            }
             ("turn/completed", _) => {
                 self.completed += 1;
                 let turn = p.get("turn").unwrap_or(&NULL);
@@ -533,6 +541,9 @@ impl Parser {
                     let mut so_far = Tokens::default();
                     self.seen.iter().for_each(|(_, t)| so_far.add(*t));
                     notes.push(Note::Live(so_far));
+                    if parent.is_none() { // a subagent's calls read its own window
+                        notes.push(Note::Context(t.total()));
+                    }
                 }
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     match s(block, "type") {
@@ -943,6 +954,12 @@ mod tests {
         let live: Vec<u64> = run(Style::Claude, &lines).1.into_iter()
             .filter_map(|n| if let Note::Live(t) = n { Some(t.total()) } else { None }).collect();
         assert_eq!(live, [1107, 1107, 2212, 2218]);
+        let context: Vec<u64> = run(Style::Claude, &lines).1.into_iter()
+            .filter_map(|n| if let Note::Context(n) = n { Some(n) } else { None }).collect();
+        assert_eq!(context.last(), Some(&1111), "the latest call's window, not the turn's sum");
+        let sub = event("m3", 1).replace(r#""parent_tool_use_id":null"#, r#""parent_tool_use_id":"toolu_1""#);
+        assert!(!run(Style::Claude, &[sub.as_str()]).1.iter().any(|n| matches!(n, Note::Context(_))), "nor a subagent's");
+        assert!(run(Style::Codex, &[CODEX[12]]).1.contains(&Note::Context(38852 + 671)), "codex: its last call");
     }
 
     #[test]

@@ -32,8 +32,12 @@ add a dark mode switch to the settings page
   to stop it.
 - You can type the next message while it works. It waits under the box and goes when the turn ends.
 - The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
-  `/clear` starts a new conversation. Claude shrinks a long conversation to a summary by itself once it passes
-  200,000 tokens, so later calls stay smaller; `/compact` does it at once.
+  `/clear` starts a new conversation.
+- A long conversation costs more with every call, because the agent reads all of it again each time. Once it passes
+  64,000 tokens, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
+  reply, the steps taken, the files changed and the change itself. No extra call writes it, and the turn's log says
+  when it happens. Claude also shrinks a conversation by itself once it passes 200,000 tokens within one turn;
+  `/compact` makes Claude do that at once.
 - To give every Claude turn your own rules (how you push, what never to do), write them in `rules.md` in Ringo's
   state folder (`~/.local/share/ringo/rules.md`). Keep it short: every line is read on every call.
 
@@ -112,7 +116,19 @@ work.
 ## Talk to a different agent
 
 Put its name first: `@codex why is this slow?`. The rest of the conversation goes to Codex too, until you pick another
-with `@claude`. Each agent keeps its own conversation.
+with `@claude`. It is one conversation: Codex is told what you said to Claude, what Claude answered and what it
+changed, so `@codex take it from here` carries on the same work.
+
+## Give each agent its own task
+
+Type `/separate`, then give each agent its task: `@claude fix the login bug`, then `@codex write the README`. They
+work at the same time, each in its own conversation, and neither is told what the other does. Each still takes one
+turn at a time, and your next message to a busy agent waits for it. The top line says `separate` while it is on.
+`/together` puts them back in one conversation. Esc stops the latest turn; `/kill N` stops a given one.
+
+`/undo` still takes back one turn at a time. When two agents worked here at once, a turn's undo leaves out any file
+the other agent also changed, and its last line says so, so one agent's work is never taken back with the other's.
+Using two agents at once also uses both plans at once: `/usage` shows how much each has left.
 
 ## Compare agents
 
