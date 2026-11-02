@@ -161,7 +161,7 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 Start `ringo` in any folder, as you would `claude` or `codex`. In a git project each turn's change can be undone,
 copies work and `/review BASE` reviews its commits; in any other folder, a repository that holds your home folder (a
 dotfiles repository) included, the agents still work in the folder and `/undo` works from Ringo's own store (see the
-safety model), while copies and `/review` need a git project. Ringo's private state stays out of every repository;
+safety model), and so does `/review #N` of a turn there, while copies and `/review BASE` need a git project. Ringo's private state stays out of every repository;
 its folder carries a `.gitignore` of its own.
 
 A turn costs about 12,000 to 15,000 tokens before the agent starts (measured under
@@ -364,11 +364,18 @@ would lower it; a setting of max is lowered to xhigh while `deep` or `ultra` is 
 seeded candidates, and one review plus one revision passed 11 of 11. Higher effort alone measured no gain on the
 tasks tried (high at 54,275 tokens against low at 21,754, both 26 of 26), and neither did more reviewers or more
 rounds (see README). So after a turn in the folder that changed files, the shell runs `/review #N` (the review
-pipeline, one call on the session's backend, about 70k tokens of material at the median). Lines sent meanwhile wait;
+pipeline, one call, about 70k tokens of material at the median). Outside a git project the turn's before and after
+are commits in Ringo's undo store, and the review reads them there: it reads only git objects (`ls-tree`, `cat-file`,
+`diff`), and both runtimes build the same material from a bare store as from a project. The call goes to the
+session's backend unless that plan has a limit used up: as an ultra turn starts, the shell reads the plans the way
+`/usage` does (about a second each, no model call; the other plan only when the first has no room), and a used-up
+Codex plan sends the review to the `claude` preset, a used-up Claude plan to `codex-chatgpt`. A plan it cannot read
+counts as having room, and a backend of your own is used as it is. When neither plan has room the shell says so while
+the turn runs, and no review follows it. Lines sent meanwhile wait;
 Esc or Ctrl-C stops the review and gives them back to the input.
 A review with findings queues one turn for the same agent, which continues its conversation and is handed the
-review (`{#R}`); no review follows that turn. Outside a git project there is no review, so `ultra` runs as `deep`
-and says so. The revision is Ringo's line, so the conversation does not show it as yours. Claude Code's own
+review (`{#R}`); no review follows that turn. Where `/undo` is off there is no before and after to review, and
+`/tier ultra` says so. The revision is Ringo's line, so the conversation does not show it as yours. Claude Code's own
 `ultracode` setting is not used: it runs Claude Code's dynamic workflows, which
 `--safe-mode` turns off and which Ringo does not measure.
 

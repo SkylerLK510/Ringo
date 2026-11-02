@@ -87,6 +87,10 @@ names the tier when it is not `standard`. In `ultra`, lines you send while the r
 review and gives them back), and nothing follows the one fixing turn. Ringo's own measurements found that higher effort alone did not change results on the
 tasks it was tried on, while one review and one fix did, so `ultra` is the tier for work you want checked.
 
+`ultra` works in any folder where `/undo` does, git project or not. The review runs on Codex; when Codex's plan has
+used up a limit, it runs on Claude instead. Ringo checks both plans as the turn starts (no tokens), and when neither
+has room it says so then, so you can stop the turn or let it run without a review.
+
 ## See what you have used
 
 `/usage` shows:
@@ -187,7 +191,8 @@ file and Ringo prints where.
 | `#N is working in this folder` | wait for it to end, or press Esc to stop it |
 | `/undo is off here: ...` | start Ringo in the folder you work on (not your home folder, and inside a git project when it names one); for a very large folder, type `git init` in a terminal there once |
 | `your files changed where #N edits them` | `/diff N` shows the change; apply it by hand, or commit yours and `/apply N` again |
-| `needs a git project` | copies and `/review` work only in a git project |
+| `needs a git project` | copies and `/review BASE` work only in a git project (`/review #N` works wherever `/undo` does) |
+| `ultra: ... so #N's change will not be reviewed` | both plans have used up a limit; the line says when each starts over |
 | `no agent NAME` | add it with `/setup` |
 | `#N is running; /kill it first` | `/kill N`, then try again |
 | a turn that seems stuck | Esc stops it; `/show N` reads its log |

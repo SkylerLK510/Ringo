@@ -810,14 +810,15 @@ impl Session {
         self.git || self.store.is_some()
     }
 
-    /// A commit holding `tree`, on `parent` when there is one; no branch points at it.
+    /// A commit holding `tree`, on `parent` when there is one; no branch points at it. It goes where the folder's
+    /// trees are: the project's repository, or outside one Ringo's undo store.
     fn commit(&self, tree: &str, parent: Option<&str>, message: &str) -> Result<String, String> {
         let mut args = vec!["-c", "user.name=ringo", "-c", "user.email=ringo@localhost", "commit-tree", "--no-gpg-sign",
                             tree, "-m", message];
         if let Some(parent) = parent {
             args.extend(["-p", parent]);
         }
-        git(&self.repo, &args)
+        self.folder_git(&args)
     }
 
     /// Refuses a change to the owner's folder while an agent turn works in it: the turn's own after would take it in.
@@ -1117,8 +1118,8 @@ impl Session {
     }
 
     /// `/review` of an agent's write job: its change becomes an unreferenced commit on the job's base (no hooks,
-    /// no branch), reviewed by Ringo with the task as the change description.
-    pub fn review_job(&mut self, of: usize) -> Result<usize, String> {
+    /// no branch), reviewed by Ringo on `backend` with the task as the change description.
+    pub fn review_job(&mut self, of: usize, backend: &str) -> Result<usize, String> {
         let job = self.job(of)?;
         if job.status != Status::Done {
             return Err(format!("#{of} has not finished"));
@@ -1131,13 +1132,12 @@ impl Session {
                 let head = self.commit(&tree, Some(&base), &format!("ringo job {of}"))?;
                 (wt, base, head)
             }
-            (_, _, Some(_), Some(_)) if !self.git && !job.changed.is_empty() => {
-                return Err(format!("/review #{of} needs a git project"));
-            }
+            // Outside a git project the trees are in Ringo's undo store, and the review reads only git objects
+            // (ls-tree, cat-file, diff), so it reads them from there.
             (_, _, Some(before), Some(after)) if !job.changed.is_empty() => {
                 let base = self.commit(&before, None, &format!("ringo job {of}: before"))?;
                 let head = self.commit(&after, Some(&base), &format!("ringo job {of}"))?;
-                (self.repo.clone(), base, head)
+                (self.store.clone().unwrap_or_else(|| self.repo.clone()), base, head)
             }
             _ => return Err(format!("#{of} changed no files to review")),
         };
@@ -1146,7 +1146,7 @@ impl Session {
         let dir = self.next_dir()?;
         let pr = dir.join("pr.txt");
         fs::write(&pr, format!("The task given to the agent:\n\n{prompt}\n")).map_err(|e| e.to_string())?;
-        let args = self.review_args(&wt, &base, &head, &dir, Some(&pr));
+        let args = self.review_args(&wt, &base, &head, &dir, Some(&pr), backend);
         self.launch_ringo(&format!("review of #{of}"), args, dir.join("trace"))
     }
 
@@ -1163,13 +1163,13 @@ impl Session {
             return Err("/review BASE [HEAD] reviews a git project's commits: start ringo inside one".into());
         }
         let dir = self.next_dir()?;
-        let args = self.review_args(&self.repo, base, head, &dir, None);
+        let args = self.review_args(&self.repo, base, head, &dir, None, &self.backend);
         self.launch_ringo(&format!("review {base}..{head}"), args, dir.join("trace"))
     }
 
-    fn review_args(&self, repo: &Path, base: &str, head: &str, dir: &Path, pr: Option<&Path>) -> Vec<OsString> {
+    fn review_args(&self, repo: &Path, base: &str, head: &str, dir: &Path, pr: Option<&Path>, backend: &str) -> Vec<OsString> {
         let mut args: Vec<OsString> = vec!["review".into(), "--repo".into(), repo.into()];
-        args.extend(["--base", base, "--head", head, "--backend", &self.backend, "--timeout", "180"].map(Into::into));
+        args.extend(["--base", base, "--head", head, "--backend", backend, "--timeout", "180"].map(Into::into));
         if let Some(pr) = pr {
             args.extend(["--pr-text".into(), pr.into()]);
         }
