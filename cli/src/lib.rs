@@ -420,6 +420,8 @@ pub struct Session {
     store: Option<PathBuf>,
     /// Why /undo is off here, when it is.
     pub no_undo: Option<String>,
+    /// Whether the session opened in the owner's home folder (or above it), where no one project is meant.
+    pub at_home: bool,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
     pub max_jobs: usize,
@@ -725,7 +727,8 @@ impl Session {
                 Err(why) => (None, Some(why)),
             },
         };
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, dir, jobs: Vec::new(), max_jobs: 3,
+        let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
@@ -803,6 +806,12 @@ impl Session {
 
     fn folder_git(&self, args: &[&str]) -> Result<String, String> {
         run_git(self.folder(), args).map(trimmed)
+    }
+
+    /// The owner's own rules for every Claude turn: a file they write in Ringo's state folder. With none, a turn is as
+    /// it always was.
+    pub fn rules_path(&self) -> PathBuf {
+        self.root.join("rules.md")
     }
 
     /// Whether /undo works here: a git project, or Ringo's own store for the folder.
@@ -1046,11 +1055,45 @@ impl Session {
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", effort]);
                 }
+                // A subscription login runs Opus with a 1M window, where Claude Code compacts a conversation only near
+                // 967k: every call re-reads all of it, so one long turn here read 3.9M tokens with its last calls at
+                // 140k each. A 200k window is where Claude Code compacts on a 200k model, by itself, mid-turn as well
+                // as on resuming; the system prompt (with the files appended below) stays, and it re-reads the five
+                // files last changed. An owner who sets the variable keeps their own.
+                if std::env::var_os("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none() {
+                    cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "200000");
+                }
                 if let Some(session) = &resume {
                     cmd.args(["--resume", session]);
                 }
-                if let Some(doc) = ["CLAUDE.md", "AGENTS.md"].iter().map(|d| cwd.join(d)).find(|p| p.is_file()) {
-                    cmd.arg("--append-system-prompt-file").arg(doc);
+                // The owner's own rules (`rules_path`), which safe mode would otherwise drop with their CLAUDE.md, go
+                // first; with the repository's file as well, the two go in one file of the job's, as bytes, so neither
+                // needs to be UTF-8. Nothing here stops the turn: a file that cannot be read or written is said in its log.
+                let doc = ["CLAUDE.md", "AGENTS.md"].iter().map(|d| cwd.join(d)).find(|p| p.is_file());
+                let rules = match fs::read(self.rules_path()) {
+                    Ok(bytes) => Some(bytes).filter(|b| !b.trim_ascii().is_empty()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => {
+                        self.jobs[id - 1].push_log(format!("your rules.md is left out of this turn: {e}"));
+                        None
+                    }
+                };
+                let append = match (rules, doc) {
+                    (Some(rules), Some(doc)) => {
+                        let both = dir.join("instructions.md");
+                        match fs::read(&doc).and_then(|text| fs::write(&both, [rules.trim_ascii_end(), b"\n\n", &text].concat())) {
+                            Ok(()) => Some(both),
+                            Err(e) => {
+                                self.jobs[id - 1].push_log(format!("your rules.md is left out of this turn: {e}"));
+                                Some(doc)
+                            }
+                        }
+                    }
+                    (Some(_), None) => Some(self.rules_path()),
+                    (None, doc) => doc,
+                };
+                if let Some(file) = append {
+                    cmd.arg("--append-system-prompt-file").arg(file);
                 }
                 input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": prompt}})));
                 Style::Claude

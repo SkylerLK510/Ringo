@@ -564,6 +564,43 @@ fn agent_commands_are_pinned() {
                 String::new()));
 }
 
+/// Every Claude turn runs with a 200k auto-compact window, so a long conversation is compacted by Claude itself
+/// instead of growing toward the 1M window; the owner's own rules file, when there is one, goes in ahead of the
+/// project's instructions.
+#[test]
+fn claude_turns_compact_at_200k_and_carry_the_owners_rules() {
+    let r = repo("compact-rules");
+    fs::write(r.join("AGENTS.md"), "Project rule.\n").unwrap();
+    let claude = fake(&root(), "claude-rules", "#!/bin/sh\nprintf '%s' \"$CLAUDE_CODE_AUTO_COMPACT_WINDOW\" > \"$0.window\"\n\
+        rm -f \"$0.appended\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --append-system-prompt-file ] && cat \"$2\" > \"$0.appended\"; shift; done\n\
+        head -n 1 > /dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-r\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let mut s = Session::with_state(&r, &root().join("state-compact-rules")).unwrap();
+    s.programs.insert(agent("claude"), claude.clone());
+    let run = |s: &mut Session| {
+        let id = s.launch_agent(agent("claude"), false, "the task").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        (fs::read_to_string(claude.with_extension("window")).unwrap(),
+         fs::read_to_string(claude.with_extension("appended")).unwrap_or_default())
+    };
+    // an owner who sets the window keeps it
+    let window = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW").unwrap_or_else(|_| "200000".into());
+    assert_eq!(run(&mut s), (window, "Project rule.\n".to_string()), "no rules file: as before");
+    fs::write(s.rules_path(), "My rule.\n\n").unwrap();
+    assert_eq!(run(&mut s).1, "My rule.\n\nProject rule.\n", "the owner's rules first, then the project's");
+    fs::remove_file(r.join("AGENTS.md")).unwrap();
+    assert_eq!(run(&mut s).1, "My rule.\n\n", "rules alone");
+    fs::write(s.rules_path(), "  \n").unwrap();
+    assert_eq!(run(&mut s).1, "", "an empty rules file adds nothing");
+    // files that are not UTF-8 go in as they are, and the turn runs
+    fs::write(s.rules_path(), b"R\xe9gle.\n").unwrap();
+    fs::write(r.join("CLAUDE.md"), b"Projet \xe9t\xe9.\n").unwrap();
+    let id = s.launch_agent(agent("claude"), false, "the task").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done, "the turn runs");
+    assert_eq!(fs::read(claude.with_extension("appended")).unwrap(), b"R\xe9gle.\n\nProjet \xe9t\xe9.\n");
+}
+
 /// agy (verified with 1.4.12): the prompt on stdin as one stream-json message, stream-json out, session-only deny
 /// rules (read turns cannot write files; no turn runs commands, MCP tools or browser actions), resume by
 /// conversation id, where agy reports the conversation's usage so far and only the turn's own is counted. The prompt
