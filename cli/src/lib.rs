@@ -369,6 +369,8 @@ pub struct Job {
     pub lane: Option<Agent>,
     /// Each step's first line (a command and its exit, an edit), for Ringo's record of the conversation.
     pub steps: Vec<String>,
+    /// Whether it ran a shell command, which may have written files it did not report.
+    pub ran: bool,
     /// Lines for the agent's stdin while the turn runs (Claude's answers to its permission requests); None closes it.
     input: Option<Sender<Option<String>>>,
     pid: Option<u32>,
@@ -951,30 +953,33 @@ impl Session {
     /// no model call, and never a summary of a summary. The record uncut goes in the job's folder.
     fn handoff(&mut self, id: usize, agent: Agent, resume: &mut Option<String>, prompt: &str) -> Option<(String, String)> {
         let fills = self.context.get(&agent).copied().unwrap_or(0);
-        let fresh = resume.is_none() || fills > self.handoff_at;
         let lane = self.lane(agent, id);
         let mine = lane.iter().rposition(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent));
-        let turns = if fresh { &lane[..] } else { &lane[mine.map_or(0, |at| at + 1)..] };
-        let (Some(first), Some(last)) = (turns.first(), turns.last()) else { return None };
-        let (from, to) = (first.id, last.id);
-        let (record, whole) = self.record(turns);
+        // a fresh start that would save too little resumes, told what the others did since, as any other turn
+        let (fresh, text, about, span, whole) = [resume.is_none() || fills > self.handoff_at, false].into_iter().find_map(|fresh| {
+            let turns = if fresh { &lane[..] } else { &lane[mine.map_or(0, |at| at + 1)..] };
+            let (first, last) = (turns.first()?.id, turns.last()?.id);
+            let (record, whole) = self.record(turns);
+            let head = match fresh {
+                true => "Ringo's record of this conversation so far, which you start fresh from",
+                false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
+            };
+            let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
+                                and can be wrong; the files here are the truth). The whole record, uncut, is in {}.\n\n{}\n\n\
+                                The owner's new message:\n", self.jobs[id - 1].dir.join("record.md").display(), record.trim_end());
+            let about = text.len() as u64 / 4; // the owner's message goes either way
+            (!fresh || resume.is_none() || about * 2 <= fills).then(|| {
+                (fresh, text, about, if first == last { format!("#{first}") } else { format!("#{first} to #{last}") }, whole)
+            })
+        })?;
         let file = self.jobs[id - 1].dir.join("record.md");
-        let head = match fresh {
-            true => "Ringo's record of this conversation so far, which you start fresh from",
-            false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
-        };
-        let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account and \
-                            can be wrong; the files here are the truth). The whole record, uncut, is in {}.\n\n{}\n\n\
-                            The owner's new message:\n{prompt}", file.display(), record.trim_end());
-        let about = text.len() as u64 / 4;
-        let span = if from == to { format!("#{from}") } else { format!("#{from} to #{to}") };
         let note = match (fresh, resume.is_some()) {
-            (true, true) if about * 2 > fills => return None, // the record would save too little: resume as before
             (true, true) => format!("handoff: {} starts fresh from Ringo's record of {span} (about {} tokens) instead \
                                      of re-reading {} at every call", agent.name(), fmt_k(about), fmt_k(fills)),
             (true, false) => format!("told {} the conversation so far, {span} (about {} tokens)", agent.name(), fmt_k(about)),
             _ => format!("told {} what {span} did (about {} tokens)", agent.name(), fmt_k(about)),
         };
+        let text = text + prompt;
         if let Err(e) = fs::write(&file, whole) {
             self.jobs[id - 1].push_log(format!("the whole record could not be kept: {e}"));
         }
@@ -1065,7 +1070,7 @@ impl Session {
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
-                             asks: VecDeque::new(), lane: None, steps: Vec::new(), input: None, pid: None,
+                             asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)) });
         Ok(id)
     }
@@ -1664,7 +1669,8 @@ impl Session {
             let changed = self.folder_git(&["diff", "--name-only", &before, &after]).unwrap_or_default();
             let mut changed: Vec<String> = changed.lines().map(str::to_string).collect();
             // Another agent's turn here at the same time (/separate) is in this diff too: the turn keeps only the
-            // files it said it edited and the other did not, so /undo never takes back the other's work.
+            // files it said it edited and the other did not, so /undo never takes back the other's work. A command
+            // the other ran may have written any file without saying so: then the turn keeps none.
             // ceiling: a file only a command wrote, or both edited, stays out of /undo; an edit the other turn made
             // just before this one ended may not have been reported yet.
             let job = &self.jobs[id - 1];
@@ -1672,11 +1678,13 @@ impl Session {
                 .filter(|o| o.id != id && o.before.is_some() && (o.running() || o.started + o.age() > job.started)).collect();
             if !others.is_empty() {
                 let theirs: BTreeSet<&String> = others.iter().flat_map(|o| &o.touched).collect();
+                let commands = others.iter().any(|o| o.ran);
                 let (mine, left): (Vec<String>, Vec<String>) = changed.into_iter()
-                    .partition(|f| job.touched.contains(f) && !theirs.contains(f));
+                    .partition(|f| !commands && job.touched.contains(f) && !theirs.contains(f));
                 if !left.is_empty() {
                     let at = others.iter().map(|o| format!("#{}", o.id)).collect::<Vec<_>>().join(", ");
-                    self.jobs[id - 1].push_log(format!("{} changed while {at} worked here too, so /undo leaves {}",
+                    let how = if commands { "ran commands" } else { "worked" };
+                    self.jobs[id - 1].push_log(format!("{} changed while {at} {how} here too, so /undo leaves {}",
                                                        left.join(", "), if left.len() == 1 { "it" } else { "them" }));
                 }
                 changed = mine;
@@ -1800,6 +1808,7 @@ impl Session {
                                 .unwrap_or(path);
                             job.touched.insert(rel.to_string_lossy().into_owned());
                         }
+                        Note::Ran => job.ran = true,
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
                         Note::Limits(info) => self.claude_limits = Some(info),
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above

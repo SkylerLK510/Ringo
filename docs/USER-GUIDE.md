@@ -127,7 +127,8 @@ turn at a time, and your next message to a busy agent waits for it. The top line
 `/together` puts them back in one conversation. Esc stops the latest turn; `/kill N` stops a given one.
 
 `/undo` still takes back one turn at a time. When two agents worked here at once, a turn's undo leaves out any file
-the other agent also changed, and its last line says so, so one agent's work is never taken back with the other's.
+the other agent also changed, and every file when the other ran a command (Ringo cannot tell what a command
+changed); the turn's log says which. So one agent's work is never taken back with the other's.
 Using two agents at once also uses both plans at once: `/usage` shows how much each has left.
 
 ## Compare agents

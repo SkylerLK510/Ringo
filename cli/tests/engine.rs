@@ -1031,14 +1031,16 @@ fn a_turn_stopped_by_quitting_is_still_in_the_usage_record() {
 }
 
 /// A fake claude: records its arguments and its message, says "done", and reports a 70k window when the message says
-/// ends with GROW (10 tokens otherwise; a record of an earlier GROW does not count); with WRITE-O it writes o.txt and says so as its Write tool would.
+/// ends with GROW, 300 with HUGE (10 tokens otherwise; a record of an earlier one does not count); with BASH it runs a
+/// command; with WRITE-O it writes o.txt and says so as its Write tool would.
 const CLAUDE_TALKS: &str = r#"#!/bin/sh
 for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
 head -n 1 > "$0.stdin"
 echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'
 case "$(cat "$0.stdin")" in *WRITE-O*) echo o > o.txt
   echo '{"type":"assistant","message":{"id":"w1","content":[{"type":"tool_use","id":"tu1","name":"Write","input":{"file_path":"'"$PWD"'/o.txt","content":"o"}}]},"parent_tool_use_id":null}' ;; esac
-case "$(cat "$0.stdin")" in *'GROW"}}') big=70000 ;; *) big=10 ;; esac
+case "$(cat "$0.stdin")" in *'BASH"}}') echo '{"type":"assistant","message":{"id":"b1","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"true"}}]},"parent_tool_use_id":null}' ;; esac
+case "$(cat "$0.stdin")" in *'GROW"}}') big=70000 ;; *'HUGE"}}') big=300 ;; *) big=10 ;; esac
 echo '{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":'$big',"output_tokens":5}},"parent_tool_use_id":null}'
 echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
 "#;
@@ -1091,6 +1093,14 @@ fn agents_share_one_conversation_and_a_long_one_starts_fresh_from_ringos_record(
     assert!(whole.contains("#2 · the owner to codex: take it from here") && whole.contains("+made"), "the record uncut");
     said(&mut s, "claude", "after");
     assert_eq!(claude_heard(&claude), ("after".into(), true), "the new conversation goes on as any other");
+    // Past the threshold, but the record would not be half the window: claude resumes, still told what codex did.
+    said(&mut s, "claude", "HUGE");
+    s.handoff_at = 200; // past it, but the whole record is more than half of 305 tokens
+    said(&mut s, "codex", "meanwhile");
+    let id = said(&mut s, "claude", "and so");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.starts_with("While you were away") && told.contains("the owner to codex: meanwhile"), "{told}");
+    assert!(s.job(id).unwrap().log.iter().any(|l| l.starts_with("told claude what #")));
     // /clear: a new conversation, which hears nothing of the old one.
     s.forget();
     said(&mut s, "codex", "new");
@@ -1125,6 +1135,12 @@ fn separate_agents_work_at_once_and_undo_keeps_their_work_apart() {
     assert!(!r.join("o.txt").exists() && r.join("made.txt").exists());
     assert!(s.undo().unwrap().contains(&format!("undid #{slow}")));
     assert!(!r.join("made.txt").exists() && r.join("b.txt").exists(), "only its own file went back");
+    // A command the other turn ran could have written any file without saying so: the turn keeps none for /undo.
+    let slow = s.launch_agent(agent("codex"), false, "SLOW again").unwrap();
+    let other = s.launch_agent(agent("claude"), false, "BASH").unwrap();
+    assert_eq!((wait(&mut s, other), wait(&mut s, slow)), (Status::Done, Status::Done));
+    assert!(s.job(slow).unwrap().changed.is_empty(), "made.txt came back, but #{other} ran a command meanwhile");
+    assert!(s.job(slow).unwrap().log.iter().any(|l| l == &format!("made.txt changed while #{other} ran commands here too, so /undo leaves it")));
     // Back together, the next turn waits again, and hears nothing of what the others did on their own.
     s.separate = false;
     said(&mut s, "codex", "together");

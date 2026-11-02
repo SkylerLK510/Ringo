@@ -405,7 +405,9 @@ simple deterministic records have matched or beaten that in published work (obse
 summaries at about half the cost on SWE-bench Verified, JetBrains 2025), and summaries of summaries lose rules.
 
 With `/separate`, two agents' turns can change the folder at the same time. A turn's undo then keeps only the
-files it reported editing (Claude's Edit and Write, Codex's file changes) that the other turn did not; the rest are
+files it reported editing (Claude's Edit and Write, Codex's file changes) that the other turn did not, and none when
+the other ran a shell command (Claude's Bash, a Codex command that did more than read), which may have written any
+file without saying so; the rest are
 named in its log and stay out of `/undo`, so one agent's undo never takes back the other's work. The limit: a file only
 a command wrote is left out, and an edit the other turn made just before this one ended may not be known yet.
 

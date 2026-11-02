@@ -3338,6 +3338,7 @@ mod tests {
         assert_eq!((fmt_until(90), fmt_until(3 * 3600 + 120), fmt_until(2 * 86_400 + 7200)), ("2 min".into(), "3 h 2 min".into(), "2 d 2 h".into()));
     }
 
+    #[cfg(unix)]
     #[test]
     fn separate_lets_each_agent_take_its_own_turn_at_once() {
         use std::os::unix::fs::PermissionsExt;
