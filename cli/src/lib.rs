@@ -188,9 +188,9 @@ pub enum Tier {
     Quick,
     /// Each agent's own default (and the owner's settings): what a turn has always been.
     Standard,
-    /// High reasoning effort.
+    /// Extra-high reasoning effort (xhigh).
     Deep,
-    /// High effort, then Ringo reviews each change a turn makes here and the agent gets one revision turn when the
+    /// Deep, then Ringo reviews each change a turn makes here and the agent gets one revision turn when the
     /// review finds defects: the one extra spend Ringo measured to raise quality (3 of 11 to 11 of 11 on its seeded
     /// task). The shell drives the review and the revision.
     Ultra,
@@ -217,7 +217,9 @@ impl Tier {
         match self {
             Tier::Quick => Some("low"),
             Tier::Standard => None,
-            Tier::Deep | Tier::Ultra => Some("high"),
+            // xhigh: every agent takes it (Claude, Codex's models, agy). "high" would lower an owner whose own
+            // settings run Claude at xhigh; a setting above xhigh (max) is still lowered to it.
+            Tier::Deep | Tier::Ultra => Some("xhigh"),
         }
     }
 }
@@ -317,6 +319,8 @@ pub struct Job {
     pub title_full: String,
     pub status: Status,
     pub started: Instant,
+    /// The tier the session was in when the job started; it keeps it whatever the session changes to.
+    pub tier: Tier,
     pub elapsed: Option<Duration>,
     pub activity: String,
     pub tokens: Tokens,
@@ -865,7 +869,7 @@ impl Session {
         let id = self.jobs.len() + 1;
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
-        self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
+        self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(), tier: self.tier,
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
@@ -1335,6 +1339,9 @@ impl Session {
                     thread::sleep(Duration::from_millis(50));
                 }
             }
+            for note in parser.leftover() {
+                let _ = tx.send(Event::Note(id, note));
+            }
             let exit = child.wait();
             let status = if cancel.load(Ordering::SeqCst) {
                 Status::Cancelled
@@ -1754,6 +1761,13 @@ impl Session {
             }
             thread::sleep(Duration::from_millis(15));
         }
+        // Their last events, so every stopped job ends here and is in the usage record.
+        let until = Instant::now() + Duration::from_millis(500);
+        while self.jobs.iter().any(Job::running) && Instant::now() < until {
+            self.pump();
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.pump();
     }
 }
 
@@ -1970,7 +1984,10 @@ pub fn plan(agent: Agent, program: &Path) -> Result<Plan, String> {
             if v.pointer("/response/subtype").and_then(|s| s.as_str()) != Some("success") {
                 return Err(parse::short(&v.pointer("/response/error").map(|e| e.to_string()).unwrap_or_default(), 120));
             }
-            Ok(claude_plan(&v["response"]["response"]))
+            // a success with no limits in it: the plan read failed inside Claude (a busy usage endpoint, a login
+            // without the scope), so the shell's fallback is used
+            Some(claude_plan(&v["response"]["response"])).filter(|p| !p.windows.is_empty())
+                .ok_or("Claude could not read the plan's limits just now".into())
         }
         Adapter::Codex => {
             let mut cmd = Command::new(program);
@@ -2077,6 +2094,9 @@ mod tests {
         assert_eq!(plan.windows, [Window { name: "5 hours".into(), percent: 5.0, resets: Some(1_793_593_800) },
                                   Window { name: "week".into(), percent: 59.0, resets: iso_secs("2026-11-04T13:00:00+00:00") }]);
         assert!(plan.notes.is_empty());
+        // its own read of the plan failed: a success with no limits, which plan() turns into an error
+        assert!(claude_plan(&serde_json::json!({"subscription_type": "max", "rate_limits_available": true, "rate_limits": null}))
+            .windows.is_empty());
         // a Claude turn's rate_limit_event: utilization as a fraction
         let event = serde_json::json!({"status": "allowed", "unifiedWindows": {
             "five_hour": {"utilization": 0.21, "resetsAt": 1_793_332_800u64}, "seven_day": {"utilization": 0.32, "resetsAt": 1_793_797_200u64}}});

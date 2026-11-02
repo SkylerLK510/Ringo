@@ -113,6 +113,8 @@ pub struct Parser {
     usage: Value,
     /// Lines for the agent's stdin, written as soon as they are taken.
     writes: Vec<String>,
+    /// Codex: whether the turn's usage has been reported.
+    counted: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -175,7 +177,7 @@ impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, turn: None, thread: String::new(), usage: Value::Null,
-                 writes: Vec::new() }
+                 writes: Vec::new(), counted: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -315,11 +317,7 @@ impl Parser {
                     let why = turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("the turn failed");
                     return self.fail(format!("codex: {}", short(why, 200)));
                 }
-                let usage = &self.usage;
-                let cached = u(usage, "cachedInputTokens").min(u(usage, "inputTokens"));
-                notes.push(Note::Tokens(Tokens { input: u(usage, "inputTokens") - cached, cache_read: cached,
-                                                 cache_write: u(usage, "cacheWriteInputTokens"),
-                                                 output: u(usage, "outputTokens") }));
+                notes.push(self.codex_tokens());
             }
             ("error", _) if p.get("willRetry").and_then(Value::as_bool) == Some(true) => {
                 notes.push(Note::Log(format!("retrying: {}", short(p.pointer("/error/message").and_then(Value::as_str).unwrap_or(""), 200))));
@@ -335,6 +333,24 @@ impl Parser {
             _ => {}
         }
         notes
+    }
+
+    /// The Codex thread's usage so far, as the turn's count (the runner takes off what earlier turns had used).
+    fn codex_tokens(&mut self) -> Note {
+        self.counted = true;
+        let usage = &self.usage;
+        let cached = u(usage, "cachedInputTokens").min(u(usage, "inputTokens"));
+        Note::Tokens(Tokens { input: u(usage, "inputTokens") - cached, cache_read: cached,
+                              cache_write: u(usage, "cacheWriteInputTokens"), output: u(usage, "outputTokens") })
+    }
+
+    /// What the stream left unsaid when it ended: a Codex turn that failed or was stopped before turn/completed still
+    /// used what its last usage update says.
+    pub fn leftover(&mut self) -> Vec<Note> {
+        match self.style == Style::Codex && !self.counted && self.usage.is_object() {
+            true => vec![self.codex_tokens()],
+            false => Vec::new(),
+        }
     }
 
     /// Codex's multi-agent tool calls: spawned agents become subagent nodes, their states update them.
@@ -602,8 +618,11 @@ impl Parser {
 /// `model_usage_since_last_result`, this run's alone, comes first (Claude Code 2.1.316); `usage` is the last fallback.
 fn claude_tokens(e: &Value) -> Tokens {
     let mut t = Tokens::default();
-    let models = ["model_usage_since_last_result", "modelUsage"].into_iter()
-        .find_map(|k| e.get(k).and_then(Value::as_object).filter(|m| !m.is_empty()));
+    // When it is there it is this run's whole count, an empty one (a run that made no model call) included.
+    let models = match e.get("model_usage_since_last_result").and_then(Value::as_object) {
+        Some(run) => Some(run),
+        None => e.get("modelUsage").and_then(Value::as_object).filter(|m| !m.is_empty()),
+    };
     if let Some(models) = models {
         for m in models.values() {
             t.add(Tokens { input: u(m, "inputTokens"), cache_write: u(m, "cacheCreationInputTokens"),
@@ -764,9 +783,26 @@ mod tests {
         let (_, notes) = run(Style::Claude, &[CLAUDE[0], limits, result]);
         assert!(notes.contains(&Note::Tokens(Tokens { input: 24, cache_write: 1, cache_read: 2, output: 10630 })), "{notes:?}");
         assert!(notes.iter().any(|n| matches!(n, Note::Limits(i) if i["unifiedWindows"]["five_hour"]["utilization"] == 0.21)));
+        // a resumed run that made no model call: an empty per-run count is zero, not the whole session's again
+        let none = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"m":{"inputTokens":26,"outputTokens":13070}},"model_usage_since_last_result":{}}"#;
+        assert!(run(Style::Claude, &[CLAUDE[0], none]).1.contains(&Note::Tokens(Tokens::default())));
         // older Claude Code without the per-run field: modelUsage as before
         let old = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"m":{"inputTokens":5,"outputTokens":6}}}"#;
         assert!(run(Style::Claude, &[CLAUDE[0], old]).1.contains(&Note::Tokens(Tokens { input: 5, output: 6, ..Tokens::default() })));
+    }
+
+    #[test]
+    fn a_codex_turn_that_fails_or_stops_still_counts_what_it_used() {
+        let usage = CODEX[12]; // thread/tokenUsage/updated
+        let failed = r#"{"method":"turn/completed","params":{"threadId":"01a1","turn":{"id":"u1","items":[],"status":"failed","error":{"message":"usage limit"}}}}"#;
+        for lines in [&[CODEX[2], usage, failed][..], &[CODEX[2], usage][..]] { // failed; stopped before turn/completed
+            let (mut p, notes) = run(Style::Codex, lines);
+            assert!(!notes.iter().any(|n| matches!(n, Note::Tokens(_))));
+            assert_eq!(p.leftover(), [Note::Tokens(Tokens { input: 3396, cache_read: 35456, cache_write: 0, output: 671 })]);
+            assert!(p.leftover().is_empty(), "counted once");
+        }
+        let (mut p, _) = run(Style::Codex, CODEX);
+        assert!(p.leftover().is_empty(), "a completed turn was counted at turn/completed");
     }
 
     #[test]

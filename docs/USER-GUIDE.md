@@ -78,13 +78,13 @@ changes files in this folder but has no network.
 |---|---|---|
 | `quick` | agents think less (low effort) | fewer |
 | `standard` | each agent's own default | as before |
-| `deep` | agents think more (high effort) | more, and slower |
+| `deep` | agents think more (extra-high effort) | more, and slower |
 | `ultra` | `deep`, then Ringo reviews each change a turn makes here; when the review finds defects, the agent gets one turn to fix them | one review (about 70,000) and at most one more turn |
 
 `/tier deep` sets one; `/tier` alone shows the one in use. It applies to turns started after it, for this session
 only: Ringo starts in `standard` every time, so a tier that spends more is never left on by accident. The top line
-names the tier when it is not `standard`. In `ultra`, lines you send while the review runs wait for it, and nothing
-follows the one fixing turn. Ringo's own measurements found that higher effort alone did not change results on the
+names the tier when it is not `standard`. In `ultra`, lines you send while the review runs wait for it (Esc stops the
+review and gives them back), and nothing follows the one fixing turn. Ringo's own measurements found that higher effort alone did not change results on the
 tasks it was tried on, while one review and one fix did, so `ultra` is the tier for work you want checked.
 
 ## See what you have used

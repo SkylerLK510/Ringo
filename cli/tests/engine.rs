@@ -897,7 +897,7 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
             "{c}\n{x}\n{a}");
     for tier in [ringo_cli::Tier::Deep, ringo_cli::Tier::Ultra] {
         let (c, x, a) = effort(&mut s, tier);
-        assert!(has(&c, &["--effort", "high"]) && has(&x, &["-c", "model_reasoning_effort=\"high\""]) && has(&a, &["--effort", "high"]));
+        assert!(has(&c, &["--effort", "xhigh"]) && has(&x, &["-c", "model_reasoning_effort=\"xhigh\""]) && has(&a, &["--effort", "xhigh"]));
     }
     // every job that used tokens is in the record /usage totals. Claude: 7 a turn. Codex and agy count what a turn
     // added to its thread's total, and these fakes answer with one thread and one total every time, so only their
@@ -907,4 +907,28 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
     assert_eq!((total("claude"), total("codex"), total("agy")), (28, 12, 2));
     assert!(first.is_some());
     assert_eq!(fs::read_to_string(state.join("usage.jsonl")).unwrap().lines().count(), 6);
+}
+
+#[test]
+fn a_turn_stopped_by_quitting_is_still_in_the_usage_record() {
+    let r = repo("quit-usage");
+    let state = root().join("quit-usage-state");
+    let _ = fs::remove_dir_all(&state);
+    // a Claude turn that reports its first message's usage, then works on
+    let claude = fake(&root(), "claude-quit", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-q\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":6}},\"parent_tool_use_id\":null}'\n\
+        sleep 30\n");
+    let mut s = Session::with_state(&r, &state).unwrap();
+    s.programs.insert(agent("claude"), claude);
+    let id = s.launch_agent(agent("claude"), false, "work").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.job(id).unwrap().live.total() == 0 {
+        assert!(Instant::now() < deadline);
+        s.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.shutdown();
+    assert_eq!(s.job(id).unwrap().status, Status::Cancelled);
+    assert_eq!(s.used_since(86_400).0.get("claude").map(|t| t.total()), Some(11));
 }

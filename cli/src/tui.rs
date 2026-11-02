@@ -1332,7 +1332,9 @@ impl App {
             && self.checking.is_none();
         let Some((agent, task, line)) = free.then(|| self.queue.pop_front()).flatten() else { return false };
         let revision = self.revision.as_deref() == Some(task.as_str());
-        self.echo(&line);
+        if !revision {
+            self.echo(&line); // the revision is Ringo's, said by after_end, not the owner's
+        }
         match self.turn(agent, &task) {
             Ok(_) if revision => self.revision_id = Some(self.s.jobs.len()), // its handoff is the review shown above
             Ok(Some(text)) => self.say(text),
@@ -1369,17 +1371,21 @@ impl App {
         }
         let (Kind::Agent { agent, write: false }, Status::Done) = (&job.kind, &job.status) else { return };
         let agent = *agent;
-        if self.s.tier != Tier::Ultra || job.changed.is_empty() || self.revision_id == Some(id) {
+        if job.tier != Tier::Ultra || job.changed.is_empty() || self.revision_id == Some(id) {
             return;
         }
         if !self.s.git {
-            self.say(format!("  ultra: Ringo's review needs a git project, so #{id} ran at high effort alone"));
+            self.say(format!("  ultra: Ringo's review needs a git project, so #{id} ran at higher effort alone"));
+            return;
+        }
+        if let Some((review, ..)) = self.checking {
+            self.say(format!("  ultra: #{id} ended while review #{review} runs; /review #{id} checks it"));
             return;
         }
         match self.s.review_job(id) {
             Ok(review) => {
                 self.checking = Some((review, id, agent));
-                self.say(format!("  ultra: Ringo reviews #{id}'s change as #{review}; lines you send wait for it"));
+                self.say(format!("  ultra: Ringo reviews #{id}'s change as #{review}; lines you send wait for it (Esc stops it)"));
             }
             Err(e) => self.say(format!("  ultra: no review of #{id}: {e}")),
         }
@@ -1391,8 +1397,8 @@ impl App {
         let what = match tier {
             Tier::Quick => "agents think less (low effort): fewer tokens, for small or plain tasks",
             Tier::Standard => "each agent's own default",
-            Tier::Deep => "agents think more (high effort): slower, and more tokens",
-            Tier::Ultra => "high effort, then Ringo reviews each change made here (one Codex call, about 70k tokens) \
+            Tier::Deep => "agents think more (xhigh effort): slower, and more tokens",
+            Tier::Ultra => "xhigh effort, then Ringo reviews each change made here (one Codex call, about 70k tokens) \
                             and the agent gets one turn to fix what the review finds",
         };
         format!("  tier: {}: {what}; for this session (Ringo starts in standard)", tier.name())
@@ -1467,7 +1473,13 @@ impl App {
         }))
     }
 
-    /// Stops the turn running in this folder; lines queued behind it go back into the input, to send or change.
+    /// What holds this folder now, for Esc and Ctrl-C to stop: the turn running here, or ultra's review of one.
+    fn holding(&self) -> Option<usize> {
+        self.s.busy().or(self.checking.map(|(review, ..)| review))
+    }
+
+    /// Stops the turn running in this folder (or ultra's review of the last one); lines queued behind it go back into
+    /// the input, to send or change.
     fn stop(&mut self, id: usize) {
         let _ = self.s.kill(id);
         let queued: Vec<String> = self.queue.drain(..).map(|(_, _, line)| line).collect();
@@ -1475,7 +1487,10 @@ impl App {
             self.input = queued.join("\n").chars().collect();
             self.cursor = self.input.len();
         }
-        self.say(format!("  stopping #{id}; what it changed so far stays (/undo takes it back)"));
+        match self.checking {
+            Some((review, turn, _)) if review == id => self.say(format!("  stopping review #{id}; #{turn}'s change stays as it is")),
+            _ => self.say(format!("  stopping #{id}; what it changed so far stays (/undo takes it back)")),
+        }
     }
 
     /// Whether a line would wait in the queue: a line for an agent in this folder while a turn runs here.
@@ -1824,7 +1839,7 @@ impl App {
                 if !self.input.is_empty() {
                     self.input.clear();
                     self.cursor = 0;
-                } else if let Some(id) = self.s.busy() {
+                } else if let Some(id) = self.holding() {
                     self.stop(id);
                 } else if self.quit_armed {
                     self.quit = true;
@@ -1904,7 +1919,7 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
             }
-            KeyCode::Esc => match self.s.busy() {
+            KeyCode::Esc => match self.holding() {
                 Some(id) => self.stop(id),
                 None => self.scroll = 0,
             },
@@ -2220,7 +2235,10 @@ impl App {
         // the head: the mark and the folder; the mode and the session's tokens at the right
         let (mode, tokens) = (self.s.mode.name(), fmt_tokens(self.s.tokens()));
         let tier = match self.s.tier { Tier::Standard => String::new(), t => format!("{} · ", t.name()) };
-        let right = [format!("{mode} mode · {tier}{tokens} tokens "), format!("{mode} · {tier}{tokens} "), String::new()].into_iter()
+        // a tier other than standard is the last to go: it changes what each turn costs
+        let right = [format!("{mode} mode · {tier}{tokens} tokens "), format!("{mode} · {tier}{tokens} "),
+                     format!("{} ", tier.trim_end_matches(['·', ' '])), String::new()].into_iter()
+            .filter(|r| r.is_empty() || !r.trim().is_empty())
             .find(|r| 10 + 8 + cols(r) <= w).unwrap_or_default(); // a narrow head keeps the folder's start
         let left = one_row(&self.label, w.saturating_sub(12 + cols(&right)));
         let pad = w.saturating_sub(10 + cols(&left) + cols(&right));
@@ -2439,6 +2457,8 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
+        // A job that just ended is seen before any waiting line starts: ultra's review holds the folder from there.
+        app.feed();
         while let Some((ask, route)) = app.s.routed.pop_front() {
             app.start_routed(ask, &route);
             dirty = true;
@@ -2763,7 +2783,18 @@ mod tests {
         assert!(a.checking.is_none() && a.revision.is_none());
         let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
         assert!(said.contains("Ringo reviews #1") && said.contains("one turn to fix what review #2 found"), "{said}");
-        // a review with no findings asks for nothing; standard tier reviews nothing
+        // a turn keeps the tier it started in: ultra chosen while a standard turn runs brings no review of it
+        a.run(Cmd::Tier(Some(Tier::Standard)), "/tier standard").unwrap();
+        a.talk(a.main, "once more".into(), "once more".into()).unwrap();
+        a.s.tier = Tier::Ultra;
+        while a.s.running() > 0 {
+            a.s.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        a.feed();
+        a.dispatch();
+        assert_eq!((a.s.jobs.len(), a.checking), (4, None), "no review of a turn started in standard");
+        assert!(!said.contains("Ringo's review #2 of your change"), "the revision is not shown as a line typed: {said}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2778,6 +2809,18 @@ mod tests {
         a.s.tier = Tier::Deep;
         let rows = screen(&mut a, 80, 10);
         assert!(rows[0].ends_with("ask mode · deep · 0 tokens"), "the head names a tier other than standard: {rows:#?}");
+        a.s.tier = Tier::Ultra;
+        let narrow = screen(&mut a, 32, 10);
+        assert!(narrow[0].ends_with("ultra"), "a costly tier is the last thing the head drops: {narrow:#?}");
+        // Esc stops ultra's review as it would a turn, and gives the waiting lines back
+        a.checking = Some((7, 6, a.main));
+        a.queue.push_back((a.main, "next".into(), "next".into()));
+        assert_eq!(a.holding(), Some(7));
+        a.key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(a.input.iter().collect::<String>(), "next");
+        a.checking = None;
+        a.input.clear();
+        a.cursor = 0;
         assert_eq!(a.run(Cmd::Usage, "/usage"), Ok(None));
         let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
         assert!(said.contains("this session: 0 tokens") && said.contains("last 24 hours"), "{said}");

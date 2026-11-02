@@ -352,20 +352,24 @@ or for the spinner while a job runs.
 |---|---|---|---|---|
 | `quick` | `--effort low` | `-c model_reasoning_effort="low"` | `--effort low` | |
 | `standard` | nothing: each agent's own default and the owner's settings (a Codex `config.toml` that sets an effort keeps it) | | | |
-| `deep` | `--effort high` | `"high"` | `--effort high` | |
-| `ultra` | `--effort high` | `"high"` | `--effort high` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
+| `deep` | `--effort xhigh` | `"xhigh"` | `--effort xhigh` | |
+| `ultra` | `--effort xhigh` | `"xhigh"` | `--effort xhigh` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
 
 A tier changes no prompt: effort is a model setting, not text. The shell starts in `standard` every time, so a tier
-that spends more is never left on from an earlier day.
+that spends more is never left on from an earlier day. `deep` is xhigh, not high, because an owner's own settings can
+already run Claude at xhigh (Claude Code reads `effortLevel` from its settings under `--safe-mode` too), and high
+would lower it; a setting of max is lowered to xhigh while `deep` or `ultra` is on.
 
 `ultra` builds on the one extra spend Ringo measured to raise quality. On COMPLEX-01, checks alone passed 3 of 11
 seeded candidates, and one review plus one revision passed 11 of 11. Higher effort alone measured no gain on the
 tasks tried (high at 54,275 tokens against low at 21,754, both 26 of 26), and neither did more reviewers or more
 rounds (see README). So after a turn in the folder that changed files, the shell runs `/review #N` (the review
-pipeline, one call on the session's backend, about 70k tokens of material at the median). Lines sent meanwhile wait.
+pipeline, one call on the session's backend, about 70k tokens of material at the median). Lines sent meanwhile wait;
+Esc or Ctrl-C stops the review and gives them back to the input.
 A review with findings queues one turn for the same agent, which continues its conversation and is handed the
 review (`{#R}`); no review follows that turn. Outside a git project there is no review, so `ultra` runs as `deep`
-and says so. Claude Code's own `ultracode` setting is not used: it runs Claude Code's dynamic workflows, which
+and says so. The revision is Ringo's line, so the conversation does not show it as yours. Claude Code's own
+`ultracode` setting is not used: it runs Claude Code's dynamic workflows, which
 `--safe-mode` turns off and which Ringo does not measure.
 
 ## Usage
@@ -378,16 +382,18 @@ and says so. Claude Code's own `ultracode` setting is not used: it runs Claude C
   counts.
 - **Plans:** asked of each set-up agent in the background, about a second each:
   - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given
-    a message, so no model call (its answer says cost 0). Claude marks it experimental. When it fails, the last
-    `rate_limit_event` a Claude turn in this session sent stands in.
+    a message, so no model call (its answer says cost 0). Claude marks it experimental. When it fails, or succeeds
+    with no limits in it (its own read of the plan failed), the last `rate_limit_event` a Claude turn in this session
+    sent stands in.
   - **Codex:** `account/rateLimits/read` over `codex app-server` (no thread is started): each window's used percent,
     length and reset time, and the full resets left. `account/rateLimitResetCredit/consume`, which spends one, is never
     called.
   - **agy:** it reports no plan usage.
 
-A resumed Claude turn counts its own tokens: `model_usage_since_last_result` comes before `modelUsage`, which on a
-resumed session is the whole session's so far. One second turn was counted at 452,900 tokens before this fix; it used
-433,179.
+A resumed Claude turn counts its own tokens: `model_usage_since_last_result`, whenever it is there (an empty one is a
+run with no model call), comes before `modelUsage`, which on a resumed session is the whole session's so far. One
+second turn was counted at 452,900 tokens before this fix; it used 433,179. A Codex turn that fails or is stopped
+before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so it reaches the record too.
 
 ## Safety model
 
