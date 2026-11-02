@@ -6,7 +6,7 @@ pub mod parse;
 pub mod rt;
 
 use parse::{Note, Parser, Permission, Style, Tokens};
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -180,6 +180,50 @@ impl Mode {
     }
 }
 
+/// How hard agents think, and whether Ringo checks their change (`/tier`). The shell starts in Standard every time,
+/// so a tier that spends more is never left on by accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    /// Low reasoning effort: fewer tokens, for small or plain tasks.
+    Quick,
+    /// Each agent's own default (and the owner's settings): what a turn has always been.
+    Standard,
+    /// Extra-high reasoning effort (xhigh).
+    Deep,
+    /// Deep, then Ringo reviews each change a turn makes here and the agent gets one revision turn when the
+    /// review finds defects: the one extra spend Ringo measured to raise quality (3 of 11 to 11 of 11 on its seeded
+    /// task). The shell drives the review and the revision.
+    Ultra,
+}
+
+impl Tier {
+    pub const ALL: [Tier; 4] = [Tier::Quick, Tier::Standard, Tier::Deep, Tier::Ultra];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Tier::Quick => "quick",
+            Tier::Standard => "standard",
+            Tier::Deep => "deep",
+            Tier::Ultra => "ultra",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Tier> {
+        Tier::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// The reasoning effort agents run at; None leaves each agent's own.
+    pub fn effort(self) -> Option<&'static str> {
+        match self {
+            Tier::Quick => Some("low"),
+            Tier::Standard => None,
+            // xhigh: every agent takes it (Claude, Codex's models, agy). "high" would lower an owner whose own
+            // settings run Claude at xhigh; a setting above xhigh (max) is still lowered to it.
+            Tier::Deep | Tier::Ultra => Some("xhigh"),
+        }
+    }
+}
+
 /// The owner's answer to an agent that asks before it acts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
@@ -275,6 +319,8 @@ pub struct Job {
     pub title_full: String,
     pub status: Status,
     pub started: Instant,
+    /// The tier the session was in when the job started; it keeps it whatever the session changes to.
+    pub tier: Tier,
     pub elapsed: Option<Duration>,
     pub activity: String,
     pub tokens: Tokens,
@@ -392,6 +438,12 @@ pub struct Session {
     usage_so_far: HashMap<(Agent, String), Tokens>,
     /// How far agents act without asking.
     pub mode: Mode,
+    /// How hard they think (see `Tier`).
+    pub tier: Tier,
+    /// Ringo's state folder, where `usage.jsonl` keeps what each finished job used.
+    root: PathBuf,
+    /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
+    pub claude_limits: Option<serde_json::Value>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
     pub always_ask: Vec<String>,
     /// Rules the owner allowed for this session: answered at once, and given to every later Claude turn.
@@ -676,7 +728,7 @@ impl Session {
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
-                     usage_so_far: HashMap::new(), mode: Mode::Ask, always_ask, allowed: BTreeSet::new(),
+                     usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
     }
 
@@ -817,7 +869,7 @@ impl Session {
         let id = self.jobs.len() + 1;
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
-        self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(),
+        self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(), tier: self.tier,
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
@@ -910,6 +962,9 @@ impl Session {
                 if !names_connector(prompt) {
                     cmd.args(["-c", "features.plugins=false", "-c", "features.apps=false"]);
                 }
+                if let Some(effort) = self.tier.effort() {
+                    cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
+                }
                 let mut thread = serde_json::json!({"cwd": cwd, "sandbox": sandbox,
                                                     "approvalPolicy": if auto { "on-request" } else { "never" }});
                 if auto {
@@ -987,6 +1042,9 @@ impl Session {
                         cmd.arg("--allowedTools").args(&self.allowed);
                     }
                 }
+                if let Some(effort) = self.tier.effort() {
+                    cmd.args(["--effort", effort]);
+                }
                 if let Some(session) = &resume {
                     cmd.args(["--resume", session]);
                 }
@@ -1009,6 +1067,9 @@ impl Session {
                     .arg(format!(r#"{{"permissions":{{"deny":{deny}}}}}"#));
                 if edits {
                     cmd.args(["--mode", "accept-edits"]);
+                }
+                if let Some(effort) = self.tier.effort() {
+                    cmd.args(["--effort", effort]);
                 }
                 if let Some(conversation) = &resume {
                     cmd.args(["--conversation", conversation]);
@@ -1278,6 +1339,9 @@ impl Session {
                     thread::sleep(Duration::from_millis(50));
                 }
             }
+            for note in parser.leftover() {
+                let _ = tx.send(Event::Note(id, note));
+            }
             let exit = child.wait();
             let status = if cancel.load(Ordering::SeqCst) {
                 Status::Cancelled
@@ -1319,6 +1383,18 @@ impl Session {
         };
         if let Status::Failed(reason) = &status {
             job.push_log(format!("failed: {reason}"));
+        }
+        // What it used, kept for /usage's last day and week (a stopped turn's messages' own counts included).
+        let used = Tokens { input: job.tokens.input + job.live.input, cache_read: job.tokens.cache_read + job.live.cache_read,
+                            cache_write: job.tokens.cache_write + job.live.cache_write, output: job.tokens.output + job.live.output };
+        if used.total() > 0 {
+            let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
+            let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let record = serde_json::json!({"at": at, "agent": who, "input": used.input, "cache_read": used.cache_read,
+                                            "cache_write": used.cache_write, "output": used.output});
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.root.join("usage.jsonl")) {
+                let _ = writeln!(f, "{record}");
+            }
         }
         job.asks.clear(); // nobody is waiting for these answers any more
         job.input = None;
@@ -1452,12 +1528,32 @@ impl Session {
                             job.touched.insert(rel.to_string_lossy().into_owned());
                         }
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
+                        Note::Limits(info) => self.claude_limits = Some(info),
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above
                     }
                 }
             }
         }
         changed
+    }
+
+    /// What finished jobs used in the last `secs` seconds, by agent, from `usage.jsonl` (every session's), and when its
+    /// first record was written.
+    // ceiling: reads the whole file, one short line a job; a year of daily use is a few MB.
+    pub fn used_since(&self, secs: u64) -> (BTreeMap<String, Tokens>, Option<u64>) {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let (mut by, mut first) = (BTreeMap::new(), None);
+        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
+            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let at = r["at"].as_u64().unwrap_or(0);
+            first = first.or(Some(at));
+            if now.saturating_sub(at) <= secs {
+                let n = |k: &str| r[k].as_u64().unwrap_or(0);
+                let t: &mut Tokens = by.entry(r["agent"].as_str().unwrap_or("?").to_string()).or_default();
+                t.add(Tokens { input: n("input"), cache_read: n("cache_read"), cache_write: n("cache_write"), output: n("output") });
+            }
+        }
+        (by, first)
     }
 
     /// The oldest action an agent waits on the owner for, across every job: (job, what it asks).
@@ -1665,6 +1761,13 @@ impl Session {
             }
             thread::sleep(Duration::from_millis(15));
         }
+        // Their last events, so every stopped job ends here and is in the usage record.
+        let until = Instant::now() + Duration::from_millis(500);
+        while self.jobs.iter().any(Job::running) && Instant::now() < until {
+            self.pump();
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.pump();
     }
 }
 
@@ -1797,9 +1900,219 @@ pub fn sign_in(agent: Agent, program: &Path) -> SignIn {
     }
 }
 
+// --- The owner's subscription plans: how much of each limit is used, asked of the agents with no model call -----
+
+/// One limit of a plan: what it is, how much of it is used (0-100) and when it starts over (Unix seconds).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Window {
+    pub name: String,
+    pub percent: f64,
+    pub resets: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Plan {
+    /// The plan's name as the agent reports it (max, plus, ...).
+    pub name: String,
+    pub windows: Vec<Window>,
+    /// Anything else worth a line: reset credits left, extra usage.
+    pub notes: Vec<String>,
+}
+
+/// Unix seconds of an ISO 8601 time such as `2026-11-02T04:30:00.368171+00:00` (fractions dropped).
+pub fn iso_secs(text: &str) -> Option<u64> {
+    let num = |range: std::ops::Range<usize>| text.get(range)?.parse::<i64>().ok();
+    let (y, mo, d, h, mi, sec) = (num(0..4)?, num(5..7)?, num(8..10)?, num(11..13)?, num(14..16)?, num(17..19)?);
+    // days from 1970-01-01 to the date (H. Hinnant's days_from_civil)
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (mo + if mo > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    let tail = &text[19..];
+    let tail = tail.trim_start_matches(|c: char| c == '.' || c.is_ascii_digit());
+    let offset = match tail.as_bytes().first() {
+        Some(b'+' | b'-') if tail.len() >= 6 => {
+            let mins = tail[1..3].parse::<i64>().ok()? * 60 + tail[4..6].parse::<i64>().ok()?;
+            if tail.starts_with('-') { -mins } else { mins }
+        }
+        _ => 0, // Z, or none
+    };
+    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + sec - offset * 60).ok()
+}
+
+/// Writes `requests` to the program's stdin, one a line, and returns the first stdout line `wanted` accepts; the
+/// program is stopped then, or after `limit`.
+fn ask_once(mut cmd: Command, requests: &[serde_json::Value], wanted: impl Fn(&serde_json::Value) -> bool + Send + 'static,
+            limit: Duration) -> Result<serde_json::Value, String> {
+    agent_env(&mut cmd);
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+        .map_err(|e| format!("{}: {e}", cmd.get_program().to_string_lossy()))?;
+    let mut stdin = child.stdin.take().ok_or("no stdin")?;
+    for r in requests {
+        writeln!(stdin, "{r}").map_err(|e| e.to_string())?;
+    }
+    let stdout = child.stdout.take().ok_or("no stdout")?;
+    let (tx, rx) = channel();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) && wanted(&v) {
+                let _ = tx.send(v);
+                return;
+            }
+        }
+    });
+    let answer = rx.recv_timeout(limit);
+    drop(stdin); // both end when their input does
+    let _ = child.kill();
+    let _ = child.wait();
+    answer.map_err(|_| format!("no answer within {} s", limit.as_secs()))
+}
+
+/// The owner's plan as an agent reports it, asked without a model call: Claude Code's `get_usage` control request (a
+/// session that is never sent a message), Codex's app-server `account/rateLimits/read`. Each takes about a second.
+/// Claude marks `get_usage` experimental; when it fails, the shell falls back to the last turn's rate-limit event.
+pub fn plan(agent: Agent, program: &Path) -> Result<Plan, String> {
+    match agent.spec().adapter {
+        Adapter::Claude => {
+            let mut cmd = Command::new(program);
+            cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--safe-mode",
+                      "--no-session-persistence"]);
+            let ask = serde_json::json!({"type": "control_request", "request_id": "ringo-usage",
+                                         "request": {"subtype": "get_usage", "skip_behaviors": true}});
+            let v = ask_once(cmd, &[ask], |v| v["type"] == "control_response", Duration::from_secs(15))?;
+            if v.pointer("/response/subtype").and_then(|s| s.as_str()) != Some("success") {
+                return Err(parse::short(&v.pointer("/response/error").map(|e| e.to_string()).unwrap_or_default(), 120));
+            }
+            // a success with no limits in it: the plan read failed inside Claude (a busy usage endpoint, a login
+            // without the scope), so the shell's fallback is used
+            Some(claude_plan(&v["response"]["response"])).filter(|p| !p.windows.is_empty())
+                .ok_or("Claude could not read the plan's limits just now".into())
+        }
+        Adapter::Codex => {
+            let mut cmd = Command::new(program);
+            cmd.args(["app-server", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"",
+                      "-c", "analytics.enabled=false"]);
+            let hello = serde_json::json!({"id": 1, "method": "initialize",
+                                           "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
+            let ask = serde_json::json!({"id": 2, "method": "account/rateLimits/read", "params": {"excludeResetCreditDetails": true}});
+            let v = ask_once(cmd, &[hello, serde_json::json!({"method": "initialized"}), ask], |v| v["id"] == 2,
+                             Duration::from_secs(15))?;
+            if let Some(e) = v.get("error") {
+                return Err(parse::short(e["message"].as_str().unwrap_or("an error"), 120));
+            }
+            Ok(codex_plan(&v["result"]))
+        }
+        Adapter::Agy | Adapter::Plain => Err("reports no plan usage".into()),
+    }
+}
+
+fn claude_window(kind: &str) -> String {
+    match kind {
+        "session" | "five_hour" => "5 hours".into(),
+        "weekly_all" | "seven_day" => "week".into(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// Claude Code's `get_usage` answer (2.1.316): `rate_limits.limits` as its /usage shows them, else the two windows.
+pub fn claude_plan(r: &serde_json::Value) -> Plan {
+    let mut plan = Plan { name: r["subscription_type"].as_str().unwrap_or("").to_string(), ..Plan::default() };
+    let limits = r.pointer("/rate_limits/limits").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+    for l in &limits {
+        plan.windows.push(Window { name: claude_window(l["kind"].as_str().unwrap_or("")), percent: l["percent"].as_f64().unwrap_or(0.0),
+                                   resets: l["resets_at"].as_str().and_then(iso_secs) });
+    }
+    if limits.is_empty() {
+        for key in ["five_hour", "seven_day"] {
+            if let Some(w) = r["rate_limits"].get(key).filter(|w| w.is_object()) {
+                plan.windows.push(Window { name: claude_window(key), percent: w["utilization"].as_f64().unwrap_or(0.0),
+                                           resets: w["resets_at"].as_str().and_then(iso_secs) });
+            }
+        }
+    }
+    if r.pointer("/rate_limits/extra_usage/is_enabled").and_then(|b| b.as_bool()) == Some(true) {
+        plan.notes.push("extra usage is on".into());
+    }
+    plan
+}
+
+/// The windows of a Claude turn's `rate_limit_event` (`rate_limit_info`), whose utilization is a fraction.
+pub fn claude_plan_from_event(info: &serde_json::Value) -> Plan {
+    let mut plan = Plan::default();
+    for key in ["five_hour", "seven_day"] {
+        if let Some(w) = info.pointer(&format!("/unifiedWindows/{key}")).filter(|w| w.is_object()) {
+            plan.windows.push(Window { name: claude_window(key), percent: w["utilization"].as_f64().unwrap_or(0.0) * 100.0,
+                                       resets: w["resetsAt"].as_u64() });
+        }
+    }
+    plan
+}
+
+/// Codex's `account/rateLimits/read` answer (codex-cli 0.166.0).
+pub fn codex_plan(r: &serde_json::Value) -> Plan {
+    let limits = &r["rateLimits"];
+    let mut plan = Plan { name: limits["planType"].as_str().unwrap_or("").to_string(), ..Plan::default() };
+    for key in ["primary", "secondary"] {
+        let w = &limits[key];
+        if !w.is_object() {
+            continue;
+        }
+        let name = match w["windowDurationMins"].as_u64() {
+            Some(300) => "5 hours".to_string(),
+            Some(10_080) => "week".to_string(),
+            Some(m) if m % 1440 == 0 => format!("{} days", m / 1440),
+            Some(m) => format!("{} hours", m / 60),
+            None => key.to_string(),
+        };
+        plan.windows.push(Window { name, percent: w["usedPercent"].as_f64().unwrap_or(0.0), resets: w["resetsAt"].as_u64() });
+    }
+    if let Some(n) = r.pointer("/rateLimitResetCredits/availableCount").and_then(|n| n.as_u64()).filter(|n| *n > 0) {
+        plan.notes.push(format!("{n} full reset{} left", if n == 1 { "" } else { "s" }));
+    }
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plans_read_as_the_agents_report_them() {
+        assert_eq!(iso_secs("2026-11-02T04:30:00.368171+00:00"), Some(1_793_593_800));
+        assert_eq!(iso_secs("2026-11-02T00:30:00-04:00"), Some(1_793_593_800));
+        assert_eq!(iso_secs("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_secs("soon"), None);
+        // Claude Code 2.1.316's get_usage answer (trimmed)
+        let claude = serde_json::json!({"subscription_type": "max", "rate_limits": {
+            "five_hour": {"utilization": 5, "resets_at": "2026-11-02T04:30:00.368171+00:00"},
+            "limits": [{"kind": "session", "group": "session", "percent": 5, "resets_at": "2026-11-02T04:30:00.368171+00:00"},
+                       {"kind": "weekly_all", "group": "weekly", "percent": 59, "resets_at": "2026-11-04T13:00:00+00:00"}],
+            "extra_usage": {"is_enabled": false}}});
+        let plan = claude_plan(&claude);
+        assert_eq!(plan.name, "max");
+        assert_eq!(plan.windows, [Window { name: "5 hours".into(), percent: 5.0, resets: Some(1_793_593_800) },
+                                  Window { name: "week".into(), percent: 59.0, resets: iso_secs("2026-11-04T13:00:00+00:00") }]);
+        assert!(plan.notes.is_empty());
+        // its own read of the plan failed: a success with no limits, which plan() turns into an error
+        assert!(claude_plan(&serde_json::json!({"subscription_type": "max", "rate_limits_available": true, "rate_limits": null}))
+            .windows.is_empty());
+        // a Claude turn's rate_limit_event: utilization as a fraction
+        let event = serde_json::json!({"status": "allowed", "unifiedWindows": {
+            "five_hour": {"utilization": 0.21, "resetsAt": 1_793_332_800u64}, "seven_day": {"utilization": 0.32, "resetsAt": 1_793_797_200u64}}});
+        let plan = claude_plan_from_event(&event);
+        assert_eq!((plan.windows[0].name.as_str(), plan.windows[0].percent.round(), plan.windows[1].resets),
+                   ("5 hours", 21.0, Some(1_793_797_200)));
+        // codex-cli 0.166.0's account/rateLimits/read answer (trimmed)
+        let codex = serde_json::json!({"rateLimits": {"limitId": "codex", "planType": "plus",
+            "primary": {"usedPercent": 41, "windowDurationMins": 300, "resetsAt": 1_793_594_030u64},
+            "secondary": {"usedPercent": 34, "windowDurationMins": 10080, "resetsAt": 1_794_078_152u64}},
+            "rateLimitResetCredits": {"availableCount": 2, "credits": null}});
+        let plan = codex_plan(&codex);
+        assert_eq!(plan.name, "plus");
+        assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 41.0), ("week", 34.0)]);
+        assert_eq!(plan.notes, ["2 full resets left"]);
+    }
 
     #[test]
     fn the_undo_store_takes_only_a_small_folder() {
