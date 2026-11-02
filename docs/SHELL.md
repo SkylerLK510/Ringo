@@ -103,10 +103,13 @@ too, each agent keeping its own conversation. Codex owns the abstract work: Ring
 › add a retry to the HTTP client
 
 #1 claude
-  • Grep fn send in src · Found 2 files
-  • Read client.rs · 214 lines
-  • Edit client.rs
-  • $ cargo test retry
+  ✓ read 1 file, searched 1 time
+  ✓ edit client.rs                                 +3 −1
+      - let resp = self.http.send(req)?;
+      + let resp = retry(3, || self.http.send(req.clone()))?;
+      + // backs off 100 ms, then doubles
+      + ...
+  ✓ run the retry tests
 
   Added a retry with backoff to `send` in **client.rs**, and a test for it.
 
@@ -119,9 +122,13 @@ too, each agent keeping its own conversation. Codex owns the abstract work: Ring
 ```
 
 The shell fills the terminal (the alternate screen, as Codex's does). The conversation takes the top: your lines,
-every reply, and what each agent does under its job number: one `•` row per tool call or command once it has run,
-with what came of it (how many files a search found, how many lines a read took, an error, a failed command's exit
-code; a step too long for the row loses the end of its pattern or command to `…`, and `/show N` has it whole), then
+every reply, and what each agent does under its job number: one row per step once it has run, with what came of it
+(an error, a failed command's exit code). A command reads as the agent described it ("run the retry tests"), not as
+its shell line; Codex's commands lose the shell they run in. An edit shows the lines it changed under it (removed in
+red, added in green, up to 8, then a count; a new file its first 4) and `+3 −1` at the row's end. Reads, searches and
+folder listings that went through are counted on one row that grows as the agent looks ("read 6 files, searched 4
+times"), until another step or the reply comes; Codex's commands that only read or searched count the same way. A
+step too long for the row loses its end to `…`, and `/show N` has every step whole, each read and search too. Then
 one line when a job ends with its time, tokens and Ringo model calls, and the files it changed. A reply appears as it
 is written (Claude's and agy's text deltas, Codex's `item/agentMessage/delta`), and the whole reply replaces the
 pieces when it is complete. Replies render their
@@ -474,8 +481,8 @@ events into `Job` records (status, activity, tokens, subagents, touched files), 
 
 ## Not yet
 
-A JSON-lines mode for a non-Rust front end, an edit's diff shown in the conversation as it lands, and measured
-repository-level comparisons of agent turns against the pipelines.
+A JSON-lines mode for a non-Rust front end, and measured repository-level comparisons of agent turns against the
+pipelines.
 
 Route suggestions (`/route on`: word rules that put the matching command in the input for a line that read like a
 task; acceptable 35 times in 38 on 100 held-out lines, covering about half of the tasks) were removed when a plain

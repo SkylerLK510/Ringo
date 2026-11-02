@@ -808,8 +808,10 @@ enum Out {
     Line(Line<'static>, usize),
     /// An agent's reply, as markdown, two columns in.
     Reply(String),
-    /// A step an agent took, on one row under its job.
+    /// A step an agent took, on one row under its job; an edit's changed lines follow it, one row each.
     Step(String),
+    /// A run of steps that only looked, counted: files read, searches, folders listed.
+    Looked([u32; 3]),
     /// The box the shell opens with, a line per row (the first is its title).
     Welcome(Vec<String>),
 }
@@ -824,7 +826,26 @@ impl Out {
                     line
                 })
                 .collect(),
-            Out::Step(text) => vec![step_row(text, width, theme)],
+            Out::Step(text) => {
+                let mut lines = text.lines();
+                let mut rows = vec![step_row(lines.next().unwrap_or(""), width, theme)];
+                rows.extend(lines.map(|line| {
+                    let style = match line.as_bytes().first() {
+                        Some(b'+') => theme.ok,
+                        Some(b'-') => theme.fail,
+                        _ => theme.dim,
+                    };
+                    Line::from(Span::styled(format!("      {}", cut(line, width.saturating_sub(6))), style))
+                }));
+                rows
+            }
+            Out::Looked(n) => {
+                let parts: Vec<String> = [(n[0], "read", "file"), (n[1], "searched", "time"), (n[2], "listed", "folder")]
+                    .into_iter().filter(|(k, ..)| *k > 0)
+                    .map(|(k, verb, what)| format!("{verb} {k} {what}{}", if k == 1 { "" } else { "s" })).collect();
+                vec![Line::from(vec![Span::styled("  ✓ ", theme.ok),
+                                     Span::styled(cut(&parts.join(", "), width.saturating_sub(4)), theme.dim)])]
+            }
             Out::Welcome(lines) => {
                 // the title in the brand colour, the rest under it, dim
                 let mut rows = Vec::new();
@@ -853,21 +874,26 @@ fn one_row(text: &str, width: usize) -> String {
     if cols(text) <= width {
         return text.to_string();
     }
-    let cut = |t: &str, room: usize| {
-        let (mut out, mut used) = (String::new(), 0);
-        for c in t.chars() {
-            used += c.width().unwrap_or(0);
-            if used + 1 > room {
-                break;
-            }
-            out.push(c);
-        }
-        format!("{}…", out.trim_end())
-    };
     match text.rsplit_once(" · ") {
         Some((what, came)) if cols(came) + 3 <= width / 2 => format!("{} · {came}", cut(what, width - cols(came) - 3)),
         _ => cut(text, width),
     }
+}
+
+/// Text in at most `room` columns: a longer one is cut, and ends in "…".
+fn cut(text: &str, room: usize) -> String {
+    if cols(text) <= room {
+        return text.to_string();
+    }
+    let (mut out, mut used) = (String::new(), 0);
+    for c in text.chars() {
+        used += c.width().unwrap_or(0);
+        if used + 1 > room {
+            break;
+        }
+        out.push(c);
+    }
+    format!("{}…", out.trim_end())
 }
 
 /// A step's row: ✓ when it went through, ✗ when it failed, ◌ when the turn ended before its result, · when its agent
@@ -1240,6 +1266,21 @@ impl App {
                     },
                     Said::Step(text) => {
                         self.out.push(Out::Step(clean(&text)));
+                    }
+                    // a run of reads and searches is one row, counting up as the agent looks
+                    Said::Looked(kind, _) => {
+                        let at = ["read", "search", "list"].iter().position(|k| *k == kind).unwrap_or(0);
+                        match self.out.last_mut() {
+                            Some(Out::Looked(n)) if self.last == id => {
+                                n[at] += 1;
+                                self.fitted.truncate(self.out.len() - 1);
+                            }
+                            _ => {
+                                let mut n = [0; 3];
+                                n[at] = 1;
+                                self.out.push(Out::Looked(n));
+                            }
+                        }
                     }
                     Said::Line(text) => {
                         for line in clean(&text).lines() {
@@ -2820,6 +2861,38 @@ mod tests {
                                  Said::Partial("Next".into())];
         a.feed();
         assert_eq!(replies(&a), ["Hello, world.", "Next"], "the whole reply replaces its pieces; the next block opens anew");
+        a.s.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn looks_are_counted_on_one_row_and_an_edit_shows_its_lines_in_colour() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app(&["claude"]);
+        a.theme = Theme::named("siamese", crate::theme::Depth::TrueColor).unwrap();
+        let fake = std::env::temp_dir().join(format!("ringo-tui-fake-looks-{}", std::process::id()));
+        std::fs::write(&fake, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(a.main, fake);
+        a.talk(a.main, "hi".into(), "hi".into()).unwrap();
+        a.s.jobs[0].fresh = vec![Said::Looked("read", "Read a.rs".into()), Said::Looked("search", "Grep x".into()),
+                                 Said::Looked("read", "Read b.rs".into()),
+                                 Said::Step("Edit a.rs · +1 −1\n- let x = 1;\n+ let x = 2;".into()),
+                                 Said::Looked("list", "LS src".into())];
+        a.feed();
+        let rows = screen(&mut a, 70, 16);
+        let at = |text: &str| rows.iter().position(|r| r.trim_start().starts_with(text)).unwrap_or_else(|| panic!("{text}: {rows:#?}"));
+        let (looked, edit, gone, came, again) = (at("✓ read 2 files, searched 1 time"), at("✓ edit a.rs"), at("- let x = 1;"),
+                                                 at("+ let x = 2;"), at("✓ listed 1 folder"));
+        assert!(looked < edit && edit + 1 == gone && gone + 1 == came && came < again, "{rows:#?}");
+        assert!(rows[edit].ends_with("+1 −1"), "{rows:#?}");
+        // removed lines in the failure colour, added ones in the success colour
+        let colour = |row: usize, text: &str| {
+            let fitted = a.out.iter().flat_map(|o| o.rows(70, &a.theme)).collect::<Vec<_>>();
+            fitted.into_iter().find(|l| l.to_string().contains(text)).map(|l| l.spans[0].style).unwrap_or_default()
+                .fg.unwrap_or_else(|| panic!("row {row} has no colour"))
+        };
+        assert_eq!((colour(gone, "let x = 1"), colour(came, "let x = 2")), (a.theme.fail.fg.unwrap(), a.theme.ok.fg.unwrap()));
         a.s.shutdown();
     }
 
