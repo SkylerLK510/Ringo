@@ -19,6 +19,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LOG_LINES: usize = 2000; // per job in memory; the full stream is on disk
+/// Past this many tokens in an agent's window, its next turn starts fresh from Ringo's record of the conversation
+/// instead of re-reading all of it at every call (see `Session::handoff`).
+pub const HANDOFF_AT: u64 = 64_000;
+/// How much of Ringo's record goes into a turn, in characters (about four a token): the turns, newest first, then
+/// the change they made.
+const RECORD_CHARS: usize = 60_000;
 
 /// How Ringo talks to an agent's program. The protocols are code; which agents use them, and how each one is
 /// installed, signed in and updated, is data: agents.json in the binary, plus the owner's own entries.
@@ -358,6 +364,13 @@ pub struct Job {
     pub undone: bool,
     /// What the agent waits for the owner to allow, oldest first.
     pub asks: VecDeque<Permission>,
+    /// A turn in this folder: None in the conversation all agents share; Some(its agent) when it ran in /separate,
+    /// in that agent's own.
+    pub lane: Option<Agent>,
+    /// Each step's first line (a command and its exit, an edit), for Ringo's record of the conversation.
+    pub steps: Vec<String>,
+    /// Whether it ran a shell command, which may have written files it did not report.
+    pub ran: bool,
     /// Lines for the agent's stdin while the turn runs (Claude's answers to its permission requests); None closes it.
     input: Option<Sender<Option<String>>>,
     pid: Option<u32>,
@@ -390,6 +403,9 @@ impl Job {
             self.fresh.push(said); // a piece of the reply: the log takes the whole reply when it comes
             return;
         };
+        if let Said::Step(step) = &said {
+            self.steps.push(step.lines().next().unwrap_or("").to_string());
+        }
         for l in text.lines() {
             if self.log.len() == LOG_LINES {
                 self.log.pop_front();
@@ -449,6 +465,14 @@ pub struct Session {
     /// Why no job may start now (an agent update is replacing a program), if one may not.
     pub hold: Option<String>,
     threads: HashMap<Agent, String>,
+    /// How full each agent's conversation is, in tokens, as its latest call read it (see `handoff`).
+    context: HashMap<Agent, u64>,
+    /// Past this, an agent's next turn starts fresh from Ringo's record instead (tests lower it).
+    pub handoff_at: u64,
+    /// /separate: each agent keeps a conversation of its own, and they can take turns here at the same time.
+    pub separate: bool,
+    /// The first job of the conversation (/clear starts a new one).
+    start: usize,
     /// The running total each resumable conversation last reported, by agent and conversation id.
     usage_so_far: HashMap<(Agent, String), Tokens>,
     /// How far agents act without asking.
@@ -468,6 +492,11 @@ pub struct Session {
     pub routed: VecDeque<(usize, String)>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
+}
+
+/// Tokens as a log line says them: 12.3k.
+fn fmt_k(n: u64) -> String {
+    format!("{:.1}k", n as f64 / 1e3)
 }
 
 /// Where Ringo keeps private state: the same root as its releases (RINGO_RELEASE_HOME or ~/.local/share/ringo).
@@ -745,6 +774,7 @@ impl Session {
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
+                     context: HashMap::new(), handoff_at: HANDOFF_AT, separate: false, start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
     }
@@ -774,7 +804,15 @@ impl Session {
     /// The agent turn running in the owner's folder, if one is: one at a time, since it may edit the folder and
     /// continues its agent's conversation.
     pub fn busy(&self) -> Option<usize> {
-        self.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })).map(|j| j.id)
+        self.jobs.iter().rev().find(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })).map(|j| j.id)
+    }
+
+    /// The turn here that `agent` has to wait for: any, or in /separate only its own.
+    pub fn busy_for(&self, agent: Agent) -> Option<usize> {
+        self.jobs.iter().rev().find(|j| j.running() && match j.kind {
+            Kind::Agent { agent: a, write: false } => !self.separate || a == agent,
+            _ => false,
+        }).map(|j| j.id)
     }
 
     /// Whether the agent has a conversation to continue (a turn of it in the folder has started one).
@@ -785,6 +823,8 @@ impl Session {
     /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
     pub fn forget(&mut self) {
         self.threads.clear();
+        self.context.clear();
+        self.start = self.jobs.len() + 1;
     }
 
     /// The folder's files as they are now, as a git tree: every file git does not ignore, untracked ones too. A
@@ -884,7 +924,9 @@ impl Session {
         if !edited.is_empty() {
             return Err(format!("{} changed after #{id}, so nothing was undone", edited.lines().collect::<Vec<_>>().join(", ")));
         }
-        fs::write(&file, run_git(self.folder(), &["diff", "--binary", &after, &before])?).map_err(|e| e.to_string())?;
+        let mut args = vec!["diff", "--binary", after.as_str(), before.as_str(), "--"];
+        args.extend(changed.iter().map(String::as_str)); // its own files only (see `end_with`)
+        fs::write(&file, run_git(self.folder(), &args)?).map_err(|e| e.to_string())?;
         let file = file.to_string_lossy().into_owned();
         self.folder_git(&["apply", "--check", &file])
             .map_err(|e| format!("#{id}'s files no longer match it, so nothing was undone ({e})"))?;
@@ -892,6 +934,126 @@ impl Session {
         let job = &mut self.jobs[id - 1];
         job.undone = true;
         Ok(format!("undid #{id}: {} back as before", job.changed.join(", ")))
+    }
+
+    /// The finished turns here that `agent`'s conversation holds, before job `upto`, oldest first: since /clear, every
+    /// agent's turns in the shared conversation and its own; in /separate its own alone. /compact is no turn of it.
+    fn lane(&self, agent: Agent, upto: usize) -> Vec<&Job> {
+        self.jobs[self.start - 1..upto - 1].iter().filter(|j| match j.kind {
+            Kind::Agent { agent: a, write: false } => !j.running() && j.title_full.trim() != "/compact"
+                && (a == agent || (!self.separate && j.lane.is_none())),
+            _ => false,
+        }).collect()
+    }
+
+    /// What `agent`'s turn `id` is sent instead of the owner's `prompt` alone, and a line for its log. In the shared
+    /// conversation, a conversation it continues hears what the other agents did since its last turn, and one it
+    /// starts hears all of it. A conversation past `handoff_at` tokens starts fresh from the record (`resume` goes),
+    /// when the record is at most half its size. Ringo's own code writes the record from what it kept of each turn:
+    /// no model call, and never a summary of a summary. The record uncut goes in the job's folder.
+    fn handoff(&mut self, id: usize, agent: Agent, resume: &mut Option<String>, prompt: &str) -> Option<(String, String)> {
+        let fills = self.context.get(&agent).copied().unwrap_or(0);
+        let lane = self.lane(agent, id);
+        let mine = lane.iter().rposition(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent));
+        // a fresh start that would save too little resumes, told what the others did since, as any other turn
+        let (fresh, text, about, span, whole) = [resume.is_none() || fills > self.handoff_at, false].into_iter().find_map(|fresh| {
+            let turns = if fresh { &lane[..] } else { &lane[mine.map_or(0, |at| at + 1)..] };
+            let (first, last) = (turns.first()?.id, turns.last()?.id);
+            let (record, whole) = self.record(turns);
+            let head = match fresh {
+                true => "Ringo's record of this conversation so far, which you start fresh from",
+                false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
+            };
+            let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
+                                and can be wrong; the files here are the truth). The whole record, uncut, is in {}.\n\n{}\n\n\
+                                The owner's new message:\n", self.jobs[id - 1].dir.join("record.md").display(), record.trim_end());
+            let about = text.len() as u64 / 4; // the owner's message goes either way
+            (!fresh || resume.is_none() || about * 2 <= fills).then(|| {
+                (fresh, text, about, if first == last { format!("#{first}") } else { format!("#{first} to #{last}") }, whole)
+            })
+        })?;
+        let file = self.jobs[id - 1].dir.join("record.md");
+        let note = match (fresh, resume.is_some()) {
+            (true, true) => format!("handoff: {} starts fresh from Ringo's record of {span} (about {} tokens) instead \
+                                     of re-reading {} at every call", agent.name(), fmt_k(about), fmt_k(fills)),
+            (true, false) => format!("told {} the conversation so far, {span} (about {} tokens)", agent.name(), fmt_k(about)),
+            _ => format!("told {} what {span} did (about {} tokens)", agent.name(), fmt_k(about)),
+        };
+        let text = text + prompt;
+        if let Err(e) = fs::write(&file, whole) {
+            self.jobs[id - 1].push_log(format!("the whole record could not be kept: {e}"));
+        }
+        if fresh && let Some(old) = resume.take() {
+            self.threads.remove(&agent);
+            self.usage_so_far.remove(&(agent, old));
+            self.context.remove(&agent);
+        }
+        Some((text, note))
+    }
+
+    /// Ringo's record of `turns`, oldest first, and the same uncut: each turn's message from the owner, word for
+    /// word; the agent's reply (the newest whole, older ones' first paragraph); its failed steps and its last ones;
+    /// the files it changed; then the change the turns made, as a diff. Newest first into RECORD_CHARS; an older turn
+    /// past it is left to the whole record.
+    fn record(&self, turns: &[&Job]) -> (String, String) {
+        let cut = |text: &str, n: usize| match text.char_indices().nth(n) {
+            Some((at, _)) => format!("{}… (cut; the whole is in the record)", &text[..at]),
+            None => text.to_string(),
+        };
+        let render = |j: &Job, whole: bool, full: bool| {
+            let who = match j.kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
+            let said = j.title_full.trim();
+            let mut part = format!("#{} · the owner to {who}: {}\n", j.id, if full { said.to_string() } else { cut(said, 4000) });
+            let reply = j.reply();
+            let reply = reply.trim();
+            part += &match &j.status {
+                Status::Done if full => format!("{who}: {reply}\n"),
+                Status::Done if whole => format!("{who}: {}\n", cut(reply, 6000)),
+                Status::Done => format!("{who}: {}\n", cut(reply.split("\n\n").next().unwrap_or(""), 600)),
+                Status::Failed(why) => format!("{who}: (failed: {why})\n"),
+                _ => format!("{who}: (stopped before it finished)\n"),
+            };
+            let failed: Vec<&str> = j.steps.iter().map(String::as_str).filter(|s| s.starts_with(parse::FAILED)).collect();
+            let steps: Vec<&str> = match full {
+                true => j.steps.iter().map(String::as_str).collect(),
+                false => failed.iter().copied().take(5)
+                    .chain(j.steps.iter().rev().take(if whole { 5 } else { 0 }).rev().map(String::as_str)
+                        .filter(|s| !s.starts_with(parse::FAILED))).collect(),
+            };
+            if !steps.is_empty() {
+                part += &format!("steps ({} in all): {}\n", j.steps.len(), steps.join(" | "));
+            }
+            if !j.changed.is_empty() {
+                part += &format!("changed: {}{}\n", j.changed.join(", "), if j.undone { " (taken back with /undo)" } else { "" });
+            }
+            part
+        };
+        let mut kept = Vec::new();
+        let mut used = 0;
+        for (i, j) in turns.iter().enumerate().rev() {
+            let part = render(j, i + 1 == turns.len(), false);
+            if used + part.len() > RECORD_CHARS && !kept.is_empty() {
+                kept.push(format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1));
+                break;
+            }
+            used += part.len();
+            kept.push(part);
+        }
+        kept.reverse();
+        let mut whole: Vec<String> = turns.iter().map(|j| render(j, true, true)).collect();
+        // The change the turns made: from before the first to after the last, in their files only.
+        let files: BTreeSet<&str> = turns.iter().flat_map(|j| j.changed.iter().map(String::as_str)).collect();
+        let (first, last) = (turns.iter().find_map(|j| j.before.as_deref()), turns.iter().rev().find_map(|j| j.after.as_deref()));
+        if let (Some(first), Some(last), false) = (first, last, files.is_empty()) {
+            let mut args = vec!["diff", first, last, "--"];
+            args.extend(&files);
+            if let Ok(diff) = run_git(self.folder(), &args).map(|d| String::from_utf8_lossy(&d).into_owned()) {
+                let room = RECORD_CHARS.saturating_sub(used).clamp(2_000, 16_000);
+                kept.push(format!("The change these turns made, as git shows it:\n{}", cut(&diff, room)));
+                whole.push(format!("The change these turns made, as git shows it:\n{diff}"));
+            }
+        }
+        (kept.join("\n"), whole.join("\n"))
     }
 
     fn new_job(&mut self, kind: Kind, title: &str) -> Result<usize, String> {
@@ -908,7 +1070,7 @@ impl Session {
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
-                             asks: VecDeque::new(), input: None, pid: None,
+                             asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)) });
         Ok(id)
     }
@@ -930,7 +1092,7 @@ impl Session {
         if write && self.mode == Mode::Read {
             return Err(format!("read mode: agents do not edit. /mode ask (or Shift-Tab) lets @{name}! edit its own copy"));
         }
-        if !write && let Some(busy) = self.busy() {
+        if !write && let Some(busy) = self.busy_for(agent) {
             return Err(format!("busy: #{busy} is working in this folder; one turn at a time"));
         }
         // A turn in the owner's folder edits it, unless in read mode; a write turn edits its own copy.
@@ -970,9 +1132,19 @@ impl Session {
             self.repo.clone()
         };
         let mut cmd = Command::new(self.program(agent));
-        let resume = if write { None } else { self.threads.get(&agent).cloned() };
+        let mut resume = if write { None } else { self.threads.get(&agent).cloned() };
+        let mut sent = prompt.to_string();
+        if !write {
+            self.jobs[id - 1].lane = self.separate.then_some(agent);
+            if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
+                sent = text;
+                self.jobs[id - 1].push_log(note);
+            }
+        }
         let sandbox = if edits { "workspace-write" } else { "read-only" };
-        let (mut input, mut turn) = (Some(prompt.to_string()), None);
+        // `sent` is what the agent gets; the owner's message (`prompt`) stays the job's title, prompt.txt and what
+        // decides the turn's settings
+        let (mut input, mut turn) = (Some(sent.clone()), None);
         let style = match spec.adapter {
             Adapter::Codex => {
                 // One `codex app-server` per turn, so the reply streams as it is written: the same agent and settings
@@ -1025,7 +1197,7 @@ impl Session {
                 input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
                                      serde_json::json!({"id": 2, "method": method, "params": thread})));
                 turn = Some(serde_json::json!({"id": 3, "method": "turn/start",
-                                               "params": {"input": [{"type": "text", "text": prompt}]}}));
+                                               "params": {"input": [{"type": "text", "text": sent}]}}));
                 Style::Codex
             }
             Adapter::Claude => {
@@ -1133,7 +1305,7 @@ impl Session {
                 if let Some(file) = append {
                     cmd.arg("--append-system-prompt-file").arg(file);
                 }
-                input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": prompt}})));
+                input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": sent}})));
                 Style::Claude
             }
             Adapter::Agy => {
@@ -1156,7 +1328,7 @@ impl Session {
                 if let Some(conversation) = &resume {
                     cmd.args(["--conversation", conversation]);
                 }
-                input = Some(format!("{}\n", serde_json::json!({"event": "user", "message": {"content": prompt}})));
+                input = Some(format!("{}\n", serde_json::json!({"event": "user", "message": {"content": sent}})));
                 Style::Agy
             }
             Adapter::Plain => {
@@ -1164,7 +1336,7 @@ impl Session {
                 // headless-scripting; unverified here). Grok's --always-approve runs every tool call unsandboxed
                 // inside its worktree.
                 for arg in &spec.args { // the prompt goes in last, so its own text is never filled in
-                    cmd.arg(arg.replace("{cwd}", &cwd.to_string_lossy()).replace("{prompt}", prompt));
+                    cmd.arg(arg.replace("{cwd}", &cwd.to_string_lossy()).replace("{prompt}", &sent));
                 }
                 if spec.args.iter().any(|a| a.contains("{prompt}")) {
                     input = None;
@@ -1495,8 +1667,30 @@ impl Session {
         if let Some(before) = self.jobs[id - 1].before.clone()
             && let Ok(after) = self.snapshot(&self.jobs[id - 1].dir.join("index")) {
             let changed = self.folder_git(&["diff", "--name-only", &before, &after]).unwrap_or_default();
+            let mut changed: Vec<String> = changed.lines().map(str::to_string).collect();
+            // Another agent's turn here at the same time (/separate) is in this diff too: the turn keeps only the
+            // files it said it edited and the other did not, so /undo never takes back the other's work. A command
+            // the other ran may have written any file without saying so: then the turn keeps none.
+            // ceiling: a file only a command wrote, or both edited, stays out of /undo; an edit the other turn made
+            // just before this one ended may not have been reported yet.
+            let job = &self.jobs[id - 1];
+            let others: Vec<&Job> = self.jobs.iter()
+                .filter(|o| o.id != id && o.before.is_some() && (o.running() || o.started + o.age() > job.started)).collect();
+            if !others.is_empty() {
+                let theirs: BTreeSet<&String> = others.iter().flat_map(|o| &o.touched).collect();
+                let commands = others.iter().any(|o| o.ran);
+                let (mine, left): (Vec<String>, Vec<String>) = changed.into_iter()
+                    .partition(|f| !commands && job.touched.contains(f) && !theirs.contains(f));
+                if !left.is_empty() {
+                    let at = others.iter().map(|o| format!("#{}", o.id)).collect::<Vec<_>>().join(", ");
+                    let how = if commands { "ran commands" } else { "worked" };
+                    self.jobs[id - 1].push_log(format!("{} changed while {at} {how} here too, so /undo leaves {}",
+                                                       left.join(", "), if left.len() == 1 { "it" } else { "them" }));
+                }
+                changed = mine;
+            }
             let job = &mut self.jobs[id - 1];
-            job.changed = changed.lines().map(str::to_string).collect();
+            job.changed = changed;
             job.after = Some(after);
         }
     }
@@ -1601,6 +1795,11 @@ impl Session {
                             }
                         }
                         Note::Live(t) => job.live = t,
+                        Note::Context(n) => {
+                            if let Kind::Agent { agent, write: false } = job.kind {
+                                self.context.insert(agent, n);
+                            }
+                        }
                         Note::Call => job.calls += 1,
                         Note::Touched(path) => {
                             let cwd = job.worktree.clone().unwrap_or_else(|| self.repo.clone());
@@ -1609,6 +1808,7 @@ impl Session {
                                 .unwrap_or(path);
                             job.touched.insert(rel.to_string_lossy().into_owned());
                         }
+                        Note::Ran => job.ran = true,
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
                         Note::Limits(info) => self.claude_limits = Some(info),
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above

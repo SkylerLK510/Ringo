@@ -38,6 +38,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer"),
     ("/clear", "start a new conversation"),
     ("/compact", "shrink a long conversation so later turns cost less"),
+    ("/separate", "a task of its own for each agent, all working at once"),
+    ("/together", "the agents back in one conversation"),
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
@@ -132,6 +134,8 @@ pub enum Cmd {
     Copy,
     Clear,
     Compact,
+    /// `/separate` (true): each agent a conversation of its own, at the same time; `/together` (false): one again.
+    Separate(bool),
     /// `?`: the keys.
     Keys,
     Backend(String),
@@ -183,6 +187,8 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "copy" => Ok(Cmd::Copy),
             "clear" | "new" => Ok(Cmd::Clear),
             "compact" => Ok(Cmd::Compact),
+            "separate" => Ok(Cmd::Separate(true)),
+            "together" => Ok(Cmd::Separate(false)),
             "ask" if !tail.is_empty() => Ok(Cmd::Ask(tail.into())),
             "auto" => Ok(Cmd::Auto),
             "usage" | "cost" => Ok(Cmd::Usage),
@@ -1252,8 +1258,9 @@ impl App {
 
     /// The settings in force, printed under the manual.
     fn settings(&self) -> String {
-        format!("  now: mode {} · tier {} · talking to {} · questions and pipelines on {} · theme {}\n  private state: {}",
-                self.s.mode.name(), self.s.tier.name(), self.main.name(), self.s.backend, self.theme.name, self.s.dir.display())
+        format!("  now: mode {} · tier {} · talking to {} · agents {} · questions and pipelines on {} · theme {}\n  private state: {}",
+                self.s.mode.name(), self.s.tier.name(), self.main.name(), if self.s.separate { "separate" } else { "together" },
+                self.s.backend, self.theme.name, self.s.dir.display())
     }
 
     /// An agent's reply, or the manual: markdown, between blank lines.
@@ -1451,25 +1458,31 @@ impl App {
             let id = self.s.launch_agent(agent, true, &expanded)?;
             return Ok(Some(format!("  #{id}: {} works only in its own copy; /apply {id} keeps its change", agent.name())));
         }
-        if self.must_wait() {
+        if self.must_wait(agent) {
             self.queue.push_back((agent, task, line));
             return Ok(None);
         }
         self.turn(agent, &task)
     }
 
-    /// Whether a turn in this folder has to wait: one runs here, lines wait before it, every job slot is taken, or an
-    /// agent update holds the session.
-    fn must_wait(&self) -> bool {
-        self.s.busy().is_some() || !self.queue.is_empty() || self.s.running() >= self.s.max_jobs || self.s.hold.is_some()
-            || self.checking.is_some()
+    /// Whether `agent`'s turn in this folder has to wait: one runs here (in /separate, one of its own), lines wait
+    /// before it, every job slot is taken, or an agent update holds the session.
+    fn must_wait(&self, agent: Agent) -> bool {
+        self.s.busy_for(agent).is_some() || self.queue.iter().any(|(a, ..)| !self.s.separate || *a == agent)
+            || self.s.running() >= self.s.max_jobs || self.s.hold.is_some() || self.checking.is_some()
     }
 
-    /// Starts the oldest waiting line once the folder is free; true when it did.
+    /// Starts the oldest waiting line whose agent is free (together, any turn here holds every agent, so the lines go
+    /// in order; in /separate each agent's go in order); true when it did.
     fn dispatch(&mut self) -> bool {
-        let free = self.s.busy().is_none() && self.s.running() < self.s.max_jobs && self.s.hold.is_none()
-            && self.checking.is_none();
-        let Some((agent, task, line)) = free.then(|| self.queue.pop_front()).flatten() else { return false };
+        if self.s.running() >= self.s.max_jobs || self.s.hold.is_some() || self.checking.is_some() {
+            return false;
+        }
+        let free = (0..self.queue.len()).find(|&i| {
+            let agent = self.queue[i].0;
+            self.s.busy_for(agent).is_none() && !self.queue.iter().take(i).any(|(a, ..)| !self.s.separate || *a == agent)
+        });
+        let Some((agent, task, line)) = free.and_then(|i| self.queue.remove(i)) else { return false };
         let revision = self.revision.as_deref() == Some(task.as_str());
         if !revision {
             self.echo(&line); // the revision is Ringo's, said by after_end, not the owner's
@@ -1730,7 +1743,12 @@ impl App {
     /// the input, to send or change.
     fn stop(&mut self, id: usize) {
         let _ = self.s.kill(id);
-        let queued: Vec<String> = self.queue.drain(..).map(|(_, _, line)| line).collect();
+        // in /separate the other agents' lines keep waiting for their own turns
+        let whose = self.s.job(id).ok().and_then(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None });
+        let (back, keep): (VecDeque<_>, VecDeque<_>) = self.queue.drain(..)
+            .partition(|(a, ..)| !self.s.separate || Some(*a) == whose);
+        self.queue = keep;
+        let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
         if !queued.is_empty() && self.input.is_empty() {
             self.input = queued.join("\n").chars().collect();
             self.cursor = self.input.len();
@@ -1743,12 +1761,12 @@ impl App {
 
     /// Whether a line would wait in the queue: a line for an agent in this folder while a turn runs here.
     fn waits(&self, cmd: &Result<Cmd, String>) -> bool {
-        let here = match cmd {
-            Ok(Cmd::Talk(_) | Cmd::Compact) => self.main.spec().read,
-            Ok(Cmd::Agents(agents, _)) => matches!(agents[..], [(a, false)] if a.spec().read),
-            _ => false,
+        let agent = match cmd {
+            Ok(Cmd::Talk(_) | Cmd::Compact) => Some(self.main),
+            Ok(Cmd::Agents(agents, _)) => match agents[..] { [(a, false)] => Some(a), _ => None },
+            _ => None,
         };
-        here && self.must_wait()
+        agent.is_some_and(|a| a.spec().read && self.must_wait(a))
     }
 
     fn submit(&mut self) {
@@ -1819,6 +1837,20 @@ impl App {
                     return Err(format!("{} has no conversation here to compact yet", agent.name()));
                 }
                 return self.talk(agent, "/compact".into(), line.to_string());
+            }
+            Cmd::Separate(on) if on == self.s.separate => Some(match on {
+                true => "  the agents already work separately; /together puts them back in one conversation".into(),
+                false => "  the agents already share one conversation; /separate gives each a task of its own".into(),
+            }),
+            Cmd::Separate(on) => {
+                self.s.separate = on;
+                Some(match on {
+                    true => "  separate: each agent keeps a conversation of its own and works at the same time as the \
+                             others, one turn each (@claude … and @codex … run side by side). What one does is not \
+                             told to the others. /together puts them back in one conversation".into(),
+                    false => "  together: one conversation again, one turn at a time. Each agent hears what the others \
+                              do from now on; what they did separately stays their own".into(),
+                })
             }
             Cmd::Tier(None) => Some(format!("  tier: {} (also: {})", self.s.tier.name(),
                 Tier::ALL.iter().filter(|t| **t != self.s.tier).map(|t| t.name()).collect::<Vec<_>>().join(", "))),
@@ -2517,7 +2549,8 @@ impl App {
         // the head: the mark and the folder; the mode and the session's tokens at the right
         let (mode, tokens) = (self.s.mode.name(), fmt_tokens(self.s.tokens()));
         let tier = match self.s.tier { Tier::Standard => String::new(), t => format!("{} · ", t.name()) };
-        // a tier other than standard is the last to go: it changes what each turn costs
+        let tier = format!("{}{tier}", if self.s.separate { "separate · " } else { "" });
+        // a tier other than standard (and /separate) is the last to go: it changes what each turn costs
         let right = [format!("{mode} mode · {tier}{tokens} tokens "), format!("{mode} · {tier}{tokens} "),
                      format!("{} ", tier.trim_end_matches(['·', ' '])), String::new()].into_iter()
             .filter(|r| r.is_empty() || !r.trim().is_empty())
@@ -3227,7 +3260,7 @@ mod tests {
             a.s.pump();
             a.feed();
             if a.checking.is_some() {
-                assert!(a.must_wait(), "a line sent during the review waits for it");
+                assert!(a.must_wait(a.main), "a line sent during the review waits for it");
             }
             a.dispatch();
             std::thread::sleep(Duration::from_millis(20));
@@ -3303,6 +3336,34 @@ mod tests {
             assert!(full.rows(w, &t).iter().all(|l| l.width() <= w), "a gauge fits its width ({w})");
         }
         assert_eq!((fmt_until(90), fmt_until(3 * 3600 + 120), fmt_until(2 * 86_400 + 7200)), ("2 min".into(), "3 h 2 min".into(), "2 d 2 h".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn separate_lets_each_agent_take_its_own_turn_at_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app(&["claude", "codex"]);
+        let (claude, codex) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
+        assert_eq!((parse("/separate", &[claude]), parse("/together", &[claude])), (Ok(Cmd::Separate(true)), Ok(Cmd::Separate(false))));
+        let fake = std::env::temp_dir().join(format!("ringo-tui-fake-both-{}", std::process::id()));
+        std::fs::write(&fake, "#!/bin/sh\nsleep 5\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(claude, fake.clone());
+        a.s.programs.insert(codex, fake);
+        assert!(a.talk(claude, "fix it".into(), "fix it".into()).is_ok());
+        assert_eq!(a.talk(codex, "docs".into(), "@codex docs".into()), Ok(None), "together: it waits for claude's turn");
+        assert!(a.run(Cmd::Separate(true), "/separate").unwrap().unwrap().contains("separate:"));
+        assert!(a.dispatch() && a.s.running() == 2, "separate: codex starts beside claude");
+        assert_eq!(a.talk(claude, "more".into(), "more".into()), Ok(None), "claude's next line waits for claude");
+        assert_eq!(a.talk(codex, "and".into(), "@codex and".into()), Ok(None));
+        assert!(!a.dispatch(), "both are busy");
+        assert!(screen(&mut a, 80, 12)[0].ends_with("ask mode · separate · 0 tokens"), "the head says so");
+        // Esc stops the latest turn (codex's); only codex's waiting line comes back to the input
+        a.key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(a.input.iter().collect::<String>(), "@codex and");
+        assert!(a.queue.len() == 1 && a.queue[0].0 == claude);
+        assert!(a.run(Cmd::Separate(true), "/separate").unwrap().unwrap().contains("already"));
+        a.s.shutdown();
     }
 
     #[test]

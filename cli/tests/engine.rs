@@ -497,6 +497,7 @@ fn agent_commands_are_pinned() {
     let grok = fake(&root(), "grok-golden", &format!("#!/bin/sh\n{RECORD}echo done\n"));
     let mut s = session(&r, agent("codex"), &codex);
     s.codex_home = root().join("codex-home-golden"); // none: the owner's own Codex instructions add nothing
+    s.separate = true; // each agent on its own, so no turn here is told another's (see the handoff tests)
     s.programs.insert(agent("claude"), claude.clone());
     s.programs.insert(agent("grok"), grok.clone());
     let repo = s.repo.to_string_lossy().into_owned();
@@ -1027,4 +1028,121 @@ fn a_turn_stopped_by_quitting_is_still_in_the_usage_record() {
     s.shutdown();
     assert_eq!(s.job(id).unwrap().status, Status::Cancelled);
     assert_eq!(s.used_since(86_400).0.get("claude").map(|t| t.total()), Some(11));
+}
+
+/// A fake claude: records its arguments and its message, says "done", and reports a 70k window when the message says
+/// ends with GROW, 300 with HUGE (10 tokens otherwise; a record of an earlier one does not count); with BASH it runs a
+/// command; with WRITE-O it writes o.txt and says so as its Write tool would.
+const CLAUDE_TALKS: &str = r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+head -n 1 > "$0.stdin"
+echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'
+case "$(cat "$0.stdin")" in *WRITE-O*) echo o > o.txt
+  echo '{"type":"assistant","message":{"id":"w1","content":[{"type":"tool_use","id":"tu1","name":"Write","input":{"file_path":"'"$PWD"'/o.txt","content":"o"}}]},"parent_tool_use_id":null}' ;; esac
+case "$(cat "$0.stdin")" in *'BASH"}}') echo '{"type":"assistant","message":{"id":"b1","content":[{"type":"tool_use","id":"tu2","name":"Bash","input":{"command":"true"}}]},"parent_tool_use_id":null}' ;; esac
+case "$(cat "$0.stdin")" in *'GROW"}}') big=70000 ;; *'HUGE"}}') big=300 ;; *) big=10 ;; esac
+echo '{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":'$big',"output_tokens":5}},"parent_tool_use_id":null}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+"#;
+
+/// What the fake claude was last sent, and whether it resumed a conversation.
+fn claude_heard(claude: &Path) -> (String, bool) {
+    let line: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.stdin", claude.display())).unwrap()).unwrap();
+    let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+    (line["message"]["content"].as_str().unwrap().to_string(), argv.lines().any(|a| a == "--resume"))
+}
+
+fn said(s: &mut Session, who: &str, text: &str) -> usize {
+    let id = s.launch_agent(agent(who), false, text).unwrap();
+    assert_eq!(wait(s, id), Status::Done);
+    id
+}
+
+#[test]
+fn agents_share_one_conversation_and_a_long_one_starts_fresh_from_ringos_record() {
+    let r = repo("handoff");
+    let (codex, claude) = (fake(&root(), "codex-handoff", &codex_ok()), fake(&root(), "claude-handoff", CLAUDE_TALKS));
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    s.codex_home = root().join("codex-home-golden");
+    said(&mut s, "claude", "fix it");
+    assert_eq!(claude_heard(&claude), ("fix it".into(), false), "nothing to tell yet");
+    // Codex's first turn hears the conversation so far, from Ringo's own record: no model call writes it.
+    said(&mut s, "codex", "take it from here");
+    let told = turn_text(&codex);
+    assert!(told.starts_with("Ringo's record of this conversation so far, which you start fresh from"), "{told}");
+    assert!(told.contains("#1 · the owner to claude: fix it\nclaude: done\n"), "{told}");
+    assert!(told.ends_with("The owner's new message:\ntake it from here"), "{told}");
+    // Claude goes on with its own conversation and hears only what happened since its last turn: the words, the
+    // reply, the files and the change itself.
+    said(&mut s, "claude", "and now");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.starts_with("While you were away, other agents took turns"), "{told}");
+    assert!(told.contains("#2 · the owner to codex: take it from here\ncodex: all done\n") && !told.contains("#1 ·"), "{told}");
+    assert!(told.contains("changed: b.txt, c.bin, made.txt") && told.contains("+made"), "{told}");
+    let id = said(&mut s, "claude", "GROW");
+    assert_eq!(claude_heard(&claude), ("GROW".into(), true), "nothing new since its own turn");
+    // Its window passed 64k: the next turn starts fresh from the record of the whole conversation.
+    let id2 = said(&mut s, "claude", "then");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(!resumed && told.starts_with("Ringo's record of this conversation so far, which you start fresh from"), "{told}");
+    assert!(["#1 · ", "#2 · ", "#3 · ", &format!("#{id} · the owner to claude: GROW")].iter().all(|t| told.contains(t)), "{told}");
+    assert!(told.ends_with("The owner's new message:\nthen"));
+    assert!(s.job(id2).unwrap().log.iter().any(|l| l.starts_with("handoff: claude starts fresh")));
+    let whole = fs::read_to_string(s.job(id2).unwrap().dir.join("record.md")).unwrap();
+    assert!(whole.contains("#2 · the owner to codex: take it from here") && whole.contains("+made"), "the record uncut");
+    said(&mut s, "claude", "after");
+    assert_eq!(claude_heard(&claude), ("after".into(), true), "the new conversation goes on as any other");
+    // Past the threshold, but the record would not be half the window: claude resumes, still told what codex did.
+    said(&mut s, "claude", "HUGE");
+    s.handoff_at = 200; // past it, but the whole record is more than half of 305 tokens
+    said(&mut s, "codex", "meanwhile");
+    let id = said(&mut s, "claude", "and so");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.starts_with("While you were away") && told.contains("the owner to codex: meanwhile"), "{told}");
+    assert!(s.job(id).unwrap().log.iter().any(|l| l.starts_with("told claude what #")));
+    // /clear: a new conversation, which hears nothing of the old one.
+    s.forget();
+    said(&mut s, "codex", "new");
+    assert_eq!(turn_text(&codex), "new");
+}
+
+#[test]
+fn separate_agents_work_at_once_and_undo_keeps_their_work_apart() {
+    let r = repo("separate");
+    let codex = fake(&root(), "codex-separate", &codex_script(&format!("case \"$turn\" in *SLOW*) sleep 1 ;; esac\n{CODEX_EDITS}"),
+                                                             &codex_done("all done", (10, 4, 2))));
+    let claude = fake(&root(), "claude-separate", CLAUDE_TALKS);
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    s.codex_home = root().join("codex-home-golden");
+    let slow = s.launch_agent(agent("codex"), false, "SLOW").unwrap();
+    assert!(s.launch_agent(agent("claude"), false, "WRITE-O").unwrap_err().contains("busy"), "together: one turn here at a time");
+    s.separate = true;
+    let other = s.launch_agent(agent("claude"), false, "WRITE-O").unwrap();
+    assert!(s.launch_agent(agent("codex"), false, "again").unwrap_err().contains(&format!("#{slow}")), "each agent one turn at a time");
+    assert_eq!(wait(&mut s, other), Status::Done);
+    assert!(s.job(slow).unwrap().running(), "claude finished while codex still works");
+    assert_eq!(claude_heard(&claude), ("WRITE-O".into(), false), "neither is told what the other does");
+    assert_eq!(wait(&mut s, slow), Status::Done);
+    assert_eq!(turn_text(&codex), "SLOW");
+    // Each keeps the files it said it edited; what neither said it edited (codex's b.txt and c.bin, written by a
+    // command) stays out of /undo, said in its log.
+    assert_eq!(s.job(other).unwrap().changed, ["o.txt"]);
+    assert_eq!(s.job(slow).unwrap().changed, ["made.txt"]);
+    assert!(s.job(slow).unwrap().log.iter().any(|l| l == &format!("b.txt, c.bin, o.txt changed while #{other} worked here too, so /undo leaves them")));
+    assert!(s.undo().unwrap().contains(&format!("undid #{other}")));
+    assert!(!r.join("o.txt").exists() && r.join("made.txt").exists());
+    assert!(s.undo().unwrap().contains(&format!("undid #{slow}")));
+    assert!(!r.join("made.txt").exists() && r.join("b.txt").exists(), "only its own file went back");
+    // A command the other turn ran could have written any file without saying so: the turn keeps none for /undo.
+    let slow = s.launch_agent(agent("codex"), false, "SLOW again").unwrap();
+    let other = s.launch_agent(agent("claude"), false, "BASH").unwrap();
+    assert_eq!((wait(&mut s, other), wait(&mut s, slow)), (Status::Done, Status::Done));
+    assert!(s.job(slow).unwrap().changed.is_empty(), "made.txt came back, but #{other} ran a command meanwhile");
+    assert!(s.job(slow).unwrap().log.iter().any(|l| l == &format!("made.txt changed while #{other} ran commands here too, so /undo leaves it")));
+    // Back together, the next turn waits again, and hears nothing of what the others did on their own.
+    s.separate = false;
+    said(&mut s, "codex", "together");
+    assert_eq!(turn_text(&codex), "together");
 }

@@ -68,10 +68,15 @@ pub enum Note {
     /// What a running turn has used so far, as its messages report it (Claude): shown until the turn's own count
     /// (`Tokens`) arrives, and kept if it never does (a stopped turn).
     Live(Tokens),
+    /// How much of the model's window the conversation fills, as its latest call read and wrote it: past
+    /// `Session::handoff_at`, the agent's next turn starts fresh from Ringo's record of the conversation.
+    Context(u64),
     /// One model call finished (Ringo pipelines report these).
     Call,
     /// The agent is editing this file (as the agent reported it, usually an absolute path).
     Touched(String),
+    /// The agent ran a shell command, which may have written files it does not report (see `Session::end_with`).
+    Ran,
     /// The turn cannot succeed; the runner stops the job.
     Fail(String),
     /// The agent waits for the owner's answer before it acts.
@@ -377,6 +382,7 @@ impl Parser {
                 } else {
                     let mark = if how.is_empty() { "" } else { FAILED };
                     notes.push(Note::Step(format!("{mark}$ {}{how}", short(bare_command(s(item, "command")), 300))));
+                    notes.push(Note::Ran);
                 }
             }
             ("item/started" | "item/completed", "fileChange") => {
@@ -424,7 +430,12 @@ impl Parser {
                 notes.push(activity(format!("plan {finished}/{} done", plan.len())));
             }
             // The thread's usage so far; a resumed thread's counts its earlier turns too, as `codex exec` did.
-            ("thread/tokenUsage/updated", _) => self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default(),
+            ("thread/tokenUsage/updated", _) => {
+                self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                if let Some(last) = p.pointer("/tokenUsage/last") { // the latest call alone; its input counts the cached part
+                    notes.push(Note::Context(u(last, "inputTokens") + u(last, "outputTokens")));
+                }
+            }
             ("turn/completed", _) => {
                 self.completed += 1;
                 let turn = p.get("turn").unwrap_or(&NULL);
@@ -533,6 +544,9 @@ impl Parser {
                     let mut so_far = Tokens::default();
                     self.seen.iter().for_each(|(_, t)| so_far.add(*t));
                     notes.push(Note::Live(so_far));
+                    if parent.is_none() { // a subagent's calls read its own window
+                        notes.push(Note::Context(t.total()));
+                    }
                 }
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {
                     match s(block, "type") {
@@ -623,6 +637,9 @@ impl Parser {
         let mut notes = vec![Note::Activity { node: parent.clone(), text: format!("{name} {}", short(target, 70)) }];
         if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
             notes.push(Note::Touched(s(input, "file_path").to_string()));
+        }
+        if name == "Bash" { // a subagent's command writes the same folder
+            notes.push(Note::Ran);
         }
         if parent.is_none() {
             // A search names where it looked: five greps for one pattern in five folders read as five lines.
@@ -839,7 +856,8 @@ mod tests {
         // a command is one line once it ran; its exit code only when it failed
         assert!(notes.contains(&Note::Step("$ ls".into())), "without the shell Codex runs it in");
         let failed = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"make test","exitCode":2,"status":"failed"}}}"#;
-        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("✗ $ make test · exit 2".into())]);
+        assert_eq!(run(Style::Codex, &[failed]).1, [Note::Step("✗ $ make test · exit 2".into()), Note::Ran],
+                   "a command may have written files it does not name");
         // a request of the server's own is refused at once, so the turn never waits on it
         let mut p = Parser::new(Style::Codex);
         p.line(r#"{"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"01a1"}}"#);
@@ -915,8 +933,9 @@ mod tests {
         ];
         let notes: Vec<Note> = codex.iter().flat_map(|l| Parser::new(Style::Codex).line(l)).collect();
         assert_eq!(notes, [
-            Note::Looked { kind: "read", text: "read a.rs".into() },
+            Note::Looked { kind: "read", text: "read a.rs".into() }, // only looked: no Ran
             Note::Step("$ cargo test".into()),
+            Note::Ran,
             Note::Step("Edit a.rs · +1 −1\n- 1\n+ 2".into()),
             Note::Step("Write n.rs · 2 lines\n+ one\n+ two".into()),
         ]);
@@ -943,6 +962,12 @@ mod tests {
         let live: Vec<u64> = run(Style::Claude, &lines).1.into_iter()
             .filter_map(|n| if let Note::Live(t) = n { Some(t.total()) } else { None }).collect();
         assert_eq!(live, [1107, 1107, 2212, 2218]);
+        let context: Vec<u64> = run(Style::Claude, &lines).1.into_iter()
+            .filter_map(|n| if let Note::Context(n) = n { Some(n) } else { None }).collect();
+        assert_eq!(context.last(), Some(&1111), "the latest call's window, not the turn's sum");
+        let sub = event("m3", 1).replace(r#""parent_tool_use_id":null"#, r#""parent_tool_use_id":"toolu_1""#);
+        assert!(!run(Style::Claude, &[sub.as_str()]).1.iter().any(|n| matches!(n, Note::Context(_))), "nor a subagent's");
+        assert!(run(Style::Codex, &[CODEX[12]]).1.contains(&Note::Context(38852 + 671)), "codex: its last call");
     }
 
     #[test]
