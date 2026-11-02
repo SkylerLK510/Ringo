@@ -135,7 +135,7 @@ pub struct Parser {
     /// answered, taken or refused), and Claude: whether a result came after the last of them.
     steered: usize,
     answered: bool,
-    spoke: bool,
+    heard: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -274,7 +274,7 @@ impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, turn: None, thread: String::new(), usage: Value::Null,
-                 writes: Vec::new(), counted: false, steered: 0, answered: false, spoke: false }
+                 writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -306,6 +306,11 @@ impl Parser {
     /// takes a line with its next tool result, or, when none comes, answers it in a run of its own after its result.
     pub fn settled(&self, sent: usize) -> bool {
         self.completed() && self.steered >= sent && (self.style != Style::Claude || self.answered)
+    }
+
+    /// How many of the owner's lines for the running turn it has taken in (or, Codex, answered).
+    pub fn taken(&self) -> usize {
+        self.steered
     }
 
     pub fn line(&mut self, line: &str) -> Vec<Note> {
@@ -562,7 +567,6 @@ impl Parser {
                 self.compacted = true;
             }
             ("assistant", _) => {
-                self.spoke = true;
                 if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
                     let t = Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
                                      cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") };
@@ -589,12 +593,14 @@ impl Parser {
                 }
             }
             ("user", _) if e.get("isReplay") == Some(&Value::Bool(true)) => {
-                // --replay-user-messages: a line of the owner's, echoed as Claude takes it in; the first is the
-                // turn's own message
-                if self.spoke {
+                // --replay-user-messages: a message on stdin, echoed as Claude takes it in, in the order sent: the
+                // turn's own first (as it starts), then the owner's lines, each when it is read, even one sent 0.1 s
+                // after the turn's (Claude Code 2.1.316)
+                if self.heard {
                     self.steered += 1;
                     self.answered = false;
                 }
+                self.heard = true;
             }
             ("user", _) => {
                 for block in e.pointer("/message/content").and_then(Value::as_array).into_iter().flatten() {

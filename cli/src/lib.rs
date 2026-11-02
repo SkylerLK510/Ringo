@@ -388,6 +388,8 @@ pub struct Job {
     gate: Arc<Mutex<Gate>>,
     /// Codex: the thread and the running turn, which a line for it names.
     codex_turn: Option<(String, String)>,
+    /// Whether the turn runs with the owner's connectors, which a line that names one needs.
+    connectors: bool,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
 }
@@ -495,8 +497,9 @@ pub struct Session {
     pub handoff_at: u64,
     /// /separate: each agent keeps a conversation of its own, and they can take turns here at the same time.
     pub separate: bool,
-    /// The owner's lines a turn ended before taking in (`steer`), for the shell to send next.
-    pub returned: Vec<(Agent, String)>,
+    /// The owner's lines a turn ended before taking in (`steer`): the job and the line, for the shell to send next
+    /// (or, the turn stopped, to put back in the input).
+    pub returned: Vec<(usize, Agent, String)>,
     /// The first job of the conversation (/clear starts a new one).
     start: usize,
     /// The running total each resumable conversation last reported, by agent and conversation id.
@@ -839,7 +842,8 @@ impl Session {
     pub fn steer(&mut self, id: usize, text: &str) -> bool {
         let Some(job) = self.jobs.get_mut(id.wrapping_sub(1)) else { return false };
         let Kind::Agent { agent, .. } = job.kind else { return false };
-        if !job.running() || job.title_full.trim() == "/compact" {
+        // a line that names a connector needs a turn started with them
+        if !job.running() || job.title_full.trim() == "/compact" || (names_connector(text) && !job.connectors) {
             return false;
         }
         let line = match agent.spec().adapter {
@@ -863,6 +867,11 @@ impl Session {
         // the owner's words, for Ringo's record of the conversation
         job.title_full = format!("{}\n\nthen, while it worked: {text}", job.title_full.trim_end());
         true
+    }
+
+    /// Whether job `id` was stopped (Esc, /kill).
+    pub fn stopped(&self, id: usize) -> bool {
+        self.jobs.get(id.wrapping_sub(1)).is_some_and(|j| j.cancel.load(Ordering::SeqCst))
     }
 
     /// The turn here that `agent` has to wait for: any, or in /separate only its own.
@@ -1130,7 +1139,7 @@ impl Session {
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
-                             codex_turn: None });
+                             codex_turn: None, connectors: false });
         Ok(id)
     }
 
@@ -1202,6 +1211,7 @@ impl Session {
         }
         // the connectors load as below: Claude's outside read mode, Codex's in every mode
         if prompt.trim() != "/compact" && names_connector(prompt) {
+            self.jobs[id - 1].connectors = spec.adapter == Adapter::Codex || (spec.adapter == Adapter::Claude && self.mode != Mode::Read);
             sent.push_str(match spec.adapter {
                 Adapter::Claude if self.mode != Mode::Read => CLAUDE_CONNECTOR_NOTE,
                 Adapter::Codex => CODEX_CONNECTOR_NOTE,
@@ -1464,7 +1474,7 @@ impl Session {
             _ => return Err(format!("#{of} changed no files to review")),
         };
         let job = self.job(of)?;
-        let prompt = fs::read_to_string(job.dir.join("prompt.txt")).unwrap_or_else(|_| job.title.clone());
+        let prompt = job.title_full.clone(); // the task with every line sent while it worked
         let dir = self.next_dir()?;
         let pr = dir.join("pr.txt");
         fs::write(&pr, format!("The task given to the agent:\n\n{prompt}\n")).map_err(|e| e.to_string())?;
@@ -1668,7 +1678,16 @@ impl Session {
                     thread::sleep(Duration::from_millis(50));
                 }
             }
-            gate.lock().unwrap_or_else(|e| e.into_inner()).closed = true; // its output ended: a line now goes next
+            // Its output ended: a line sent now goes next, and one it never took in (it stopped or failed first)
+            // goes back.
+            let (sent, taken) = {
+                let mut gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+                gate.closed = true;
+                (gate.sent, parser.taken())
+            };
+            for n in taken.min(sent)..sent {
+                let _ = tx.send(Event::Note(id, Note::Refused(n)));
+            }
             for note in parser.leftover() {
                 let _ = tx.send(Event::Note(id, note));
             }
@@ -1891,9 +1910,9 @@ impl Session {
                             if let (Some(text), Kind::Agent { agent, .. }) = (job.steered.get(n).cloned(), job.kind.clone()) {
                                 // it is the next turn's message, not this one's
                                 job.title_full = job.title_full.replacen(&format!("\n\nthen, while it worked: {text}"), "", 1);
-                                job.push_log(format!("{} had finished before your line reached it, so it goes next: {}",
+                                job.push_log(format!("{} ended before taking in your line, so it is not part of this turn: {}",
                                                      agent.name(), parse::short(&text, 60)));
-                                self.returned.push((agent, text));
+                                self.returned.push((id, agent, text));
                             }
                         }
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),

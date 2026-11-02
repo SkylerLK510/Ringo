@@ -1053,7 +1053,12 @@ read first
 echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'
 echo '{"type":"user","isReplay":true,"message":{"role":"user","content":"x"},"parent_tool_use_id":null}'
 replay='{"type":"user","isReplay":true,"message":{"role":"user","content":"y"},"parent_tool_use_id":null}'
-case "$first" in *LATE*)
+case "$first" in *QUIT*)
+  sleep 1
+  echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":10,"output_tokens":5}},"parent_tool_use_id":null}'
+  echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+  exit 0 ;;
+*LATE*)
   echo '{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"first"}],"usage":{"input_tokens":10,"output_tokens":5}},"parent_tool_use_id":null}'
   echo '{"type":"result","subtype":"success","is_error":false,"result":"first","model_usage_since_last_result":{"m":{"inputTokens":10,"outputTokens":5}}}'
   read second; printf '%s\n' "$second" > "$0.steer"; echo "$replay"
@@ -1076,6 +1081,7 @@ fn a_line_sent_while_claude_works_goes_into_its_turn() {
     let mut s = session(&r, agent("claude"), &claude);
     for (task, reply) in [("fix it", "both"), ("fix it LATE", "second")] {
         let id = s.launch_agent(agent("claude"), false, task).unwrap();
+        assert!(!s.steer(id, "also check my clickup tasks"), "a turn started without the connectors cannot use them");
         assert!(s.steer(id, "and the docs"));
         // stdin closes only once the line is taken in and answered: the fake ends when it does
         assert_eq!(wait(&mut s, id), Status::Done, "{task}");
@@ -1088,6 +1094,13 @@ fn a_line_sent_while_claude_works_goes_into_its_turn() {
                 "the owner's words, for the record: {}", j.title_full);
         assert!(!s.steer(id, "too late"), "an ended turn takes no more: the line waits for the next");
     }
+    assert!(s.returned.is_empty());
+    // a turn that ends without taking the line in gives it back, for the next turn, and it is not in this one's record
+    let id = s.launch_agent(agent("claude"), false, "fix it QUIT").unwrap();
+    assert!(s.steer(id, "and the tests"));
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert_eq!(s.returned, [(id, agent("claude"), "and the tests".to_string())]);
+    assert_eq!(s.job(id).unwrap().title_full, "fix it QUIT");
 }
 
 /// What the fake claude was last sent, and whether it resumed a conversation.

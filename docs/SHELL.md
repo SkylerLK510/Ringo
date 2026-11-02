@@ -98,11 +98,12 @@ stream-json message on the stdin Ringo already keeps open for permission answers
 result, or, when the line arrives during its final answer, answers it in a run of its own right after its result;
 both runs count in the turn. Claude echoes each message as it takes it in (`--replay-user-messages`, which adds no
 tokens), and Ringo closes its stdin only once every line has been taken in and answered. Codex gets `turn/steer`,
-which names the running turn and adds the line to it, a final answer included (one `turn/completed`). A line Codex
-refuses because its turn had just ended, or one sent as a turn's input closed, goes as the next turn instead, so none
-is lost. agy's stdin closes after its prompt and a `/compact` turn takes none, so a line for them waits under the box,
-as does a line typed behind one already waiting. Your words go into Ringo's record of the turn ("then, while it
-worked: ...").
+which names the running turn and adds the line to it, a final answer included (one `turn/completed`). A line the turn
+never took in (Codex refused it because the turn had just ended, the input had closed, or the agent stopped or failed
+first) goes as the next turn instead, or back in the input if you stopped the turn, so none is lost. agy's stdin closes
+after its prompt and a `/compact` turn takes none, so a line for them waits under the box, as does a line typed behind
+one already waiting, and one that names a connector when the turn was started without them. Your words go into Ringo's
+record of the turn ("then, while it worked: ...") and into what `/review` and ultra's review judge the change by.
 
 Checked live with Claude Code 2.1.316 and codex-cli 0.166.0, with "Also end your reply with the word KIWI." sent
 while each worked. During `sleep 8 && echo first` (sent 4 s in), Claude answered `first … KIWI` in one result. During

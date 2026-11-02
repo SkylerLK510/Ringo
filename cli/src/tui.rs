@@ -2784,9 +2784,16 @@ pub fn run() -> ExitCode {
             app.say(format!("  agents set up: {}", names.join(", ")));
         }
         dirty |= app.s.pump();
-        // a line a turn ended before taking in goes next, ahead of the lines typed after it
-        for (agent, text) in std::mem::take(&mut app.s.returned).into_iter().rev() {
-            app.queue.push_front((agent, text.clone(), text));
+        // A line a turn ended before taking in goes next, ahead of the lines typed after it; one for a turn you
+        // stopped goes back in the input, as the waiting lines do.
+        for (id, agent, text) in std::mem::take(&mut app.s.returned).into_iter().rev() {
+            if app.s.stopped(id) {
+                let rest: String = app.input.iter().collect();
+                app.input = if rest.is_empty() { text } else { format!("{text}\n{rest}") }.chars().collect();
+                app.cursor = app.input.len();
+            } else {
+                app.queue.push_front((agent, text.clone(), text));
+            }
         }
         dirty |= app.quota_done();
         // A job that just ended is seen before any waiting line starts: ultra's review holds the folder from there.
