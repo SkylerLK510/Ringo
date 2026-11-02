@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -297,6 +297,16 @@ pub fn rule_covers(rule: &str, p: &Permission) -> bool {
     field == content
 }
 
+/// Added to a Claude turn that reaches a connector. One ClickUp question (Claude Code 2.1.316) loaded 30 ClickUp tools
+/// to use 3, and read the whole workspace's week (a 42,839-character answer) before asking for the owner's own (1,308):
+/// every call after re-read both, 254k tokens in 7 calls.
+const CLAUDE_CONNECTOR_NOTE: &str = "\n\n(Ringo: this reaches a connector. Load only the tools it needs (ToolSearch with \
+    max_results 5 or fewer: each loaded tool is re-read by every later call), and ask for only what answers it, filtered \
+    on the service's side: the owner's own items unless the message says otherwise, only the dates and fields needed.)";
+/// The same for Codex, whose connectors come as apps rather than tools to search for.
+const CODEX_CONNECTOR_NOTE: &str = "\n\n(Ringo: this reaches a connector. Ask for only what answers it, filtered on the \
+    service's side: the owner's own items unless the message says otherwise, only the dates and fields needed.)";
+
 /// Whether a task names a service only the owner's connectors reach. An identifier (`email_parser`) is one word.
 pub fn names_connector(task: &str) -> bool {
     let lower = task.to_lowercase();
@@ -373,6 +383,11 @@ pub struct Job {
     pub ran: bool,
     /// Lines for the agent's stdin while the turn runs (Claude's answers to its permission requests); None closes it.
     input: Option<Sender<Option<String>>>,
+    /// The owner's lines sent to the running turn (`Session::steer`), and the gate they pass with the reader.
+    pub steered: Vec<String>,
+    gate: Arc<Mutex<Gate>>,
+    /// Codex: the thread and the running turn, which a line for it names.
+    codex_turn: Option<(String, String)>,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
 }
@@ -414,6 +429,15 @@ impl Job {
         }
         self.fresh.push(said);
     }
+}
+
+/// How many of the owner's lines went to a running turn, and whether its stdin has closed: the sender and the reader
+/// take the same lock, so a line is either written before the close (and the reader waits until the agent has taken
+/// it in) or refused, to go as the next turn. None is lost.
+#[derive(Default)]
+struct Gate {
+    sent: usize,
+    closed: bool,
 }
 
 /// Something a job adds to the conversation.
@@ -471,6 +495,8 @@ pub struct Session {
     pub handoff_at: u64,
     /// /separate: each agent keeps a conversation of its own, and they can take turns here at the same time.
     pub separate: bool,
+    /// The owner's lines a turn ended before taking in (`steer`), for the shell to send next.
+    pub returned: Vec<(Agent, String)>,
     /// The first job of the conversation (/clear starts a new one).
     start: usize,
     /// The running total each resumable conversation last reported, by agent and conversation id.
@@ -774,7 +800,7 @@ impl Session {
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
-                     context: HashMap::new(), handoff_at: HANDOFF_AT, separate: false, start: 1,
+                     context: HashMap::new(), handoff_at: HANDOFF_AT, separate: false, returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
     }
@@ -805,6 +831,38 @@ impl Session {
     /// continues its agent's conversation.
     pub fn busy(&self) -> Option<usize> {
         self.jobs.iter().rev().find(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })).map(|j| j.id)
+    }
+
+    /// Sends the owner's `text` into job `id`, a turn of Claude's or Codex's still running, as Claude Code and Codex
+    /// take a message typed while they work: it reads it at its next step. False when the turn cannot take it (agy,
+    /// a /compact, a Codex turn not yet started, or one whose input has closed); the line then waits for the next turn.
+    pub fn steer(&mut self, id: usize, text: &str) -> bool {
+        let Some(job) = self.jobs.get_mut(id.wrapping_sub(1)) else { return false };
+        let Kind::Agent { agent, .. } = job.kind else { return false };
+        if !job.running() || job.title_full.trim() == "/compact" {
+            return false;
+        }
+        let line = match agent.spec().adapter {
+            Adapter::Claude => serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}),
+            Adapter::Codex => match &job.codex_turn {
+                Some((thread, turn)) => serde_json::json!({"id": parse::STEER_ID + job.steered.len() as u64,
+                    "method": "turn/steer", "params": {"threadId": thread, "expectedTurnId": turn,
+                                                       "input": [{"type": "text", "text": text}]}}),
+                None => return false,
+            },
+            _ => return false,
+        };
+        let Some(input) = &job.input else { return false };
+        let mut gate = job.gate.lock().unwrap_or_else(|e| e.into_inner());
+        if gate.closed || input.send(Some(format!("{line}\n"))).is_err() {
+            return false;
+        }
+        gate.sent += 1;
+        drop(gate);
+        job.steered.push(text.to_string());
+        // the owner's words, for Ringo's record of the conversation
+        job.title_full = format!("{}\n\nthen, while it worked: {text}", job.title_full.trim_end());
+        true
     }
 
     /// The turn here that `agent` has to wait for: any, or in /separate only its own.
@@ -1071,7 +1129,8 @@ impl Session {
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
-                             cancel: Arc::new(AtomicBool::new(false)) });
+                             cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
+                             codex_turn: None });
         Ok(id)
     }
 
@@ -1141,6 +1200,14 @@ impl Session {
                 self.jobs[id - 1].push_log(note);
             }
         }
+        // the connectors load as below: Claude's outside read mode, Codex's in every mode
+        if prompt.trim() != "/compact" && names_connector(prompt) {
+            sent.push_str(match spec.adapter {
+                Adapter::Claude if self.mode != Mode::Read => CLAUDE_CONNECTOR_NOTE,
+                Adapter::Codex => CODEX_CONNECTOR_NOTE,
+                _ => "",
+            });
+        }
         let sandbox = if edits { "workspace-write" } else { "read-only" };
         // `sent` is what the agent gets; the owner's message (`prompt`) stays the job's title, prompt.txt and what
         // decides the turn's settings
@@ -1202,10 +1269,12 @@ impl Session {
             }
             Adapter::Claude => {
                 // The prompt goes in on stdin as one stream-json message, and stdin stays open until the result: a
-                // permission request comes out as a control_request and Ringo writes the owner's answer back.
-                // The reply streams as it is written (--include-partial-messages); it changes no tokens.
+                // permission request comes out as a control_request and Ringo writes the owner's answer back, and a
+                // line the owner sends while it works goes in as another message (`steer`), echoed back when Claude
+                // takes it in (--replay-user-messages), so stdin closes only after it is answered.
+                // The reply streams as it is written (--include-partial-messages); neither changes any tokens.
                 cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                          "--include-partial-messages"]);
+                          "--include-partial-messages", "--replay-user-messages"]);
                 if self.mode != Mode::Read && names_connector(prompt) {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
@@ -1540,6 +1609,7 @@ impl Session {
             });
         }
         let (tx, cancel, pid) = (self.tx.clone(), self.jobs[id - 1].cancel.clone(), child.id());
+        let gate = self.jobs[id - 1].gate.clone();
         let stdout = child.stdout.take();
         thread::spawn(move || {
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
@@ -1560,8 +1630,14 @@ impl Session {
                         let _ = pipe.send(Some(format!("{line}\n")));
                     }
                 }
-                if parser.completed() && let Some(close) = closer.take() {
-                    let _ = close.send(None); // the result is in: nothing more will be asked, so the agent may exit
+                if parser.completed() && closer.is_some() {
+                    // the result is in and every line of the owner's taken: nothing more will be asked, so the agent
+                    // may exit
+                    let mut gate = gate.lock().unwrap_or_else(|e| e.into_inner());
+                    if parser.settled(gate.sent) && let Some(close) = closer.take() {
+                        gate.closed = true;
+                        let _ = close.send(None);
+                    }
                 }
             };
             if let Some(out) = stdout {
@@ -1592,6 +1668,7 @@ impl Session {
                     thread::sleep(Duration::from_millis(50));
                 }
             }
+            gate.lock().unwrap_or_else(|e| e.into_inner()).closed = true; // its output ended: a line now goes next
             for note in parser.leftover() {
                 let _ = tx.send(Event::Note(id, note));
             }
@@ -1809,6 +1886,16 @@ impl Session {
                             job.touched.insert(rel.to_string_lossy().into_owned());
                         }
                         Note::Ran => job.ran = true,
+                        Note::Turn { thread, turn } => job.codex_turn = Some((thread, turn)),
+                        Note::Refused(n) => {
+                            if let (Some(text), Kind::Agent { agent, .. }) = (job.steered.get(n).cloned(), job.kind.clone()) {
+                                // it is the next turn's message, not this one's
+                                job.title_full = job.title_full.replacen(&format!("\n\nthen, while it worked: {text}"), "", 1);
+                                job.push_log(format!("{} had finished before your line reached it, so it goes next: {}",
+                                                     agent.name(), parse::short(&text, 60)));
+                                self.returned.push((agent, text));
+                            }
+                        }
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
                         Note::Limits(info) => self.claude_limits = Some(info),
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above
