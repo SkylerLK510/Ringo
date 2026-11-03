@@ -190,6 +190,7 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a copy's change, apply it to your files (uncommitted, onto what is there now), remove the copy |
 | `/restart` | start the installed Ringo in this terminal, the conversations going on (applies an update; see Ringo's own updates) |
+| `/update`, `/update approve` | update the agents found out of date; when a release runs the pipelines, check this Ringo's against it offline, then move them on your approval (see The pipelines' release) |
 | `/show N`, `/kill N`, `/copy`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's log (its last 2,000 lines; the whole stream is in its folder), stop it with everything it started, copy the last answer, set the backend for `/ask` and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. In a git project each turn's change can be undone,
@@ -355,7 +356,27 @@ Ringo leaves some builds for you to update yourself:
 - one run with `RINGO_HOME` set.
 
 `RINGO_NO_UPDATE_CHECK=1` turns the check off. Updating needs git and cargo (a `cargo install` needed them already).
-No model call is made, and the release gate still decides what the pipelines run.
+No model call is made, and the release gate still decides what the pipelines run (next section).
+
+### The pipelines' release
+
+Once a release is active ([RELEASES.md](RELEASES.md)), `/review`, `/design`, `/research`, `/work` and plain lines
+run that release, not the files of the Ringo you are using. An update to Ringo leaves the pipelines where they were.
+When the shell opens and the active release is behind this Ringo, it says so. `/update` then checks the new one in
+the background:
+1. It stages this Ringo as a release (`release update`). Staging activates nothing.
+2. It runs the offline speed check against the active release (`bench_latency.py`, `active-fixture` mode, 100
+   pairs of each workload). The backends are simulated, so no model is called. It takes about 3 minutes.
+3. It shows the result, for example `0 slower, 3 negligible, 6 uncertain; averages moved -1.5% to +0.9%`.
+
+`/update approve` activates the new release, recording you as the approver. It also records, as your reason for
+accepting any uncertain workload, the result the shell showed you. A slower release is never offered, and
+activation refuses it in any case. The next pipeline run uses the new release; one already running keeps its own.
+The release before stays available: the shell prints the `ringo release rollback` command that goes back to it.
+
+Only `suite.json` and the raw `execution.jsonl` are kept, in `checks/NEW-ACTIVE/` in Ringo's state folder. Asking
+again, or after a restart, reuses them instead of measuring again. The per-run output (about 28 MB) is removed.
+With no release active, the pipelines run this Ringo's own files, and `/update` says nothing about them.
 
 ### Agent updates
 

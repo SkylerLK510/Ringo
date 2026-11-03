@@ -88,6 +88,52 @@ print('No defects found.')
         self.assertFalse((self.state / 'active.json').exists())
         self.assertEqual((self.bundle / 'ringo.py').stat().st_mode & 0o222, 0)  # Windows: the read-only attribute
 
+    def test_update_measures_a_changed_checkout_once_and_leaves_activation_to_the_owner(self):
+        measured = []
+
+        def measure(out, active, root):  # stands in for bench_latency's three minutes
+            measured.append(active)
+            out.mkdir()
+            suite = self.report(rel.stage(self.source, root), baseline=active)
+            (out / 'suite.json').write_text(json.dumps(suite))
+            (out / 'execution.jsonl').write_text('{}\n')
+            (out / 'review-0-candidate.stderr').write_text('per-run output, not kept')
+
+        update = lambda **kw: rel.update(self.state, self.source, measure=measure, **kw)
+        self.assertEqual(update(), {'active': None, 'behind': False})  # no release: nothing to move
+        self.activate()
+        self.assertEqual(update(), {'active': self.rid, 'behind': False})
+        p = self.source / 'prompts/review.md'
+        p.write_text(p.read_text() + '\nUpdated test release.\n')
+        bundles = sorted((self.state / 'bundles').iterdir())
+        (self.state / 'checks/.check-killed/run').mkdir(parents=True)  # a check the shell quit in the middle of
+        (self.state / 'checks/.check-killed/run/out.txt').write_text('x')
+        for path in ('run/out.txt', 'run', ''):
+            (self.state / 'checks/.check-killed' / path).chmod(0o555)
+        os.utime(self.state / 'checks/.check-killed', (time.time() - 7200,) * 2)
+        (self.state / 'checks/.check-running').mkdir()  # another shell's, under way
+        self.assertEqual(update(check=True), {'active': self.rid, 'behind': True})
+        self.assertEqual(sorted((self.state / 'bundles').iterdir()), bundles)  # a check stages nothing
+        result = update()
+        self.assertEqual(measured, [self.rid])
+        self.assertEqual((result['slower'], result['negligible'], result['uncertain']), (0, len(rel.LATENCY_WORKLOADS), 0))
+        self.assertIn('no model calls: 0 slower', result['reason'])
+        kept = Path(result['suite']).parent
+        self.assertEqual(sorted(p.name for p in kept.iterdir()), ['execution.jsonl', 'suite.json'])
+        self.assertEqual(sorted((self.state / 'checks').iterdir()), [self.state / 'checks/.check-running', kept])
+        self.assertEqual(update(), result)  # asked again: the kept suite, not a second measurement
+        self.assertEqual(measured, [self.rid])
+        self.assertEqual(rel.pointer(self.state)['active']['release'], self.rid)  # never activated by itself
+        rel.activate(self.state, result['release'], rel.read_json(result['suite']), 'unit-test-human', self.rid)
+        self.assertEqual(update(), {'active': result['release'], 'behind': False})
+        p.write_text(p.read_text() + 'Again.\n')
+        forged = self.state / 'checks' / f"{rel.stage(self.source, self.state)}-{result['release']}"
+        forged.mkdir()
+        (forged / 'suite.json').write_text(json.dumps(self.report(self.rid)))  # it measured another release
+        with self.assertRaisesRegex(ValueError, 'measured other releases'):
+            update()
+        self.assertEqual(measured, [self.rid])
+
     @unittest.skipIf(os.name == 'nt', POSIX_MODES)
     def test_release_state_is_private(self):
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
