@@ -103,6 +103,11 @@ print('No defects found.')
         self.assertEqual(update(), {'active': None, 'behind': False})  # no release: nothing to move
         self.activate()
         self.assertEqual(update(), {'active': self.rid, 'behind': False})
+        gone = self.source / 'prompts/check.md'
+        text = gone.read_text()
+        gone.unlink()  # a file removed is a change too
+        self.assertEqual(update(check=True), {'active': self.rid, 'behind': True})
+        gone.write_text(text)
         p = self.source / 'prompts/review.md'
         p.write_text(p.read_text() + '\nUpdated test release.\n')
         bundles = sorted((self.state / 'bundles').iterdir())
@@ -133,6 +138,12 @@ print('No defects found.')
         with self.assertRaisesRegex(ValueError, 'measured other releases'):
             update()
         self.assertEqual(measured, [self.rid])
+        p.write_text(p.read_text() + 'Changed while it ran.\n')
+        moved = lambda out, active, root: (p.write_text(p.read_text() + 'More.\n'), measure(out, active, root))
+        with self.assertRaisesRegex(ValueError, 'measured other releases'):
+            rel.update(self.state, self.source, measure=moved)
+        self.assertFalse([c for c in (self.state / 'checks').iterdir() if not c.name.startswith('.')
+                          and c.name not in (kept.name, forged.name)])  # nothing was kept for it
 
     @unittest.skipIf(os.name == 'nt', POSIX_MODES)
     def test_release_state_is_private(self):

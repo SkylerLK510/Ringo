@@ -1697,16 +1697,22 @@ impl App {
 
     /// `/update`'s other half: when a release runs the pipelines, this Ringo's own is checked against it in the
     /// background.
+    /// A speed check times processes, so it starts only with no job running and holds new ones until it ends.
     fn check_pipelines(&mut self) -> Option<String> {
-        if self.releasing.is_some() {
-            return Some("  the pipelines' release is still being checked".into());
-        }
         if !crate::updates::releases_on() {
             return None;
         }
+        if self.releasing.is_some() {
+            return Some("  the pipelines' release is still being checked; it reports here when done".into());
+        }
+        if self.s.hold.is_some() || self.s.running() > 0 || self.checking.is_some() {
+            return Some("  the pipelines' speed check waits until no job runs, so it does not share the machine \
+                         with one: /update then".into());
+        }
+        self.s.hold = Some(CHECKING.into());
         self.releasing = Some(std::thread::spawn(|| crate::updates::check_release(true)));
-        Some("  checking the pipelines' release against this Ringo: a speed check with no model calls, up to \
-              3 minutes".into())
+        Some("  checking the pipelines' release against this Ringo: an offline speed check, no model calls, up to \
+              3 minutes; jobs wait until it finishes".into())
     }
 
     /// The pipelines' check or approval, once it has answered.
@@ -1715,6 +1721,9 @@ impl App {
             return false;
         }
         let (line, ready) = self.releasing.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        if self.s.hold.as_deref() == Some(CHECKING) {
+            self.s.hold = None;
+        }
         if !line.is_empty() {
             self.say(line);
         }
@@ -1950,8 +1959,10 @@ impl App {
                     None => Some(format!("  no theme {name}: {}", crate::theme::NAMES.join(", "))),
                 }
             }
+            Cmd::Update(None) if self.releasing.is_some() => {
+                Some("  the pipelines' release is still being checked; it reports here when done".into())
+            }
             Cmd::Update(None) => {
-                let pipelines = self.check_pipelines();
                 let agents = match &self.pending {
                     _ if self.s.hold.is_some() => {
                         self.s.hold.as_ref().map(|why| format!("  {why}; it reports here when done"))
@@ -1966,6 +1977,8 @@ impl App {
                         None
                     }
                 };
+                // after an agents' update the loop starts it, so the two do not share the machine
+                let pipelines = if self.update { None } else { self.check_pipelines() };
                 [agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
             }
             Cmd::Approve if self.releasing.is_some() => Some("  the pipelines' release is still being checked".into()),
@@ -2769,6 +2782,9 @@ impl App {
     }
 }
 
+/// What holds new jobs while the pipelines' speed check runs (see App::check_pipelines).
+const CHECKING: &str = "the pipelines' speed check is running";
+
 /// The shell. `resume`: what the shell before a /restart handed on (its conversations and where its text is).
 pub fn run(resume: Option<PathBuf>) -> ExitCode {
     let exe = std::env::current_exe().map(|e| std::fs::canonicalize(&e).unwrap_or(e)).unwrap_or_default();
@@ -2952,6 +2968,9 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
             app.pending = Some(left);
             app.update = false;
             dirty = true;
+            if let Some(line) = app.check_pipelines() {
+                app.say(line);
+            }
         }
         if let Ok(news) = update_news.try_recv() {
             updating = false;

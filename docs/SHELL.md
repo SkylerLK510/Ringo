@@ -367,6 +367,8 @@ the background:
 1. It stages this Ringo as a release (`release update`). Staging activates nothing.
 2. It runs the offline speed check against the active release (`bench_latency.py`, `active-fixture` mode, 100
    pairs of each workload). The backends are simulated, so no model is called. It takes about 3 minutes.
+   It times processes, so it starts only when no job runs (and after an agents' update), and new jobs wait
+   until it ends. Plain lines queue as usual.
 3. It shows the result, for example `0 slower, 3 negligible, 6 uncertain; averages moved -1.5% to +0.9%`.
 
 `/update approve` activates the new release, recording you as the approver. It also records, as your reason for

@@ -459,9 +459,18 @@ def update(root, source=HERE, check=False, measure=bench):
         return {'active': None, 'behind': False}  # no release: the pipelines run this checkout itself
     active = state['active']['release']
     _, manifest = verify(root, active)
-    result = {'active': active, 'behind': not inventory(source).items() <= manifest['files'].items()}
+    # the bundle's own copies of the sources (a candidate-plan release, with its rewritten plan, always differs)
+    staged = {k: v for k, v in manifest['files'].items() if not k.startswith('__pycache__/') and k not in NATIVE.values()}
+    result = {'active': active, 'behind': inventory(source) != staged}
     if check or not result['behind']:
         return result
+
+    def measured(suite):
+        reports = suite['reports']
+        if {r['measurement']['candidate'] for r in reports} != {rid} \
+                or {r['measurement']['baseline'] for r in reports} != {active}:
+            raise ValueError('the speed check measured other releases')
+        return reports
     import backends
     rid = stage(source, root)
     kept = root / 'checks' / f'{rid}-{active}'
@@ -476,15 +485,13 @@ def update(root, source=HERE, check=False, measure=bench):
         with backends.private_tempdir(prefix='.check-', dir=root / 'checks') as folder:
             run, keep = Path(folder) / 'run', Path(folder) / 'keep'
             measure(run, active, root)
+            measured(read_json(run / 'suite.json'))  # the checkout changed while it ran: nothing is kept
             keep.mkdir(mode=0o700)
             for name in ('suite.json', 'execution.jsonl'):  # the rest is ~28 MB of per-run output
                 os.replace(run / name, keep / name)
             with contextlib.suppress(OSError):  # another shell kept the same check first
                 os.rename(keep, kept)
-    reports = read_json(kept / 'suite.json')['reports']
-    if {r['measurement']['candidate'] for r in reports} != {rid} \
-            or {r['measurement']['baseline'] for r in reports} != {active}:
-        raise ValueError('the kept speed check measured other releases')
+    reports = measured(read_json(kept / 'suite.json'))
     counts = {s: sum(r['status'] == s for r in reports) for s in ('slower', 'negligible', 'uncertain')}
     means = [r['metrics']['mean_relative']['estimate'] for r in reports]
     reason = (f"offline speed check of {len(reports)} workloads, no model calls: {counts['slower']} slower, "
