@@ -1145,6 +1145,33 @@ fn said(s: &mut Session, who: &str, text: &str) -> usize {
 }
 
 #[test]
+fn a_restart_drops_nothing_from_the_shared_conversation() {
+    let r = repo("restart");
+    let (codex, claude) = (fake(&root(), "codex-restart", &codex_ok()), fake(&root(), "claude-restart", CLAUDE_TALKS));
+    let open = || {
+        let mut s = session(&r, agent("claude"), &claude);
+        s.programs.insert(agent("codex"), codex.clone());
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let mut s = open();
+    said(&mut s, "claude", "fix it");
+    said(&mut s, "codex", "take it from here");
+    // /restart: the next shell gets each conversation and what each agent had yet to hear, as this one would tell it
+    let (threads, told) = (s.threads(), s.carry());
+    let mut next = open();
+    next.resume(&threads, &told);
+    said(&mut next, "claude", "and now");
+    let (heard, resumed) = claude_heard(&claude);
+    assert!(resumed && heard.starts_with("Before Ringo restarted, other turns were taken"), "{heard}");
+    assert!(heard.contains("#2 · the owner to codex: take it from here\ncodex: all done\n") && !heard.contains("#1 ·"),
+            "only what it had not heard: {heard}");
+    assert!(heard.ends_with("The owner's new message:\nand now"), "{heard}");
+    said(&mut next, "claude", "again");
+    assert_eq!(claude_heard(&claude), ("again".into(), true), "told once");
+}
+
+#[test]
 fn agents_share_one_conversation_and_a_long_one_starts_fresh_from_ringos_record() {
     let r = repo("handoff");
     let (codex, claude) = (fake(&root(), "codex-handoff", &codex_ok()), fake(&root(), "claude-handoff", CLAUDE_TALKS));

@@ -337,17 +337,19 @@ Ringo updates itself the way Claude Code does. When the shell opens, and then on
 newest `main` in the background: one `git fetch` into Ringo's own copy of the history in its state folder
 (`install/repo.git`). It never uses your checkout for this. If there is a newer version, Ringo builds it at low
 priority into a folder of its own (`install/COMMIT`, with its prompts and pipelines). All versions share one build
-folder, so only Ringo itself compiles again. Ringo then puts the new binary where the running `ringo` is and says
-`Ringo updated to 1a2b3c4 (2 new changes) · /restart to apply`. The hint by the input box says the same until you
-restart. A `ringo` started from then on is the new version.
+folder, and only one builds at a time, so only Ringo itself compiles again. The shell then says
+`Ringo updated to 1a2b3c4 (2 new changes) · /restart to apply`, and the hint by the input box says `update ready`.
 
-The shell that is open keeps its own version's files, so a pipeline it starts never mixes the two versions.
-`/restart` (once no job runs) starts the new version in the same terminal. The Claude and Codex conversations go
-on, and what the screen showed comes back as plain text. The three newest versions are kept, because another open
-shell may still run one, and older ones are removed. Build output is in `install/build.log`.
+The update is put where the running `ringo` is when the shell ends or restarts. Until then the open shell, and the
+pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
+terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on. On its first turn,
+each agent is told the turns it had not heard yet, exactly as it would have been without the restart, so the shared
+conversation loses nothing and gains no extra tokens. Ringo keeps the three newest versions and any version an open
+shell used in the last three days, and removes the rest. Build output is in `install/build.log`.
 
 Ringo leaves some builds for you to update yourself:
-- one built outside git, or from a checkout with uncommitted changes;
+- one built outside git, or with uncommitted changes to what goes into the binary (`ringo --version` then shows no
+  commit);
 - one whose checkout has moved on since it was built;
 - one from a commit that is not on `main`;
 - one run with `RINGO_HOME` set.

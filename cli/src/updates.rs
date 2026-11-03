@@ -266,23 +266,33 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// Ringo's own update, in the background: the newest `main` from where this binary came, built in a folder of its
-/// own (`install/COMMIT` in Ringo's state, its prompts and pipelines with it) and put where this binary is, so the
-/// next `ringo` and `/restart` run it. An open shell keeps its own version's files until it restarts. Only a binary
-/// built from a clean checkout of a commit on `main` updates: one with changes of its own, from a branch ahead of
-/// main, or run with RINGO_HOME is the owner's to update. The line to show, or None when there is nothing to say.
-pub fn update_ringo(exe: &Path) -> Option<String> {
+/// own (`install/COMMIT` in Ringo's state, its prompts and pipelines with it). Only a binary built from a clean
+/// checkout of a commit on `main` updates: one with changes of its own, from a branch ahead of main, or run with
+/// RINGO_HOME is the owner's to update. The line to show and the built binary, which `install` puts where this one
+/// is when the shell ends or restarts (an open shell keeps its own version until then); None: nothing to say.
+pub fn update_ringo(exe: &Path) -> Option<(String, PathBuf)> {
+    let (home, install) = (ringo_cli::ringo_home(), ringo_cli::state_root().join("install"));
+    if home.starts_with(&install) {
+        let _ = fs::write(home.join(".used"), ""); // this version is open: pruning leaves it (see prune)
+    }
     if std::env::var_os("RINGO_NO_UPDATE_CHECK").is_some() || std::env::var_os("RINGO_HOME").is_some()
         || exe.as_os_str().is_empty() {
         return None;
     }
     if cfg!(windows) {
-        let _ = fs::remove_file(exe.with_extension("old")); // the one the last update moved aside
+        let _ = fs::remove_file(exe.with_extension("old")); // the one the last install moved aside
     }
-    update_from(ringo_cli::COMMIT, &ringo_cli::ringo_home(), &ringo_cli::state_root().join("install"), exe,
-                OsStr::new("cargo"))
+    update_from(ringo_cli::COMMIT, &home, &install, OsStr::new("cargo"))
 }
 
-fn update_from(commit: &str, home: &Path, install: &Path, exe: &Path, cargo: &OsStr) -> Option<String> {
+/// The binary a shell's pipelines run: its version's own copy when the updater built it (never replaced), so they
+/// stay its version after an update is installed; else the installed one.
+pub fn own_binary(exe: &Path) -> PathBuf {
+    let own = ringo_cli::ringo_home().join(exe.file_name().unwrap_or_default());
+    if ringo_cli::ringo_home().starts_with(ringo_cli::state_root().join("install")) && own.is_file() { own } else { exe.to_path_buf() }
+}
+
+fn update_from(commit: &str, home: &Path, install: &Path, cargo: &OsStr) -> Option<(String, PathBuf)> {
     if commit.is_empty() || git(home, &["rev-parse", "HEAD"])? != commit
         || !git(home, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
         return None;
@@ -313,9 +323,9 @@ fn update_from(commit: &str, home: &Path, install: &Path, exe: &Path, cargo: &Os
     let dir = install.join(&new);
     let bin = dir.join(if cfg!(windows) { "ringo.exe" } else { "ringo" });
     if !bin.is_file() {
-        // one shell builds a version; another one that finds it building leaves it be (a lock older than the
-        // build's limit is from a shell that ended mid-build)
-        let lock = install.join(format!("{new}.lock"));
+        // One build at a time, every version's: they share one build folder. A shell that finds one under way leaves
+        // it be (a lock older than the build's limit is from a shell that ended mid-build).
+        let lock = install.join("build.lock");
         if fs::create_dir(&lock).is_err() {
             let age = fs::metadata(&lock).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
             if age.is_none_or(|a| a < BUILD_LIMIT) {
@@ -327,17 +337,12 @@ fn update_from(commit: &str, home: &Path, install: &Path, exe: &Path, cargo: &Os
         let built = build(&repo, &new, &dir, &bin, install, cargo);
         let _ = fs::remove_dir(&lock);
         if let Err(why) = built {
-            return Some(format!("  Ringo {short} is out, but it did not build: {why}"));
+            return Some((format!("  Ringo {short} is out, but it did not build: {why}"), PathBuf::new()));
         }
-    }
-    if fs::read(exe).ok() != fs::read(&bin).ok()
-        && let Err(e) = replace(exe, &bin) {
-        return Some(format!("  Ringo {short} is built ({}), but {} could not be replaced: {e}", bin.display(),
-                            exe.display()));
     }
     prune(&repo, install);
     let s = if changes == "1" { "" } else { "s" };
-    Some(format!("  Ringo updated to {short} ({changes} new change{s}) · /restart to apply"))
+    Some((format!("  Ringo updated to {short} ({changes} new change{s}) · /restart to apply"), bin))
 }
 
 const BUILD_LIMIT: Duration = Duration::from_secs(1800);
@@ -367,32 +372,42 @@ fn build(repo: &Path, new: &str, dir: &Path, bin: &Path, install: &Path, cargo: 
     fs::copy(&out, bin).map(|_| ()).map_err(|e| format!("{}: {e}", out.display()))
 }
 
-/// Puts `new` where `exe` is, renamed into place whole, so a `ringo` starting meanwhile runs one or the other.
-/// Windows cannot write over a running program but can rename it, so the old one moves aside first.
-fn replace(exe: &Path, new: &Path) -> std::io::Result<()> {
+/// Puts the built `new` where `exe` is (nothing to do when it is there already), renamed into place whole, so a
+/// `ringo` starting meanwhile runs one or the other. Windows cannot write over a running program but can rename it,
+/// so the old one moves aside first.
+pub fn install(exe: &Path, new: &Path) -> Result<(), String> {
+    if fs::read(exe).ok() == fs::read(new).ok() {
+        return Ok(());
+    }
+    let say = |e: std::io::Error| format!("{} could not be replaced ({e}); {} is the new one", exe.display(), new.display());
     let tmp = exe.with_extension(format!("new{}", std::process::id()));
-    fs::copy(new, &tmp)?; // the permissions come with it
+    fs::copy(new, &tmp).map_err(say)?; // the permissions come with it
     let old = exe.with_extension("old");
     if cfg!(windows) {
         let _ = fs::remove_file(&old);
-        fs::rename(exe, &old)?;
+        fs::rename(exe, &old).map_err(say)?;
     }
-    fs::rename(&tmp, exe).inspect_err(|_| {
+    fs::rename(&tmp, exe).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         if cfg!(windows) {
             let _ = fs::rename(&old, exe);
         }
+        say(e)
     })
 }
 
-/// Keeps the three newest versions (an open shell may still run one of them) and removes the rest.
+/// Removes versions past the three newest that no open shell has used for three days: each open shell marks its own
+/// (`.used`) when it opens and at every hourly check.
 fn prune(repo: &Path, install: &Path) {
+    let age = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
     let mut versions: Vec<(SystemTime, PathBuf)> = fs::read_dir(install).into_iter().flatten().flatten()
         .filter(|e| e.file_name().len() >= 40 && e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_hexdigit()))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
     versions.sort_by_key(|v| std::cmp::Reverse(v.0));
     for (_, dir) in versions.into_iter().skip(3) {
-        let _ = git(repo, &["worktree", "remove", "--force", &dir.to_string_lossy()]);
+        if age(&dir.join(".used")).is_none_or(|a| a > Duration::from_secs(3 * DAY_S)) {
+            let _ = git(repo, &["worktree", "remove", "--force", &dir.to_string_lossy()]);
+        }
     }
 }
 
@@ -430,23 +445,33 @@ mod tests {
         fs::write(&cargo, format!("#!/bin/sh\necho x >> '{}/builds'\nmkdir -p \"$CARGO_TARGET_DIR/release\"\n\
             printf 'new %s %s' \"$RINGO_COMMIT\" \"$RINGO_BUILD_HOME\" > \"$CARGO_TARGET_DIR/release/ringo\"\n", dir.display())).unwrap();
         fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-        let update = |commit: &str| update_from(commit, &home, &install, &exe, cargo.as_os_str());
+        let update = |commit: &str| update_from(commit, &home, &install, cargo.as_os_str());
         let builds = || fs::read_to_string(dir.join("builds")).map(|t| t.lines().count()).unwrap_or(0);
 
         let said = format!("  Ringo updated to {} (1 new change) · /restart to apply", &b[..7]);
-        assert_eq!(update(&a).as_deref(), Some(said.as_str()));
-        assert_eq!(fs::read_to_string(&exe).unwrap(), format!("new {b} {}", install.join(&b).display()),
-                   "the new binary is where this one was, and its prompts are its own version's");
+        let (line, bin) = update(&a).unwrap();
+        assert_eq!(line, said);
+        assert_eq!(fs::read_to_string(&bin).unwrap(), format!("new {b} {}", install.join(&b).display()),
+                   "the version's own binary, whose prompts are its own version's");
         assert_eq!(fs::read_to_string(install.join(&b).join("a.txt")).unwrap(), "two");
-        assert_eq!(update(&a).as_deref(), Some(said.as_str()), "said again (the shell shows a line once)");
+        assert_eq!(fs::read_to_string(&exe).unwrap(), "old", "an open shell keeps its version until it ends");
+        assert_eq!(update(&a), Some((said, bin.clone())), "said again (the shell shows a line once)");
         assert_eq!(builds(), 1, "a version is built once");
+        super::install(&exe, &bin).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), fs::read(&bin).unwrap(), "in place when the shell ends");
         assert_eq!(update(&b), None, "up to date");
         assert_eq!(fs::read_to_string(home.join("a.txt")).unwrap(), "one", "the owner's checkout is never written");
 
+        fs::create_dir(install.join("build.lock")).unwrap();
+        let c = commit(&origin, "three");
+        assert_eq!(update(&a), None, "another shell is building: this one leaves it be");
+        fs::remove_dir(install.join("build.lock")).unwrap();
+        assert!(update(&a).is_some_and(|(l, _)| l.contains(&c[..7]) && l.contains("2 new changes")));
+
         fs::write(home.join("a.txt"), "mine").unwrap();
         assert_eq!(update(&a), None, "a checkout with changes of its own is the owner's to update");
-        let c = commit(&home, "mine");
-        assert_eq!(update(&c), None, "a build ahead of main is the owner's too");
+        let d = commit(&home, "mine");
+        assert_eq!(update(&d), None, "a build ahead of main is the owner's too");
         assert_eq!(update(&a), None, "and one whose checkout moved on since it was built");
         let _ = fs::remove_dir_all(&dir);
     }

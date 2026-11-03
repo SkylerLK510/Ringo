@@ -1099,8 +1099,9 @@ struct App {
     quit: bool,
     /// `/restart` asked: when the loop ends, the installed `ringo` starts in this terminal.
     restart: bool,
-    /// What Ringo's own update said last (an update waiting for /restart).
+    /// What Ringo's own update said last, and the binary it built: put in place when the shell ends or restarts.
     updated: Option<String>,
+    staged: Option<PathBuf>,
     setup: bool,
     label: String,
     agents: Vec<Agent>,
@@ -1200,7 +1201,7 @@ impl App {
               fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
-              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, setup: false, label, agents, theme,
+              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), limits: Vec::new(),
               limits_at: None, spoke: false, checking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
@@ -2650,7 +2651,7 @@ impl App {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
                 _ if self.scroll > 0 => "scrolled up · PgDn goes back".into(),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
-                _ if self.updated.as_ref().is_some_and(|u| u.contains("/restart")) => "update installed · /restart".into(),
+                _ if self.staged.is_some() => "update ready · /restart".into(),
                 _ => "⇧⇥ mode · ? keys".into(),
             };
             let mut rows: Vec<Line> = if self.input.is_empty() {
@@ -2734,9 +2735,8 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let session = match Session::new(&cwd) {
         Ok(mut s) => {
-            if let Ok(me) = std::env::current_exe() {
-                s.pipeline = Some(vec![me.into()]); // this binary: native pipelines unless a release says otherwise
-            }
+            // this binary (native pipelines unless a release says otherwise), as its own version keeps it
+            s.pipeline = Some(vec![crate::updates::own_binary(&exe).into()]);
             s
         }
         Err(e) => {
@@ -2754,7 +2754,8 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     match resume.and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
         Some(before) => {
             let threads: Vec<(String, String)> = serde_json::from_value(before["threads"].clone()).unwrap_or_default();
-            app.s.resume_threads(&threads);
+            let told: Vec<(String, String)> = serde_json::from_value(before["told"].clone()).unwrap_or_default();
+            app.s.resume(&threads, &told);
             let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
             text.lines().for_each(|line| app.out.push(Out::text(line)));
             let commit = &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)];
@@ -2773,7 +2774,7 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     });
     // Ringo's own update: when the shell opens, then hourly, one at a time
     let (updated, update_news) = std::sync::mpsc::channel();
-    let update_ringo = |tx: std::sync::mpsc::Sender<Option<String>>, exe: PathBuf| {
+    let update_ringo = |tx: std::sync::mpsc::Sender<Option<(String, PathBuf)>>, exe: PathBuf| {
         std::thread::spawn(move || {
             let _ = tx.send(crate::updates::update_ringo(&exe));
         });
@@ -2902,11 +2903,12 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
             app.update = false;
             dirty = true;
         }
-        if let Ok(line) = update_news.try_recv() {
+        if let Ok(news) = update_news.try_recv() {
             updating = false;
-            if let Some(line) = line.filter(|l| app.updated.as_ref() != Some(l)) {
+            if let Some((line, bin)) = news.filter(|(l, _)| app.updated.as_ref() != Some(l)) {
                 app.say(&line);
                 app.updated = Some(line);
+                app.staged = Some(bin).filter(|b| b.is_file());
                 dirty = true;
             }
         }
@@ -2932,19 +2934,25 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     close(&mut terminal);
     app.s.shutdown();
     let saved = app.save();
+    // an update goes in place now that this shell is done with its version
+    let installed = app.staged.as_ref().map(|bin| crate::updates::install(&exe, bin));
+    if let Some(Err(e)) = &installed {
+        eprintln!("ringo: the update was not installed: {e}");
+    }
     if app.restart {
-        return restart(&exe, &app, saved);
+        let next = match (&installed, &app.staged) { (Some(Err(_)), Some(bin)) => bin.clone(), _ => exe.clone() };
+        return restart(&next, &app, saved);
     }
     let saved = saved.map_or(String::new(), |p| format!("; the conversation is saved in {}", p.display()));
     println!("ringo: {} tokens this session{saved}", fmt_tokens(app.s.tokens()));
     ExitCode::SUCCESS
 }
 
-/// The installed `ringo` takes this terminal over (the same process on Unix), handed the agents' conversations and
-/// this one's text, so an update applies without the conversation starting over.
+/// The installed `ringo` takes this terminal over (the same process on Unix), handed the agents' conversations, what
+/// each had yet to be told and this one's text, so an update applies without the conversation starting over.
 fn restart(exe: &Path, app: &App, saved: Option<PathBuf>) -> ExitCode {
     let handed = app.s.dir.join("restart.json");
-    let before = serde_json::json!({"threads": app.s.threads(), "conversation": saved});
+    let before = serde_json::json!({"threads": app.s.threads(), "told": app.s.carry(), "conversation": saved});
     if let Err(e) = std::fs::write(&handed, before.to_string()) {
         eprintln!("ringo: could not restart ({}: {e}); run ringo again", handed.display());
         return ExitCode::from(1);
