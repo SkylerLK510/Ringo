@@ -1088,7 +1088,9 @@ impl Session {
     /// one line each, its task and the files it has edited so far, so the new turn neither redoes nor undoes them.
     /// It hears how they ended at its next turn, as any turn it was away for.
     fn in_flight(&self, id: usize, agent: Agent) -> Option<String> {
-        let busy: Vec<String> = self.jobs.iter().filter(|j| !self.separate && j.id != id && j.running()).filter_map(|j| {
+        // a turn started in /separate is its agent's own, even after /together
+        let shared = |j: &&Job| !self.separate && j.id != id && j.running() && j.lane.is_none();
+        let busy: Vec<String> = self.jobs.iter().filter(shared).filter_map(|j| {
             let Kind::Agent { agent: other, write: false } = j.kind else { return None };
             let task: String = j.title_full.split_whitespace().collect::<Vec<_>>().join(" ");
             let task = match task.char_indices().nth(300) { Some((at, _)) => format!("{}…", &task[..at]), None => task };
@@ -1216,9 +1218,13 @@ impl Session {
         }
         kept.reverse();
         let mut whole: Vec<String> = turns.iter().map(|j| render(j, true, true)).collect();
-        // The change the turns made: from before the first to after the last, in their files only.
+        // The change the turns made: from before the first to after the one that ended last (agents work side by
+        // side, so that need not be the last in the list), in their files only.
+        // ceiling: a file one of these turns changed that a turn left out of them (its agent's own) changed too
+        // shows that turn's lines as well.
         let files: BTreeSet<&str> = turns.iter().flat_map(|j| j.changed.iter().map(String::as_str)).collect();
-        let (first, last) = (turns.iter().find_map(|j| j.before.as_deref()), turns.iter().rev().find_map(|j| j.after.as_deref()));
+        let first = turns.iter().find_map(|j| j.before.as_deref());
+        let last = turns.iter().filter(|j| j.after.is_some()).max_by_key(|j| j.started + j.age()).and_then(|j| j.after.as_deref());
         if let (Some(first), Some(last), false) = (first, last, files.is_empty()) {
             let mut args = vec!["diff", first, last, "--"];
             args.extend(&files);
@@ -1310,6 +1316,7 @@ impl Session {
         let mut cmd = Command::new(self.program(agent));
         let mut resume = if write { None } else { self.threads.get(&agent).cloned() };
         let mut sent = prompt.to_string();
+        let heard = self.heard.get(&agent).cloned(); // put back if the turn never starts (see the handoff)
         let connectors = prompt.trim() != "/compact"
             && (names_connector(prompt) || (!write && self.lane(agent, id).last().is_some_and(|j| j.reached)));
         if !write {
@@ -1560,7 +1567,14 @@ impl Session {
             Some(turn) => Parser::new(style).with_turn(turn),
             None => Parser::new(style),
         };
-        self.spawn(id, cmd, parser, input, None)?;
+        if let Err(e) = self.spawn(id, cmd, parser, input, None) {
+            // the agent never got this turn's handoff, so its next turn is told those turns again
+            match heard {
+                Some(heard) => self.heard.insert(agent, heard),
+                None => self.heard.remove(&agent),
+            };
+            return Err(e);
+        }
         Ok(id)
     }
 

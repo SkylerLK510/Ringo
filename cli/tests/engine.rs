@@ -1225,9 +1225,11 @@ fn agents_share_one_conversation_and_a_long_one_starts_fresh_from_ringos_record(
 
 #[test]
 fn together_agents_work_side_by_side_and_each_hears_every_turn_it_missed() {
+    // a slow turn edits again after its wait, once the quick one beside it has ended
+    const LATE: &str = r#"case "$turn" in *SLOW*) sleep 1; echo late > late.txt
+  echo "{\"method\":\"item/started\",\"params\":{\"threadId\":\"t-1\",\"item\":{\"type\":\"fileChange\",\"changes\":[{\"path\":\"$PWD/late.txt\"}]}}}" ;; esac"#;
     let r = repo("side");
-    let codex = fake(&root(), "codex-side", &codex_script(&format!("{CODEX_EDITS}\ncase \"$turn\" in *SLOW*) sleep 1 ;; esac"),
-                                                         &codex_done("all done", (10, 4, 2))));
+    let codex = fake(&root(), "codex-side", &codex_script(&format!("{CODEX_EDITS}\n{LATE}"), &codex_done("all done", (10, 4, 2))));
     let claude = fake(&root(), "claude-side", CLAUDE_TALKS);
     let mut s = session(&r, agent("claude"), &claude);
     s.programs.insert(agent("codex"), codex.clone());
@@ -1250,6 +1252,10 @@ fn together_agents_work_side_by_side_and_each_hears_every_turn_it_missed() {
     assert!(told.ends_with("The owner's new message:\nWRITE-O"), "{told}");
     assert!(s.job(quick).unwrap().log.iter().any(|l| l == "told claude which turns are still at work here"));
     assert_eq!(wait(&mut s, slow), Status::Done);
+    // an agent with no conversation yet hears the whole change up to the turn that ended last, which is not the last
+    // listed: Codex's late file came after Claude's quick turn ended
+    let agy_owed = s.carry().into_iter().find(|(a, _)| a == "agy").unwrap().1;
+    assert!(agy_owed.contains("+late") && agy_owed.contains("+o"), "{agy_owed}");
     // Codex goes on with its conversation and hears Claude's turn, which ended while it worked: its file is Claude's
     // own (Codex said it edited another and had run no command yet).
     said(&mut s, "codex", "next");
@@ -1270,6 +1276,34 @@ fn together_agents_work_side_by_side_and_each_hears_every_turn_it_missed() {
     let codex_owed = &carry.iter().find(|(a, _)| a == "codex").unwrap().1;
     assert!(codex_owed.starts_with(&format!("#{now} · the owner to claude: and now")) && !codex_owed.contains(&format!("#{quick} ·")),
             "{codex_owed}");
+    // a turn started in /separate stays its agent's own after /together: it is not named to the others
+    s.separate = true;
+    let alone = s.launch_agent(agent("codex"), false, "SLOW alone").unwrap();
+    s.separate = false;
+    said(&mut s, "claude", "meanwhile");
+    assert_eq!(claude_heard(&claude), ("meanwhile".into(), true), "nothing to tell, and no separate task named");
+    assert_eq!(wait(&mut s, alone), Status::Done);
+}
+
+#[test]
+fn a_turn_that_cannot_start_leaves_its_handoff_for_the_next() {
+    let r = repo("no-start");
+    let (codex, claude) = (fake(&root(), "codex-no-start", &codex_ok()), fake(&root(), "claude-no-start", CLAUDE_TALKS));
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    s.codex_home = root().join("codex-home-golden");
+    said(&mut s, "claude", "fix it");
+    let theirs = said(&mut s, "codex", "take it from here");
+    // Claude's program is there but cannot run: the turn does not start, so it was told nothing
+    let broken = root().join("claude-not-executable");
+    fs::write(&broken, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o644)).unwrap();
+    s.programs.insert(agent("claude"), broken);
+    assert!(s.launch_agent(agent("claude"), false, "and now").is_err());
+    s.programs.insert(agent("claude"), claude.clone());
+    said(&mut s, "claude", "and now");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.contains(&format!("#{theirs} · the owner to codex: take it from here")), "{told}");
 }
 
 #[test]
