@@ -6,8 +6,10 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
 import sys
+import time
 
 from latency import canonical, read_json, sha
 
@@ -439,6 +441,65 @@ def rollback(root, expected_current):
         return value
 
 
+def bench(out, active, root):
+    """bench_latency's offline suite for this checkout against the active release. In active-fixture mode both arms
+    go through this launcher, which is what either release runs through once it is selected."""
+    import bench_latency
+    with contextlib.redirect_stdout(sys.stderr):  # its progress lines; the result is the caller's stdout
+        bench_latency.run(None, out, baseline_release=active, baseline_state=root, execution='active-fixture')
+
+
+def update(root, source=HERE, check=False, measure=bench):
+    """The shell's `/update`. Says whether the active release was staged from other sources than `source`. If it
+    was, `source` is staged and measured against it offline with simulated backends, so no provider is called.
+    Nothing is activated: the owner decides that (`activate`, the shell's `/update approve`). The suite is kept
+    under checks/, so asking again, or after a restart, does not measure again."""
+    state = pointer(root)
+    if not state['active']:
+        return {'active': None, 'behind': False}  # no release: the pipelines run this checkout itself
+    active = state['active']['release']
+    _, manifest = verify(root, active)
+    # the bundle's own copies of the sources (a candidate-plan release, with its rewritten plan, always differs)
+    staged = {k: v for k, v in manifest['files'].items() if not k.startswith('__pycache__/') and k not in NATIVE.values()}
+    result = {'active': active, 'behind': inventory(source) != staged}
+    if check or not result['behind']:
+        return result
+
+    def measured(suite):
+        reports = suite['reports']
+        if {r['measurement']['candidate'] for r in reports} != {rid} \
+                or {r['measurement']['baseline'] for r in reports} != {active}:
+            raise ValueError('the speed check measured other releases')
+        return reports
+    import backends
+    rid = stage(source, root)
+    kept = root / 'checks' / f'{rid}-{active}'
+    if not (kept / 'suite.json').is_file():
+        backends.private_directory(root / 'checks', create=True, mode=0o700, exist_ok=True)
+        for stale in (root / 'checks').glob('.check-*'):  # a check killed midway (the shell quit); one takes minutes
+            if time.time() - stale.lstat().st_mtime > 3600 and not stale.is_symlink():
+                for path in [stale, *stale.rglob('*')]:
+                    if not path.is_symlink():
+                        path.chmod(0o700)  # its staged bundles are read-only
+                shutil.rmtree(stale, ignore_errors=True)
+        with backends.private_tempdir(prefix='.check-', dir=root / 'checks') as folder:
+            run, keep = Path(folder) / 'run', Path(folder) / 'keep'
+            measure(run, active, root)
+            measured(read_json(run / 'suite.json'))  # the checkout changed while it ran: nothing is kept
+            keep.mkdir(mode=0o700)
+            for name in ('suite.json', 'execution.jsonl'):  # the rest is ~28 MB of per-run output
+                os.replace(run / name, keep / name)
+            with contextlib.suppress(OSError):  # another shell kept the same check first
+                os.rename(keep, kept)
+    reports = measured(read_json(kept / 'suite.json'))
+    counts = {s: sum(r['status'] == s for r in reports) for s in ('slower', 'negligible', 'uncertain')}
+    means = [r['metrics']['mean_relative']['estimate'] for r in reports]
+    reason = (f"offline speed check of {len(reports)} workloads, no model calls: {counts['slower']} slower, "
+              f"{counts['negligible']} negligible, {counts['uncertain']} uncertain; averages moved "
+              f'{min(means):+.1%} to {max(means):+.1%}')
+    return {**result, 'release': rid, 'suite': str(kept / 'suite.json'), **counts, 'reason': reason}
+
+
 def dispatch(argv):
     """Called before application imports. Select once, then execute that bundle in-process."""
     if getattr(sys, '_ringo_release', None):
@@ -489,8 +550,8 @@ def execute(bundle, metadata, argv):
         return workflow.main(argv[1:])
     if argv[:1] == ['research']:  # Python only, also under a native bundle; a bundle staged before it has no research
         if not (bundle / 'research.py').is_file():
-            print('ringo: the active release predates research; stage a new release or roll back to run it',
-                  file=sys.stderr)
+            print('ringo: the active release predates research; /update in the shell moves the pipelines to this '
+                  'Ringo (or stage a new release, or roll back)', file=sys.stderr)
             return 2
         import research
         return research.main(argv[1:])
@@ -519,6 +580,9 @@ def main(argv=None):
     back = commands.add_parser('rollback')
     back.add_argument('--expected-current', required=True)
     commands.add_parser('status')
+    updating = commands.add_parser('update', help='stage this checkout and measure it offline against the active '
+                                                  'release; activating it stays a human decision')
+    updating.add_argument('--check', action='store_true', help='only say whether the active release is behind it')
     preview = commands.add_parser('preview', help='explicitly test an unapproved bundle; never activates it')
     preview.add_argument('--release', required=True)
     preview.add_argument('args', nargs=argparse.REMAINDER)
@@ -533,6 +597,8 @@ def main(argv=None):
                               args.expected_current, args.accept_uncertain)
         elif args.command == 'rollback':
             result = rollback(root, args.expected_current)
+        elif args.command == 'update':
+            result = update(root, check=args.check)
         elif args.command == 'preview':
             bundle, manifest = verify(root, args.release)
             rest = args.args[1:] if args.args[:1] == ['--'] else args.args

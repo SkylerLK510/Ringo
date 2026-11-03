@@ -411,9 +411,110 @@ fn prune(repo: &Path, install: &Path) {
     }
 }
 
+// The pipelines' release. Once a release is active, /review, /design, /research and /work run it rather than
+// this Ringo's own files (docs/RELEASES.md), so an update to Ringo leaves them where they were until the owner moves
+// them. `/update` stages this Ringo and measures it against that release; `/update approve` activates it.
+
+/// A release `/update` staged and measured, waiting for `/update approve`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Release {
+    pub id: String,
+    /// The release it replaces: activation refuses if another has taken its place since.
+    pub active: String,
+    pub suite: String,
+    /// What the speed check found, as the shell showed it.
+    pub reason: String,
+}
+
+/// Whether a release runs the pipelines (with none, they run this Ringo's own files).
+pub fn releases_on() -> bool {
+    ringo_cli::state_root().join("active.json").exists()
+}
+
+/// `ringo.py release ARGS` from this Ringo's checkout: its JSON answer, or what it said went wrong.
+fn release(args: &[&str]) -> Result<serde_json::Value, String> {
+    let out = Command::new(ringo_cli::python()).arg(ringo_cli::ringo_home().join("ringo.py")).arg("release").args(args)
+        .stdin(Stdio::null()).output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let said = String::from_utf8_lossy(&out.stderr);
+        return Err(said.lines().last().unwrap_or("it gave no reason").trim_start_matches("release: ").to_string());
+    }
+    serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())
+}
+
+/// The pipelines' release, run in the background. `full` is what `/update` runs: this Ringo staged and measured
+/// against the active release, a few minutes of local work and no model call. Otherwise it is the shell's opening
+/// check, which only says whether that release is behind this Ringo. Returns the line to show (empty: nothing to
+/// say) and a release to approve.
+pub fn check_release(full: bool) -> (String, Option<Release>) {
+    if !releases_on() {
+        return (String::new(), None);
+    }
+    match release(if full { &["update"] } else { &["update", "--check"] }) {
+        Ok(answer) => checked(&answer, full),
+        Err(e) if full => (format!("  the pipelines' release was not checked: {e}"), None),
+        Err(_) => (String::new(), None),
+    }
+}
+
+/// What a `release update` answer means for the owner (see check_release).
+fn checked(answer: &serde_json::Value, full: bool) -> (String, Option<Release>) {
+    let text = |key: &str| answer[key].as_str().unwrap_or("").to_string();
+    let short = |key: &str| text(key).chars().take(8).collect::<String>();
+    match (answer["behind"].as_bool().unwrap_or(false), full) {
+        (false, false) => (String::new(), None),
+        (false, true) => ("  the pipelines run this Ringo's release already".into(), None),
+        (true, false) => ("  Ringo's pipelines (/review, /design, /research, /work) run an older release than this \
+                           Ringo · /update checks the new one, then asks you".into(), None),
+        (true, true) if answer["slower"].as_u64() != Some(0) => (format!(
+            "  the pipelines stay on {}: release {} was slower ({}), so it cannot go in", short("active"),
+            short("release"), text("reason")), None),
+        (true, true) => {
+            let ready = Release { id: text("release"), active: text("active"), suite: text("suite"), reason: text("reason") };
+            (format!("  the pipelines' new release {} is ready: {} · /update approve switches to it", short("release"),
+                     ready.reason), Some(ready))
+        }
+    }
+}
+
+/// `/update approve`: the checked release activated. The owner approves it, and the reason recorded for accepting
+/// an uncertain check is what the shell showed them before they did.
+pub fn approve(r: &Release) -> String {
+    let who = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "the owner".into());
+    let (by, why) = (format!("{who} with /update approve in the Ringo shell"),
+                     format!("Approved with /update approve in the Ringo shell after it showed: {}", r.reason));
+    match release(&["activate", "--release", &r.id, "--latency-report", &r.suite, "--approved-by", &by,
+                    "--expected-current", &r.active, "--accept-uncertain", &why]) {
+        Ok(_) => format!("  the pipelines run release {} from their next run; to go back: ringo release rollback \
+                          --expected-current {}", &r.id[..r.id.len().min(8)], r.id),
+        Err(e) => format!("  the pipelines were not switched: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pipelines_release_is_offered_only_when_measured_and_not_slower() {
+        use serde_json::json;
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        // the opening check speaks only when the release is behind; /update always answers
+        assert_eq!(checked(&json!({"active": a, "behind": false}), false), (String::new(), None));
+        assert!(checked(&json!({"active": a, "behind": false}), true).0.contains("already"));
+        assert!(checked(&json!({"active": a, "behind": true}), false).0.contains("/update checks the new one"));
+        let measured = json!({"active": a, "behind": true, "release": b, "suite": "/s/suite.json", "slower": 0,
+                              "negligible": 3, "uncertain": 6, "reason": "0 slower, 3 negligible, 6 uncertain"});
+        let (line, ready) = checked(&measured, true);
+        assert!(line.contains("bbbbbbbb is ready: 0 slower, 3 negligible, 6 uncertain · /update approve"), "{line}");
+        assert_eq!(ready, Some(Release { id: b.clone(), active: a.clone(), suite: "/s/suite.json".into(),
+                                         reason: "0 slower, 3 negligible, 6 uncertain".into() }));
+        let slower = json!({"active": a, "behind": true, "release": b, "slower": 1, "reason": "1 slower"});
+        let (line, ready) = checked(&slower, true);
+        assert!(line.contains("stay on aaaaaaaa") && ready.is_none(), "{line}");
+        // an answer that does not say how many were slower is not offered
+        assert!(checked(&json!({"active": a, "behind": true, "release": b}), true).1.is_none());
+    }
 
     #[cfg(unix)]
     #[test]

@@ -178,6 +178,22 @@ failures even when the expected CLI error occurs. Do not quietly exclude them
 from a study or describe their speed as success. Never run performance measurements
 concurrently with tests or inference and then call the timing conditions controlled.
 
+## From the shell: `release update`
+
+```sh
+python3 ringo.py release update --check   # is the active release behind this checkout? stages nothing
+python3 ringo.py release update           # stage it and measure it against the active release
+```
+
+`update` compares this checkout's runtime files, plans and prompts with the active bundle's copies of them. If one
+was added, changed or removed, it stages the checkout. A candidate-plan (RRSI) release always counts as behind,
+since its review plan is rewritten. It then runs the paired experiment above (`active-fixture`, 100 pairs, both
+arms through this launcher). Selecting either release runs that launcher, so the measured difference is the
+difference activation makes. The command prints the new release, its suite and the counts. It never activates. The shell's `/update` runs
+it in the background and `/update approve` runs `activate`. The suite and the raw execution log are kept in
+`checks/NEW-ACTIVE/` and reused on the next call; the per-run output is removed. A slower suite is reported but not
+offered. A bootstrap/verifier study that must time the old launcher still needs `--baseline-launcher` by hand.
+
 ## Activate and roll back
 
 ```sh

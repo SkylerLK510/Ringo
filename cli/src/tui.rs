@@ -56,7 +56,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/drop N", "remove job N's worktree"),
     ("/kill N", "stop job N"),
     ("/setup", "add an agent and sign in to it"),
-    ("/update", "update the agents found out of date"),
+    ("/update", "update the agents found out of date, and check the pipelines' release"),
+    ("/update approve", "move the pipelines to the release /update checked"),
     ("/restart", "start Ringo again (an update applies), the conversations going on"),
     ("/theme NAME", "colours"),
     ("/backend SPEC", "backend for the pipelines"),
@@ -155,6 +156,8 @@ pub enum Cmd {
     Theme(Option<String>),
     /// `/update` (None) or `/update auto on|off`.
     Update(Option<bool>),
+    /// `/update approve`: the pipelines move to the release `/update` checked.
+    Approve,
     /// `/mode` (None: show it) or `/mode ask|auto|read`.
     Mode(Option<Mode>),
     /// `/auto`: auto mode on, or back to ask mode.
@@ -210,7 +213,8 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 (None, _) => Ok(Cmd::Update(None)),
                 (Some("auto"), Some("on")) => Ok(Cmd::Update(Some(true))),
                 (Some("auto"), Some("off")) => Ok(Cmd::Update(Some(false))),
-                _ => Err("/update, or /update auto on|off".into()),
+                (Some("approve"), None) => Ok(Cmd::Approve),
+                _ => Err("/update, /update approve, or /update auto on|off".into()),
             },
             "backend" if !tail.is_empty() => Ok(Cmd::Backend(tail.into())),
             "show" => job_number(words.next()).map(Cmd::Show),
@@ -1112,6 +1116,10 @@ struct App {
     /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
     pending: Option<Vec<crate::updates::Update>>,
     update: bool,
+    /// The pipelines' release being checked or approved in the background (updates::check_release), and a checked
+    /// one waiting for `/update approve`.
+    releasing: Option<std::thread::JoinHandle<(String, Option<crate::updates::Release>)>>,
+    release: Option<crate::updates::Release>,
     /// Plan reads under way, one thread an agent, each with whether its answer goes into the conversation (/usage)
     /// or only into `limits` (the side panel's gauges).
     plans: Vec<(bool, std::thread::JoinHandle<PlanRead>)>,
@@ -1202,7 +1210,7 @@ impl App {
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), limits: Vec::new(),
+              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), limits: Vec::new(),
               limits_at: None, spoke: false, checking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
@@ -1687,6 +1695,42 @@ impl App {
         self.limits_at = Some(Instant::now());
     }
 
+    /// `/update`'s other half: when a release runs the pipelines, this Ringo's own is checked against it in the
+    /// background.
+    /// A speed check times processes, so it starts only with no job running and holds new ones until it ends.
+    fn check_pipelines(&mut self) -> Option<String> {
+        if !crate::updates::releases_on() {
+            return None;
+        }
+        if self.releasing.is_some() {
+            return Some("  the pipelines' release is still being checked; it reports here when done".into());
+        }
+        if self.s.hold.is_some() || self.s.running() > 0 || self.checking.is_some() {
+            return Some("  the pipelines' speed check waits until no job runs, so it does not share the machine \
+                         with one: /update then".into());
+        }
+        self.s.hold = Some(CHECKING.into());
+        self.releasing = Some(std::thread::spawn(|| crate::updates::check_release(true)));
+        Some("  checking the pipelines' release against this Ringo: an offline speed check, no model calls, up to \
+              3 minutes; jobs wait until it finishes".into())
+    }
+
+    /// The pipelines' check or approval, once it has answered.
+    fn release_done(&mut self) -> bool {
+        if !self.releasing.as_ref().is_some_and(|h| h.is_finished()) {
+            return false;
+        }
+        let (line, ready) = self.releasing.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        if self.s.hold.as_deref() == Some(CHECKING) {
+            self.s.hold = None;
+        }
+        if !line.is_empty() {
+            self.say(line);
+        }
+        self.release = ready;
+        true
+    }
+
     /// The plan reads that have answered: kept for the side panel, and as gauges in the conversation for /usage.
     fn plans_done(&mut self) -> bool {
         let (done, running): (Vec<_>, Vec<_>) = std::mem::take(&mut self.plans).into_iter().partition(|(_, h)| h.is_finished());
@@ -1915,18 +1959,34 @@ impl App {
                     None => Some(format!("  no theme {name}: {}", crate::theme::NAMES.join(", "))),
                 }
             }
-            Cmd::Update(None) => match &self.pending {
-                _ if self.s.hold.is_some() => {
-                    self.s.hold.as_ref().map(|why| format!("  {why}; it reports here when done"))
-                }
-                None => Some("  the update check is still running; try again in a moment".into()),
-                Some(p) if p.is_empty() => Some("  nothing to update (checked when the shell opened)".into()),
-                Some(_) if self.s.running() > 0 => {
-                    Some("  wait for the running jobs, or /kill them: an update replaces the agent's program".into())
-                }
-                Some(_) => {
-                    self.update = true;
-                    None
+            Cmd::Update(None) if self.releasing.is_some() => {
+                Some("  the pipelines' release is still being checked; it reports here when done".into())
+            }
+            Cmd::Update(None) => {
+                let agents = match &self.pending {
+                    _ if self.s.hold.is_some() => {
+                        self.s.hold.as_ref().map(|why| format!("  {why}; it reports here when done"))
+                    }
+                    None => Some("  the agents' update check is still running; try again in a moment".into()),
+                    Some(p) if p.is_empty() => Some("  no agent to update (checked when the shell opened)".into()),
+                    Some(_) if self.s.running() > 0 => {
+                        Some("  wait for the running jobs, or /kill them: an update replaces the agent's program".into())
+                    }
+                    Some(_) => {
+                        self.update = true;
+                        None
+                    }
+                };
+                // after an agents' update the loop starts it, so the two do not share the machine
+                let pipelines = if self.update { None } else { self.check_pipelines() };
+                [agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
+            }
+            Cmd::Approve if self.releasing.is_some() => Some("  the pipelines' release is still being checked".into()),
+            Cmd::Approve => match self.release.take() {
+                None => Some("  nothing to approve: /update checks the pipelines' release first".into()),
+                Some(r) => {
+                    self.releasing = Some(std::thread::spawn(move || (crate::updates::approve(&r), None)));
+                    Some("  moving the pipelines to the checked release".into())
                 }
             },
             Cmd::Update(Some(on)) => {
@@ -2652,6 +2712,7 @@ impl App {
                 _ if self.scroll > 0 => "scrolled up · PgDn goes back".into(),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
                 _ if self.staged.is_some() => "update ready · /restart".into(),
+                _ if self.release.is_some() => "pipelines ready · /update approve".into(),
                 _ => "⇧⇥ mode · ? keys".into(),
             };
             let mut rows: Vec<Line> = if self.input.is_empty() {
@@ -2721,6 +2782,9 @@ impl App {
     }
 }
 
+/// What holds new jobs while the pipelines' speed check runs (see App::check_pipelines).
+const CHECKING: &str = "the pipelines' speed check is running";
+
 /// The shell. `resume`: what the shell before a /restart handed on (its conversations and where its text is).
 pub fn run(resume: Option<PathBuf>) -> ExitCode {
     let exe = std::env::current_exe().map(|e| std::fs::canonicalize(&e).unwrap_or(e)).unwrap_or_default();
@@ -2765,6 +2829,7 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     }
     let asked = app.plan_agents();
     app.read_limits(&asked, false); // for the side panel's gauges
+    app.releasing = Some(std::thread::spawn(|| crate::updates::check_release(false))); // are the pipelines behind?
     let (notes, news) = std::sync::mpsc::channel();
     let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
     let auto = saved.get("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -2863,6 +2928,7 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
             app.plans_done();
             dirty = true;
         }
+        dirty |= app.release_done();
         let asking = app.s.pending().map(|(_, p)| p.id.clone());
         if asking != app.asked.as_ref().map(|(id, _)| id.clone()) {
             app.asked = asking.map(|id| (id, Instant::now()));
@@ -2902,6 +2968,9 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
             app.pending = Some(left);
             app.update = false;
             dirty = true;
+            if let Some(line) = app.check_pipelines() {
+                app.say(line);
+            }
         }
         if let Ok(news) = update_news.try_recv() {
             updating = false;
@@ -3013,6 +3082,8 @@ mod tests {
         assert_eq!(parse("/update auto on", Codex), Ok(Cmd::Update(Some(true))));
         assert_eq!(parse("/update auto off", Codex), Ok(Cmd::Update(Some(false))));
         assert!(parse("/update auto", Codex).is_err());
+        assert_eq!(parse("/update approve", Codex), Ok(Cmd::Approve));
+        assert!(parse("/update approve now", Codex).is_err());
         assert_eq!(parse("@codex why is it slow?", Codex), Ok(Cmd::Agents(vec![(Codex, false)], "why is it slow?".into())));
         assert_eq!(parse("@claude! fix it", Codex), Ok(Cmd::Agents(vec![(Claude, true)], "fix it".into())));
         assert_eq!(parse("@codex @claude! do x", Grok), Ok(Cmd::Agents(vec![(Codex, false), (Claude, true)], "do x".into())));
