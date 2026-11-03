@@ -493,6 +493,8 @@ pub struct Session {
     /// Why no job may start now (an agent update is replacing a program), if one may not.
     pub hold: Option<String>,
     threads: HashMap<Agent, String>,
+    /// What each agent is told on its first turn after a /restart: Ringo's record of the turns it had not heard.
+    told: HashMap<Agent, String>,
     /// How full each agent's conversation is, in tokens, as its latest call read it (see `handoff`).
     context: HashMap<Agent, u64>,
     /// Past this, an agent's next turn starts fresh from Ringo's record instead (tests lower it).
@@ -539,11 +541,17 @@ pub fn state_root() -> PathBuf {
     PathBuf::from(home).join(".local/share/ringo")
 }
 
-/// The Ringo checkout whose ringo.py runs the pipelines: RINGO_HOME, else the checkout this binary was built from.
+/// The Ringo checkout whose ringo.py runs the pipelines: RINGO_HOME, else the one this binary was built from (the
+/// updater's copy of that version, or the checkout `cargo install` ran in).
 pub fn ringo_home() -> PathBuf {
-    std::env::var_os("RINGO_HOME").map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf())
+    std::env::var_os("RINGO_HOME").map(PathBuf::from).unwrap_or_else(|| match env!("RINGO_BUILD_HOME") {
+        "" => Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf(),
+        home => PathBuf::from(home),
+    })
 }
+
+/// The commit this binary was built from; empty for a build outside git.
+pub const COMMIT: &str = env!("RINGO_COMMIT");
 
 pub fn python() -> OsString {
     std::env::var_os("RINGO_PYTHON").unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into())
@@ -804,7 +812,7 @@ impl Session {
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(),
+                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(),
                      context: HashMap::new(), handoff_at: HANDOFF_AT, separate: false, returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
@@ -877,6 +885,40 @@ impl Session {
     }
 
     /// The turn here that `agent` has to wait for: any, or in /separate only its own.
+    /// Each agent's conversation, by name: what /restart hands the next shell so the conversations go on.
+    pub fn threads(&self) -> Vec<(String, String)> {
+        self.threads.iter().map(|(a, id)| (a.name().to_string(), id.clone())).collect()
+    }
+
+    /// What /restart hands the next shell for each agent: Ringo's record of the turns its next turn would have been
+    /// told here (the other agents' since its own last one; all of them for one with no conversation yet), so
+    /// restarting drops nothing from the shared conversation and adds nothing to it.
+    pub fn carry(&self) -> Vec<(String, String)> {
+        Agent::all().into_iter().filter_map(|agent| {
+            let lane = self.lane(agent, self.jobs.len() + 1);
+            let mine = lane.iter().rposition(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent));
+            let since = match self.threads.contains_key(&agent) { true => mine.map_or(0, |at| at + 1), false => 0 };
+            let turns = &lane[since..];
+            let told = self.told.get(&agent).map_or(String::new(), |before| format!("{}\n", before.trim_end()));
+            (!turns.is_empty() || !told.is_empty()).then(|| (agent.name().to_string(), told + &self.record(turns).0))
+        }).collect()
+    }
+
+    /// Goes on with what the shell before a /restart handed on: each agent's conversation, and what it had yet to be
+    /// told (agents no longer set up are left out).
+    pub fn resume(&mut self, threads: &[(String, String)], told: &[(String, String)]) {
+        for (name, id) in threads {
+            if let Some(agent) = Agent::from_name(name) {
+                self.threads.insert(agent, id.clone());
+            }
+        }
+        for (name, record) in told {
+            if let Some(agent) = Agent::from_name(name).filter(|_| !record.trim().is_empty()) {
+                self.told.insert(agent, record.clone());
+            }
+        }
+    }
+
     pub fn busy_for(&self, agent: Agent) -> Option<usize> {
         self.jobs.iter().rev().find(|j| j.running() && match j.kind {
             Kind::Agent { agent: a, write: false } => !self.separate || a == agent,
@@ -1211,6 +1253,15 @@ impl Session {
             if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
                 sent = text;
                 self.jobs[id - 1].push_log(note);
+            }
+            // the turns before a /restart that this agent had not heard, once, ahead of anything since
+            if prompt.trim() != "/compact" && let Some(before) = self.told.remove(&agent) {
+                let rest = if sent == prompt { format!("The owner's new message:\n{prompt}") } else { sent };
+                sent = format!("Before Ringo restarted, other turns were taken in this conversation. Ringo's record of \
+                                them (the owner's words are exact; the replies and steps are the agents' own account and \
+                                can be wrong; the files here are the truth):\n\n{}\n\n{rest}", before.trim_end());
+                self.jobs[id - 1].push_log(format!("told {} the turns before the restart (about {} tokens)", agent.name(),
+                                                   fmt_k(before.len() as u64 / 4)));
             }
         }
         // The connectors load for a message that names one, and for the conversation's turn after one that called one

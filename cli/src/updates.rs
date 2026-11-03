@@ -2,9 +2,13 @@
 //! session and (each feed at most once a day) which have a newer release out. `/update` runs the update for you in
 //! this terminal; with `/update auto on` the shell runs package-manager updates (Homebrew, npm, `claude update`) by
 //! itself when it opens. No model call is made. RINGO_NO_UPDATE_CHECK=1 turns the release lookup off.
+//!
+//! Ringo updates itself too (`update_ringo`): the newest `main` is built in the background and put where this
+//! binary is, and the shell says `/restart` applies it.
 
 use ringo_cli::Agent;
 use std::fs;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -242,9 +246,235 @@ pub fn apply_here(pending: Vec<Update>) -> (Vec<String>, Vec<Update>) {
     (lines, left)
 }
 
+// Ringo's own update.
+
+/// git with no prompt: a background fetch that would ask for a password or passphrase fails instead (ssh asks on the
+/// terminal itself, over the shell's screen).
+fn git_cmd(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+    }
+    cmd
+}
+
+/// A local git question's answer, or None when git says no.
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = git_cmd(dir).args(args).stderr(Stdio::null()).output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Ringo's own update, in the background: the newest `main` from where this binary came, built in a folder of its
+/// own (`install/COMMIT` in Ringo's state, its prompts and pipelines with it). Only a binary built from a clean
+/// checkout of a commit on `main` updates: one with changes of its own, from a branch ahead of main, or run with
+/// RINGO_HOME is the owner's to update. The line to show and the built binary, which `install` puts where this one
+/// is when the shell ends or restarts (an open shell keeps its own version until then); None: nothing to say.
+pub fn update_ringo(exe: &Path) -> Option<(String, PathBuf)> {
+    let (home, install) = (ringo_cli::ringo_home(), ringo_cli::state_root().join("install"));
+    if home.starts_with(&install) {
+        let _ = fs::write(home.join(".used"), ""); // this version is open: pruning leaves it (see prune)
+    }
+    if std::env::var_os("RINGO_NO_UPDATE_CHECK").is_some() || std::env::var_os("RINGO_HOME").is_some()
+        || exe.as_os_str().is_empty() {
+        return None;
+    }
+    if cfg!(windows) {
+        let _ = fs::remove_file(exe.with_extension("old")); // the one the last install moved aside
+    }
+    update_from(ringo_cli::COMMIT, &home, &install, OsStr::new("cargo"))
+}
+
+/// The binary a shell's pipelines run: its version's own copy when the updater built it (never replaced), so they
+/// stay its version after an update is installed; else the installed one.
+pub fn own_binary(exe: &Path) -> PathBuf {
+    let own = ringo_cli::ringo_home().join(exe.file_name().unwrap_or_default());
+    if ringo_cli::ringo_home().starts_with(ringo_cli::state_root().join("install")) && own.is_file() { own } else { exe.to_path_buf() }
+}
+
+fn update_from(commit: &str, home: &Path, install: &Path, cargo: &OsStr) -> Option<(String, PathBuf)> {
+    if commit.is_empty() || git(home, &["rev-parse", "HEAD"])? != commit
+        || !git(home, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
+        return None;
+    }
+    fs::create_dir_all(install).ok()?;
+    let (repo, log) = (install.join("repo.git"), install.join("update.log"));
+    if !repo.join("HEAD").is_file() {
+        // Ringo's own copy of the history, so no checkout of the owner's is ever written to
+        let url = git(home, &["remote", "get-url", "origin"])?;
+        let tmp = install.join(format!("repo-{}.tmp", std::process::id()));
+        let mut clone = git_cmd(install);
+        clone.args(["clone", "--bare", "--quiet", &url]).arg(&tmp);
+        if bounded(clone, &log, Duration::from_secs(120)) != Some(true) || fs::rename(&tmp, &repo).is_err() {
+            let _ = fs::remove_dir_all(&tmp); // offline, or another shell made it first
+        }
+    }
+    let mut fetch = git_cmd(&repo);
+    fetch.args(["fetch", "--quiet", "origin", "+refs/heads/main:refs/heads/main"]);
+    if bounded(fetch, &log, Duration::from_secs(60)) != Some(true) {
+        return None; // offline: say nothing, ask again next time
+    }
+    let new = git(&repo, &["rev-parse", "main"])?;
+    if new == commit || git(&repo, &["merge-base", "--is-ancestor", commit, &new]).is_none() {
+        return None; // up to date, or this build is not on main
+    }
+    let changes = git(&repo, &["rev-list", "--count", &format!("{commit}..{new}")]).unwrap_or_default();
+    let short = &new[..new.len().min(7)];
+    let dir = install.join(&new);
+    let bin = dir.join(if cfg!(windows) { "ringo.exe" } else { "ringo" });
+    if !bin.is_file() {
+        // One build at a time, every version's: they share one build folder. A shell that finds one under way leaves
+        // it be (a lock older than the build's limit is from a shell that ended mid-build).
+        let lock = install.join("build.lock");
+        if fs::create_dir(&lock).is_err() {
+            let age = fs::metadata(&lock).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+            if age.is_none_or(|a| a < BUILD_LIMIT) {
+                return None;
+            }
+            let _ = fs::remove_dir(&lock);
+            fs::create_dir(&lock).ok()?;
+        }
+        let built = build(&repo, &new, &dir, &bin, install, cargo);
+        let _ = fs::remove_dir(&lock);
+        if let Err(why) = built {
+            return Some((format!("  Ringo {short} is out, but it did not build: {why}"), PathBuf::new()));
+        }
+    }
+    prune(&repo, install);
+    let s = if changes == "1" { "" } else { "s" };
+    Some((format!("  Ringo updated to {short} ({changes} new change{s}) · /restart to apply"), bin))
+}
+
+const BUILD_LIMIT: Duration = Duration::from_secs(1800);
+
+/// The version's own files (a worktree of Ringo's copy of the history) and its binary, built at low priority with
+/// the build folder every version shares, so only Ringo itself compiles again.
+fn build(repo: &Path, new: &str, dir: &Path, bin: &Path, install: &Path, cargo: &OsStr) -> Result<(), String> {
+    let _ = git(repo, &["worktree", "remove", "--force", &dir.to_string_lossy()]); // a failed try's
+    let _ = fs::remove_dir_all(dir);
+    let _ = git(repo, &["worktree", "prune"]);
+    git(repo, &["worktree", "add", "--detach", "--force", "--quiet", &dir.to_string_lossy(), new])
+        .ok_or("git could not check it out")?;
+    let mut cmd = if cfg!(unix) { Command::new("nice") } else { Command::new(cargo) };
+    if cfg!(unix) {
+        cmd.args(["-n", "10"]).arg(cargo);
+    }
+    let target = install.join("target");
+    cmd.args(["build", "--release", "--locked", "--quiet", "--manifest-path"]).arg(dir.join("cli").join("Cargo.toml"))
+        .env("RINGO_COMMIT", new).env("RINGO_BUILD_HOME", dir).env("CARGO_TARGET_DIR", &target);
+    let log = install.join("build.log");
+    match bounded(cmd, &log, BUILD_LIMIT) {
+        Some(true) => {}
+        Some(false) => return Err(format!("cargo failed; its output is in {}", log.display())),
+        None => return Err("cargo did not start or did not finish in 30 minutes".into()),
+    }
+    let out = target.join("release").join(bin.file_name().unwrap_or_default());
+    fs::copy(&out, bin).map(|_| ()).map_err(|e| format!("{}: {e}", out.display()))
+}
+
+/// Puts the built `new` where `exe` is (nothing to do when it is there already), renamed into place whole, so a
+/// `ringo` starting meanwhile runs one or the other. Windows cannot write over a running program but can rename it,
+/// so the old one moves aside first.
+pub fn install(exe: &Path, new: &Path) -> Result<(), String> {
+    if fs::read(exe).ok() == fs::read(new).ok() {
+        return Ok(());
+    }
+    let say = |e: std::io::Error| format!("{} could not be replaced ({e}); {} is the new one", exe.display(), new.display());
+    let tmp = exe.with_extension(format!("new{}", std::process::id()));
+    fs::copy(new, &tmp).map_err(say)?; // the permissions come with it
+    let old = exe.with_extension("old");
+    if cfg!(windows) {
+        let _ = fs::remove_file(&old);
+        fs::rename(exe, &old).map_err(say)?;
+    }
+    fs::rename(&tmp, exe).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        if cfg!(windows) {
+            let _ = fs::rename(&old, exe);
+        }
+        say(e)
+    })
+}
+
+/// Removes versions past the three newest that no open shell has used for three days: each open shell marks its own
+/// (`.used`) when it opens and at every hourly check.
+fn prune(repo: &Path, install: &Path) {
+    let age = |p: &Path| fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
+    let mut versions: Vec<(SystemTime, PathBuf)> = fs::read_dir(install).into_iter().flatten().flatten()
+        .filter(|e| e.file_name().len() >= 40 && e.file_name().to_string_lossy().bytes().all(|b| b.is_ascii_hexdigit()))
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path()))).collect();
+    versions.sort_by_key(|v| std::cmp::Reverse(v.0));
+    for (_, dir) in versions.into_iter().skip(3) {
+        if age(&dir.join(".used")).is_none_or(|a| a > Duration::from_secs(3 * DAY_S)) {
+            let _ = git(repo, &["worktree", "remove", "--force", &dir.to_string_lossy()]);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn ringo_updates_itself_from_main_and_only_from_main() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ringo-self-update-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (origin, home, install, exe) = (dir.join("origin"), dir.join("home"), dir.join("install"), dir.join("bin/ringo"));
+        let run = |at: &Path, args: &[&str]| {
+            let ok = Command::new("git").arg("-C").arg(at).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args)
+                .stdout(Stdio::null()).stderr(Stdio::null()).status().unwrap().success();
+            assert!(ok, "git {args:?}");
+        };
+        let commit = |at: &Path, text: &str| {
+            fs::write(at.join("a.txt"), text).unwrap();
+            run(at, &["add", "."]);
+            run(at, &["commit", "-qm", text]);
+            git(at, &["rev-parse", "HEAD"]).unwrap()
+        };
+        fs::create_dir_all(&origin).unwrap();
+        run(&origin, &["init", "-q", "-b", "main"]);
+        let a = commit(&origin, "one");
+        run(&dir, &["clone", "-q", &origin.to_string_lossy(), "home"]);
+        let b = commit(&origin, "two");
+        fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        fs::write(&exe, "old").unwrap();
+        // a cargo that "builds" a binary naming the commit and home it was given, and counts its builds
+        let cargo = dir.join("cargo");
+        fs::write(&cargo, format!("#!/bin/sh\necho x >> '{}/builds'\nmkdir -p \"$CARGO_TARGET_DIR/release\"\n\
+            printf 'new %s %s' \"$RINGO_COMMIT\" \"$RINGO_BUILD_HOME\" > \"$CARGO_TARGET_DIR/release/ringo\"\n", dir.display())).unwrap();
+        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
+        let update = |commit: &str| update_from(commit, &home, &install, cargo.as_os_str());
+        let builds = || fs::read_to_string(dir.join("builds")).map(|t| t.lines().count()).unwrap_or(0);
+
+        let said = format!("  Ringo updated to {} (1 new change) · /restart to apply", &b[..7]);
+        let (line, bin) = update(&a).unwrap();
+        assert_eq!(line, said);
+        assert_eq!(fs::read_to_string(&bin).unwrap(), format!("new {b} {}", install.join(&b).display()),
+                   "the version's own binary, whose prompts are its own version's");
+        assert_eq!(fs::read_to_string(install.join(&b).join("a.txt")).unwrap(), "two");
+        assert_eq!(fs::read_to_string(&exe).unwrap(), "old", "an open shell keeps its version until it ends");
+        assert_eq!(update(&a), Some((said, bin.clone())), "said again (the shell shows a line once)");
+        assert_eq!(builds(), 1, "a version is built once");
+        super::install(&exe, &bin).unwrap();
+        assert_eq!(fs::read(&exe).unwrap(), fs::read(&bin).unwrap(), "in place when the shell ends");
+        assert_eq!(update(&b), None, "up to date");
+        assert_eq!(fs::read_to_string(home.join("a.txt")).unwrap(), "one", "the owner's checkout is never written");
+
+        fs::create_dir(install.join("build.lock")).unwrap();
+        let c = commit(&origin, "three");
+        assert_eq!(update(&a), None, "another shell is building: this one leaves it be");
+        fs::remove_dir(install.join("build.lock")).unwrap();
+        assert!(update(&a).is_some_and(|(l, _)| l.contains(&c[..7]) && l.contains("2 new changes")));
+
+        fs::write(home.join("a.txt"), "mine").unwrap();
+        assert_eq!(update(&a), None, "a checkout with changes of its own is the owner's to update");
+        let d = commit(&home, "mine");
+        assert_eq!(update(&d), None, "a build ahead of main is the owner's too");
+        assert_eq!(update(&a), None, "and one whose checkout moved on since it was built");
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reads_versions_and_order() {

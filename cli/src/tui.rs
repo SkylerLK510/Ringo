@@ -57,6 +57,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/kill N", "stop job N"),
     ("/setup", "add an agent and sign in to it"),
     ("/update", "update the agents found out of date"),
+    ("/restart", "start Ringo again (an update applies), the conversations going on"),
     ("/theme NAME", "colours"),
     ("/backend SPEC", "backend for the pipelines"),
     ("/quit", "leave (or Ctrl-C twice)"),
@@ -161,6 +162,8 @@ pub enum Cmd {
     /// `/tier` (None: show it) or `/tier quick|standard|deep|ultra`.
     Tier(Option<Tier>),
     Usage,
+    /// `/restart`: this shell ends and the installed `ringo` takes over the conversations.
+    Restart,
     Quit,
 }
 
@@ -182,6 +185,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
         return match name {
             "usrman" | "instructions" | "manual" | "help" | "?" => Ok(Cmd::Help),
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
+            "restart" => Ok(Cmd::Restart),
             "setup" => Ok(Cmd::Setup),
             "undo" => Ok(Cmd::Undo),
             "copy" => Ok(Cmd::Copy),
@@ -818,7 +822,11 @@ impl Md {
 /// paste, and Shift-Enter where the terminal can report it.
 fn open() -> std::io::Result<DefaultTerminal> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // The first frame draws only what differs from a blank screen, so a terminal that keeps what was on it (the shell
+    // before a /restart, where there is no alternate screen of its own) is made blank. Terminal::clear would ask the
+    // terminal where its cursor is, and one that does not answer would stop the shell from opening.
+    use ratatui::crossterm::terminal::{Clear, ClearType};
+    execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All), EnableMouseCapture)?;
     // A paste arrives as one event, not as keys (its newlines as Enter). Not fatal: the legacy Windows console has no
     // bracketed paste, and there a paste's keys are told apart by their timing (see BURST).
     let _ = execute!(stdout(), EnableBracketedPaste);
@@ -1089,6 +1097,11 @@ struct App {
     last: usize,
     quit_armed: bool,
     quit: bool,
+    /// `/restart` asked: when the loop ends, the installed `ringo` starts in this terminal.
+    restart: bool,
+    /// What Ringo's own update said last, and the binary it built: put in place when the shell ends or restarts.
+    updated: Option<String>,
+    staged: Option<PathBuf>,
     setup: bool,
     label: String,
     agents: Vec<Agent>,
@@ -1188,7 +1201,7 @@ impl App {
               fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
-              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, setup: false, label, agents, theme,
+              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, plans: Vec::new(), limits: Vec::new(),
               limits_at: None, spoke: false, checking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
@@ -1925,6 +1938,13 @@ impl App {
                 self.quit = true;
                 None
             }
+            Cmd::Restart if self.s.running() > 0 => {
+                Some("  a job is running: /restart once it ends (Esc stops the turn, /kill N a job)".into())
+            }
+            Cmd::Restart => {
+                (self.restart, self.quit) = (true, true);
+                None
+            }
             Cmd::Setup => {
                 self.setup = true;
                 None
@@ -2631,6 +2651,7 @@ impl App {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
                 _ if self.scroll > 0 => "scrolled up · PgDn goes back".into(),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
+                _ if self.staged.is_some() => "update ready · /restart".into(),
                 _ => "⇧⇥ mode · ? keys".into(),
             };
             let mut rows: Vec<Line> = if self.input.is_empty() {
@@ -2700,7 +2721,9 @@ impl App {
     }
 }
 
-pub fn run() -> ExitCode {
+/// The shell. `resume`: what the shell before a /restart handed on (its conversations and where its text is).
+pub fn run(resume: Option<PathBuf>) -> ExitCode {
+    let exe = std::env::current_exe().map(|e| std::fs::canonicalize(&e).unwrap_or(e)).unwrap_or_default();
     let agents = match ringo_cli::configured_agents() {
         Some(agents) if !agents.is_empty() => agents,
         _ => crate::setup::run(), // the first start: connect at least one agent
@@ -2712,9 +2735,8 @@ pub fn run() -> ExitCode {
     let cwd = std::env::current_dir().unwrap_or_default();
     let session = match Session::new(&cwd) {
         Ok(mut s) => {
-            if let Ok(me) = std::env::current_exe() {
-                s.pipeline = Some(vec![me.into()]); // this binary: native pipelines unless a release says otherwise
-            }
+            // this binary (native pipelines unless a release says otherwise), as its own version keeps it
+            s.pipeline = Some(vec![crate::updates::own_binary(&exe).into()]);
             s
         }
         Err(e) => {
@@ -2729,7 +2751,18 @@ pub fn run() -> ExitCode {
     if let Some(mode) = saved.get("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
     }
-    app.welcome();
+    match resume.and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+        Some(before) => {
+            let threads: Vec<(String, String)> = serde_json::from_value(before["threads"].clone()).unwrap_or_default();
+            let told: Vec<(String, String)> = serde_json::from_value(before["told"].clone()).unwrap_or_default();
+            app.s.resume(&threads, &told);
+            let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+            text.lines().for_each(|line| app.out.push(Out::text(line)));
+            let commit = &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)];
+            app.say(format!("  Ringo restarted ({commit}); the conversations go on"));
+        }
+        None => app.welcome(),
+    }
     let asked = app.plan_agents();
     app.read_limits(&asked, false); // for the side panel's gauges
     let (notes, news) = std::sync::mpsc::channel();
@@ -2739,6 +2772,15 @@ pub fn run() -> ExitCode {
     std::thread::spawn(move || {
         let _ = check.send((false, crate::updates::check(&agents, &state)));
     });
+    // Ringo's own update: when the shell opens, then hourly, one at a time
+    let (updated, update_news) = std::sync::mpsc::channel();
+    let update_ringo = |tx: std::sync::mpsc::Sender<Option<(String, PathBuf)>>, exe: PathBuf| {
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::updates::update_ringo(&exe));
+        });
+    };
+    update_ringo(updated.clone(), exe.clone());
+    let (mut updating, mut updated_at) = (true, Instant::now());
 
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2861,6 +2903,19 @@ pub fn run() -> ExitCode {
             app.update = false;
             dirty = true;
         }
+        if let Ok(news) = update_news.try_recv() {
+            updating = false;
+            if let Some((line, bin)) = news.filter(|(l, _)| app.updated.as_ref() != Some(l)) {
+                app.say(&line);
+                app.updated = Some(line);
+                app.staged = Some(bin).filter(|b| b.is_file());
+                dirty = true;
+            }
+        }
+        if !updating && updated_at.elapsed() >= Duration::from_secs(3600) {
+            (updating, updated_at) = (true, Instant::now());
+            update_ringo(updated.clone(), exe.clone());
+        }
         app.feed();
         dirty |= app.fitted.len() != app.out.len();
         if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST) {
@@ -2878,9 +2933,47 @@ pub fn run() -> ExitCode {
     app.feed();
     close(&mut terminal);
     app.s.shutdown();
-    let saved = app.save().map_or(String::new(), |p| format!("; the conversation is saved in {}", p.display()));
+    let saved = app.save();
+    // an update goes in place now that this shell is done with its version
+    let installed = app.staged.as_ref().map(|bin| crate::updates::install(&exe, bin));
+    if let Some(Err(e)) = &installed {
+        eprintln!("ringo: the update was not installed: {e}");
+    }
+    if app.restart {
+        let next = match (&installed, &app.staged) { (Some(Err(_)), Some(bin)) => bin.clone(), _ => exe.clone() };
+        return restart(&next, &app, saved);
+    }
+    let saved = saved.map_or(String::new(), |p| format!("; the conversation is saved in {}", p.display()));
     println!("ringo: {} tokens this session{saved}", fmt_tokens(app.s.tokens()));
     ExitCode::SUCCESS
+}
+
+/// The installed `ringo` takes this terminal over (the same process on Unix), handed the agents' conversations, what
+/// each had yet to be told and this one's text, so an update applies without the conversation starting over.
+fn restart(exe: &Path, app: &App, saved: Option<PathBuf>) -> ExitCode {
+    let handed = app.s.dir.join("restart.json");
+    let before = serde_json::json!({"threads": app.s.threads(), "told": app.s.carry(), "conversation": saved});
+    if let Err(e) = std::fs::write(&handed, before.to_string()) {
+        eprintln!("ringo: could not restart ({}: {e}); run ringo again", handed.display());
+        return ExitCode::from(1);
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--resume").arg(&handed);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = cmd.exec(); // returns only if it failed
+        eprintln!("ringo: could not restart ({}: {e}); run ringo again", exe.display());
+        ExitCode::from(1)
+    }
+    #[cfg(not(unix))]
+    match cmd.status() {
+        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Err(e) => {
+            eprintln!("ringo: could not restart ({}: {e}); run ringo again", exe.display());
+            ExitCode::from(1)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3546,7 +3639,7 @@ mod tests {
     fn the_menu_offers_commands_and_agents() {
         let agents = [("claude", true), ("grok", false)];
         let to = |before: &str| menu(before, &agents).into_iter().map(|(to, ..)| to).collect::<Vec<_>>();
-        assert_eq!(to("/re"), ["/review ", "/review ", "/research "]);
+        assert_eq!(to("/re"), ["/review ", "/review ", "/research ", "/restart"]);
         assert_eq!(to("/he"), ["/help"], "a command that takes nothing more completes without a space");
         assert_eq!(to("@"), ["@claude ", "@claude! ", "@grok! ", "@all "], "grok works only in its own copy");
         assert_eq!(to("fix it @cl"), ["@claude ", "@claude! "]);

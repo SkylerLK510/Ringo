@@ -189,6 +189,7 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once, each in its own copy, to compare |
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
 | `/diff N`, `/apply N`, `/drop N` | see a copy's change, apply it to your files (uncommitted, onto what is there now), remove the copy |
+| `/restart` | start the installed Ringo in this terminal, the conversations going on (applies an update; see Ringo's own updates) |
 | `/show N`, `/kill N`, `/copy`, `/backend SPEC`, `/theme NAME`, `/setup`, `/quit` | print a job's log (its last 2,000 lines; the whole stream is in its folder), stop it with everything it started, copy the last answer, set the backend for `/ask` and pipelines, change colours, add an agent, quit |
 
 Start `ringo` in any folder, as you would `claude` or `codex`. In a git project each turn's change can be undone,
@@ -329,6 +330,32 @@ settings and conversations.
 Not yet: Codex cannot stop to ask, so it does not take ask mode's prompts. Its app-server protocol has the same
 three answers (`accept`, `acceptForSession`, `decline` for command, file-change and permission approvals) and could
 bring them, but it is marked experimental. agy keeps the deny rules described under Safety model.
+
+### Ringo's own updates
+
+Ringo updates itself the way Claude Code does. When the shell opens, and then once an hour, it asks GitHub for the
+newest `main` in the background: one `git fetch` into Ringo's own copy of the history in its state folder
+(`install/repo.git`). It never uses your checkout for this. If there is a newer version, Ringo builds it at low
+priority into a folder of its own (`install/COMMIT`, with its prompts and pipelines). All versions share one build
+folder, and only one builds at a time, so only Ringo itself compiles again. The shell then says
+`Ringo updated to 1a2b3c4 (2 new changes) · /restart to apply`, and the hint by the input box says `update ready`.
+
+The update is put where the running `ringo` is when the shell ends or restarts. Until then the open shell, and the
+pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
+terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on. On its first turn,
+each agent is told the turns it had not heard yet, exactly as it would have been without the restart, so the shared
+conversation loses nothing and gains no extra tokens. Ringo keeps the three newest versions and any version an open
+shell used in the last three days, and removes the rest. Build output is in `install/build.log`.
+
+Ringo leaves some builds for you to update yourself:
+- one built outside git, or with uncommitted changes to what goes into the binary (`ringo --version` then shows no
+  commit);
+- one whose checkout has moved on since it was built;
+- one from a commit that is not on `main`;
+- one run with `RINGO_HOME` set.
+
+`RINGO_NO_UPDATE_CHECK=1` turns the check off. Updating needs git and cargo (a `cargo install` needed them already).
+No model call is made, and the release gate still decides what the pipelines run.
 
 ### Agent updates
 
