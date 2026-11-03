@@ -822,7 +822,11 @@ impl Md {
 /// paste, and Shift-Enter where the terminal can report it.
 fn open() -> std::io::Result<DefaultTerminal> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    // The first frame draws only what differs from a blank screen, so a terminal that keeps what was on it (the shell
+    // before a /restart, where there is no alternate screen of its own) is made blank. Terminal::clear would ask the
+    // terminal where its cursor is, and one that does not answer would stop the shell from opening.
+    use ratatui::crossterm::terminal::{Clear, ClearType};
+    execute!(stdout(), EnterAlternateScreen, Clear(ClearType::All), EnableMouseCapture)?;
     // A paste arrives as one event, not as keys (its newlines as Enter). Not fatal: the legacy Windows console has no
     // bracketed paste, and there a paste's keys are told apart by their timing (see BURST).
     let _ = execute!(stdout(), EnableBracketedPaste);
