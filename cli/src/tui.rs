@@ -328,13 +328,7 @@ fn reviewer(backend: &str, read: impl Fn(ringo_cli::Adapter) -> Option<Result<ri
     }
 }
 
-pub fn fmt_tokens(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
-        _ => format!("{:.2}M", n as f64 / 1e6),
-    }
-}
+pub use ringo_cli::parse::fmt_tokens;
 
 fn fmt_age(d: Duration) -> String {
     let s = d.as_secs();
@@ -355,6 +349,22 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
 fn clean(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n").replace('\t', "    ").chars()
         .filter(|c| *c == '\n' || !c.is_control()).collect()
+}
+
+/// A reply still being written, its last line's open `code` or **bold** closed: shown as it will end up instead of
+/// showing the marks and then changing when they close (two of a real reply's 81 frames did). A mark with nothing
+/// after it yet is left out until its text comes. Inside a code block nothing changes. The whole reply replaces it.
+fn closed(mut text: String) -> String {
+    let fenced = text.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+    let last = text.rsplit('\n').next().unwrap_or("");
+    let Some(mark) = ["`", "**"].into_iter().find(|m| !fenced && last.matches(m).count() % 2 == 1) else { return text };
+    let after = last.rsplit(mark).next().unwrap_or("").len();
+    if text[text.len() - after..].trim().is_empty() {
+        text.truncate(text.len() - after - mark.len());
+    } else {
+        text.insert_str(text.trim_end().len(), mark);
+    }
+    text
 }
 
 /// The input as rows of at most `width` columns (a newline starts a row; a wide character takes two columns), and the
@@ -1311,12 +1321,12 @@ impl App {
                     Said::Partial(text) => match self.streams.get_mut(&id) {
                         Some((at, raw)) if *at < self.out.len() => {
                             raw.push_str(&text);
-                            self.out[*at] = Out::Reply(clean(raw));
+                            self.out[*at] = Out::Reply(closed(clean(raw)));
                             self.fitted.truncate(*at);
                         }
                         _ => {
                             self.gap();
-                            self.out.push(Out::Reply(clean(&text)));
+                            self.out.push(Out::Reply(closed(clean(&text))));
                             self.streams.insert(id, (self.out.len() - 1, text));
                         }
                     },
@@ -2872,6 +2882,19 @@ pub fn run() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reply_being_written_closes_its_open_marks() {
+        let c = |t: &str| closed(t.to_string());
+        assert_eq!(c("depends on the **load fact"), "depends on the **load fact**");
+        assert_eq!(c("Python's built-in `dic "), "Python's built-in `dic` ");
+        assert_eq!(c("a **b** and `c`"), "a **b** and `c`", "closed marks stay as they are");
+        assert_eq!(c("text **"), "text ", "nothing after the mark yet: left out (`****` would be a rule)");
+        assert_eq!(c("Python's built-in `"), "Python's built-in ");
+        assert_eq!(c("```py\nx = 2 ** 3 `"), "```py\nx = 2 ** 3 `", "inside a code block nothing is closed");
+        assert_eq!(c("```py\nx = 1\n```\nnow **this"), "```py\nx = 1\n```\nnow **this**");
+        assert_eq!(c("**bold**\n"), "**bold**\n");
+    }
 
     #[test]
     #[allow(non_snake_case)] // the names the agents had as enum variants, so this test reads as before
