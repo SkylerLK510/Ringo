@@ -32,7 +32,9 @@ fn main() -> ExitCode {
     }
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.first().and_then(|a| a.to_str()) {
-        None if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => tui::run(),
+        None if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => tui::run(None),
+        // what /restart hands the next shell
+        Some("--resume") if args.len() == 2 => tui::run(Some(args[1].clone().into())),
         None => {
             eprint!("{USAGE}");
             ExitCode::from(2)
@@ -46,7 +48,10 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("-V" | "--version") => {
-            println!("ringo {}", env!("CARGO_PKG_VERSION"));
+            match &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)] {
+                "" => println!("ringo {}", env!("CARGO_PKG_VERSION")),
+                commit => println!("ringo {} ({commit})", env!("CARGO_PKG_VERSION")),
+            }
             ExitCode::SUCCESS
         }
         Some("wait") => {

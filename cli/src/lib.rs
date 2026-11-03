@@ -539,11 +539,17 @@ pub fn state_root() -> PathBuf {
     PathBuf::from(home).join(".local/share/ringo")
 }
 
-/// The Ringo checkout whose ringo.py runs the pipelines: RINGO_HOME, else the checkout this binary was built from.
+/// The Ringo checkout whose ringo.py runs the pipelines: RINGO_HOME, else the one this binary was built from (the
+/// updater's copy of that version, or the checkout `cargo install` ran in).
 pub fn ringo_home() -> PathBuf {
-    std::env::var_os("RINGO_HOME").map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf())
+    std::env::var_os("RINGO_HOME").map(PathBuf::from).unwrap_or_else(|| match env!("RINGO_BUILD_HOME") {
+        "" => Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf(),
+        home => PathBuf::from(home),
+    })
 }
+
+/// The commit this binary was built from; empty for a build outside git.
+pub const COMMIT: &str = env!("RINGO_COMMIT");
 
 pub fn python() -> OsString {
     std::env::var_os("RINGO_PYTHON").unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into())
@@ -877,6 +883,20 @@ impl Session {
     }
 
     /// The turn here that `agent` has to wait for: any, or in /separate only its own.
+    /// Each agent's conversation, by name: what /restart hands the next shell so the conversations go on.
+    pub fn threads(&self) -> Vec<(String, String)> {
+        self.threads.iter().map(|(a, id)| (a.name().to_string(), id.clone())).collect()
+    }
+
+    /// Continues conversations a shell before this one had (agents no longer set up are left out).
+    pub fn resume_threads(&mut self, threads: &[(String, String)]) {
+        for (name, id) in threads {
+            if let Some(agent) = Agent::from_name(name) {
+                self.threads.insert(agent, id.clone());
+            }
+        }
+    }
+
     pub fn busy_for(&self, agent: Agent) -> Option<usize> {
         self.jobs.iter().rev().find(|j| j.running() && match j.kind {
             Kind::Agent { agent: a, write: false } => !self.separate || a == agent,

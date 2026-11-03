@@ -195,6 +195,7 @@ file and Ringo prints where.
 |---|---|
 | `/setup` | add an agent and sign in to it |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens |
+| `/restart` | start the updated Ringo: it updates itself in the background and says when this applies it; the conversations go on |
 | `/tier NAME` | how hard agents think: quick, standard, deep or ultra (above) |
 | `/usage` | what you have used, and how much of your plans is left |
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
