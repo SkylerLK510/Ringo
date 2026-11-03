@@ -138,6 +138,8 @@ pub struct Parser {
     steered: usize,
     answered: bool,
     heard: bool,
+    /// Claude: the tool call whose input is being written (tool, characters so far), shown before the call is whole.
+    writing: Option<(String, usize)>,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -149,6 +151,15 @@ fn u(v: &Value, key: &str) -> u64 {
 
 fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
+}
+
+/// A count as the shell says it: 950, 12.3k, 1.25M.
+pub fn fmt_tokens(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.2}M", n as f64 / 1e6),
+    }
 }
 
 /// The first line of text, at most `n` characters.
@@ -276,7 +287,7 @@ impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, turn: None, thread: String::new(), usage: Value::Null,
-                 writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false }
+                 writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -552,13 +563,42 @@ impl Parser {
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
             }
-            ("stream_event", _) => {
+            // What the turn does while a block is still being written, so the job's row is never seconds behind:
+            // Claude Code 2.1.316 says each model request, then thinking's size about once a second (a 12 s think
+            // otherwise read "starting" until it ended). Neither changes any tokens.
+            ("system", "status") if s(e, "status") == "requesting" && parent.is_none() => {
+                notes.push(Note::Activity { node: None, text: "thinking".into() });
+            }
+            ("system", "thinking_tokens") if parent.is_none() => {
+                let text = format!("thinking (~{} tokens)", fmt_tokens(u(e, "estimated_tokens")));
+                notes.push(Note::Activity { node: None, text });
+            }
+            ("stream_event", _) if parent.is_none() => {
                 // --include-partial-messages: the reply's text as it is written. Claude Code sends these for the main
                 // conversation only; each text block's whole Reply follows them.
                 let event = e.get("event").unwrap_or(&NULL);
-                if s(event, "type") == "content_block_delta" && event.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
-                    && parent.is_none() {
-                    notes.push(Note::Partial(event.pointer("/delta/text").and_then(Value::as_str).unwrap_or("").to_string()));
+                let block = event.get("content_block").unwrap_or(&NULL);
+                match (s(event, "type"), event.pointer("/delta/type").and_then(Value::as_str).unwrap_or(""), s(block, "type")) {
+                    ("content_block_delta", "text_delta", _) => {
+                        notes.push(Note::Partial(event.pointer("/delta/text").and_then(Value::as_str).unwrap_or("").to_string()));
+                    }
+                    ("content_block_start", _, "thinking") => notes.push(Note::Activity { node: None, text: "thinking".into() }),
+                    ("content_block_start", _, "text") => notes.push(Note::Activity { node: None, text: "writing".into() }),
+                    // A tool call is named when it starts; its input (a whole file for Write) can take a minute to
+                    // write, so its size shows past 1k characters. The whole call replaces this when it comes.
+                    ("content_block_start", _, "tool_use") => {
+                        self.writing = Some((s(block, "name").to_string(), 0));
+                        notes.push(Note::Activity { node: None, text: s(block, "name").to_string() });
+                    }
+                    ("content_block_delta", "input_json_delta", _) => if let Some((name, n)) = self.writing.as_mut() {
+                        let before = *n / 1000;
+                        *n += event.pointer("/delta/partial_json").and_then(Value::as_str).map_or(0, str::len);
+                        if *n / 1000 > before {
+                            notes.push(Note::Activity { node: None, text: format!("{name} ({} characters so far)", fmt_tokens(*n as u64)) });
+                        }
+                    },
+                    ("content_block_stop", _, _) => self.writing = None,
+                    _ => {}
                 }
             }
             ("rate_limit_event", _) => {
@@ -1151,6 +1191,29 @@ mod tests {
                    "tool input and a subagent's text are not the reply");
         let agy = r#"{"event":"step_update","step_update":{"state":"ACTIVE","step_type":"agent_response","text_delta":"Fix"}}"#;
         assert!(run(Style::Agy, &[agy]).1.contains(&Note::Partial("Fix".into())));
+    }
+
+    #[test]
+    fn the_row_says_what_claude_does_before_a_block_is_whole() {
+        // Shapes from Claude Code 2.1.316 (a real turn: a request, 12 s of thinking, then a tool call written in 136
+        // pieces): each shows as the turn's activity while it happens, not once the block ends.
+        let se = |event: &str, parent: &str| format!(r#"{{"type":"stream_event","event":{event},"parent_tool_use_id":{parent}}}"#);
+        let piece = |json: &str| se(&format!(r#"{{"type":"content_block_delta","index":1,"delta":{{"type":"input_json_delta","partial_json":"{json}"}}}}"#), "null");
+        let big = "x".repeat(600);
+        let lines = [
+            r#"{"type":"system","subtype":"status","status":"requesting"}"#.to_string(),
+            se(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#, "null"),
+            r#"{"type":"system","subtype":"thinking_tokens","estimated_tokens":1300,"estimated_tokens_delta":150}"#.to_string(),
+            se(r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t","name":"Write","input":{}}}"#, "null"),
+            piece(&big), piece(&big), piece(&big),
+            se(r#"{"type":"content_block_stop","index":1}"#, "null"),
+            piece(&big), // a piece of no open call: nothing
+            se(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#, "\"tu1\""),
+        ];
+        let notes = run(Style::Claude, &lines.iter().map(String::as_str).collect::<Vec<_>>()).1;
+        let rows: Vec<&str> = notes.iter().filter_map(|n| match n { Note::Activity { node: None, text } => Some(text.as_str()), _ => None }).collect();
+        assert_eq!(rows, ["thinking", "thinking", "thinking (~1.3k tokens)", "Write", "Write (1.2k characters so far)"],
+                   "the input's size shows once per 1k characters; a subagent's blocks are not the turn's");
     }
 
     #[test]

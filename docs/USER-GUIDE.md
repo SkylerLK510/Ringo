@@ -28,8 +28,9 @@ add a dark mode switch to the settings page
 - Its reply appears as it is written. Each step it takes shows as a line in plain words ("run the tests"), and each
   edit shows the lines it changed: removed in red, added in green. Reading and searching files are counted on one
   line ("read 6 files, searched 4 times"); `/show N` lists each one.
-- While it works, the row above the box shows its time, the tokens it has used and what it is doing now. Press Esc
-  to stop it.
+- While it works, the row above the box (or the side panel, in a wide window) shows its time, the tokens it has used
+  and what it is doing now, as it happens: "thinking (~1.3k tokens)" while Claude thinks, the tool it is calling as
+  soon as it starts one, and a big file's size as Claude writes it. Press Esc to stop it.
 - You can write to it while it works: Claude and Codex read your message at their next step, as they do in their
   own apps, and Ringo says `↳ #3 takes this as it works`. A message that comes as the turn is ending, or one for agy
   (which cannot take one mid-turn), waits under the box and goes next.
