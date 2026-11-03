@@ -357,7 +357,11 @@ fn clean(text: &str) -> String {
 fn closed(mut text: String) -> String {
     let fenced = text.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
     let last = text.rsplit('\n').next().unwrap_or("");
-    let Some(mark) = ["`", "**"].into_iter().find(|m| !fenced && last.matches(m).count() % 2 == 1) else { return text };
+    let odd = |line: &str, mark: &str| line.matches(mark).count() % 2 == 1;
+    // bold is counted outside the line's code spans: `2 ** 3` opens nothing
+    let mark = if fenced { None } else if odd(last, "`") { Some("`") }
+        else if odd(&last.split('`').step_by(2).collect::<String>(), "**") { Some("**") } else { None };
+    let Some(mark) = mark else { return text };
     let after = last.rsplit(mark).next().unwrap_or("").len();
     if text[text.len() - after..].trim().is_empty() {
         text.truncate(text.len() - after - mark.len());
@@ -2889,6 +2893,8 @@ mod tests {
         assert_eq!(c("depends on the **load fact"), "depends on the **load fact**");
         assert_eq!(c("Python's built-in `dic "), "Python's built-in `dic` ");
         assert_eq!(c("a **b** and `c`"), "a **b** and `c`", "closed marks stay as they are");
+        assert_eq!(c("`2 ** 3` is"), "`2 ** 3` is", "a code span's stars are not bold");
+        assert_eq!(c("**a `2 ** 3` b"), "**a `2 ** 3` b**");
         assert_eq!(c("text **"), "text ", "nothing after the mark yet: left out (`****` would be a rule)");
         assert_eq!(c("Python's built-in `"), "Python's built-in ");
         assert_eq!(c("```py\nx = 2 ** 3 `"), "```py\nx = 2 ** 3 `", "inside a code block nothing is closed");
