@@ -25,7 +25,7 @@ pub const HANDOFF_AT: u64 = 64_000;
 /// How much of Ringo's record goes into a turn, in characters (about four a token): the turns, newest first, then
 /// the change they made.
 const RECORD_CHARS: usize = 60_000;
-/// Where Claude's conversation compacts itself mid-turn, in tokens (see `launch_agent`).
+/// Where an agent's conversation compacts itself mid-turn, in tokens: Claude's and Codex's (see `launch_agent`).
 const COMPACT_AT: u64 = 200_000;
 
 /// How Ringo talks to an agent's program. The protocols are code; which agents use them, and how each one is
@@ -989,6 +989,13 @@ impl Session {
     /// send Codex to Ringo: a turn Ringo launched is then told it is already in Ringo (see CODEX_IN_RINGO). Not when
     /// the owner's Codex settings give developer instructions of their own, which the thread's would replace.
     /// ceiling: the settings are scanned for the key, not parsed; such an owner's turns still follow the file.
+    /// Whether the owner's own Codex config.toml sets `key` (theirs wins over a setting of Ringo's).
+    /// ceiling: a key under a profile counts as set too.
+    fn codex_sets(&self, key: &str) -> bool {
+        fs::read(self.codex_home.join("config.toml")).is_ok_and(|b| String::from_utf8_lossy(&b).lines()
+            .any(|l| l.trim_start().strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))))
+    }
+
     fn codex_told_to_use_ringo(&self) -> bool {
         let read = |name: &str| fs::read(self.codex_home.join(name)).map(|b| String::from_utf8_lossy(&b).to_lowercase());
         let own = read("config.toml").is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
@@ -1367,6 +1374,12 @@ impl Session {
                 cmd.args(["-c", "features.image_generation=false", "-c", "features.goals=false"]);
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
+                }
+                // Where Claude's turns compact (COMPACT_AT): Codex's own limit is near its 475k window, so one long
+                // turn here read 2.9M tokens with its calls still growing past 137k each (codex-cli 0.166.0). An owner
+                // whose config.toml sets the limit keeps their own.
+                if !self.codex_sets("model_auto_compact_token_limit") {
+                    cmd.args(["-c", &format!("model_auto_compact_token_limit={COMPACT_AT}")]);
                 }
                 let mut thread = serde_json::json!({"cwd": cwd, "sandbox": sandbox,
                                                     "approvalPolicy": if auto { "on-request" } else { "never" }});

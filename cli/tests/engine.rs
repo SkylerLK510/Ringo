@@ -520,7 +520,7 @@ fn agent_commands_are_pinned() {
                 "-c", "model_provider=\"openai\"", "-c", "features.default_mode_request_user_input=false",
                 "-c", "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false",
                 "-c", "features.plugins=false", "-c", "features.apps=false", "-c", "features.image_generation=false",
-                "-c", "features.goals=false"].map(String::from).to_vec();
+                "-c", "features.goals=false", "-c", "model_auto_compact_token_limit=200000"].map(String::from).to_vec();
     let mut codex_turn = |write: bool| -> (Vec<String>, String, String) {
         let (argv, _) = turn(agent("codex"), write, &codex);
         let thread = threads(&codex).pop().unwrap().to_string();
@@ -1289,6 +1289,24 @@ fn the_record_names_the_files_a_turn_edited_where_git_cannot_see_them() {
     let told = turn_text(&codex);
     assert!(told.contains("#1 · the owner to claude: WRITE-O\nclaude: done\n") && told.contains("\nedited (as it reported): o.txt\n")
             && !told.contains("changed:"), "{told}");
+}
+
+#[test]
+fn codex_compacts_where_claude_does_unless_the_owner_set_it() {
+    let r = repo("codex-compact");
+    let codex = fake(&root(), "codex-compact", &codex_ok());
+    let mut s = session(&r, agent("codex"), &codex);
+    let home = root().join("codex-home-compact");
+    fs::create_dir_all(&home).unwrap();
+    s.codex_home = home.clone();
+    let args = |s: &mut Session| {
+        s.forget();
+        said(s, "codex", "go");
+        fs::read_to_string(codex.with_extension("argv")).unwrap()
+    };
+    assert!(args(&mut s).lines().any(|l| l == "model_auto_compact_token_limit=200000"));
+    fs::write(home.join("config.toml"), "model = \"x\"\nmodel_auto_compact_token_limit = 350000\n").unwrap();
+    assert!(!args(&mut s).contains("model_auto_compact_token_limit"), "the owner's own limit stands");
 }
 
 #[test]

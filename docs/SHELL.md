@@ -454,6 +454,8 @@ call re-reads everything before it. On a subscription login Claude runs Opus wit
 compacts a conversation only near 967k tokens: one long turn started in a home folder read 3.9M tokens in all, its
 last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000`, the window Claude Code
 compacts at on a 200k model, and Claude compacts by itself when a conversation passes it, mid-turn as on resuming.
+Codex compacts near its own 475k window (one long turn here read 2.9M tokens, its calls still growing past 137k), so
+it runs with `-c model_auto_compact_token_limit=200000` too, unless your `config.toml` sets the key.
 Compaction keeps the system prompt (with the files appended above) and re-reads the five files last changed; the
 rest of the history becomes Claude's summary. Set the variable yourself to choose another window (100000 to
 1000000). `/compact` still compacts at once. A short exchange adds little, but start a write job (`@codex!`) for an
