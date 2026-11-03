@@ -122,11 +122,16 @@ Put its name first: `@codex why is this slow?`. The rest of the conversation goe
 with `@claude`. It is one conversation: Codex is told what you said to Claude, what Claude answered and what it
 changed, so `@codex take it from here` carries on the same work.
 
+The agents work side by side: while Claude works, `@codex write the README` starts at once. Codex is told what Claude
+is still doing and which files it has edited so far, so it leaves that alone, and each hears how the other's turn
+ended at its next one. Each agent still takes one turn at a time: a message for a busy agent goes into its turn.
+
 ## Give each agent its own task
 
-Type `/separate`, then give each agent its task: `@claude fix the login bug`, then `@codex write the README`. They
-work at the same time, each in its own conversation, and neither is told what the other does. Each still takes one
-turn at a time, and your next message to a busy agent goes into its turn. The top line says `separate` while it is on.
+Type `/separate`, then give each agent its task: `@claude fix the login bug`, then `@codex write the README`
+(`/separate @claude fix the login bug` does both in one line). They work at the same time, each in its own
+conversation, and neither is told what the other does, so their turns read less. Each still takes one turn at a
+time, and your next message to a busy agent goes into its turn. The top line says `separate` while it is on.
 `/together` puts them back in one conversation. Esc stops the latest turn; `/kill N` stops a given one.
 
 `/undo` still takes back one turn at a time. When two agents worked here at once, a turn's undo leaves out any file

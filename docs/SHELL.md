@@ -171,11 +171,11 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 
 | You type | What happens |
 |---|---|
-| `TEXT` (no `/` or `@`) | a turn of the agent you are talking to, in this folder, continuing its conversation: it reads, changes files there, and asks before anything else (in `ask` mode). One turn at a time works in the folder: a line typed while one runs waits under the input and goes when it ends (Esc stops the turn and gives the waiting lines back to the input) |
+| `TEXT` (no `/` or `@`) | a turn of the agent you are talking to, in this folder, continuing its conversation: it reads, changes files there, and asks before anything else (in `ask` mode). Each agent takes one turn at a time in the folder, and the agents work side by side: a line for an agent whose turn runs goes into that turn (Claude, Codex) or waits under the input for it (Esc stops the latest turn and gives its agent's waiting lines back to the input) |
 | `/undo` | the files the latest turn here changed go back as they were before it; each `/undo` goes one turn further back. A file you edited since makes it refuse and touch nothing |
 | `/ask TEXT` | a quick answer: one tool-free call with your last few `/ask` questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell gives it to the agent you are talking to, or to `/research`; a review is put in the input line for you to say what to review |
 | `/clear` | a new conversation: each agent's next turn starts fresh |
-| `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, nothing of one is told to another, and agents take turns in the folder at the same time (one turn each, a line for a busy agent goes into its turn). `/together`: one conversation again, one turn at a time. The head says `separate` while it is on |
+| `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, and nothing of one is told to another. `/together` (the default): one conversation again. Either way the agents work in the folder at the same time, one turn each. Text after either is sent as a line of its own once it has switched (`/separate @codex write the README`); any other command that takes nothing refuses text after it rather than drop it. The head says `separate` while it is on |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
@@ -471,8 +471,12 @@ or for the spinner while a job runs.
 ### One conversation, and a fresh start past 64k
 
 Every turn in the folder belongs to one conversation, whichever agent takes it. An agent continuing its own is sent,
-ahead of the owner's message, Ringo's record of the turns the others took since its last one; an agent starting one
-(its first turn, or after `/clear`) is sent the record of the whole conversation. When an agent's window passes
+ahead of the owner's message, Ringo's record of the other agents' turns it has not been told; an agent starting one
+(its first turn, or after `/clear`) is sent the record of the whole conversation. Agents work side by side, so a
+turn can end after a later one began: Ringo keeps which turns each agent has been told, never a place in the list, so
+each turn is told once and none is missed. A turn that starts while another agent's runs here is also told, in one
+line each, what that turn was asked and which files it has edited so far, so it leaves that work alone; it hears how
+the turn ended at its next turn. When an agent's window passes
 64,000 tokens (its latest call's input and output, as Claude's message usage and Codex's `tokenUsage.last` report
 it), its next turn does not resume: it starts fresh from the record of the whole conversation, if the record is at
 most half that size. The turn's log says which of these happened and how big the record is.
@@ -483,7 +487,8 @@ originals every time, so it is never a summary of a summary:
 - the owner's message, word for word (one past 4,000 characters is cut, and the cut said);
 - the agent's reply: the newest whole (to 6,000 characters), older ones' first paragraph (to 600);
 - the steps it took: every failed one (up to five) and, for the newest turn, its last five;
-- the files it changed, and whether `/undo` took them back;
+- the files it changed, and whether `/undo` took them back; where git cannot say (a folder with no `/undo`, such as
+  the home folder, or another turn at work here that ran commands), the files it said it edited;
 - the change the turns made, as `git diff` from before the first to after the last, in those files only.
 
 The turns go in newest first, to about 60,000 characters (about 15,000 tokens); an older turn past that is named
@@ -501,7 +506,7 @@ The agents' own compaction is a model call that summarises the whole transcript.
 matched it in published work (observation masking matched LLM summaries at about half the cost on SWE-bench Verified,
 JetBrains 2025), and summaries of summaries lose rules.
 
-With `/separate`, two agents' turns can change the folder at the same time. A turn's undo then keeps only the
+Two agents' turns can change the folder at the same time, together or separate. A turn's undo then keeps only the
 files it reported editing (Claude's Edit and Write, Codex's file changes) that the other turn did not, and none when
 the other ran a shell command (Claude's Bash, a Codex command that did more than read), which may have written any
 file without saying so. The rest are named in its log and stay out of `/undo`, so one agent's undo never takes
@@ -514,13 +519,14 @@ before this one ended may not be known yet.
 |---|---|---|---|---|
 | `quick` | `--effort low` | `-c model_reasoning_effort="low"` | `--effort low` | |
 | `standard` | nothing: each agent's own default and the owner's settings (a Codex `config.toml` that sets an effort keeps it) | | | |
-| `deep` | `--effort xhigh` | `"xhigh"` | `--effort xhigh` | |
-| `ultra` | `--effort xhigh` | `"xhigh"` | `--effort xhigh` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
+| `deep` | `--effort xhigh` | `"xhigh"` | `--effort high` | |
+| `ultra` | `--effort xhigh` | `"xhigh"` | `--effort high` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
 
 A tier changes no prompt: effort is a model setting, not text. The shell starts in `standard` every time, so a tier
 that spends more is never left on from an earlier day. `deep` is xhigh, not high, because an owner's own settings can
 already run Claude at xhigh (Claude Code reads `effortLevel` from its settings under `--safe-mode` too), and high
-would lower it; a setting of max is lowered to xhigh while `deep` or `ultra` is on.
+would lower it; a setting of max is lowered to xhigh while `deep` or `ultra` is on. agy gets high: its default model
+has no xhigh, and given it every turn failed at once (agy 1.4.12, gemini-3.8-flash).
 
 `ultra` builds on the one extra spend Ringo measured to raise quality. On COMPLEX-01, checks alone passed 3 of 11
 seeded candidates, and one review plus one revision passed 11 of 11. Higher effort alone measured no gain on the
@@ -587,8 +593,8 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   Agent SDK uses; `--permission-prompts host` alone denies them) and Ringo writes your answer back. A request Ringo
   does not serve is refused at once, so a turn never waits on it. Codex and agy cannot ask; a request Codex's
   app-server sends anyway is refused at once in the same way.
-- **Turns in your folder** run where you started `ringo`, continuing the agent's conversation, one at a time
-  (in `/separate`, one at a time for each agent): Codex
+- **Turns in your folder** run where you started `ringo`, continuing the agent's conversation, one at a time for
+  each agent: Codex
   with `workspace-write` (edits and commands inside the folder, no network; in auto mode the network and Codex's own
   reviewer for its approval requests), Claude with `acceptEdits` in ask mode and auto mode in auto mode (edits in the
   folder allowed; any other command waits for you, or for its review), agy with `--mode accept-edits` and
@@ -629,8 +635,8 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
 - **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.
-- **Limits:** three jobs at a time, and one turn at a time in your folder; a line for the agent working there goes
-  into its turn (Claude, Codex), the shell queues the others, and it refuses a fourth job.
+- **Limits:** three jobs at a time, and one turn of each agent's at a time in your folder; a line for an agent
+  working there goes into its turn (Claude, Codex) or waits for it (agy), and the shell refuses a fourth job.
 - **State:** `~/.local/share/ringo/shell/` (or under `RINGO_RELEASE_HOME`), owner-only. Each job folder keeps its
   task, raw events, reply, stderr and patch. Logs can contain your code: delete them yourself when done.
 

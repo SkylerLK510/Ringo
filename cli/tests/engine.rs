@@ -656,7 +656,7 @@ fn agy_turns_and_their_permissions() {
     const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
     let agy = fake(&root(), "agy", &format!("#!/bin/sh\n{RECORD}\
         echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
-        if [ -e \"$0.fail\" ]; then rm \"$0.fail\"; echo '{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"response\":\"quota\",\"usage\":{{}}}}}}'; exit 0; fi\n\
+        if [ -e \"$0.fail\" ]; then rm \"$0.fail\"; echo '{{\"event\":\"result\",\"result\":{{\"status\":\"ERROR\",\"response\":\"\",\"error\":\"invalid model selection\",\"usage\":{{}}}}}}'; exit 0; fi\n\
         case \" $* \" in *' --conversation '*) k=$(($(cat \"$0.k\") + 1)); echo $k > \"$0.k\" ;; *) k=1; [ -e \"$0.k\" ] || echo 1 > \"$0.k\" ;; esac\n\
         echo \"{{\\\"event\\\":\\\"result\\\",\\\"result\\\":{{\\\"status\\\":\\\"SUCCESS\\\",\\\"response\\\":\\\"done\\\",\\\"usage\\\":{{\\\"input_tokens\\\":$((7*k)),\\\"output_tokens\\\":$((2*k))}}}}}}\"\n"));
     let mut s = session(&r, agent("agy"), &agy);
@@ -680,7 +680,8 @@ fn agy_turns_and_their_permissions() {
     // A failed resumed turn reports no usage; the running total it leaves is still the last one reported.
     fs::write(format!("{}.fail", agy.display()), "").unwrap();
     let failed = s.launch_agent(agent("agy"), false, "again").unwrap();
-    assert!(matches!(wait(&mut s, failed), Status::Failed(_)));
+    // the reason is in `error`, the response empty: it is what the owner and the other agents hear
+    assert!(matches!(wait(&mut s, failed), Status::Failed(why) if why == "agy ended with ERROR: invalid model selection"));
     assert_eq!(s.job(failed).unwrap().tokens.total(), 0);
     let next = s.launch_agent(agent("agy"), false, "and now?").unwrap();
     assert_eq!(wait(&mut s, next), Status::Done);
@@ -1022,7 +1023,9 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
             "{c}\n{x}\n{a}");
     for tier in [ringo_cli::Tier::Deep, ringo_cli::Tier::Ultra] {
         let (c, x, a) = effort(&mut s, tier);
-        assert!(has(&c, &["--effort", "xhigh"]) && has(&x, &["-c", "model_reasoning_effort=\"xhigh\""]) && has(&a, &["--effort", "xhigh"]));
+        // agy's default model has no xhigh (agy 1.4.12): it gets its highest, high
+        assert!(has(&c, &["--effort", "xhigh"]) && has(&x, &["-c", "model_reasoning_effort=\"xhigh\""]) && has(&a, &["--effort", "high"]),
+                "{c}\n{x}\n{a}");
     }
     // every job that used tokens is in the record /usage totals. Claude: 7 a turn. Codex and agy count what a turn
     // added to its thread's total, and these fakes answer with one thread and one total every time, so only their
@@ -1221,6 +1224,74 @@ fn agents_share_one_conversation_and_a_long_one_starts_fresh_from_ringos_record(
 }
 
 #[test]
+fn together_agents_work_side_by_side_and_each_hears_every_turn_it_missed() {
+    let r = repo("side");
+    let codex = fake(&root(), "codex-side", &codex_script(&format!("{CODEX_EDITS}\ncase \"$turn\" in *SLOW*) sleep 1 ;; esac"),
+                                                         &codex_done("all done", (10, 4, 2))));
+    let claude = fake(&root(), "claude-side", CLAUDE_TALKS);
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    s.codex_home = root().join("codex-home-golden");
+    let slow = s.launch_agent(agent("codex"), false, "SLOW").unwrap();
+    assert!(s.launch_agent(agent("codex"), false, "again").unwrap_err().contains(&format!("#{slow}")), "each agent one turn at a time");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while s.job(slow).unwrap().touched.is_empty() {
+        assert!(Instant::now() < deadline, "codex said no edit");
+        s.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Claude starts while Codex works, in the same conversation: told what is still at work, and ends first.
+    let quick = s.launch_agent(agent("claude"), false, "WRITE-O").unwrap();
+    assert_eq!(wait(&mut s, quick), Status::Done);
+    assert!(s.job(slow).unwrap().running(), "codex still works");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(!resumed && told.starts_with("Still at work in this folder as you start"), "{told}");
+    assert!(told.contains(&format!("#{slow} codex, asked: \"SLOW\"; edited so far: made.txt\n")), "{told}");
+    assert!(told.ends_with("The owner's new message:\nWRITE-O"), "{told}");
+    assert!(s.job(quick).unwrap().log.iter().any(|l| l == "told claude which turns are still at work here"));
+    assert_eq!(wait(&mut s, slow), Status::Done);
+    // Codex goes on with its conversation and hears Claude's turn, which ended while it worked: its file is Claude's
+    // own (Codex said it edited another and had run no command yet).
+    said(&mut s, "codex", "next");
+    let told = turn_text(&codex);
+    assert!(told.starts_with("While you were away") && told.contains(&format!("#{quick} · the owner to claude: WRITE-O")), "{told}");
+    assert!(told.contains("changed: o.txt") && !told.contains(&format!("#{slow} ·")), "{told}");
+    // Claude hears both of Codex's turns: the one that ended after its own began, which a place in the lane would
+    // miss, and the one since; never its own, and nothing twice.
+    let now = said(&mut s, "claude", "and now");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.contains(&format!("#{slow} · the owner to codex: SLOW")) && told.contains("the owner to codex: next"), "{told}");
+    assert!(!told.contains(&format!("#{quick} ·")) && !told.contains("Still at work"), "{told}");
+    said(&mut s, "claude", "again");
+    assert_eq!(claude_heard(&claude), ("again".into(), true), "each turn told once");
+    // /restart hands on the same: claude has heard every turn; codex has yet to hear claude's last two
+    let carry = s.carry();
+    assert!(!carry.iter().any(|(a, _)| a == "claude"), "{carry:?}");
+    let codex_owed = &carry.iter().find(|(a, _)| a == "codex").unwrap().1;
+    assert!(codex_owed.starts_with(&format!("#{now} · the owner to claude: and now")) && !codex_owed.contains(&format!("#{quick} ·")),
+            "{codex_owed}");
+}
+
+#[test]
+fn the_record_names_the_files_a_turn_edited_where_git_cannot_see_them() {
+    // a folder with a git project inside it gets no /undo, so no snapshot says what a turn changed
+    let dir = root().join("no-undo");
+    fs::create_dir_all(dir.join("inner/.git")).unwrap();
+    let state = root().join("no-undo-state");
+    let (codex, claude) = (fake(&root(), "codex-no-undo", &codex_ok()), fake(&root(), "claude-no-undo", CLAUDE_TALKS));
+    let mut s = Session::with_state_home(&dir, &state, &root()).unwrap();
+    assert!(!s.undoable());
+    s.programs.insert(agent("claude"), claude.clone());
+    s.programs.insert(agent("codex"), codex.clone());
+    s.codex_home = root().join("codex-home-golden");
+    said(&mut s, "claude", "WRITE-O");
+    said(&mut s, "codex", "take it from here");
+    let told = turn_text(&codex);
+    assert!(told.contains("#1 · the owner to claude: WRITE-O\nclaude: done\n") && told.contains("\nedited (as it reported): o.txt\n")
+            && !told.contains("changed:"), "{told}");
+}
+
+#[test]
 fn separate_agents_work_at_once_and_undo_keeps_their_work_apart() {
     let r = repo("separate");
     let codex = fake(&root(), "codex-separate", &codex_script(&format!("case \"$turn\" in *SLOW*) sleep 1 ;; esac\n{CODEX_EDITS}"),
@@ -1229,9 +1300,8 @@ fn separate_agents_work_at_once_and_undo_keeps_their_work_apart() {
     let mut s = session(&r, agent("claude"), &claude);
     s.programs.insert(agent("codex"), codex.clone());
     s.codex_home = root().join("codex-home-golden");
-    let slow = s.launch_agent(agent("codex"), false, "SLOW").unwrap();
-    assert!(s.launch_agent(agent("claude"), false, "WRITE-O").unwrap_err().contains("busy"), "together: one turn here at a time");
     s.separate = true;
+    let slow = s.launch_agent(agent("codex"), false, "SLOW").unwrap();
     let other = s.launch_agent(agent("claude"), false, "WRITE-O").unwrap();
     assert!(s.launch_agent(agent("codex"), false, "again").unwrap_err().contains(&format!("#{slow}")), "each agent one turn at a time");
     assert_eq!(wait(&mut s, other), Status::Done);
@@ -1254,7 +1324,7 @@ fn separate_agents_work_at_once_and_undo_keeps_their_work_apart() {
     assert_eq!((wait(&mut s, other), wait(&mut s, slow)), (Status::Done, Status::Done));
     assert!(s.job(slow).unwrap().changed.is_empty(), "made.txt came back, but #{other} ran a command meanwhile");
     assert!(s.job(slow).unwrap().log.iter().any(|l| l == &format!("made.txt changed while #{other} ran commands here too, so /undo leaves it")));
-    // Back together, the next turn waits again, and hears nothing of what the others did on their own.
+    // Back together, the next turn hears nothing of what the others did on their own.
     s.separate = false;
     said(&mut s, "codex", "together");
     assert_eq!(turn_text(&codex), "together");

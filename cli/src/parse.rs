@@ -814,7 +814,9 @@ impl Parser {
                 let denied: Vec<&str> = r.get("denied_actions").and_then(Value::as_array).into_iter().flatten()
                     .map(|d| s(d, "action")).collect();
                 if s(r, "status") != "SUCCESS" {
-                    let why = format!("agy ended with {}: {}", s(r, "status"), short(&self.reply.clone(), 200));
+                    // the reason is in `error` (agy 1.4.12: an effort its model lacks); `response` is empty then
+                    let said = [s(r, "error"), self.reply.as_str()].into_iter().find(|t| !t.trim().is_empty()).unwrap_or("");
+                    let why = format!("agy ended with {}: {}", s(r, "status"), short(said, 200));
                     notes.extend(self.fail(why));
                 } else if self.reply.trim().is_empty() && !denied.is_empty() {
                     notes.extend(self.fail(format!("agy stopped: it needed permission for {}", denied.join(", "))));
