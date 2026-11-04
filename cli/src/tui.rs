@@ -19,7 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame, Terminal};
-use ringo_cli::{Adapter, Agent, Decision, Kind, Mode, Said, Session, Status, Tier};
+use ringo_cli::{Agent, Decision, Kind, Mode, Said, Session, Status, Tier};
 use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -1883,8 +1883,13 @@ impl App {
         let whose = self.s.job(id).ok().and_then(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None });
         let (back, keep): (VecDeque<_>, VecDeque<_>) = self.queue.drain(..).partition(|(a, ..)| whose.is_none_or(|w| *a == w));
         self.queue = keep;
+        let agents: Vec<Agent> = back.iter().map(|(a, ..)| *a).collect();
         let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
         if !queued.is_empty() && self.input.is_empty() {
+            // back to the agent they were for, though another may have spoken since (see `feed`)
+            if let Some(&agent) = agents.first().filter(|a| agents.iter().all(|b| b == *a)) {
+                self.main = agent;
+            }
             self.input = queued.join("\n").chars().collect();
             self.cursor = self.input.len();
         }
@@ -2796,12 +2801,14 @@ impl App {
             };
             let marked = |rest: Span<'static>| Line::from([live.mark.clone(), vec![rest]].concat());
             let mut rows: Vec<Line> = if self.input.is_empty() {
-                // a line for an agent at work goes into its turn (Claude, Codex) or waits for it (see `talk`)
-                let ask = match self.s.busy_for(self.main) {
-                    Some(_) if matches!(self.main.spec().adapter, Adapter::Claude | Adapter::Codex) =>
-                        "type more; it goes into this turn as it works",
-                    Some(_) => "type what comes next; it waits for this turn",
-                    None => "Tell Ringo what you want to do",
+                // what a line does now, by `talk`'s rules: starts a turn, goes into the agent's turn at work, or waits
+                let main = self.main;
+                let ask = if !main.spec().read || !self.must_wait(main) {
+                    "Tell Ringo what you want to do"
+                } else if self.s.busy_for(main).is_some_and(|id| self.s.steerable(id)) && !self.queue.iter().any(|(a, ..)| *a == main) {
+                    "type more; it goes into this turn as it works"
+                } else {
+                    "type what comes next; it waits for this turn"
                 };
                 vec![marked(Span::styled(ask, t.dim))]
             } else {
@@ -3650,6 +3657,27 @@ mod tests {
         assert_eq!(a.main, agy);
         let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
         assert!(said.contains("plain lines go to agy now"), "{said}");
+        // the empty input says what a line does now, by talk's rules: claude's turn at work takes it, unless a line
+        // already waits for claude
+        let bin = dir.join("claude");
+        std::fs::write(&bin, format!("{CLAUDE_PLAN}while [ -f \"$0.hold\" ]; do sleep 0.05; done\nhead -n 1 > /dev/null\n\
+            echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-f\",\"apiKeySource\":\"none\"}}'\n\
+            echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("claude.hold"), "").unwrap();
+        a.s.programs.insert(claude, bin);
+        a.main = claude;
+        let id = a.s.launch_agent(claude, false, "work").unwrap();
+        let shown = |a: &mut App, text: &str| screen(a, 80, 24).iter().any(|r| r.contains(text));
+        assert!(shown(&mut a, " claude ❯ type more; it goes into this turn as it works"));
+        a.queue.push_back((claude, "next".into(), "next".into()));
+        assert!(shown(&mut a, " claude ❯ type what comes next; it waits for this turn"));
+        // stopped, the turn's waiting line comes back for claude, though agy is the one plain lines went to since
+        a.main = agy;
+        a.stop(id);
+        assert_eq!((a.main, a.input.iter().collect::<String>()), (claude, "next".to_string()));
+        let _ = std::fs::remove_file(dir.join("claude.hold"));
+        finish(&mut a);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

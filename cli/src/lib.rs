@@ -864,11 +864,28 @@ impl Session {
     /// Sends the owner's `text` into job `id`, a turn of Claude's or Codex's still running, as Claude Code and Codex
     /// take a message typed while they work: it reads it at its next step. False when the turn cannot take it (agy,
     /// a /compact, a Codex turn not yet started, or one whose input has closed); the line then waits for the next turn.
+    /// Whether job `id` can take a line as it works (`steer`), whatever the line says: a Claude or Codex turn at work
+    /// that is not a `/compact` and has not closed its input.
+    pub fn steerable(&self, id: usize) -> bool {
+        let Some(job) = self.jobs.get(id.wrapping_sub(1)) else { return false };
+        let Kind::Agent { agent, .. } = job.kind else { return false };
+        let open = match agent.spec().adapter {
+            Adapter::Claude => true,
+            Adapter::Codex => job.codex_turn.is_some(),
+            _ => false,
+        };
+        open && job.running() && job.title_full.trim() != "/compact" && job.input.is_some()
+            && !job.gate.lock().unwrap_or_else(|e| e.into_inner()).closed
+    }
+
     pub fn steer(&mut self, id: usize, text: &str) -> bool {
-        let Some(job) = self.jobs.get_mut(id.wrapping_sub(1)) else { return false };
+        if !self.steerable(id) {
+            return false;
+        }
+        let job = &mut self.jobs[id - 1];
         let Kind::Agent { agent, .. } = job.kind else { return false };
         // a line that names a connector needs a turn started with them
-        if !job.running() || job.title_full.trim() == "/compact" || (names_connector(text) && !job.connectors) {
+        if names_connector(text) && !job.connectors {
             return false;
         }
         let line = match agent.spec().adapter {
