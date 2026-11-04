@@ -86,7 +86,10 @@ in `cli/src/agents.json`; how each protocol is spoken stays in code.
 
 Claude owns writing and reading code: a plain line goes to Claude when it is set up, else to Codex, else to any
 agent that works in the folder. `@codex` (or any `@agent`) switches who you talk to, and later plain lines go there
-too. It is one conversation: an agent is told what the others did since its last turn (see
+too; `@codex` alone switches without a turn. A plain line also goes to whichever agent's words came last in this
+folder, unless you named an agent after them: you answer what you read last. A line you have started typing keeps its
+agent, and the input box always names it (` claude ❯ `). Waiting lines show whose they are (`↳ next for claude: …`).
+It is one conversation: an agent is told what the others did since its last turn (see
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)). Codex owns the abstract work: Ringo's pipelines (`/research`,
 `/design`, `/review`) and `/ask` run on it.
 
@@ -125,7 +128,7 @@ rest (where Ringo is, who works here, the guide and the settings in force):
                   /usrman how it works · / commands · ? keys
 
 ────────────────────────────────────────────────────────────────────────────────
- ❯ Tell Ringo what you want to do                             ⇧⇥ mode · ? keys
+ claude ❯ Tell Ringo what you want to do                      ⇧⇥ mode · ? keys
 ```
 
 Then each speaker starts with a chip in their own colour (shown here as plain text):
@@ -184,7 +187,7 @@ where. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on scree
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
 | `/research TOPIC` | Ringo's research role: one live web search call, every quoted source fetched and its quote checked in code, one write call that cites only verified evidence ([details](RESEARCH-ROLE.md)). Measured once at about 68,000 tokens, most of them search results |
 | `/work SPEC.json` | Ringo's checked work loop on a task spec |
-| `@codex TASK` | talk to Codex from now on: this turn and later plain lines go to it, in this folder |
+| `@codex TASK` | talk to Codex from now on: this turn and later plain lines go to it, in this folder (`@codex` alone switches without a turn) |
 | `@codex! TASK` | Codex in its own copy of the folder (a git worktree of it as it is now, uncommitted changes included); nothing reaches your files until `/apply` |
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once, each in its own copy, to compare |
 | `{#N}` inside a task | hands job N's reply (and its change) to the agent; the shell shows exactly what was added |
@@ -197,7 +200,13 @@ Start `ringo` in any folder, as you would `claude` or `codex`. In a git project 
 copies work and `/review BASE` reviews its commits; in any other folder, a repository that holds your home folder (a
 dotfiles repository) included, the agents still work in the folder and `/undo` works from Ringo's own store (see the
 safety model), and so does `/review #N` of a turn there, while copies and `/review BASE` need a git project. Ringo's private state stays out of every repository;
-its folder carries a `.gitignore` of its own.
+its folder carries a `.gitignore` of its own. Opened in the home folder, the shell says once where a turn's edits all
+went, when they all went to one git project, so the next session can start there.
+
+When a step's output says a read was refused ("Operation not permitted": on a Mac, its privacy protection on another
+app's data or a personal folder), the turn shows you once that what it could not read may still be there: agents
+take a refused read for a missing thing (one said a browser extension was not set up). Only you see the line, so it
+costs no tokens.
 
 A turn costs about 12,000 to 15,000 tokens before the agent starts (measured under
 [Modes and permissions](#modes-and-permissions); Claude Code's own first turn measured about 50,000), and a vague
@@ -455,7 +464,8 @@ compacts a conversation only near 967k tokens: one long turn started in a home f
 last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000`, the window Claude Code
 compacts at on a 200k model, and Claude compacts by itself when a conversation passes it, mid-turn as on resuming.
 Codex compacts near its own 475k window (one long turn here read 2.9M tokens, its calls still growing past 137k), so
-it runs with `-c model_auto_compact_token_limit=200000` too, unless your `config.toml` sets the key.
+it runs with `-c model_auto_compact_token_limit=200000` too, unless your `config.toml` sets the key. A compaction
+takes a minute or more (82 s for 171k tokens, measured), and the turn's row says "compacting the conversation" meanwhile.
 Compaction keeps the system prompt (with the files appended above) and re-reads the five files last changed; the
 rest of the history becomes Claude's summary. Set the variable yourself to choose another window (100000 to
 1000000). `/compact` still compacts at once. A short exchange adds little, but start a write job (`@codex!`) for an

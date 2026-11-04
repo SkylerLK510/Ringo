@@ -31,6 +31,9 @@ add a dark mode switch to the settings page
 - While it works, the row above the box (or the side panel, in a wide window) shows its time, the tokens it has used
   and what it is doing now, as it happens: "thinking (~1.3k tokens)" while Claude thinks, the tool it is calling as
   soon as it starts one, and a big file's size as Claude writes it. Press Esc to stop it.
+- "a read there was refused" under a step means the agent could not look somewhere (on a Mac, its privacy protection
+  keeps apps out of other apps' data and some personal folders). What it could not see may still be there, so check
+  before you believe "it isn't set up".
 - You can write to it while it works: Claude and Codex read your message at their next step, as they do in their
   own apps, and Ringo says `↳ #3 takes this as it works`. A message that comes as the turn is ending, or one for agy
   (which cannot take one mid-turn), waits under the box and goes next.
@@ -119,7 +122,10 @@ work.
 ## Talk to a different agent
 
 Put its name first: `@codex why is this slow?`. The rest of the conversation goes to Codex too, until you pick another
-with `@claude`. It is one conversation: Codex is told what you said to Claude, what Claude answered and what it
+with `@claude` (on its own, `@claude` just switches). When an agent writes to you, your next plain line goes to it, so
+an answer to Codex's question reaches Codex even if you last spoke to Claude. The box you type in always starts with the
+name of the agent your line goes to (` claude ❯ `), and a line waiting for its turn says whose it is. It is one
+conversation: Codex is told what you said to Claude, what Claude answered and what it
 changed, so `@codex take it from here` carries on the same work.
 
 The agents work side by side: while Claude works, `@codex write the README` starts at once. Codex is told what Claude
