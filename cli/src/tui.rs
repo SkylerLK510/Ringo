@@ -120,6 +120,10 @@ fn load_history() -> Vec<String> {
 
 fn save_history(line: &str) {
     use std::io::Write;
+    // a test's lines are not the owner's
+    if cfg!(test) {
+        return;
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(history_file()) {
         let _ = writeln!(file, "{}", serde_json::json!(line));
     }
