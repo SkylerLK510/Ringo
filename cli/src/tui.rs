@@ -134,6 +134,8 @@ pub enum Cmd {
     /// A plain line: for the agent the owner is talking to.
     Talk(String),
     Agents(Vec<(Agent, bool)>, String),
+    /// `@codex` alone: plain lines go to that agent.
+    Switch(Agent),
     /// `/ask TEXT`: one tool-free call.
     Ask(String),
     Undo,
@@ -265,7 +267,11 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
         return if rest.is_empty() { Err("type what you want, or /help".into()) } else { Ok(Cmd::Talk(rest.to_string())) };
     }
     if rest.is_empty() {
-        return Err("say what the agent should do".into());
+        return match agents[..] {
+            [(agent, false)] if all.contains(&agent) => Ok(Cmd::Switch(agent)),
+            [(agent, false)] => Err(format!("{} is not set up here; /setup adds it", agent.name())),
+            _ => Err("say what the agent should do".into()),
+        };
     }
     Ok(Cmd::Agents(agents, rest.to_string()))
 }
@@ -1060,6 +1066,21 @@ fn first_choice(agents: &[Agent]) -> Agent {
 }
 
 /// A path under the home folder as `~/…`.
+/// The one git project below `top` that every file in `touched` (relative to `top`) is in, if there is one.
+fn one_project(top: &Path, touched: &std::collections::BTreeSet<String>) -> Option<PathBuf> {
+    let mut found: Option<PathBuf> = None;
+    for file in touched {
+        let path = top.join(file);
+        let project = path.ancestors().skip(1).take_while(|d| *d != top && d.starts_with(top))
+            .find(|d| d.join(".git").exists())?;
+        match &found {
+            Some(f) if f != project => return None,
+            _ => found = Some(project.to_path_buf()),
+        }
+    }
+    found
+}
+
 fn home_short(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     match path.strip_prefix(&home) {
@@ -1140,6 +1161,8 @@ struct App {
     limits_at: Option<Instant>,
     /// Whether the owner has said anything yet: until then the conversation shows where to start (see `splash`).
     spoke: bool,
+    /// Open in the home folder: whether the shell has pointed to the project a turn's edits all went to (once).
+    pointed: bool,
     /// Ultra: Ringo's review under way of a turn here (review job, turn, its agent), during which lines wait; the
     /// revision it asked for (its task, while queued) and that revision's job, which no review follows.
     checking: Option<(usize, usize, Agent)>,
@@ -1166,6 +1189,9 @@ struct Live {
     top: usize,
     shown: usize,
     menu: Vec<Line<'static>>,
+    /// What the input starts with: " claude ❯ ", the agent the line goes to (see `target`), and its width.
+    mark: Vec<Span<'static>>,
+    mark_w: usize,
 }
 
 impl Live {
@@ -1223,7 +1249,7 @@ impl App {
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), limits: Vec::new(),
-              limits_at: None, spoke: false, checking: None,
+              limits_at: None, spoke: false, pointed: false, checking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
 
@@ -1351,6 +1377,12 @@ impl App {
                                                         Span::styled(format!(" #{id}"), self.theme.dim)]), 0));
             }
             for said in fresh {
+                // The owner answers what they read last: an agent's words in this folder make it the one plain lines
+                // go to, unless a line is being typed (it keeps the agent its prompt shows).
+                if matches!(said, Said::Partial(_) | Said::Reply(_)) && self.input.is_empty()
+                    && let Kind::Agent { agent, write: false } = self.s.jobs[i].kind {
+                    self.main = agent;
+                }
                 match said {
                     // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
                     // ceiling: the growing reply is fitted again (its markdown parsed) for each frame it grows in.
@@ -1565,6 +1597,16 @@ impl App {
         if self.limits_at.is_some_and(|at| at.elapsed() > LIMITS_FRESH) && self.plans.is_empty() {
             let asked = self.plan_agents();
             self.read_limits(&asked, false);
+        }
+        let job = &self.s.jobs[id - 1];
+        // From the home folder, a turn whose edits all went to one project points there, once (11/03: a whole project
+        // was built from the home folder, past the opening line that says to start in the project)
+        if self.s.at_home && !self.pointed && matches!(job.kind, Kind::Agent { write: false, .. })
+            && let Some(project) = one_project(&self.s.repo, &job.touched) {
+            self.pointed = true;
+            let at = home_short(&project);
+            self.say(format!("  #{id}'s edits are all in {at}. Started there, /undo works and the project's own \
+                              instructions load: quit (Ctrl-C twice), then cd {at} && ringo"));
         }
         let job = &self.s.jobs[id - 1];
         if let Some((review, turn, agent)) = self.checking.filter(|(review, ..)| *review == id) {
@@ -1841,8 +1883,13 @@ impl App {
         let whose = self.s.job(id).ok().and_then(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None });
         let (back, keep): (VecDeque<_>, VecDeque<_>) = self.queue.drain(..).partition(|(a, ..)| whose.is_none_or(|w| *a == w));
         self.queue = keep;
+        let agents: Vec<Agent> = back.iter().map(|(a, ..)| *a).collect();
         let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
         if !queued.is_empty() && self.input.is_empty() {
+            // back to the agent they were for, though another may have spoken since (see `feed`)
+            if let Some(&agent) = agents.first().filter(|a| agents.iter().all(|b| b == *a)) {
+                self.main = agent;
+            }
             self.input = queued.join("\n").chars().collect();
             self.cursor = self.input.len();
         }
@@ -2092,6 +2139,10 @@ impl App {
             Cmd::Work(spec) => {
                 self.s.work(Path::new(&spec))?;
                 None
+            }
+            Cmd::Switch(agent) => {
+                self.main = agent;
+                Some(format!("  plain lines go to {} now", agent.name()))
             }
             Cmd::Agents(agents, prompt) => {
                 // One agent: the conversation goes on with it, here. Two or more: each in its own copy, to compare.
@@ -2505,9 +2556,10 @@ impl App {
         let jobs = if panel { Vec::new() } else { self.job_rows(w, (height / 3).max(2) as usize) };
         let mut queue: Vec<Line<'static>> = Vec::new();
         if !panel {
-            queue = self.queue.iter().take(3).map(|(_, _, line)| {
-                let text = one_row(&clean(line).replace('\n', " "), w.saturating_sub(12));
-                Line::from(vec![Span::styled("   ↳ next: ", t.dim), Span::styled(text, t.selected)])
+            queue = self.queue.iter().take(3).map(|(agent, task, _)| {
+                let head = format!("   ↳ next for {}: ", agent.name());
+                let text = one_row(&clean(task).replace('\n', " "), w.saturating_sub(cols(&head)));
+                Line::from(vec![Span::styled(head, t.dim), Span::styled(text, t.selected)])
             }).collect();
             if self.queue.len() > 3 {
                 queue.push(Line::styled(format!("   … {} more queued", self.queue.len() - 3), t.dim));
@@ -2516,7 +2568,12 @@ impl App {
         let ask = self.prompt_lines(w.saturating_sub(2));
         let ask_h = ask.as_ref().map_or(0, |(_, lines)| (lines.len() as u16 + 1).clamp(2, (height / 2).max(2)));
         let typing = ask.is_none() || !self.input.is_empty();
-        let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(3)); // " ❯ "
+        let mark: Vec<Span<'static>> = match self.target() {
+            Some((name, style)) => vec![Span::styled(format!(" {name}"), style), Span::styled(" ❯ ", t.focus)],
+            None => vec![Span::styled(" ❯ ", t.focus)],
+        };
+        let mark_w = mark.iter().map(|s| cols(&s.content)).sum::<usize>();
+        let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(mark_w));
         let shown = rows.len().min((height / 4).clamp(1, 10) as usize);
         let top = (at.0 + 1).saturating_sub(shown);
         let entries = if typing { self.menu_entries() } else { Vec::new() };
@@ -2531,7 +2588,7 @@ impl App {
                                 Span::styled(what.clone(), t.dim)])
             })
             .collect();
-        Live { panel, jobs, queue, ask, ask_h, typing, rows, at, top, shown, menu }
+        Live { panel, jobs, queue, ask, ask_h, typing, rows, at, top, shown, menu, mark, mark_w }
     }
 
     /// The cat's state now: asking beats working beats how the last job ended (for MOOD after it) beats idle.
@@ -2656,8 +2713,8 @@ impl App {
         if !self.queue.is_empty() {
             out.push(Line::default());
             out.push(head("NEXT"));
-            for (_, _, line) in &self.queue {
-                out.push(Line::styled(fit(&format!("↳ {}", clean(line).replace('\n', " "))), t.selected));
+            for (agent, task, _) in &self.queue {
+                out.push(Line::styled(fit(&format!("↳ {}: {}", agent.name(), clean(task).replace('\n', " "))), t.selected));
             }
         }
         if out.len() > height {
@@ -2742,15 +2799,22 @@ impl App {
                 _ if self.release.is_some() => "pipelines ready · /update approve".into(),
                 _ => "⇧⇥ mode · ? keys".into(),
             };
+            let marked = |rest: Span<'static>| Line::from([live.mark.clone(), vec![rest]].concat());
             let mut rows: Vec<Line> = if self.input.is_empty() {
-                let ask = match self.s.busy() {
-                    Some(_) => "type what comes next; it waits for this turn".to_string(),
-                    None => "Tell Ringo what you want to do".to_string(),
+                // what a line does now, by `talk`'s rules: starts a turn, goes into the agent's turn at work, or waits
+                let main = self.main;
+                let ask = if !main.spec().read || !self.must_wait(main) {
+                    "Tell Ringo what you want to do"
+                } else if self.s.busy_for(main).is_some_and(|id| self.s.steerable(id)) && !self.queue.iter().any(|(a, ..)| *a == main) {
+                    "type more; it goes into this turn as it works"
+                } else {
+                    "type what comes next; it waits for this turn"
                 };
-                vec![Line::from(vec![Span::styled(" ❯ ", t.focus), Span::styled(ask, t.dim)])]
+                vec![marked(Span::styled(ask, t.dim))]
             } else {
-                live.rows.iter().enumerate().skip(live.top).take(live.shown).map(|(i, r)| {
-                    Line::from(vec![Span::styled(if i == 0 { " ❯ " } else { "   " }, t.focus), Span::raw(r.clone())])
+                live.rows.iter().enumerate().skip(live.top).take(live.shown).map(|(i, r)| match i {
+                    0 => marked(Span::raw(r.clone())),
+                    _ => Line::from(vec![Span::raw(" ".repeat(live.mark_w)), Span::raw(r.clone())]),
                 }).collect()
             };
             // the hint at the right of the first row where the text leaves room for it; an empty input without the
@@ -2761,18 +2825,33 @@ impl App {
                     first.spans.push(Span::raw(" ".repeat(pad)));
                     first.spans.push(Span::styled(hint, t.dim));
                 } else if self.input.is_empty() {
-                    *first = Line::from(vec![Span::styled(" ❯ ", t.focus), Span::styled(hint, t.dim)]);
+                    *first = marked(Span::styled(hint, t.dim));
                 }
             }
             f.render_widget(Paragraph::new(rows), input);
             if live.ask.is_none() || !self.input.is_empty() {
-                f.set_cursor_position((input.x + 3 + live.at.1 as u16, input.y + (live.at.0 - live.top) as u16));
+                f.set_cursor_position((input.x + live.mark_w as u16 + live.at.1 as u16, input.y + (live.at.0 - live.top) as u16));
             }
         }
     }
 
     /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
     /// blank row, and the answers (or how to reach them while a line is being typed).
+    /// Whom the line being typed goes to, as its prompt shows: the agent plain lines go to, or the one its @ names
+    /// (all, for @all). A command, or an @ word that names no agent yet, shows no one.
+    fn target(&self) -> Option<(&'static str, Style)> {
+        let line: String = self.input.iter().collect();
+        if line.trim_start().starts_with('/') {
+            return None;
+        }
+        match line.split_whitespace().next().and_then(|w| w.strip_prefix('@')) {
+            None => Some((self.main.name(), self.agent_style(self.main))),
+            Some("all") => Some(("all", self.theme.focus)),
+            Some(name) => Agent::from_name(name.trim_end_matches('!')).filter(|a| self.agents.contains(a))
+                .map(|a| (a.name(), self.agent_style(a))),
+        }
+    }
+
     fn prompt_lines(&self, width: usize) -> Option<(String, Vec<Line<'static>>)> {
         let (id, p) = self.s.pending()?;
         let job = self.s.job(id).ok()?;
@@ -3119,7 +3198,10 @@ mod tests {
                    "every agent, each in its own copy");
         assert_eq!(parse("@all! compare", Codex), parse("@all compare", Codex));
         assert!(parse("@nobody x", Codex).unwrap_err().contains("agy"));
-        assert!(parse("@codex", Codex).is_err());
+        // an agent alone: plain lines go to it; one not set up, one in its own copy, or two, say what to do
+        assert_eq!(parse("@codex", Codex), Ok(Cmd::Switch(Codex)));
+        assert_eq!(parse("@agy", Codex), Err("agy is not set up here; /setup adds it".into()));
+        assert!(parse("@claude!", Codex).is_err() && parse("@codex @claude", Codex).is_err());
         assert_eq!(parse("/review #3", Codex), Ok(Cmd::ReviewJob(3)));
         assert_eq!(parse("/review main", Codex), Ok(Cmd::ReviewRepo("main".into(), "HEAD".into())));
         assert_eq!(parse("/apply 2", Codex), Ok(Cmd::Apply(2)));
@@ -3165,6 +3247,22 @@ mod tests {
         assert_eq!(vertical(&input, 9, false), None); // the last line: history
     }
 
+    #[test]
+    fn edits_from_the_home_folder_point_to_their_one_project() {
+        let top = std::env::temp_dir().join(format!("ringo-home-{}", std::process::id()));
+        for d in ["code/bot/.git", "code/bot/src", "code/other/.git", "notes"] {
+            std::fs::create_dir_all(top.join(d)).unwrap();
+        }
+        let set = |files: &[&str]| files.iter().map(|f| f.to_string()).collect::<std::collections::BTreeSet<String>>();
+        assert_eq!(one_project(&top, &set(&["code/bot/src/a.rs", "code/bot/README.md"])), Some(top.join("code/bot")));
+        assert_eq!(one_project(&top, &set(&["code/bot/a.rs", "code/other/b.rs"])), None, "two projects");
+        assert_eq!(one_project(&top, &set(&["code/bot/a.rs", "notes/c.md"])), None, "one file in no project");
+        assert_eq!(one_project(&top, &set(&[])), None, "no edits");
+        std::fs::create_dir_all(top.join(".git")).unwrap();
+        assert_eq!(one_project(&top, &set(&["notes/c.md"])), None, "the home folder's own repository is not a project");
+        let _ = std::fs::remove_dir_all(&top);
+    }
+
     /// A shell on a session in a fresh folder outside git, for drawing its screen.
     fn app(agents: &[&str]) -> App {
         let dir = std::env::temp_dir().join(format!("ringo-tui-test-{}-{}", std::process::id(), agents.join("-")));
@@ -3199,7 +3297,7 @@ mod tests {
         let at = rows[middle].find('▲').unwrap();
         assert!((at as i32 - (80 - 8) / 2).abs() <= 1, "centred: {rows:#?}");
         assert!(a.intro().contains("/undo takes back its last change"), "outside git too, in Ringo's own store");
-        assert!(rows[23].starts_with(" ❯ Tell Ringo what you want to do") && rows[23].ends_with("⇧⇥ mode · ? keys"),
+        assert!(rows[23].starts_with(" claude ❯ Tell Ringo what you want to do") && rows[23].ends_with("⇧⇥ mode · ? keys"),
                 "{rows:#?}");
         a.echo("hello");
         assert!(!screen(&mut a, 80, 24).iter().any(|r| r.contains("/usrman how it works")), "it goes once you speak");
@@ -3510,6 +3608,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_plain_line_goes_to_the_agent_that_spoke_last_and_the_prompt_says_which() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app(&["claude", "agy"]);
+        let (claude, agy) = (Agent::from_name("claude").unwrap(), Agent::from_name("agy").unwrap());
+        let dir = std::env::temp_dir().join(format!("ringo-follow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("agy");
+        std::fs::write(&fake, "#!/bin/sh\ncat > /dev/null\n\
+            echo '{\"event\":\"init\",\"conversation_id\":\"c-f\",\"init\":{}}'\n\
+            echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"do you have the key?\",\"usage\":{}}}'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(agy, fake);
+        let finish = |a: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while a.s.running() > 0 {
+                assert!(Instant::now() < deadline, "the turn did not finish");
+                a.s.pump();
+                a.feed();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            a.feed();
+        };
+        let target = |a: &mut App, line: &str| {
+            a.input = line.chars().collect();
+            a.target().map(|(name, _)| name)
+        };
+        // the prompt names who the line goes to: the agent plain lines go to, the one an @ names, no one for a command
+        assert_eq!(a.main, claude);
+        assert_eq!(target(&mut a, "fix it"), Some("claude"));
+        assert_eq!((target(&mut a, "@agy fix it"), target(&mut a, "@all x")), (Some("agy"), Some("all")));
+        assert_eq!((target(&mut a, "@ag"), target(&mut a, "/help"), target(&mut a, "@codex x")), (None, None, None));
+        a.input.clear();
+        assert!(screen(&mut a, 80, 24)[23].starts_with(" claude ❯ "));
+        // agy's words came last (a turn the owner started earlier, working beside claude's): the next line is for agy
+        a.s.launch_agent(agy, false, "find the key").unwrap();
+        finish(&mut a);
+        assert_eq!(a.main, agy, "it spoke last");
+        // a line being typed keeps the agent its prompt showed
+        a.main = claude;
+        a.input = "half typed".chars().collect();
+        a.s.launch_agent(agy, false, "again").unwrap();
+        finish(&mut a);
+        assert_eq!(a.main, claude);
+        // an agent named alone takes the plain lines
+        a.input = "@agy".chars().collect();
+        a.submit();
+        assert_eq!(a.main, agy);
+        let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+        assert!(said.contains("plain lines go to agy now"), "{said}");
+        // the empty input says what a line does now, by talk's rules: claude's turn at work takes it, unless a line
+        // already waits for claude
+        let bin = dir.join("claude");
+        std::fs::write(&bin, format!("{CLAUDE_PLAN}while [ -f \"$0.hold\" ]; do sleep 0.05; done\nhead -n 1 > /dev/null\n\
+            echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-f\",\"apiKeySource\":\"none\"}}'\n\
+            echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(dir.join("claude.hold"), "").unwrap();
+        a.s.programs.insert(claude, bin);
+        a.main = claude;
+        let id = a.s.launch_agent(claude, false, "work").unwrap();
+        let shown = |a: &mut App, text: &str| screen(a, 80, 24).iter().any(|r| r.contains(text));
+        assert!(shown(&mut a, " claude ❯ type more; it goes into this turn as it works"));
+        a.queue.push_back((claude, "next".into(), "next".into()));
+        assert!(shown(&mut a, " claude ❯ type what comes next; it waits for this turn"));
+        // stopped, the turn's waiting line comes back for claude, though agy is the one plain lines went to since
+        a.main = agy;
+        a.stop(id);
+        assert_eq!((a.main, a.input.iter().collect::<String>()), (claude, "next".to_string()));
+        let _ = std::fs::remove_file(dir.join("claude.hold"));
+        finish(&mut a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ultra_reviews_a_change_and_gives_one_turn_to_fix_it_and_no_more() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("ringo-ultra-{}", std::process::id()));
@@ -3665,7 +3838,9 @@ mod tests {
         assert_eq!(a.queue.len(), 1, "it waits instead of being refused");
         assert!(a.waits(&Ok(Cmd::Talk("and this".into()))), "and the next line shows when it starts, not now");
         let rows = screen(&mut a, 60, 12);
-        assert!(rows.iter().any(|r| r.contains("↳ next: fix it")), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.contains("↳ next for claude: fix it")), "{rows:#?}");
+        let wide = screen(&mut a, 120, 30);
+        assert!(wide.iter().any(|r| r.contains("↳ claude: fix it")), "the side panel names it too: {wide:#?}");
         // /auto turns auto on and never off: typed with auto on (remembered from last time) it says so and stays
         a.s.mode = Mode::Auto;
         assert!(a.run(Cmd::Auto, "/auto").unwrap().unwrap().contains("already on"));

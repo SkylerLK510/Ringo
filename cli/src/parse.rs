@@ -125,6 +125,8 @@ pub struct Parser {
     seen: Vec<(String, Tokens)>,
     /// Claude reported a compaction (`/compact`), whose result may carry no text.
     compacted: bool,
+    /// A step's read was refused (see `refused`), said once a turn.
+    refused: bool,
     /// Codex: the turn/start request, sent once the thread's id is known; the thread; its usage so far.
     turn: Option<Value>,
     thread: String,
@@ -284,9 +286,21 @@ fn bare_command(command: &str) -> &str {
 }
 
 impl Parser {
+    /// A line for the owner when a step's output says a read was refused: agents take macOS's privacy protection
+    /// ("Operation not permitted" on another app's data or a personal folder) for the thing being missing, as one said
+    /// a browser extension was not set up (11/03). Shown to the owner only, so no agent reads it: no tokens.
+    fn refused(&mut self, output: &Value) -> Option<Note> {
+        if self.refused || !output.to_string().contains("Operation not permitted") {
+            return None;
+        }
+        self.refused = true;
+        Some(Note::Log("a read there was refused (Operation not permitted, macOS's privacy protection on a Mac): what \
+                        it could not read may still be there".into()))
+    }
+
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new(), compacted: false, turn: None, thread: String::new(), usage: Value::Null,
+                 seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None }
     }
 
@@ -405,6 +419,7 @@ impl Parser {
             ("item/started", "reasoning") | ("item/reasoning/summaryTextDelta", _) => notes.push(activity("thinking".into())),
             ("item/started", "commandExecution") => notes.push(activity(format!("$ {}", short(bare_command(s(item, "command")), 80)))),
             ("item/completed", "commandExecution") => {
+                notes.extend(self.refused(item));
                 // One line once it ran: the command, and its exit code when it failed.
                 let how = match (item.get("exitCode").and_then(Value::as_i64), s(item, "status")) {
                     (Some(0), _) => String::new(),
@@ -473,6 +488,7 @@ impl Parser {
             ("item/started", "webSearch") => notes.push(activity(format!("search {}", short(s(item, "query"), 60)))),
             ("item/completed", "webSearch") => notes.push(Note::Step(format!("search {}", short(s(item, "query"), 120)))),
             ("item/completed", "collabAgentToolCall") => notes.extend(self.codex_subagents(item)),
+            ("item/started", "contextCompaction") => notes.push(activity("compacting the conversation".into())),
             ("item/completed", "contextCompaction") => notes.push(Note::Log("compacted the conversation".into())),
             ("turn/plan/updated", _) => {
                 let plan = p.get("plan").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -569,6 +585,10 @@ impl Parser {
             ("system", "status") if s(e, "status") == "requesting" && parent.is_none() => {
                 notes.push(Note::Activity { node: None, text: "thinking".into() });
             }
+            // a compaction takes a minute or more (82 s at 171k tokens, Claude Code 2.1.317), so the row says so
+            ("system", "status") if s(e, "status") == "compacting" && parent.is_none() => {
+                notes.push(Note::Activity { node: None, text: "compacting the conversation".into() });
+            }
             ("system", "thinking_tokens") if parent.is_none() => {
                 let text = format!("thinking (~{} tokens)", fmt_tokens(u(e, "estimated_tokens")));
                 notes.push(Note::Activity { node: None, text });
@@ -658,6 +678,7 @@ impl Parser {
                         notes.push(Note::SubagentEnd { id: id.to_string(), ok });
                     } else if let Some(at) = self.calls.iter().position(|(call, ..)| call == id) {
                         let (_, tool, text, rows) = self.calls.remove(at);
+                        notes.extend(self.refused(block));
                         let text = format!("{text}{}", outcome(&tool, block, ok));
                         notes.push(match (ok, looked(&tool)) {
                             (true, Some(kind)) => Note::Looked { kind, text },
@@ -1219,6 +1240,20 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_read_is_said_to_the_owner_once() {
+        let call = |id: &str| format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"command":"ls ~/Library"}}}}]}},"parent_tool_use_id":null}}"#);
+        let result = |id: &str| format!(r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"{id}","content":"ls: Chrome: Operation not permitted\ntotal 0","is_error":false}}]}},"parent_tool_use_id":null}}"#);
+        let lines = [call("a"), result("a"), call("b"), result("b")];
+        let notes = run(Style::Claude, &lines.iter().map(String::as_str).collect::<Vec<_>>()).1;
+        let said = |notes: &[Note]| notes.iter().filter(|n| matches!(n, Note::Log(l) if l.contains("may still be there"))).count();
+        assert_eq!(said(&notes), 1, "once a turn: {notes:?}");
+        let codex = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"ls ~/Library/x","exitCode":1,"status":"failed","aggregatedOutput":"ls: x: Operation not permitted"}}}"#;
+        assert_eq!(said(&run(Style::Codex, &[codex]).1), 1);
+        let fine = r#"{"method":"item/completed","params":{"item":{"type":"commandExecution","command":"ls","exitCode":0,"status":"completed","aggregatedOutput":"a.rs"}}}"#;
+        assert_eq!(said(&run(Style::Codex, &[fine]).1), 0);
+    }
+
+    #[test]
     fn a_compaction_is_logged() {
         // The shape the Agent SDK documents for `/compact` on a resumed session.
         let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":41230}}"#;
@@ -1228,6 +1263,12 @@ mod tests {
         assert_eq!(p.finish(), Ok(()), "a compaction that says nothing is still done");
         let (p, _) = run(Style::Claude, &[done]);
         assert!(p.finish().is_err(), "any other turn without a reply fails closed");
+        // while it runs, the row says so (Claude Code 2.1.317's status; Codex's item)
+        let compacting = Note::Activity { node: None, text: "compacting the conversation".into() };
+        let claude = r#"{"type":"system","subtype":"status","status":"compacting","compact_output_chars":0}"#;
+        assert_eq!(run(Style::Claude, &[claude]).1, std::slice::from_ref(&compacting));
+        let codex = r#"{"method":"item/started","params":{"item":{"type":"contextCompaction","id":"c1"}}}"#;
+        assert_eq!(run(Style::Codex, &[codex]).1, [compacting]);
     }
 
     #[test]
