@@ -38,8 +38,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer"),
     ("/clear", "start a new conversation"),
     ("/compact", "shrink a long conversation so later turns cost less"),
-    ("/separate", "a task of its own for each agent, all working at once"),
-    ("/together", "the agents back in one conversation"),
+    ("/separate", "a conversation of its own for each agent, so none is told what the others do"),
+    ("/together", "the agents back in one conversation, still working side by side"),
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
@@ -120,6 +120,10 @@ fn load_history() -> Vec<String> {
 
 fn save_history(line: &str) {
     use std::io::Write;
+    // a test's lines are not the owner's
+    if cfg!(test) {
+        return;
+    }
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(history_file()) {
         let _ = writeln!(file, "{}", serde_json::json!(line));
     }
@@ -176,6 +180,10 @@ fn job_number(word: Option<&str>) -> Result<usize, String> {
 
 /// One input line as a command. A line without `/` or `@` is for the agent the owner is talking to; @all means every
 /// set-up agent.
+/// Commands that take nothing after them.
+const BARE: [&str; 20] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
+                          "copy", "clear", "new", "compact", "separate", "together", "auto", "usage", "cost"];
+
 pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
     let line = line.trim();
     if line == "?" {
@@ -185,6 +193,10 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
         let mut words = rest.split_whitespace();
         let name = words.next().unwrap_or("");
         let tail = rest[name.len()..].trim();
+        // what comes after a command that takes nothing would otherwise be dropped unseen
+        if BARE.contains(&name) && !tail.is_empty() {
+            return Err(format!("/{name} takes nothing after it: send the rest on a line of its own"));
+        }
         return match name {
             "usrman" | "instructions" | "manual" | "help" | "?" => Ok(Cmd::Help),
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
@@ -1511,22 +1523,21 @@ impl App {
         self.turn(agent, &task)
     }
 
-    /// Whether `agent`'s turn in this folder has to wait: one runs here (in /separate, one of its own), lines wait
-    /// before it, every job slot is taken, or an agent update holds the session.
+    /// Whether `agent`'s turn in this folder has to wait: one of its own runs here, a line of its own waits before
+    /// it, every job slot is taken, or an agent update holds the session. Other agents' turns do not hold it.
     fn must_wait(&self, agent: Agent) -> bool {
-        self.s.busy_for(agent).is_some() || self.queue.iter().any(|(a, ..)| !self.s.separate || *a == agent)
+        self.s.busy_for(agent).is_some() || self.queue.iter().any(|(a, ..)| *a == agent)
             || self.s.running() >= self.s.max_jobs || self.s.hold.is_some() || self.checking.is_some()
     }
 
-    /// Starts the oldest waiting line whose agent is free (together, any turn here holds every agent, so the lines go
-    /// in order; in /separate each agent's go in order); true when it did.
+    /// Starts the oldest waiting line whose agent is free (each agent's lines go in order); true when it did.
     fn dispatch(&mut self) -> bool {
         if self.s.running() >= self.s.max_jobs || self.s.hold.is_some() || self.checking.is_some() {
             return false;
         }
         let free = (0..self.queue.len()).find(|&i| {
             let agent = self.queue[i].0;
-            self.s.busy_for(agent).is_none() && !self.queue.iter().take(i).any(|(a, ..)| !self.s.separate || *a == agent)
+            self.s.busy_for(agent).is_none() && !self.queue.iter().take(i).any(|(a, ..)| *a == agent)
         });
         let Some((agent, task, line)) = free.and_then(|i| self.queue.remove(i)) else { return false };
         let revision = self.revision.as_deref() == Some(task.as_str());
@@ -1825,10 +1836,10 @@ impl App {
     /// the input, to send or change.
     fn stop(&mut self, id: usize) {
         let _ = self.s.kill(id);
-        // in /separate the other agents' lines keep waiting for their own turns
+        // the stopped agent's lines come back, the other agents' keep waiting for their own turns; ultra's review
+        // held every line, so all of them come back when it stops
         let whose = self.s.job(id).ok().and_then(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None });
-        let (back, keep): (VecDeque<_>, VecDeque<_>) = self.queue.drain(..)
-            .partition(|(a, ..)| !self.s.separate || Some(*a) == whose);
+        let (back, keep): (VecDeque<_>, VecDeque<_>) = self.queue.drain(..).partition(|(a, ..)| whose.is_none_or(|w| *a == w));
         self.queue = keep;
         let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
         if !queued.is_empty() && self.input.is_empty() {
@@ -1864,11 +1875,26 @@ impl App {
             self.history.push(line.clone());
         }
         self.hist = self.history.len();
-        let cmd = parse(&line, &self.agents.clone());
-        if !self.waits(&cmd) {
-            self.echo(&line); // a queued line shows when it starts
+        // "/separate @agy …": the switch, then the rest as a line of its own
+        let switch = ["/separate", "/together"].into_iter().find_map(|c| {
+            line.trim().strip_prefix(c).filter(|rest| rest.starts_with(char::is_whitespace)).map(|rest| (c, rest.trim()))
+        });
+        match switch {
+            Some((c, rest)) => {
+                self.send(c);
+                self.send(rest);
+            }
+            None => self.send(&line),
         }
-        match cmd.and_then(|cmd| self.run(cmd, &line)) {
+    }
+
+    /// One line from the input: a command, or a message for an agent.
+    fn send(&mut self, line: &str) {
+        let cmd = parse(line, &self.agents.clone());
+        if !self.waits(&cmd) {
+            self.echo(line); // a queued line shows when it starts
+        }
+        match cmd.and_then(|cmd| self.run(cmd, line)) {
             Ok(Some(text)) => self.say(text),
             Ok(None) => {}
             Err(e) => self.say(format!("  {e}")),
@@ -1927,11 +1953,11 @@ impl App {
             Cmd::Separate(on) => {
                 self.s.separate = on;
                 Some(match on {
-                    true => "  separate: each agent keeps a conversation of its own and works at the same time as the \
-                             others, one turn each (@claude … and @codex … run side by side). What one does is not \
-                             told to the others. /together puts them back in one conversation".into(),
-                    false => "  together: one conversation again, one turn at a time. Each agent hears what the others \
-                              do from now on; what they did separately stays their own".into(),
+                    true => "  separate: each agent keeps a conversation of its own, and what one does is not told to \
+                             the others. They still work side by side, one turn each. /together puts them back in one \
+                             conversation".into(),
+                    false => "  together: one conversation again, with the agents side by side, one turn each. Each \
+                              hears what the others do from now on; what they did separately stays their own".into(),
                 })
             }
             Cmd::Tier(None) => Some(format!("  tier: {} (also: {})", self.s.tier.name(),
@@ -2022,7 +2048,8 @@ impl App {
                              log.len(), job.dir.display(), log.join("\n")))
             }
             Cmd::Kill(id) => {
-                if self.s.busy() == Some(id) {
+                // a turn in this folder: its agent's waiting lines come back to the input, as Esc does
+                if self.s.job(id).is_ok_and(|j| j.running() && matches!(j.kind, Kind::Agent { write: false, .. })) {
                     self.stop(id);
                     return Ok(None);
                 }
@@ -3439,6 +3466,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_switch_takes_the_rest_of_its_line_and_agents_work_side_by_side() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = app(&["claude", "agy"]);
+        let (claude, agy) = (Agent::from_name("claude").unwrap(), Agent::from_name("agy").unwrap());
+        let dir = std::env::temp_dir().join(format!("ringo-side-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("agy");
+        std::fs::write(&fake, "#!/bin/sh\ncat > \"$0.stdin\"\n[ -e \"$0.hold\" ] && sleep 2\n\
+            echo '{\"event\":\"init\",\"conversation_id\":\"c-s\",\"init\":{}}'\n\
+            echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"ok\",\"usage\":{}}}'\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(agy, fake.clone());
+        let finish = |a: &mut App| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while a.s.running() > 0 {
+                assert!(Instant::now() < deadline, "the turn did not finish");
+                a.s.pump();
+                a.feed();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let send = |a: &mut App, line: &str| {
+            a.input = line.chars().collect();
+            a.submit();
+        };
+        // "/separate @agy …": the switch, then the rest as its own line (it was dropped)
+        send(&mut a, "/separate @agy hello there");
+        assert!(a.s.separate);
+        finish(&mut a);
+        assert_eq!(std::fs::read_to_string(fake.with_extension("stdin")).unwrap(),
+                   "{\"event\":\"user\",\"message\":{\"content\":\"hello there\"}}\n");
+        // together again: a turn of agy's holds agy's next line, and no other agent's
+        send(&mut a, "/together");
+        assert!(!a.s.separate);
+        std::fs::write(fake.with_extension("hold"), "").unwrap();
+        send(&mut a, "@agy slow one");
+        assert!(a.s.busy_for(agy).is_some());
+        assert!(a.must_wait(agy) && !a.must_wait(claude), "only agy waits");
+        finish(&mut a);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn ultra_reviews_a_change_and_gives_one_turn_to_fix_it_and_no_more() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("ringo-ultra-{}", std::process::id()));
@@ -3554,20 +3625,24 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn separate_lets_each_agent_take_its_own_turn_at_once() {
+    fn each_agent_takes_its_own_turn_at_once_together_or_separate() {
         use std::os::unix::fs::PermissionsExt;
         let mut a = app(&["claude", "codex"]);
         let (claude, codex) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
         assert_eq!((parse("/separate", &[claude]), parse("/together", &[claude])), (Ok(Cmd::Separate(true)), Ok(Cmd::Separate(false))));
+        // what follows a command that takes nothing is refused, never dropped (the input splits off a switch's rest)
+        for line in ["/separate @agy go", "/undo now", "/clear all of it", "/compact focus on x"] {
+            assert!(parse(line, &[claude]).unwrap_err().contains("takes nothing after it"), "{line}");
+        }
         let fake = std::env::temp_dir().join(format!("ringo-tui-fake-both-{}", std::process::id()));
         std::fs::write(&fake, "#!/bin/sh\nsleep 5\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         a.s.programs.insert(claude, fake.clone());
         a.s.programs.insert(codex, fake);
         assert!(a.talk(claude, "fix it".into(), "fix it".into()).is_ok());
-        assert_eq!(a.talk(codex, "docs".into(), "@codex docs".into()), Ok(None), "together: it waits for claude's turn");
+        assert_eq!(a.talk(codex, "docs".into(), "@codex docs".into()), Ok(None));
+        assert_eq!(a.s.running(), 2, "together too, codex starts beside claude");
         assert!(a.run(Cmd::Separate(true), "/separate").unwrap().unwrap().contains("separate:"));
-        assert!(a.dispatch() && a.s.running() == 2, "separate: codex starts beside claude");
         // a line for claude goes into claude's running turn; codex's has not started one it can take a line in yet
         assert_eq!(a.talk(claude, "more".into(), "more".into()), Ok(Some("  ↳ #1 takes this as it works".into())));
         assert_eq!(a.s.jobs[0].steered, ["more"]);
