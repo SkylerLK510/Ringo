@@ -1,24 +1,47 @@
 # Ringo
 
-A local harness for code review, design proposals, bounded checked and reviewed
-artifact work, and guarded improvement of its own prompts and pipelines. Ringo
-runs model CLIs and assembles their results; it uses frozen provider models and
-does not train model weights.
+Ringo is a local harness that runs model CLIs (Claude Code, Codex, Ollama) for four kinds of job:
 
-This repository owns the harness, its model calls and their budget. The original
-[design council](https://github.com/SkylerLK510/DukChulBOT) owns proposal judging,
-rubric scoring, decision gates and journals. A future IDE (a Rust engine; see
-[Roadmap](#roadmap)) will be a separate client; none is implemented here.
+- reviewing code changes
+- writing design proposals
+- doing small pieces of work, with checks and a review
+- answering research questions from sources it verifies
 
-**About the name:** the harness and the [Ringo IDE](https://github.com/SkylerLK510/Ringo-IDE) are both named after
-Ringo, one of my three beloved cats.
+It can also improve its own prompts and pipelines, behind guards. It uses frozen provider models and does not train
+model weights. A task's plan sets how many model calls it makes. Nothing is applied, adopted or published until a
+person reviews it.
 
-## Install
+Related repositories:
+
+- The [Design Council](https://github.com/SkylerLK510/DukChulBOT) judges proposals: rubric scoring, decision gates
+  and journals. Ringo makes the model calls and owns their budget.
+- The [Ringo IDE](https://github.com/SkylerLK510/Ringo-IDE) will be a separate client of this harness (a Rust engine;
+  see [Roadmap](#roadmap)). None of it is implemented here.
+
+**About the name:** the harness and the IDE are both named after Ringo, one of my three beloved cats.
+
+## Contents
+
+- [Quick start](#quick-start)
+- [What Ringo does](#what-ringo-does)
+- [Using Ringo](#using-ringo): [review](#review-a-change), [design](#write-a-design), [work](#do-bounded-work),
+  [research](#research), [the shell](#the-ringo-shell)
+- [Model calls, time limits and cost](#model-calls-time-limits-and-cost)
+- [Backends](#backends)
+- [Experiments](#experiments-what-we-tried-what-broke-what-we-measured)
+- [Evaluation, improvement and releases](#evaluation-improvement-and-releases)
+- [Roadmap](#roadmap)
+- [Use from an agent](#use-from-an-agent)
+- [Ringo and the Design Council](#ringo-and-the-design-council)
+- [Credits](#credits) and [License](#license)
+
+## Quick start
 
 Ringo is one Python program that uses only the standard library. You need:
-- Python 3.11 or newer;
-- git, or a ZIP download;
-- at least one model CLI for model calls. The offline test suite needs none.
+
+- Python 3.11 or newer
+- git, or a ZIP download
+- at least one model CLI, to make model calls (the offline tests need none)
 
 ### macOS
 
@@ -31,8 +54,8 @@ python3 -m unittest discover -s tests -q   # offline check: makes no model calls
 python3 ringo.py --help
 ```
 
-The `python3` that comes with Apple's command-line tools may be older than 3.11. If `python3 --version` prints an
-older version, use the Homebrew or python.org Python.
+The `python3` that comes with Apple's command-line tools may be older than 3.11. If it is, use the Homebrew or
+python.org Python.
 
 ### Linux
 
@@ -47,20 +70,19 @@ python3 -m unittest discover -s tests -q
 python3 ringo.py --help
 ```
 
-Ubuntu 24.04 and later ship Python 3.12. On an older release, install Python 3.11 or newer before running Ringo.
+Ubuntu 24.04 and later ship Python 3.12. On an older release, install Python 3.11 or newer first.
 
 ### Windows
 
-The offline test suite passes natively on Windows (CI runs it on `windows-latest` with Python 3.11 and 3.14), so
-Ringo runs with a native Python 3.11 or newer. Real model calls have so far been run only on macOS, so they are
-untested natively. Native Windows refuses `.cmd`/`.bat` backend and check programs: call the underlying executable
-directly (for example, `node.exe` with the CLI's JavaScript entrypoint). Private run, store, release-state and
-temporary folders are created atomically with a protected DACL granting full control only to the current user,
-verified before sensitive files are written; new files and folders inherit that access. Existing user-supplied
-folders are tightened and verified, but earlier open handles are not revoked: new folders are the private case.
-A filesystem that cannot set and verify the DACL is refused.
-This does not restrict administrators taking ownership, other processes using your account, or explicit ACLs that
-files and folders inside a root already have. To run Ringo as on Linux instead, use WSL 2, the Windows Subsystem for Linux:
+Ringo runs natively with Python 3.11 or newer, and the offline test suite passes on Windows in CI. Real model calls
+have so far been run only on macOS.
+
+- Native Windows refuses `.cmd` and `.bat` backend and check programs. Call the underlying executable directly, for
+  example `node.exe` with the CLI's JavaScript entry point.
+- Private folders are locked to your Windows account. [Portability](docs/EXPERIMENTS.md#9-portability) explains
+  what that covers and what it doesn't.
+
+To run Ringo as on Linux instead, use WSL 2 (the Windows Subsystem for Linux):
 
 1. Open PowerShell as Administrator, run `wsl --install`, then restart Windows. This installs WSL 2 with Ubuntu.
 2. Open **Ubuntu** from the Start menu and follow the Linux steps above inside it.
@@ -74,22 +96,19 @@ checks above.
 
 ### Model CLIs
 
-Install at least one, from its official instructions ([Codex CLI](https://github.com/openai/codex),
-[Claude Code](https://code.claude.com/docs/en/setup)):
+Install at least one. Ringo calls them with your existing sign-in and doesn't need an API key.
 
-- **Codex CLI** (Ringo backend `codex-chatgpt`):
+- **Codex CLI** ([instructions](https://github.com/openai/codex); Ringo backend `codex-chatgpt`):
   - macOS, Linux, WSL: `curl -fsSL https://chatgpt.com/codex/install.sh | sh`, `brew install --cask codex` or
     `npm install -g @openai/codex`.
   - Windows PowerShell: `powershell -ExecutionPolicy ByPass -c "irm https://chatgpt.com/codex/install.ps1 | iex"`.
   - Sign in: run `codex` and choose **Sign in with ChatGPT**. A Plus, Pro, Business, Edu or Enterprise plan covers
     the calls.
-- **Claude Code** (Ringo backend `claude`):
+- **Claude Code** ([instructions](https://code.claude.com/docs/en/setup); Ringo backend `claude`):
   - macOS, Linux, WSL: `curl -fsSL https://claude.ai/install.sh | bash` or `brew install --cask claude-code`.
   - Windows: `irm https://claude.ai/install.ps1 | iex` in PowerShell, or `winget install Anthropic.ClaudeCode`.
   - Sign in: run `claude` and follow the browser prompts. It needs a Pro, Max, Team, Enterprise or Console account.
 - **Ollama** for local models (Ringo backend `ollama:MODEL`): see [ollama.com/download](https://ollama.com/download).
-
-Ringo calls these CLIs with your existing sign-in. It does not need an API key.
 
 ### First run
 
@@ -99,96 +118,33 @@ python3 ringo.py work --spec examples/v3-codex.json --out ~/ringo-runs/first-run
 python3 ringo.py work --spec examples/v3-claude.json --out ~/ringo-runs/first-run-claude
 ```
 
-The example asks for a small `slugify` function with explicit rules. Ringo then:
-1. writes `slug.py`;
-2. runs the example's check against it;
-3. reviews the result;
-4. puts the version ready for your review in `~/ringo-runs/first-run/final/`.
+The example asks for a small `slugify` function with explicit rules. Ringo:
+
+1. writes `slug.py`
+2. runs the example's check against it
+3. reviews the result
+4. puts the version that's ready for your review in `~/ringo-runs/first-run/final/`
 
 `report.json` lists the rounds, checks and token usage. Our first run of the Codex example took one round, two model
-calls, about 2,800 tokens and 14 seconds. Run folders must be outside the Ringo checkout, which keeps private
-material out of the repository. Ringo creates them with owner-only permissions.
+calls, about 2,800 tokens and 14 seconds.
 
-### The `ringo` shell
+Run folders must be outside the Ringo checkout, which keeps private material out of the repository. Ringo creates
+them with owner-only permissions.
 
-`cargo install --path cli`, then type `ringo`: Ringo's own full-screen session. You say what you want in plain words
-and the agent you are talking to (Claude Code, Codex, Google's Antigravity CLI (agy), Grok or an agent you add) does
-it in that folder, asking before it runs a command; `/undo` takes a turn's change back. You can also give a task to
-several agents at once, each in its own copy, run Ringo's pipelines with them, and watch every job and subagent as it
-runs. The first start finds the agents installed on your computer and signs you in. One switch (`/mode
-ask|auto|read`, Shift-Tab) sets how far every agent may act before it asks you. Start with the step-by-step
-[user guide](docs/USER-GUIDE.md) (`/help` in the shell); the full reference is [docs/SHELL.md](docs/SHELL.md).
+## What Ringo does
 
-### The native runtime, and why it moved to Rust
+| Command | What it does |
+| --- | --- |
+| `review` | Reviews a code change and lists its findings |
+| `design` | Writes a design proposal from a brief |
+| `work` | Writes or revises a set of files until fixed checks pass, then gets one review and makes one revision |
+| `research` | Answers a brief from web sources that Ringo checks itself |
+| `wait DIR` | Waits for a background run to finish and prints its state |
+| `release` | Manages approved, versioned releases of Ringo itself |
+| `ringo` (the shell) | A full-screen session for working with several agents and running Ringo's pipelines |
 
-`ringo review`, `ringo design` and `ringo work` now run inside the `ringo` binary. The runtime in `cli/src/rt/` is
-ported module by module from the Python files of the same names (`context`, `pipelines`, `findings`, `backends`,
-`harness`, `workflow`). The Python runtime stays, unchanged, as the reference: `python3 ringo.py ...` works as before.
-
-**Speed was not the reason.** Python's own cost is about 70 ms per run, against 18-56 s of model time, so 0.1-0.4%.
-The one large overhead the profile found was about 1 s per Codex call: a network fetch of Codex's model list. That
-was fixed in Python, by giving each call's private Codex home the owner's cached list (design overhead fell from
-806 ms to 72 ms).
-
-**The reasons:**
-- **One engine.** The shell, the planned IDE and its local code model all need to start, follow and stop pipelines
-  and agents. The shell had re-implemented in Rust what `backends.py` does in Python: environment scrubbing,
-  process groups and event parsing. Now they share one library.
-- **Less per job.** We measured a review with a fake model that answers in 0.30 s, median of 7 runs:
-  - native: 8.1 MB peak memory, 0.34 s wall time;
-  - Python: 24.5 MB, 0.39 s.
-
-  The shell runs up to three pipelines at once and idles at 2.5 MB.
-- **One binary to install.** `review` and `design` need no Python, with one exception: reviewing a change to `.py`
-  files runs `python3` once to read their symbols (see "What stayed Python"). `work` runs the task's own checks,
-  which need Python when the task does.
-
-**The published results still describe it, because it sends the same requests.** The benchmark numbers in this
-README were measured on the Python runtime. The port counts only where it sends the model the same bytes:
-- **Module by module.** Each module was ported against its Python original with differential tests on generated,
-  corpus and git-history inputs: over a million cases in all, most of them generated JSON inputs. No mismatch was
-  accepted. The deviations left (a JSON nesting limit near 1,000 levels instead of about 116,000, 128-bit integers)
-  are listed in the test files.
-- **End to end.** `tests/native_gate.py` runs 16 review, design and work tasks through both runtimes, with fake
-  `codex`, `claude` and plain programs. It compares every request and every record each run writes. A request here
-  means the argv, stdin, the system prompt, the private Codex home, and the environment variables that decide
-  auth. The run uses no model calls; today all 16 tasks are identical.
-- **Real use.** Through the binary with real Codex calls, the same commands worked:
-  - a design (1 call);
-  - a review of a commit (1 call);
-  - the slugify `work` example (2 calls, ready for review in round 1, passing the example's checks);
-  - `/design` from the shell (1 call).
-
-**The release gate still decides what runs.**
-- A release can carry the native binary only with a passing gate report for that exact binary and that exact Python
-  runtime (`ringo.py release stage --native BIN --native-gate REPORT`).
-- Activation still needs the latency evidence and your approval.
-- The binary checks the pinned release itself before running it: the bundle, its hashes, the active pointer and
-  the approval record. `cli/tests/gate_release.rs` stages a real native release and checks the genuine chain and
-  seven forgeries.
-- With no release state, the binary runs as checkout code, as `ringo.py` runs its own checkout.
-- With release state, `ringo.py` decides which runtime runs.
-- Windows keeps the Python runtime.
-
-**What stayed Python:**
-- **Python's `ast` parser.** rustpython-parser disagreed with CPython in 90 of 11,442 symbol cases, and
-  tree-sitter-python in 24, on the standard library and this repository. So the native runtime asks `python3` for
-  Python symbols, with an embedded copy of the same function, which disagreed in none.
-- **Research tooling and release management.** `evaluate.py`, `improve.py`, `evalplus_study.py`, `shadow_labels.py`
-  and `releases.py` stay Python.
-
-**Bugs the port found and fixed, in both runtimes:**
-- The `claude` preset now removes API keys and endpoint overrides, so its calls stay on your subscription login
-  (`claude:<command>` keeps your environment).
-- A refreshed Codex login is copied back only from a regular file: never through a symlink, never from a FIFO.
-- A review of a submodule bump to a commit the repository lacks no longer fails.
-- Trace folders are private from the moment they are created.
-- Codex's setup call is killed with everything it started.
-
-## Run
-
-Python 3.11+ and the standard library, or the `ringo` binary (`cargo install --path cli`), which takes the same
-commands (`ringo review ...`). From this checkout:
+Run the commands with `python3 ringo.py COMMAND`, or with the `ringo` binary (`cargo install --path cli`), which
+takes the same commands. The binary doesn't run `research` yet.
 
 ```sh
 python3 ringo.py --help
@@ -200,70 +156,89 @@ python3 ringo.py research --input brief.md --trace /ABSOLUTE/PATH/TO/new-trace -
 python3 -m unittest discover -s tests -q
 ```
 
-For reviews, prefer `--repo PATH --base SHA --head SHA [--pr-text FILE]`: Ringo
-builds the material in code from git objects (read-only, offline; an incomplete
-partial clone is refused): the change description, the three-dot diff, the complete
-changed files and README at head, then the unchanged definitions, subclasses,
-callers and tests of the changed symbols, within a byte budget
-(`--context-budget`, default 400000) that never drops the change itself, and a
-manifest of what was added and left out. The material is built in code before the
-call; the call is tool-free only on `claude`, `codex-chatgpt` and `ollama:` (the `codex` preset keeps a read-only
-shell, and a custom command's tools are unknown). `--input FILE` instead takes the material as one file. For designs, supply the decision brief and hard
-constraints. Review/design default to one strong model call; a call that fails or
-replies in the wrong shape is tried once more, so at most two. Custom plans are JSON
-files under `plans/`, with instructions under `prompts/`; a plan makes one call per
-pass (one per batch of findings for a batched checker, at most 50 findings per
-reader reply), each retried at most once,
-plus at most one checker repair. `work` makes one writer call per round and one
-review call after the first candidate that passes every executable check, at most
-`max_rounds + 2` with the review's one retry. Failed checks and review findings
-feed the next writer round directly. A task that opts into the Council makes judge
-calls instead: the first `first_judges` (3 of the default 6), and the rest only if
-those do not recommend, at most `max_rounds x (1 + samples)`. A call you stop can
-add one retry, and a call that passes its time limit can add one probe call. There
-is no call cap: the plan or the round count decides the calls, and `--max-cost` and
-time limits bound money and time.
+## Using Ringo
 
-`--timeout` (review/design, default 900) and `timeout_s` (work, default 120) are soft: a call past it is not killed. Ringo checks it for free, sends one tiny probe call to the same backend (none under a cost cap), writes `incidents/<step>.<attempt>.json` in the trace (a private temporary folder without one) and prints one line, recommending a stop only when the evidence suggests a stall: the backend still answers and comparable calls in the run finished in a third of the time, or the output shows reconnects. Writing `stop` to the printed decision file stops the call and retries it once; nothing decides for you. Every call is stopped at twice its soft limit, never under 900 seconds (and, in `work`, at the run deadline), and is not retried after that.
+### Review a change
 
-A run with `--trace` (and every `work` run) keeps a small `state.json`; `python3 ringo.py wait DIR` blocks until
-it finishes and prints it, so an agent waits with one command instead of polling.
+Prefer `--repo PATH --base SHA --head SHA [--pr-text FILE]`. Ringo then builds the review material itself, in code,
+from git objects. This is read-only and offline, and an incomplete partial clone is refused. The material contains:
 
-`work` revises a declared set of text files: a writer model returns complete
-files or exact search/replace edits, which Ringo turns into complete files; fixed
-executable checks run on them. The first candidate that passes them gets one
-review, and its findings drive one revision. A result that passes every check
-after that is written to the run's `final/` folder for human review, with the
-review it answered; nothing is applied, adopted or published. The Design Council
-is opt-in: a task that names a council bridge and rubric (the council's
-`rubrics/report.json` for documents and reports, `artifact_design.json` for visual
-artifacts) gets a council decision instead of the review, judged with 6 samples by
-default. In a controlled code test the Council cost 7x the tokens of checks alone
-with no significant quality gain, and one review plus one revision delivered every
-candidate passing all acceptance tests at a third of the Council's tokens. See
-[the work guide](docs/COUNCIL-WORKFLOW.md) for the measurement, the task format,
-outputs, budgets and trust limits.
+1. the change description and the three-dot diff
+2. the complete changed files, and the README at head
+3. the unchanged definitions, subclasses, callers and tests of the changed symbols
+4. a manifest of what was added and what was left out
 
-Opt-in spec fields tune `work` for cost and safety, and the defaults are unchanged:
-- `roles`: the model and reasoning effort for each call role (writer, revision, escalate, tests, review).
-- `protocol: "text"`: plain `@@@` blocks instead of JSON-escaped files, with exact `REPLACE` edits for revisions.
-- `protocol_repair`: one immediate call, asking for whole files, instead of losing the round to a reply that cannot be
-  applied.
-- `no_regression`: a revision that breaks a check, or a spec test the adopted candidate passed, is set aside. For
-  documents with `scripts`, a revision may not introduce a number that no successful script printed.
-- `scripts`: a document writer computes its numbers with a script that Ringo runs and shows to the writer and the
-  review.
-- `spec_tests` and `candidates`: blind tests written from the brief, and best-of-k first drafts selected by execution.
+Other options:
 
-`candidates` adds k - 1 writer calls in round 1, `protocol_repair` at most one call per round and `spec_tests` one.
+- **Size:** the material fits a byte budget (`--context-budget`, default 400000). The budget only drops context,
+  never the change itself.
+- **Your own material:** `--input FILE` takes the material as one file instead.
+- **Tools:** the call has no tools on `claude`, `codex-chatgpt` and `ollama:`. The `codex` preset keeps a read-only
+  shell, and a custom command's tools are unknown.
+- **A second checker:** `--checker-backend SPEC` runs a plan's verdicts pass and its repair on another backend, so a
+  different model or provider checks the findings. The plan needs a verdicts pass, and the trace records which
+  backend made each call.
+- **ReviewBench output:** `--findings-json FILE` also writes the findings as
+  [ReviewBench](https://github.com/review-bench/ReviewBench) agent-contract JSON, one entry per finding and file.
+  With `--repo`, files are checked against head and lines are clamped.
+  [adapters/reviewbench](adapters/reviewbench/README.md) runs Ringo as a ReviewBench reviewer image, so runs can be
+  reproduced and scored with the benchmark's own judge. No ReviewBench result is claimed here.
+- **Custom plans:** JSON files under `plans/`, with their instructions under `prompts/`.
 
-### V3: the recommended `work` settings
+The [harness guide](docs/HARNESS.md) has the full details.
 
-V3 is the configuration our experiments favour (see [Experiments](#experiments-what-we-tried-what-broke-what-we-measured)):
-- one strong model at low effort on every role;
-- the text protocol, protocol repair and the no-regression gate;
-- review material without rewrite diffs;
-- one review, and at most three rounds.
+### Write a design
+
+```sh
+python3 ringo.py design --input brief.md --out proposal.md
+```
+
+Supply the decision brief and its hard constraints.
+
+### Do bounded work
+
+`work` revises a declared set of text files:
+
+1. A writer model returns complete files, or exact search-and-replace edits that Ringo turns into complete files.
+2. Fixed executable checks run on them. Failed checks go straight back to the writer for the next round.
+3. The first candidate that passes every check gets one review, and the review's findings drive one revision.
+4. A result that still passes every check goes to the run's `final/` folder for your review, together with the review
+   it answered. Nothing is applied, adopted or published.
+
+**The Design Council is opt-in.** A task that names a council bridge and rubric gets a council decision instead of
+the review. Use the council's `rubrics/report.json` for documents and reports, or `artifact_design.json` for visual
+artifacts. It is judged with 6 samples by default. In a controlled code test, the Council cost 7x the tokens of checks
+alone with no significant quality gain. One review plus one revision delivered every candidate passing all
+acceptance tests, at a third of the Council's tokens.
+
+**Optional spec fields** tune `work` for cost and safety. The defaults are unchanged.
+
+| Field | What it does |
+| --- | --- |
+| `roles` | Sets the model and reasoning effort for each call role (writer, revision, escalate, tests, review) |
+| `protocol: "text"` | Uses plain `@@@` blocks instead of JSON-escaped files, with exact `REPLACE` edits for revisions |
+| `protocol_repair` | Makes one immediate call asking for whole files, instead of losing the round to a reply that can't be applied |
+| `no_regression` | Sets aside a revision that breaks a check, or a spec test the adopted candidate passed. For documents with `scripts`, a revision may not introduce a number that no successful script printed |
+| `scripts` | Has a document's writer compute its numbers with a script, which Ringo runs and shows to the writer and the review |
+| `spec_tests` | Adds blind tests written from the brief |
+| `candidates` | Writes k first drafts and keeps the best one, chosen by running them |
+
+`candidates` adds k - 1 writer calls in round 1, `protocol_repair` adds at most one call per round, and `spec_tests`
+adds one. In a check, script or spec-test command, `"{python}"` means the interpreter running Ringo, so one spec runs
+on every OS.
+
+The [work guide](docs/COUNCIL-WORKFLOW.md) covers the Council measurement, the task format, outputs, budgets and
+trust limits.
+
+#### Recommended settings: V3
+
+V3 is the configuration our experiments favour (see
+[Experiments](#experiments-what-we-tried-what-broke-what-we-measured)):
+
+- one strong model at low effort on every role
+- the text protocol, protocol repair and the no-regression gate
+- review material without rewrite diffs
+- one review, and at most three rounds
 
 It adds nothing that costs extra tokens. To use it on your own task, add these fields to its spec:
 
@@ -272,504 +247,266 @@ It adds nothing that costs extra tokens. To use it on your own task, add these f
 "roles": {"writer": {"effort": "low"}, "revision": {"effort": "low"}, "review": {"effort": "low"}}
 ```
 
-With a Claude backend, leave out `roles`, because Claude takes a model, not an effort. `"{python}"` in a check,
-script or spec-test command means the interpreter running Ringo, so one spec runs on every OS. `scripts`
-(writer-computed numbers for documents) is opt-in and not part of V3: it adds 1–2k tokens per document. Use it only
-for a document whose numbers must be computed.
+With a Claude backend, leave out `roles`, because Claude takes a model, not an effort. `scripts` is not part of V3:
+it adds 1–2k tokens per document, so use it only for a document whose numbers must be computed.
 
 ### Research
 
-`research` answers a brief from web sources that Ringo checks itself. It is new and unmeasured: nothing here
-claims it finds better sources, or costs fewer tokens, than asking a model directly.
+`research` answers a brief from web sources that Ringo checks itself. It is new and unmeasured. Nothing here claims
+that it finds better sources, or costs fewer tokens, than asking a model directly.
 
-It makes at most two model calls, with no retry, repair or probe call (`--timeout` is a hard limit per call,
-default 600 seconds):
-1. **Gather.** One call on the `codex-search` preset: `codex-chatgpt` (ChatGPT login, API keys removed, read-only,
-   shell and other tools off) with live web search on (`codex --search exec`). A web search is the only tool item it
-   may contain; any other fails the call. It replies with one JSON line per source: the URL, the title, the date if
-   the page states one, and narrow claims, each with an exact quote copied from the page.
-2. **Verify**, in code, at no token cost. Ringo fetches every URL itself and accepts a quote only if it finds it
-   inside one passage of that URL's final page, after normalising whitespace, curly quotes and dashes. A match that
-   differs only in case is accepted and flagged. DOIs and arXiv ids in a URL or claim are looked up (doi.org, arXiv
-   abstract pages) and their titles compared with the claimed work.
-3. **Write.** One tool-free call (`--backend`, default `codex-chatgpt`; `claude` and `ollama:MODEL` also work) that
-   sees only the verified evidence and replies with JSON blocks naming evidence ids. Ringo numbers the citations,
-   writes the source list (address, retrieval time, content hash, signals and each quote), and checks that every
-   citation maps to verified evidence. A reply in the wrong form is rejected, and the verified evidence list is
-   written instead.
+It makes at most two model calls, with no retry, repair or probe call. `--timeout` is a hard limit per call, 600
+seconds by default.
 
-Calls per outcome: a report, or a writer reply that fails or is rejected, 2; no verified source, a malformed search
-reply or a failed search call, 1; a search turn that made no web search, 1, reported as unavailable because its
-sources would come from the model's memory; a private brief without consent, or a Codex CLI without live search or
-without the features the preset turns off, 0. Research never falls back to an API key, to a model's own knowledge
-or to an agent turn.
+1. **Gather.** One call on the `codex-search` preset: ChatGPT login, API keys removed, read-only, every tool off
+   except live web search. The reply lists sources, each with narrow claims and an exact quote from the page.
+2. **Verify.** Ringo fetches every URL itself, in code, at no token cost. It accepts a quote only if it finds it on
+   that page, ignoring differences in whitespace, curly quotes and dashes (a match that differs only in case is
+   accepted and flagged). DOIs and arXiv ids are looked up, and their titles are compared with the claimed work.
+3. **Write.** One call with no tools (`--backend`, default `codex-chatgpt`; `claude` and `ollama:MODEL` also work)
+   sees only the verified evidence. Ringo numbers the citations, writes the source list, and checks that every
+   citation points to verified evidence. If the reply is in the wrong form, Ringo writes the verified evidence list
+   instead.
 
-The fetcher accepts only http and https, refuses URLs with credentials, resolves each host and refuses loopback,
-private, link-local, multicast, reserved and cloud-metadata addresses (IPv4 addresses inside IPv6 forms too), checks
-again on every redirect, and connects only to addresses it checked. It sends no cookies, credentials or referrer and
-uses no proxy. Each job fetches at most 10 URLs, with 3 redirects each, 2 MiB transferred and 8 MiB decompressed per
-page, 10 seconds per fetch and 60 seconds in all, two at a time. A source is **verified** (a quote was found on its
-page), **not checkable** (a PDF, a paywall or login, a page with no extractable text, a redirect loop; listed as a
-limitation, never cited) or **dropped** (unreachable, blocked, oversized, or no quote found on that page; a quote
-found only on another page does not count). An identifier that does not exist, or names a different work, drops the
-source when it is in the URL and the claim when it is in the claim.
+Things to know:
 
-"Verified" means the quoted text was on the page when Ringo fetched it. It does not mean the page is true, that the
-report's sentences follow from the quotes, or that the source is the best one. The final check covers evidence ids,
-eligibility, citations and structure; it cannot catch every sentence the evidence does not support. Review the
-claim-to-evidence support yourself for anything that matters.
+- **"Verified" means the quote was on the page when Ringo fetched it.** It doesn't mean the page is true or that
+  the report's sentences follow from the quotes. For anything that matters, check the evidence yourself.
+- **Primary sources rank first** (standards, confirmed papers, official documentation), by simple rules on the
+  address and page metadata. Aggregators and user-generated sites rank last.
+- **The brief is sent to a web search.** A brief with a file path, code, a credential, an email address or a marker
+  such as CONFIDENTIAL is refused unless you pass `--allow-private-search`.
+- **No fallbacks.** Research never falls back to an API key, a model's own knowledge or an agent turn.
 
-Primary sources are preferred by transparent rules on the address and page metadata, never by a quality score:
-standards bodies, resolver-confirmed DOIs and arXiv ids, scholarly repositories and scholarly page metadata,
-government and academic domains, and documentation hosts and paths rank first; aggregators and user-generated sites
-are labelled and rank last; other sources stay eligible in between. The same work at several addresses (the same
-final or canonical URL, the same content or the same confirmed identifier) is one citation.
+The [research guide](docs/RESEARCH-ROLE.md) has the formats, the fetcher's safety limits, the ranking rules, and
+the number of calls for each outcome.
 
-The brief is sent to a web search. A brief that holds a file path, a code block, a credential, an email address or a
-marker such as CONFIDENTIAL is refused unless you pass `--allow-private-search`. `--trace` and `--out` must be outside
-this checkout: the trace keeps the brief, both replies and a record of every fetch. The Rust `ringo` binary does not
-run research yet. The [research guide](docs/RESEARCH-ROLE.md) has the formats, bounds, rules and outcomes.
+### The `ringo` shell
 
-### Backends, findings and usage
+Install it with `cargo install --path cli`, then type `ringo` to open Ringo's own full-screen session.
 
-`review --findings-json FILE` also writes the findings as
-[ReviewBench](https://github.com/review-bench/ReviewBench) agent-contract JSON,
-one entry per finding and file. With `--repo`, files are checked against head
-and lines clamped. [adapters/reviewbench](adapters/reviewbench/README.md) runs
-Ringo as a ReviewBench reviewer image, so runs can be reproduced and scored with
-the benchmark's own judge. No ReviewBench result is claimed here.
+- Say what you want in plain words. The agent you're talking to (Claude Code, Codex, Google's Antigravity CLI (agy),
+  Grok or an agent you add) does it in that folder, and asks before it runs a command. `/undo` takes a turn's change
+  back.
+- Give a task to several agents at once, each in its own copy, run Ringo's pipelines with them, and watch every job
+  and subagent as it runs.
+- On first start, the shell finds the agents installed on your computer and signs you in.
+- One switch (`/mode ask|auto|read`, or Shift-Tab) sets how far every agent may go before it asks you.
 
-Backends include Claude Code, Codex, local Ollama and commands that read stdin.
-Every Codex backend (`codex`, `codex-chatgpt`, `codex-search` and `codex:<command>`) runs with a
-private, per-call `CODEX_HOME` holding only a copy of your `auth.json` and an empty
-`HOME`, so your global Codex instructions (`~/.codex/AGENTS.md`), skills
-(`~/.codex/skills`, `~/.agents/skills`) and memories do not load in the child. A
-login the child refreshes is written back to your `auth.json` only if that file
-did not change during the call. Ringo parses the CLI's JSON events and records
-reported tokens; a turn that uses a tool its backend does not declare is rejected.
-`codex-chatgpt` also forces native ChatGPT authentication, strips API-key and
-endpoint overrides and disables the shell. Its calls are single tool-free turns, so
-it also replaces the Codex agent prompt with one line and drops the code-mode,
-multi-agent, skills and environment blocks Codex adds to every request (see the
-[improvement log](docs/IMPROVEMENT-LOG.md)). The `codex` preset keeps its shell and
-the caller's configured authentication. `codex:<command>` runs your own Codex
-command line, which must pass `--json`; it may use web search only if that command
-line passes `--search`. Codex dollar cost remains unknown.
-`--checker-backend SPEC` runs a plan's verdicts pass and its repair on a second
-backend, so another model or provider checks the findings; the plan needs a
-verdicts pass, and the trace records which backend made each call.
-Authenticate with the provider's supported CLI. Usage consumes the selected account's
-allowance or API billing according to authentication and plan settings. Unknown
-cost is not zero. `--trace` uses a new folder outside this checkout; it contains
-private material. Opening the CLI help or running tests makes no provider calls.
+Start with the step-by-step [user guide](docs/USER-GUIDE.md) (`/help` in the shell). The full reference is
+[docs/SHELL.md](docs/SHELL.md).
 
-Routine usage reports use [token counts](docs/TOKEN-USAGE.md): uncached input,
-cached input, cache writes, output and their reported total, with missing usage
-identified explicitly. The optimization goal is fewer whole-task tokens than the
-same agent working alone at equal or better quality, including harness/Council
-overhead and retries. No monetary spending cap has been set for this work.
-Dollar estimates are omitted; protected evaluation gates remain unchanged.
+### The native runtime
+
+`review`, `design` and `work` also run natively inside the `ringo` binary. The Python runtime stays, unchanged, as
+the reference.
+
+- **Why Rust:** the shell, the planned IDE and its local model all need one engine to start, follow and stop
+  pipelines. The binary also uses less memory per job (8.1 MB peak against 24.5 MB), and it is one program to
+  install. Speed was not the reason: Python's own cost is 0.1–0.4% of a run.
+- **Same requests:** the port sends the model the same bytes as the Python runtime, checked module by module and end
+  to end. That's why the published results, measured on the Python runtime, still apply.
+- **Releases:** a release can carry the binary only with a passing check for that exact binary. Windows keeps the
+  Python runtime.
+
+The [native runtime notes](docs/NATIVE-RUNTIME.md) cover the measurements, the release gate, what stayed in Python,
+and the bugs the port found.
+
+## Model calls, time limits and cost
+
+### How many calls
+
+Ringo has no call cap. The plan or the round count decides the calls, and `--max-cost` and time limits bound the
+money and time.
+
+| Task | Model calls |
+| --- | --- |
+| `review` or `design`, default plan | One strong call. A call that fails or replies in the wrong shape is tried once more, so at most two |
+| A custom plan | One per pass, each retried at most once, plus at most one checker repair. A batched checker makes one call per batch of findings (at most 50 findings per reader reply) |
+| `work` | One writer call per round, plus one review after the first candidate that passes every check: at most `max_rounds + 2`, counting the review's one retry |
+| `work` with the Council | Judge calls instead of the review: the first `first_judges` (3 of the default 6), and the rest only if those don't recommend. At most `max_rounds x (1 + samples)` |
+| `research` | At most two, with no retries |
+
+Outside research, a call you stop can add one retry, and a call that passes its time limit can add one probe call.
+
+### Time limits
+
+`--timeout` (review and design, default 900 seconds) and `timeout_s` (work, default 120 seconds) are soft limits. A
+call past its limit keeps running. Ringo sends one tiny probe call to the backend (none under a cost cap), records an
+incident in the trace, and prints one line. It recommends stopping only when the evidence suggests a stall. To stop
+the call, write `stop` to the decision file Ringo prints. The call is then retried once. Every call is stopped at
+twice its soft limit (never under 900 seconds, and in `work` also at the run deadline), with no retry. The
+[harness guide](docs/HARNESS.md) has the details.
+
+### Waiting for a run
+
+A run with `--trace`, and every `work` run, keeps a small `state.json`. `python3 ringo.py wait DIR` blocks until the
+run finishes and prints it, so an agent can wait with one command instead of polling.
+
+### Usage and cost
+
+- Calls use your selected account's allowance, or its API billing, depending on how it signs in and its plan.
+  Unknown cost is not zero, and Codex's dollar cost is unknown.
+- Usage reports use [token counts](docs/TOKEN-USAGE.md): uncached input, cached input, cache writes, output and their
+  reported total. Missing usage is marked as missing.
+- The goal is fewer whole-task tokens than the same agent working alone, at equal or better quality, counting
+  harness and Council overhead and retries. No monetary spending cap has been set for this work, dollar estimates
+  are left out, and protected evaluation gates stay unchanged.
+- Opening the CLI help or running the tests makes no provider calls.
+
+## Backends
+
+| Backend | What it runs |
+| --- | --- |
+| `claude` | Claude Code. API keys and endpoint overrides are removed, so calls stay on your subscription login |
+| `claude:<command>` | Your own Claude Code command line, with your environment kept |
+| `codex-chatgpt` | Codex CLI with native ChatGPT sign-in forced, API-key and endpoint overrides removed, and the shell off |
+| `codex` | Codex CLI with its shell, and with your configured authentication |
+| `codex-search` | `codex-chatgpt` with live web search, used by `research` |
+| `codex:<command>` | Your own Codex command line, which must pass `--json`. It may use web search only if it passes `--search` |
+| `ollama:MODEL` | A local Ollama model |
+
+Commands that read stdin also work as backends.
+
+How Ringo keeps calls isolated:
+
+- **Every Codex backend** runs with a private `CODEX_HOME` for each call, holding only a copy of your `auth.json`, and
+  an empty `HOME`. So your global Codex instructions (`~/.codex/AGENTS.md`), skills (`~/.codex/skills`,
+  `~/.agents/skills`) and memories don't load. A login the call refreshes is written back to your `auth.json` only
+  if that file didn't change during the call.
+- **`codex-chatgpt` calls are single turns with no tools.** So Ringo replaces the Codex agent prompt with one line
+  and drops the code-mode, multi-agent, skills and environment blocks that Codex adds to every request (see the
+  [improvement log](docs/IMPROVEMENT-LOG.md)).
+- **Tool use is checked.** Ringo parses the CLI's JSON events and records the tokens it reports. A turn that uses a
+  tool its backend doesn't declare is rejected.
+- **Traces are private.** `--trace` takes a new folder outside this checkout. It contains private material.
+
+Sign in with each provider's supported CLI.
 
 ## Experiments: what we tried, what broke, what we measured
 
-Every number here comes from our own runs. The task contents, hidden tests and raw traces stay private so the tasks
-can be reused. This section records the designs, the results and every mistake we found.
+Every number comes from our own runs. Task contents, hidden tests and raw traces stay private so the tasks can be
+reused. The [experiments log](docs/EXPERIMENTS.md) has the method, every study, the mistakes we found and the ideas
+we rejected.
 
 **The current adoption rule:** a change is adopted only if it uses no more tokens than what it replaces. Cheaper
 credits do not justify more tokens.
 
-### How we measure
+### Results at a glance
 
-- **Tasks:** each is a brief with hidden acceptance tests. Every hidden test traces to a sentence in the brief.
-  Mutants (plausible wrong answers that still pass the public checks) show that the hidden tests catch real
-  mistakes.
-- **Held-out discipline:** held-out tasks are frozen by hash before any model call, and development uses separate
-  tasks.
-- **Arms:**
-  - the Codex CLI agent alone at high effort (AH) and at low effort (AL);
-  - Claude Code alone (CA);
-  - Ringo configurations.
+| Question | What we found | Section |
+| --- | --- | --- |
+| Is the multi-judge Design Council worth it by default? | About 7x the tokens of checks alone, with no significant quality gain. Now opt-in | [1](docs/EXPERIMENTS.md#1-the-design-council-2026-10-27) |
+| Where do the tokens go? | Output tokens are the cost. Most of an agent's tokens are cached re-reads, and high effort on every call bought nothing | [2](docs/EXPERIMENTS.md#2-where-the-tokens-go-one-code-task-with-26-hidden-tests-one-run-per-arm-all-2626) |
+| Ringo against the Codex agent, held-out tasks | Same quality (100%). Low-effort Ringo, and later V3, matched the low-effort agent's credits with about 80% fewer tokens | [3](docs/EXPERIMENTS.md#3-current-ringo-against-the-agents-held-out-tasks-phase-1), [6](docs/EXPERIMENTS.md#6-v3-removing-the-kinks) |
+| HumanEval+, 154 tasks | A quality tie (147 against 148). Ringo used 14.4x fewer tokens and 2.2x fewer credits | [7](docs/EXPERIMENTS.md#7-humaneval-the-review-earns-its-place-on-code-2026-10-28) |
+| Four refinements built from HumanEval+ failures | Made Ringo worse on MBPP+ (126 against 132 of 150, p = 0.031). All removed | [8](docs/EXPERIMENTS.md#8-mbpp-four-refinements-from-humaneval-failures-rejected-2026-10-29) |
 
-  Every arm gets the same brief, public checks and instructions.
-- **Quality:** the share of hidden tests that the delivered files pass.
-- **Cost:**
-  - Tokens are all input (uncached and cached) plus all output, for every provider.
-  - Codex credits use the published rates for GPT-6.1 Sol (50 per million uncached input tokens, 2.5 cached, 250
-    output) and GPT-6 Luna (2.5, 0.25, 12.5).
-- **Decision rule, written before the runs:** a harness wins outright only if its paired quality interval lies
-  above zero and it costs less.
-- **Statistics:** two runs per arm per task; a 95% paired bootstrap with 10,000 resamples.
-- **Audit:** an agent run that touched the hidden material would be excluded. None did.
+The log also covers building and testing v2 (sections [4](docs/EXPERIMENTS.md#4-building-v2-trials-and-errors) and
+[5](docs/EXPERIMENTS.md#5-v2-on-the-held-out-tasks-phase-2)), [portability](docs/EXPERIMENTS.md#9-portability), the
+[ideas we rejected](docs/EXPERIMENTS.md#10-ideas-we-considered-and-did-not-adopt) and
+[what would move Ringo next](docs/EXPERIMENTS.md#11-what-would-move-it-next).
 
-### 1. The Design Council (2026-10-27)
+## Evaluation, improvement and releases
 
-The multi-judge Council cost about 7× the tokens of checks alone, with no significant quality gain. One review and
-one revision delivered every candidate passing all acceptance tests, at a third of the Council's tokens. The Council
-became opt-in (#15).
-
-### 2. Where the tokens go: one code task with 26 hidden tests, one run per arm, all 26/26
-
-| Arm | Tokens | Credits |
-|---|---|---|
-| Codex agent alone, high effort | 190,695 | 5.11 |
-| One bare model call, high effort | 9,305 | 1.93 |
-| Ringo, writer plus 6 Council judges | 75,229 | 7.04 |
-| Ringo, check-first Council | 71,941 | 6.61 |
-| Ringo, one review, high effort | 54,275 | 6.61 |
-| Ringo, one review, low effort | 21,754 | 2.05 |
-
-What we learned:
-- **Output tokens are the cost.** They cost 5× uncached input and 100× cached input.
-- **The agent's tokens were mostly re-reads.** 84% were cached re-reads of its own session.
-- **High effort on every call bought nothing.**
-- **No caching across calls.** A fresh `codex exec` call gets no cache hits from an earlier call.
-
-### 3. Current Ringo against the agents (held-out tasks, phase 1)
-
-Six tasks were built for this study:
-- four code tasks: semantic-version ranges, a ledger, cron schedules, patch application;
-- two analysis memos: a vendor decision, an incident postmortem.
-
-Each has 27–40 hidden tests, and each arm ran twice.
-
-| Arm | Hidden tests passed | Credits per task | Tokens per task | Seconds |
-|---|---|---|---|---|
-| Codex agent, high (AH) | 100% | 2.94 | 153k | 115 |
-| Codex agent, low (AL) | 100% | 1.52 | 89k | 46 |
-| Claude Code (CA) | 100% | (Claude: $0.32 API-equivalent) | 150k | 66 |
-| Ringo, every call high (RH) | 100% | 2.38 | 26k | 129 |
-| Ringo, every call low (RL) | 100% | 1.49 | 20k | 45 |
-
-- **No quality win was possible.** Every arm passed every hidden test.
-- **RH:** used 1.57× AL's credits, so it lost to AL. High effort everywhere was the bloat.
-- **RL:** used 0.98× AL's credits and 0.22× its tokens.
-
-### 4. Building v2: trials and errors
-
-We tuned only on development tasks: a 26-test job-queue task, an ISO 8601 duration library (40 hidden tests) and an
-inventory reconciliation memo (35).
-
-| We tried | What happened | What we changed |
-|---|---|---|
-| The text protocol as the default | 28 existing tests built on JSON broke | Made it opt-in (`protocol: "text"`) |
-| The writer's `@@@ FILE` blocks | It closed them with `@@@ END`, so every round was malformed | `END` is accepted after any block |
-| GPT-6 Luna writing spec tests | It quoted the brief in four-quote docstrings, which do not compile, so the suite was lost | Brief sentences go in `# brief:` comments; four-quote docstrings are repaired |
-| Luna's edits | It wrote a bare `@@@` where `@@@ WITH` belonged | A bare marker is read by position |
-| Luna's edit anchors | An anchor matched twice, and the round was lost | `protocol_repair`: one immediate call that asks for whole files |
-| Three Luna drafts (job queue) | 0.24–0.31 credits against 5.11 for the agent, but 25/26 in four of four runs. Every run returned `''` where the brief said `empty`, and Luna's tests shared that blind spot | Luna is not a writer |
-| Sol writer, Luna for everything else (job queue) | 26/26 at 0.81 credits. Half of Luna's tests were wrong, and an unchanged reply ended the run before the review | An unchanged reply stands by the code and goes on to the review |
-| Two Sol drafts (duration library) | Both drafts passed 40/40, but revisions driven by wrong Luna tests delivered 36/40 twice | Dual agreement (a test every draft fails stops gating) and the no-regression gate, after which it passed 40/40 |
-| Luna's rationale-only replies | Counted as malformed | They stand by the code |
-| Three Luna drafts (memo) | Luna sent only scripts, the run ended (a bug), and Sol escalation then wrote the memo at 3.0 credits | Fixed the bug; dropped Luna as a writer |
-
-### 5. v2 on the held-out tasks (phase 2)
-
-| Arm | Hidden tests passed | Credits per task | Tokens per task |
-|---|---|---|---|
-| V2S: Sol writer; Luna tests, revision and review | 99.4% (one memo run lost 2 of 28) | 1.13 | 58k |
-| V2K: V2S with two Sol drafts | 100% | 1.93 | 61k |
-
-- **V2S** had the lowest credits, but nearly 3× RL's tokens and twice its time.
-- **V2K** used more credits than AL.
-
-Current Ringo was outperforming v2, and the data showed why:
-- **The first draft was already right.** In all 36 runs we checked (RH, RL, V2S), Ringo's first draft passed every
-  hidden test, so everything after round 1 was overhead.
-- **The reviews' findings were all false.** Luna reviews raised findings on 12 of 12 V2S runs, all false. Sol
-  reviews raised findings on 3 of 12 RL runs, also false but harmless.
-- **The one loss:** the Sol writer had the right answer (40 customers, SEV2) for three rounds. Then a Luna review
-  claimed the count was wrong, and a Luna revision changed it to 56 and SEV1 with no successful script behind it.
-
-### 6. V3: removing the kinks
-
-**Fixes:**
-- **The number-evidence gate:** with `scripts`, a document revision may not introduce a number that no successful
-  script printed. Replayed on the real loss, the revision's only unbacked number was the wrong 56, so the revision
-  would have been set aside.
-- **Review material:** a rewritten file gets no diff. A stub-to-implementation diff repeated the whole file, which
-  was 2–3k of a code review's 8k input tokens.
-- **Scripts:** a script whose output already matches the document no longer forces a round. Script logs no longer
-  overwrite the round's check logs.
-- **Prompts:** when feedback is wrong, change nothing and say why; resend the script when changing a number.
-
-**Three Ringo code reviews of these changes found seven more bugs, all fixed with tests:**
-- a spec-runner timeout crashed the run;
-- unittest class fixtures were skipped;
-- module fixtures were skipped;
-- teardown errors were dropped;
-- fixture errors were matched to the wrong module;
-- the blind test writer was shown fixtures;
-- the number gate ignored sign changes.
-
-**Dev check (one run each):**
-
-| Task | Current Ringo (RL) | V3 without scripts | V3 with scripts |
-|---|---|---|---|
-| Memo, 35 hidden tests | 34/35, 2.14 credits, 28k tokens | 34/35, 2.08 credits, 25k tokens | 35/35, 2.55 credits, 29k tokens |
-| Duration library, 40 hidden tests | 40/40, 1.47 credits, 18k tokens | 40/40, 0.89 credits, 10k tokens | n/a (code) |
-
-**Phase 3** used fresh repetitions 3 and 4 of the six held-out tasks. V3 was designed after seeing phases 1 and 2,
-so this is a confirmation, not a clean held-out test.
-
-| Arm | Hidden tests passed | Credits per task | Tokens per task | Seconds |
-|---|---|---|---|---|
-| V3 with memo scripts (V3s) | 100% | 1.44 | 17.7k | 46 |
-| Current Ringo (RL) | 100% | 1.52 | 20.3k | 46 |
-| Codex agent, low (AL) | 100% | 1.42 | 88.2k | 45 |
-
-- **Against RL:** at equal quality, V3s used 5% fewer credits and 13% fewer tokens.
-- **Against AL:** about equal credits (1.01×) and 80% fewer tokens.
-- **By task:** on code, V3s used fewer tokens than RL on three of four tasks (14k against 25k, 11k against 14k, 14k
-  against 21k) and the same on the ledger task (15k each), where RL used slightly fewer credits (1.18 against 1.20).
-  On the memos the scripts added tokens: 23k against RL's 17k on the vendor memo. Under the adoption rule, the
-  recommended V3 therefore leaves `scripts` out.
-
-### 7. HumanEval+: the review earns its place on code (2026-10-28)
-
-The first study with hidden-test headroom: 163 HumanEval+ tasks (EvalPlus v0.1.10, Apache-2.0; HumanEval/32 left
-out because its own reference fails the benchmark's root check). The original HumanEval tests are the public check;
-EvalPlus's extra inputs, about 80 times as many, are the hidden tests. Every task ran once on V3 (Codex, Sol low).
-Details and the method are in [AGCL](docs/AGCL.md); task files and traces stay private.
-
-**Against a standalone agent.** The same tasks also ran through the Codex CLI as a plain agent (Sol low, a fresh
-workspace per task), in a fixed random order until an 80-credit ceiling stopped it after 154 tasks. On those 154:
-
-| Arm | Hidden tests passed | Tokens per task | Credits per task |
-|---|---|---|---|
-| Codex agent | 148/154 | 50,325 | 0.513 |
-| Ringo V3 | 147/154 | 3,500 | 0.235 |
-
-Quality is a tie: the two disagree on 3 tasks (the agent alone passes 2, Ringo alone 1; exact McNemar p = 1.0), and 5
-fail for both. Ringo uses 14.4 times fewer tokens and 2.2 times fewer credits. 87% of the agent's tokens are cached
-input, its own context re-sent on each of about five steps. So Ringo does not beat the agent outright here: it
-matches it at a fraction of the cost, and a quality win needs harder tasks.
-
-| Idea | Measured | Decision |
-|---|---|---|
-| Stop after round 1 when the checks pass | Saves 53% of tokens. The review then caught one defect the public tests missed (HumanEval/137), so stopping harms 1 of 162 eligible runs: upper bound 2.9%, over the 2% bar set beforehand | Rejected; `stop_on_checks` removed |
-| Keep the review on code | 24 planted defects that pass the public tests: the review flagged 24/24 and quoted the line on 23, with findings on 3/24 of the same drafts before seeding | Kept |
-| A reviewer from another family (Claude Sonnet 5.5) | Same catch rate (24/24), no false alarms (0/24), but 51% more tokens per review (2,963 against 1,957) | Not adopted: adds tokens |
-| Distinguishing inputs without a model: 200 inputs mutated from the public tests | Told 20 of 23 planted defects apart from the correct draft. Between Claude's and Codex's real drafts it flagged 1 of the 8 tasks Codex fails and 24 of the 150 it passes; it missed the one revision that mattered | Not adopted: misses the corners hidden tests reach |
-| A second draft from another family | Either draft passes on 154 of 158 tasks, against 150 for Codex alone: real headroom, but no zero-token signal picks the right one | Open; nothing built on it |
-
-**Mistakes found in the study itself:** HumanEval/38 and /50 test their function through a helper the prompt
-defines, and the generated public check imported only the function, so it could never pass. Both were rerun with the
-fix. 14 of 163 Claude drafts were replies Ringo could not apply; a `work` round answers that with one repair call, so
-the drafts were redone with it.
-
-### 8. MBPP+: four refinements from HumanEval+ failures, rejected (2026-10-29)
-
-Four changes came from reading two of V3's HumanEval+ failures. HumanEval/47 hardcoded its docstring's wrong
-example, and /34 sorted before deduplicating. Each change was written to add no tokens:
-
-- a writer rule: follow the behaviour the brief names over its examples, and never special-case an input;
-- a static note on code fitted to one literal example;
-- a stop when a revision leaves code that fails a check unchanged, handing the dispute to a person;
-- review wording that names edge values.
-
-HumanEval+ cannot test changes built from its own failures. So the changes ran on 150 MBPP+ tasks (v0.2.0, a
-seeded random sample; the other 228 stay sealed), paired with V3 on the same model, under a plan registered before
-the first call ([preregistration](docs/prereg/2026-10-29-v3-refine-mbpp.md)).
-
-| Arm | Hidden tests passed | Tokens per task | Credits per task |
-|---|---|---|---|
-| V3 | 132/150 | 2,631 | 0.171 |
-| V3 + the four changes | 126/150 | 2,666 | 0.175 |
-
-Six tasks went from pass to fail and none the other way (exact McNemar p = 0.031), so the changes made Ringo worse.
-They also used 35 more tokens per task (95% interval -43 to +118). The official EvalPlus evaluator agrees with the study's grader on all 300 graded files.
-The study cost 51.9 credits.
-
-**Why.** The study tests the four changes together, so these are per-task readings, not separate effects. MBPP's
-prose is short, and its examples define the behaviour.
-- The writer rule told the writer to follow the named behaviour over the examples. On 4 tasks it overrode correct
-  examples.
-- The stop rule then ended 5 runs as disputes. On 4 of those tasks, V3 delivered a correct answer by fixing its code
-  in round 2.
-- The edge-value wording led the review to flag float precision on huge integers (Mbpp/14). The revision broke the
-  expected result. Overall, false alarms nearly doubled: 13 of 127 passing drafts against 7 of 131.
-- The static note never fired.
-
-All four were removed. A rule fitted to one benchmark's quirk, here a wrong docstring example, does harm where the
-examples are the specification. On these tasks, deferring to the check worked better than trusting the prose.
-
-### 9. Portability
-
-- **`ringo.py wait`:** its liveness check used `os.kill(pid, 0)`, which terminates the process on Windows. On Windows
-  it now opens the process and waits on it with a zero timeout instead.
-- **Spec runner:** it used `SIGALRM`, which Windows lacks. It now runs without it there; the suite's timeout still
-  bounds it.
-- **Release bundles:** these left out `spec_runner.py`. It is now in the bundle.
-- **CI:** it runs on Ubuntu, macOS and Windows, and the whole offline suite passes natively on Windows. The native
-  port locks with `msvcrt`, ends a call's or check's process tree through a job object, and splits backend commands
-  without treating `\` in Windows paths as an escape. Tests of POSIX-only properties (permission bits, `os.killpg`,
-  FIFOs, the Linux ReviewBench image) are skipped there. Windows private folders use a protected, verified DACL
-  with one inheritable full-control ACE for the current user, including traces, stores, release state, temporary
-  prompts and private Codex homes. New roots receive it atomically at creation; child files and folders inherit it.
-  Pre-existing roots are tightened, but earlier open handles are not revoked. Failure to set or verify the DACL
-  stops writing. Ringo checks the private roots, not every folder inside them: a file or folder already inside a
-  root with an explicit ACL of its own keeps it, and so does what is written into it. Administrators taking
-  ownership are outside this guarantee too.
-  Explicit `.cmd`/`.bat`
-  launches are refused, including trusted backends and checks; call the underlying executable to avoid `cmd.exe`
-  argument interpretation. POSIX permissions and process launching are unchanged.
-
-### 10. Ideas we considered and did not adopt
-
-A deep-research pass checked 25 published claims: 19 were confirmed and 6 refuted. Its verdicts are included below.
-
-| Idea | Evidence | Decision |
-|---|---|---|
-| High effort on every call | RH: 2.38 credits against RL's 1.49, same quality | Rejected: bloat |
-| The Council by default | About 7× tokens, no quality gain | Opt-in |
-| Luna as the writer | Cheap, but missed rules and could not write a memo | Rejected |
-| Luna reviews and revisions | False findings on 12 of 12 runs; caused the one loss | Rejected: weak models may advise, never change the result |
-| Spec tests by default | Never improved a result; wrong tests drove regressions | Opt-in, with dual agreement |
-| Two Sol drafts (V2K) | 1.27× AL's credits, with no quality to buy | Opt-in (`candidates`) |
-| Shared-primer session forking: a seed session holds the brief, and later calls fork from it to read it from cache | `codex exec fork --ephemeral` reuses the parent's cache routing (Codex CLI 0.164.0); cached input costs 0.05× (estimated 27–34% fewer credits, not measured). A separate seed adds about 10k tokens per memo run. Using the writer as the seed adds the writer's transcript to the reviewer's context | Not adopted: it adds tokens |
-| A cheap scout plus a router | The published saving came from a cheap fixer, not from the router | Rejected; Luna as writer already failed here |
-| Learned per-step routers | No measurable end-to-end gain; needs a fine-tuned model | Rejected |
-| A strong advisor beside a weak executor | Published gains are confounded and inside noise | Deferred |
-| Single-pass claim verification | Worked only with a fine-tuned small model | At most a pilot |
-| Batching similar checks into one call | About 4× fewer reasoning tokens, in one preprint | At most a pilot |
-| Stop after round 1 when the checks pass (`stop_on_checks`) | 1 harm in 162 HumanEval+ runs; bound 2.9% over the 2% bar (section 7) | Removed |
-| A reviewer from another model family | Same catches, fewer false alarms, 51% more tokens per review (section 7) | Not adopted |
-| Distinguishing inputs from mutated public inputs | Flagged 1 of 8 real hidden failures, with 24 false flags in 150 (section 7) | Not adopted |
-| Letting a model rewrite an ambiguous brief directly | Below the original brief in 11 of 12 model-benchmark cells (SpecFix, arXiv 2505.07270) | Not tried: published as harmful |
-| Regenerating when the model seems uncertain | Lower pass@1 in 5 of 6 configurations (arXiv 2608.14659; small models) | Not tried: published as harmful |
-| Fixed multi-round repair | Repair with a noisy verifier turned correct answers wrong (arXiv 2607.17641); at a matched budget, more first drafts beat more repairs (Olausson et al., ICLR 2024) | Not tried; `max_rounds` stays bounded by the checks |
-| Context compaction (shrinking history or material) | Vendors compact with a model call over the whole context, which adds tokens; deterministic masking matched LLM summaries at half the cost on SWE-bench Verified (arXiv 2508.21433). Ringo's pipelines keep no history. Offline, windowing changed files to ±15 lines would cut review material 39%, with untested recall ([details](docs/CONTEXT-COMPACTION.md)) | Not adopted now; not tested |
-| Follow the named behaviour over the examples (writer rule) | 4 round-1 losses and no gains on MBPP+ (section 8) | Removed |
-| Stop when unchanged code fails a check, and hand the dispute to a person | Ended 5 MBPP+ runs; V3 delivered 4 of those tasks correctly (section 8) | Removed |
-| A static note on code fitted to one literal example | Fired on 1 of 645 earlier drafts and on none of 300 MBPP+ runs | Removed: inert |
-| Edge values named in the review prompt | False alarms 13/127 against 7/131; one revision broke a passing draft (section 8) | Removed |
-
-### 11. What would move it next
-
-- **Tasks with headroom, measured against the agent.** On HumanEval+ the two tie on quality and Ringo costs far less
-  (section 7). V3 passes 132 of 150 MBPP+ tasks at 2,631 tokens each (section 8). The agent on those same tasks, and
-  harder sets such as LiveCodeBench, come next.
-- **Refinements need unseen tasks.** The four changes built from HumanEval+ failures, tested together, did harm on
-  MBPP+ (section 8). A candidate is now built on one set and judged on a sealed one.
-- **Choosing between two drafts.** Two drafts from different families pass more hidden tests than either alone, but
-  the cheap signals tried so far cannot tell which one is right. A published e-process release rule
-  (arXiv 2605.12947) and execution-based selection (DiffCodeGen, arXiv 2605.20473) are the starting points; both
-  spend far more samples than Ringo, so the question is a gate that pays only when drafts disagree.
-- **The IDE.** Two of the largest gains need a person in the loop: asking at the fork (a one-click choice where the
-  spec has two readings) and remembering the user's conventions. Both belong in the IDE (see Roadmap).
-
-## Roadmap
-
-- **IDE:** a Rust engine that runs on macOS, with support for Python, Jupyter notebooks, Rust and C/C++. It will
-  carry live context, one-click decisions where a spec is ambiguous, and per-repository preference memory. It will be
-  a separate client of this harness.
-  Its local model is meant to do more than complete code: keep Claude, Codex and other agents supplied with current
-  facts about the code, so they spend fewer tokens finding them, and audit a codebase in the background, proposing
-  small fixes that pass the project's checks before the user approves them. None of it is built or measured yet.
-- **Native Windows model calls:** the offline suite passes natively; real Claude and Codex calls still need a run.
-- **Audit-Gated Continual Learning ([AGCL](docs/AGCL.md)):** Ringo learns when it can stop spending tokens, and it
-  changes behavior only through a release with a measured harm bound and human approval. Built: `shadow_labels.py`
-  and the HumanEval+ studies in `evalplus_study.py`. The first candidate, stopping when the checks pass, was rejected
-  by its sealed study; a new candidate needs a new study on untouched tasks.
-- **Benchmarks with headroom,** so quality gains can be measured.
-
-## Engineering optimization goals
-
-Optimize the harness for working code, sound design judgment and architectural
-insight, with concrete task outcomes and separate evidence for each. Whole-task
-token efficiency remains an objective while correctness and quality hold. See
-[engineering objectives](docs/ENGINEERING-OBJECTIVES.md) for task families,
-measurement, Council responsibilities and the gaps in today's review-only
-evaluator. This direction does not start an evaluation or improvement campaign.
-
-## Evaluation and improvement
-
-See [the harness guide](docs/HARNESS.md) and [the agent skill](skills/ringo-harness/SKILL.md).
-
-The [improvement log](docs/IMPROVEMENT-LOG.md) records each measured improvement,
-when it was measured and the change that made it. Every number in it is recomputed
-by `improvement_log.py` from raw evidence committed under `docs/improvements/`, and
-an entry whose evidence does not show the improvement is refused by the tests.
-
-[Approved releases and latency checks](docs/RELEASES.md) describes local versioned
-bundles, explicit activation/rollback, pinned runs and a separate offline latency
-gate. `python3 ringo.py release --help` manages releases; staging does not activate
-them. RRSI candidate adoption still requires existing sealed-test evidence and a
-human decision. Timing experiments use simulated backends and make no provider calls.
-
-[Optimization regression cases](docs/OPTIMIZE-CASES.md) check release integrity before inference,
-fresh-invocation rechecks and complete timing schedules. The full offline suite
-also runs in GitHub Actions on Python 3.11 and 3.14. The
-[overfitting audit](docs/OVERFITTING-GUARDRAILS.md) maps evidence and held-out-data
-guardrails to their tests and remaining limits.
-
-[HarBenchmark](HarBenchmark.md) provides twelve public development cases and an
-offline scorer across review, constrained repairs, design calculations, artifact
-consistency, research arithmetic and evaluation/accounting. Its comparison tables
-separate sourced external results from local development evidence and unmeasured
-coverage. See the [benchmark gap research](docs/BENCHMARK-GAPS.md) and the
-[separate security/CI bot brief](docs/SECURITY-CI-BOT-RESEARCH.md). These additions
-make no provider calls and add no work to the normal harness execution path.
+Ringo is optimized for working code, sound design judgment and architectural insight, with concrete task outcomes
+and separate evidence for each. Whole-task token efficiency remains an objective while correctness and quality hold.
+The [engineering objectives](docs/ENGINEERING-OBJECTIVES.md) cover task families, measurement, the Council's
+responsibilities and the gaps in today's review-only evaluator. That direction doesn't start an evaluation or
+improvement campaign by itself.
 
 ```sh
 python3 evaluate.py --help
 python3 improve.py --help
+python3 ringo.py release --help
 ```
 
-Evaluation freezes inputs, separates repository groups, grades blind, records an
-integrity ledger, and controls validation/test reuse. Improvement campaigns search
-review prompts/plans against dev evidence. A finalist requires a sealed-test pass
-and human adoption. These gates stay advisory; no automatic adoption occurs.
-`work` repairs one task's files and does not change Ringo's prompts or plans.
-A dollar-budgeted run requires an explicitly declared fallback for unpriced attempts.
-The final admitted call can exceed a remaining budget.
+- **Evaluation** (`evaluate.py`) freezes its inputs, separates repository groups, grades blind, records an integrity
+  ledger, and controls how validation and test data are reused.
+- **Improvement campaigns** (`improve.py`) search review prompts and plans against development evidence. A finalist
+  needs a sealed-test pass and a person's adoption. These gates stay advisory, and nothing is adopted automatically.
+  (`work` repairs one task's files; it never changes Ringo's own prompts or plans.)
+- **Releases** are local, versioned bundles with explicit activation and rollback, pinned runs and a separate offline
+  latency gate. Staging a release doesn't activate it. Adopting an RRSI candidate still needs sealed-test evidence and
+  a human decision. Timing experiments use simulated backends and make no provider calls.
+- **Budgets:** a dollar-budgeted run needs an explicitly declared fallback for attempts without a price. The last
+  admitted call can go past the remaining budget.
+- **Isolation limits:** backend calls start in empty folders, which are not filesystem boundaries. Codex and custom
+  commands may keep file-access tools, so use an external boundary when answer keys must be out of reach. Evaluation
+  locking currently uses POSIX `fcntl`.
 
-Backend calls start in empty directories, which are not filesystem boundaries.
-Codex and custom commands may retain file-access tools; use an external boundary
-when answer keys must be inaccessible. Evaluation locking currently uses POSIX
-`fcntl`.
+More detail:
 
-## Research credit
+| Document | What it covers |
+| --- | --- |
+| [Harness guide](docs/HARNESS.md) and [agent skill](skills/ringo-harness/SKILL.md) | How the harness, evaluation and improvement work |
+| [Improvement log](docs/IMPROVEMENT-LOG.md) | Each measured improvement, when it was measured and the change that made it. `improvement_log.py` recomputes every number from raw evidence under `docs/improvements/`, and the tests refuse an entry whose evidence doesn't show the improvement |
+| [Releases and latency checks](docs/RELEASES.md) | Release bundles, activation, rollback and the latency gate |
+| [Optimization regression cases](docs/OPTIMIZE-CASES.md) | Release integrity before inference, fresh-invocation rechecks and complete timing schedules |
+| [Overfitting audit](docs/OVERFITTING-GUARDRAILS.md) | The evidence and held-out-data guardrails, their tests and their remaining limits |
+| [HarBenchmark](HarBenchmark.md) | Twelve public development cases and an offline scorer, covering review, constrained repairs, design calculations, artifact consistency, research arithmetic and evaluation/accounting. Its tables keep sourced external results apart from local development evidence and unmeasured coverage |
+| [Benchmark gaps](docs/BENCHMARK-GAPS.md) and [security/CI bot brief](docs/SECURITY-CI-BOT-RESEARCH.md) | Research on benchmark gaps, and a brief for a separate security and CI bot |
 
-**Research credit.** We credit **Peng Xia and coauthors at Google Cloud AI Research**, with collaborators at UNC-Chapel Hill, Stanford University and Washington University in St. Louis, for *RRSI: Regularized Recursive Self-Improvement of Agent Harnesses* (2026). Their work inspired this portion of Ringo's improvement loop. Ringo adapts selected ideas from the paper. See the [original paper](https://arxiv.org/abs/2609.24972) and the [authors' project page](https://regularized-rsi.com/).
+These tools make no provider calls and add no work to a normal harness run. The full offline suite also runs in
+GitHub Actions on Python 3.11 and 3.14.
 
-The proposal loop also draws on [Meta-Harness](https://arxiv.org/abs/2603.28052).
-Ringo implements selected ideas; it is not a full reproduction of either paper.
-See the guide for the implemented limits and required confirmation.
+## Roadmap
 
-## Repository separation
-
-The runtime has no import or hardcoded path dependency on the council checkout.
-`backends.py` contains the minimal extracted subprocess, command-preset and JSON
-parsing helpers. Council judging remains in its own repository and is not bundled
-into this CLI. A `work` task that opts into the Council supplies an external
-council bridge command and rubric explicitly: the council scores the replies it is
-given and makes no model calls, while Ringo makes the writer and judge calls and
-owns their budget.
-Existing evaluation stores must be re-frozen for this source layout; do not reuse
-old digests or copy sealed data into this repository.
-
-No performance or quality gain is claimed from this repository extraction.
+- **IDE:** a Rust engine that runs on macOS, with support for Python, Jupyter notebooks, Rust and C/C++. It will
+  carry live context, one-click decisions where a spec is ambiguous, and per-repository preference memory, as a
+  separate client of this harness. Its local model is meant to do more than complete code. It would keep Claude,
+  Codex and other agents supplied with current facts about the code, so they spend fewer tokens finding them. It
+  would also audit a codebase in the background, proposing small fixes that pass the project's checks for the user
+  to approve. None of it is built or measured yet.
+- **Native Windows model calls:** the offline suite passes natively, but real Claude and Codex calls still need a run.
+- **Audit-Gated Continual Learning ([AGCL](docs/AGCL.md)):** Ringo learns when it can stop spending tokens, and it
+  changes behavior only through a release with a measured harm bound and human approval. Built so far:
+  `shadow_labels.py` and the HumanEval+ studies in `evalplus_study.py`. The first candidate, stopping when the checks
+  pass, was rejected by its sealed study. A new candidate needs a new study on untouched tasks.
+- **Benchmarks with headroom,** so quality gains can be measured.
+- **Research workloads:** the target includes intensive ML and finance research. The
+  [research requirements](docs/RESEARCH-REQUIREMENTS.md) set goals for evidence, reproducibility, numerical testing
+  and domain validation, with the Design Council for structured assessment and Ringo for execution and validation.
+  Basic integration exists: `work` combines generated files, fixed checks and an opt-in council assessment. The
+  research workflow those requirements describe is future work, and the harness hasn't been validated for that
+  workload.
 
 ## Use from an agent
 
-The [Ringo workflow skill](skills/ringo-harness/SKILL.md) connects ordinary coding
-and design work to actual bounded harness calls. Link that folder into the agent's
-user skills directory and set its local instructions to use it for substantive
-engineering work. For Codex, the user skill location is `~/.agents/skills/`; for
-Claude Code it is `~/.claude/skills/`. Use `RINGO_HOME` to identify this checkout
-when needed. The CLI remains explicitly invoked; installing a skill is guidance,
-not a background daemon. Start a new agent session after changing global instructions.
+The [Ringo workflow skill](skills/ringo-harness/SKILL.md) connects ordinary coding and design work to real, bounded
+harness calls.
 
-## Intended research use
+1. Link the skill's folder into the agent's user skills folder: `~/.agents/skills/` for Codex, `~/.claude/skills/`
+   for Claude Code.
+2. Set the agent's local instructions to use it for substantive engineering work.
+3. Set `RINGO_HOME` to this checkout if the agent needs to find it.
+4. Start a new agent session after changing global instructions.
 
-The target includes intensive ML and finance research. See the
-[research requirements](docs/RESEARCH-REQUIREMENTS.md) for evidence, reproducibility,
-numerical testing and domain validation goals. The selected direction uses Design
-Council for structured assessment, with Ringo providing execution and validation.
-Basic integration exists: `work` combines generated files, fixed checks and an
-opt-in council assessment. The research workflow those requirements describe is future work, and
-the current harness has not been validated for that workload.
+The CLI is still run explicitly. Installing the skill is guidance, not a background daemon.
+
+## Ringo and the Design Council
+
+- The runtime has no import or hardcoded path dependency on the council checkout. `backends.py` holds the minimal
+  extracted helpers for subprocesses, command presets and JSON parsing.
+- Council judging stays in its own repository and isn't bundled into this CLI.
+- A `work` task that opts into the Council supplies a council bridge command and rubric explicitly. The council
+  scores the replies it's given and makes no model calls. Ringo makes the writer and judge calls and owns their
+  budget.
+- Existing evaluation stores must be re-frozen for this source layout. Don't reuse old digests or copy sealed data
+  into this repository.
+- No performance or quality gain is claimed from separating the repositories.
+
+## Credits
+
+We credit **Peng Xia and coauthors at Google Cloud AI Research**, with collaborators at UNC-Chapel Hill, Stanford
+University and Washington University in St. Louis, for *RRSI: Regularized Recursive Self-Improvement of Agent
+Harnesses* (2026). Their work inspired this part of Ringo's improvement loop, and Ringo adapts selected ideas from the
+paper. See the [original paper](https://arxiv.org/abs/2609.24972) and the
+[authors' project page](https://regularized-rsi.com/).
+
+The proposal loop also draws on [Meta-Harness](https://arxiv.org/abs/2603.28052). Ringo implements selected ideas;
+it is not a full reproduction of either paper. The [harness guide](docs/HARNESS.md) describes the implemented limits
+and the confirmation they require.
 
 ## License
 

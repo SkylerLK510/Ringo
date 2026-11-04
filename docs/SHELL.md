@@ -8,7 +8,7 @@ pipelines with them, and watch every job and subagent as it runs.
 
 The shell is a small Rust program (`cli/`). Its `/review`, `/design` and `/work` start the same binary, which runs
 Ringo's pipelines natively, sending the same requests as the Python runtime (see the
-[README](../README.md#the-native-runtime-and-why-it-moved-to-rust)), or hands them to `ringo.py` when your release
+[native runtime notes](NATIVE-RUNTIME.md)), or hands them to `ringo.py` when your release
 state says so.
 
 ## Install

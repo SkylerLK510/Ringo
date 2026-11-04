@@ -29,5 +29,5 @@ the log and in their own reports.
 
 Keep credentials, private research, task contents, hidden tests and run traces outside
 this repository. The exceptions are published improvement evidence (above) and the experiment
-summaries the owner publishes in the README's Experiments section: designs, aggregate results
+summaries the owner publishes in the README's Experiments section and docs/EXPERIMENTS.md: designs, aggregate results
 and lessons, never task contents. Preserve human review of proposed artifacts and policy adoption.
