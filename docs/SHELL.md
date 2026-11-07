@@ -352,9 +352,12 @@ folder, and only one builds at a time, so only Ringo itself compiles again. The 
 
 The update is put where the running `ringo` is when the shell ends or restarts. Until then the open shell, and the
 pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
-terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on. On its first turn,
-each agent is told the turns it had not heard yet, exactly as it would have been without the restart, so the shared
-conversation loses nothing and gains no extra tokens. Ringo keeps the three newest versions and any version an open
+terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on as it would have
+without the restart: Ringo hands on how full each conversation is and its own record of it. On its first turn, each
+agent is told the turns it had not heard yet, or, if its conversation is past 64k, starts fresh from the record (see
+[One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)); a later fresh start
+still begins with the turns before the restart. Until 11/07 the size was not handed on, so a long conversation went
+on after every restart: two turns on 11/04 re-read 98k and 155k tokens at every call. Ringo keeps the three newest versions and any version an open
 shell used in the last three days, and removes the rest. Build output is in `install/build.log`.
 
 Ringo leaves some builds for you to update yourself:
