@@ -1185,7 +1185,8 @@ fn a_long_conversation_starts_fresh_after_a_restart_and_keeps_the_turns_before_i
         s
     };
     let mut s = open();
-    said(&mut s, "claude", "fix it");
+    let long = format!("fix it {}", "x".repeat(5000)); // longer than the record keeps inline
+    said(&mut s, "claude", &long);
     said(&mut s, "claude", "GROW"); // its window passes 64k
     said(&mut s, "codex", "take it from here"); // which claude has yet to hear
     let (threads, told, records) = (s.threads(), s.carry(), s.carry_record());
@@ -1204,6 +1205,12 @@ fn a_long_conversation_starts_fresh_after_a_restart_and_keeps_the_turns_before_i
     let log = &next.job(id).unwrap().log;
     assert!(log.iter().any(|l| l.starts_with("handoff: claude starts fresh from Ringo's record of the turns before the restart")),
             "{log:?}");
+    // the record inline is cut; the one it names is whole, and this shell's whole record names it too
+    assert!(!heard.contains(&long) && heard.contains("(cut; the whole is in the record)"), "{heard}");
+    let uncut = heard.split("(these turns uncut: ").nth(1).and_then(|r| r.split(')').next()).expect(&heard);
+    assert!(fs::read_to_string(uncut).unwrap().contains(&long), "{uncut}");
+    let whole = fs::read_to_string(next.job(id).unwrap().dir.join("record.md")).unwrap();
+    assert!(whole.contains(&format!("(these turns uncut: {uncut})")), "{whole}");
     said(&mut next, "claude", "after");
     assert_eq!(claude_heard(&claude), ("after".into(), true), "the new conversation goes on");
     // A later fresh start still holds the turns before the restart, then the ones since.
@@ -1217,6 +1224,37 @@ fn a_long_conversation_starts_fresh_after_a_restart_and_keeps_the_turns_before_i
     // /clear: a new conversation hears nothing from before the restart either
     next.forget();
     said(&mut next, "codex", "new");
+    assert_eq!(turn_text(&codex), "new");
+}
+
+#[test]
+fn a_fresh_start_after_an_older_shells_restart_still_hears_the_turns_before_it() {
+    let r = repo("restart-older");
+    let (codex, claude) = (fake(&root(), "codex-restart-older", &codex_ok()), fake(&root(), "claude-restart-older", CLAUDE_TALKS));
+    let open = || {
+        let mut s = session(&r, agent("claude"), &claude);
+        s.programs.insert(agent("codex"), codex.clone());
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let mut s = open();
+    said(&mut s, "claude", "fix it"); // codex has no conversation yet
+    // a shell from before records were handed on: conversations and what each agent had yet to hear, no records
+    let (threads, told) = (s.threads(), s.carry());
+    let mut next = open();
+    next.resume(&threads, &told, &[]);
+    said(&mut next, "claude", "and now");
+    said(&mut next, "codex", "your turn");
+    let heard = turn_text(&codex);
+    let since = heard.find("(Ringo restarted here; the turns since are numbered from #1 again)").expect(&heard);
+    assert!(heard.starts_with("Ringo's record of this conversation so far") && heard[..since].contains("the owner to claude: fix it"),
+            "{heard}");
+    assert!(heard[since..].contains("#1 · the owner to claude: and now") && !heard.contains("Before Ringo restarted"), "{heard}");
+    // /clear right after such a restart: the new conversation hears none of what codex had yet to be told
+    let mut cleared = open();
+    cleared.resume(&threads, &told, &[]);
+    cleared.forget();
+    said(&mut cleared, "codex", "new");
     assert_eq!(turn_text(&codex), "new");
 }
 

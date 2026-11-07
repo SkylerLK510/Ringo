@@ -948,11 +948,17 @@ impl Session {
 
     /// What else /restart hands the next shell, so each agent's next turn there starts fresh or goes on as it would
     /// have here: how full its conversation is, and Ringo's record of the turns it holds. Without them, a conversation
-    /// past `handoff_at` went on after every restart (two turns re-read 98k and 155k at every call).
+    /// past `handoff_at` went on after every restart (two turns re-read 98k and 155k at every call). The record uncut
+    /// is written to this shell's folder, and the record handed on ends with where.
     pub fn carry_record(&self) -> Vec<(String, u64, String)> {
         Agent::all().into_iter().filter_map(|agent| {
             let fills = self.context.get(&agent).copied().unwrap_or(0);
-            let record = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1)).0;
+            let (record, whole) = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1));
+            let file = self.dir.join(format!("record-{}.md", agent.name()));
+            let record = match record.is_empty() || fs::write(&file, whole).is_err() {
+                true => record,
+                false => format!("{record}\n(these turns uncut: {})", file.display()),
+            };
             (fills > 0 || !record.is_empty()).then(|| (agent.name().to_string(), fills, record))
         }).collect()
     }
@@ -1169,7 +1175,7 @@ impl Session {
         // a fresh start that would save too little resumes, told what the others did since, as any other turn
         let picked = [resume.is_none() || fills > self.handoff_at, false].into_iter().find_map(|fresh| {
             let turns = if fresh { &lane[..] } else { &unheard[..] };
-            let restarted = fresh && self.before.contains_key(&agent);
+            let restarted = fresh && self.carried(agent).is_some();
             let span = match (turns.first(), turns.last()) {
                 (Some(f), Some(l)) if f.id == l.id => format!("#{}", f.id),
                 (Some(f), Some(l)) => format!("#{} to #{}", f.id, l.id),
@@ -1218,7 +1224,7 @@ impl Session {
             self.jobs[id - 1].push_log(format!("the whole record could not be kept: {e}"));
         }
         if fresh {
-            self.told.remove(&agent); // the turns before the restart it had not heard are in the record
+            self.told.remove(&agent); // the turns before the restart it had not heard are in the record (`carried`)
         }
         if fresh && let Some(old) = resume.take() {
             self.threads.remove(&agent);
@@ -1228,11 +1234,17 @@ impl Session {
         Some((text, note))
     }
 
+    /// The turns before a /restart that `agent`'s fresh start begins with: the record of its conversation there, or,
+    /// from a shell that handed on no records, the turns it had yet to be told (its own were never recorded).
+    fn carried(&self, agent: Agent) -> Option<&String> {
+        self.before.get(&agent).or_else(|| self.told.get(&agent))
+    }
+
     /// Ringo's record for `agent`'s fresh start: the turns before a /restart that its conversation held, if any, then
     /// `turns`, as `record` gives them; the older turns are cut first.
     fn fresh_record(&self, agent: Agent, turns: &[&Job]) -> (String, String) {
         let (record, whole) = self.record(turns);
-        let Some(before) = self.before.get(&agent) else { return (record, whole) };
+        let Some(before) = self.carried(agent) else { return (record, whole) };
         let join = |a: &str, b: &str| match b.is_empty() {
             true => a.trim_end().to_string(),
             false => format!("{}\n\n(Ringo restarted here; the turns since are numbered from #1 again)\n\n{b}", a.trim_end()),
