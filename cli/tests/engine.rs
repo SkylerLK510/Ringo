@@ -1,7 +1,7 @@
 //! The conductor against fake agents in throwaway git repositories (Unix: the fakes are shell scripts).
 #![cfg(unix)]
 
-use ringo_cli::{Agent, Decision, Mode, Session, Status};
+use ringo_cli::{kept, Agent, Decision, Kept, Mode, Session, Status};
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -824,6 +824,15 @@ fn a_follow_up_keeps_the_connectors_the_turn_before_used() {
     };
     let safe = |s: &mut Session, task: &str| turn(s, false, task);
     assert!(!safe(&mut s, "what ClickUp tasks are mine?"), "it names a connector");
+    // after a quit or a crash, `ringo --resume` goes on with them too
+    let kept = s.keep(None).unwrap();
+    let mut next = session(&r, agent("claude"), &claude);
+    next.go_on(&kept).unwrap();
+    assert!(!safe(&mut next, "and the overdue ones?"), "the turn before the resume called one");
+    let mut cleared = session(&r, agent("claude"), &claude);
+    cleared.go_on(&kept).unwrap();
+    cleared.forget();
+    assert!(safe(&mut cleared, "and the overdue ones?"), "/clear: a new conversation, with no turn before");
     assert!(turn(&mut s, true, "fix the parser") && turn(&mut s, true, "fix the parser"),
             "an @claude! turn starts fresh in its own copy: it continues no conversation");
     assert!(!safe(&mut s, "and the overdue ones?"), "the conversation's turn before called one");
@@ -1256,6 +1265,61 @@ fn a_fresh_start_after_an_older_shells_restart_still_hears_the_turns_before_it()
     cleared.forget();
     said(&mut cleared, "codex", "new");
     assert_eq!(turn_text(&codex), "new");
+}
+
+#[test]
+fn a_conversation_kept_after_each_turn_goes_on_after_a_crash() {
+    let r = repo("crash");
+    let (codex, claude) = (fake(&root(), "codex-crash", &codex_ok()), fake(&root(), "claude-crash", CLAUDE_TALKS));
+    let open = || {
+        let mut s = session(&r, agent("claude"), &claude);
+        s.programs.insert(agent("codex"), codex.clone());
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let state = root().join("state");
+    let mut s = open();
+    said(&mut s, "claude", "fix it");
+    let path = s.keep(None).unwrap(); // the shell keeps it after every turn
+    said(&mut s, "codex", "take it from here");
+    assert_eq!(s.keep(None).unwrap(), path, "one file per shell, replaced whole");
+    let (dir, folder) = (s.dir.clone(), s.repo.clone());
+    drop(s); // a crash: nothing more is written
+    // `ringo --resume` lists it for this folder alone, by the owner's latest message
+    let listed = kept(&state, &folder);
+    let ours: Vec<&Kept> = listed.iter().filter(|k| k.path == path).collect();
+    assert_eq!(ours.len(), 1, "{listed:?}");
+    assert_eq!(ours[0].about, "take it from here");
+    assert!(!kept(&state, &root().join("elsewhere")).iter().any(|k| k.path == path));
+    let mut next = open();
+    assert!(next.go_on(&path).is_some());
+    said(&mut next, "claude", "and now");
+    let (heard, resumed) = claude_heard(&claude);
+    assert!(resumed && heard.contains("#2 · the owner to codex: take it from here") && !heard.contains("#1 ·"), "{heard}");
+    // once the new shell keeps its own, the crashed one is no longer listed: one conversation, one entry
+    let own = next.keep(None).unwrap();
+    let listed = kept(&state, &folder);
+    assert!(listed.iter().any(|k| k.path == own && k.about == "and now") && !listed.iter().any(|k| k.path == path), "{listed:?}");
+    assert!(dir.join("resumed.json").exists());
+    // newest first, so Enter takes the latest: an older conversation of the same folder comes after
+    let older = state.join("shell").join("0-older");
+    fs::create_dir_all(&older).unwrap();
+    fs::write(older.join("resume.json"), serde_json::json!({"folder": folder, "saved": 1, "about": "older"}).to_string()).unwrap();
+    let mine: Vec<String> = kept(&state, &folder).into_iter().map(|k| k.about).filter(|a| a == "older" || a == "and now").collect();
+    assert_eq!(mine, ["and now", "older"]);
+    fs::remove_dir_all(&older).unwrap();
+    // a shell that goes on and keeps before a turn of its own (a /restart right away) is still listed by the latest
+    let mut again = open();
+    again.go_on(&own).unwrap();
+    let theirs = again.keep(None).unwrap();
+    assert!(kept(&state, &folder).iter().any(|k| k.path == theirs && k.about == "and now"));
+    // /separate goes on as /separate: neither agent is then told what the other does
+    let mut alone = open();
+    alone.separate = true;
+    said(&mut alone, "claude", "alone");
+    let mut after = open();
+    after.go_on(&alone.keep(None).unwrap()).unwrap();
+    assert!(after.separate && !again.separate);
 }
 
 #[test]

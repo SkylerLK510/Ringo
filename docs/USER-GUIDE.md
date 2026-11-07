@@ -200,6 +200,11 @@ A paste keeps its lines and is not sent until you press Enter. Shift-Enter works
 (iTerm2, kitty, WezTerm, Ghostty); in macOS Terminal use Ctrl-J. When you quit, the conversation is saved as a text
 file and Ringo prints where.
 
+To go on with a conversation later, after you quit, a crash or a closed terminal, run `ringo --resume` (or `ringo -r`)
+in the same folder. It lists that folder's conversations, newest first, by your latest message; Enter takes the
+newest. Each agent goes on with its own conversation as if Ringo had only restarted. Ringo keeps the conversation
+after every turn, so a crash loses at most the turn it cut short.
+
 ## Settings
 
 | Command | What it does |

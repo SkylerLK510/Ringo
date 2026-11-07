@@ -1447,8 +1447,24 @@ impl App {
                 ended.push(id);
             }
         }
+        let any = !ended.is_empty();
         for id in ended {
             self.after_end(id);
+        }
+        if any {
+            self.keep();
+        }
+    }
+
+    /// Keeps this conversation for `ringo --resume` (see `Session::keep`), its text with it.
+    fn keep(&mut self) -> Option<PathBuf> {
+        let text = self.save();
+        match self.s.keep(text.as_deref()) {
+            Ok(path) => Some(path),
+            Err(e) => {
+                self.say(format!("  this conversation could not be kept for ringo --resume: {e}"));
+                None
+            }
         }
     }
 
@@ -2888,11 +2904,53 @@ impl App {
     }
 }
 
+/// `ringo --resume`: the conversations kept for this folder, newest first, and the one the owner picks (Enter takes the
+/// newest). None when there is none or the owner picks none.
+fn pick(session: &Session) -> Option<PathBuf> {
+    let root = session.dir.parent().and_then(Path::parent).unwrap_or(&session.dir);
+    let kept: Vec<ringo_cli::Kept> = ringo_cli::kept(root, &session.repo).into_iter().take(10).collect();
+    if kept.is_empty() {
+        eprintln!("ringo: no conversation to go on with in {}; run ringo to start one", session.repo.display());
+        return None;
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    println!("Conversations in {}, newest first:", session.repo.display());
+    for (n, k) in kept.iter().enumerate() {
+        println!("  {}. {} ago · {}", n + 1, fmt_ago(now.saturating_sub(k.saved)), k.about);
+    }
+    print!("Go on with which (Enter for 1, q to cancel)? ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok()?;
+    match line.trim() {
+        "" => Some(kept[0].path.clone()),
+        n => n.parse::<usize>().ok().and_then(|n| kept.get(n.checked_sub(1)?)).map(|k| k.path.clone()),
+    }
+}
+
+/// A time ago, roughly: 40 s, 12 min, 3 h, 2 d.
+fn fmt_ago(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs / 60),
+        3600..86400 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86400),
+    }
+}
+
 /// What holds new jobs while the pipelines' speed check runs (see App::check_pipelines).
 const CHECKING: &str = "the pipelines' speed check is running";
 
-/// The shell. `resume`: what the shell before a /restart handed on (its conversations and where its text is).
-pub fn run(resume: Option<PathBuf>) -> ExitCode {
+/// How the shell starts: new, from what the shell before a /restart handed on, or from a conversation the owner picks
+/// (`ringo --resume`).
+pub enum Start {
+    New,
+    Restarted(PathBuf),
+    Pick,
+}
+
+/// The shell.
+pub fn run(start: Start) -> ExitCode {
     let exe = std::env::current_exe().map(|e| std::fs::canonicalize(&e).unwrap_or(e)).unwrap_or_default();
     let agents = match ringo_cli::configured_agents() {
         Some(agents) if !agents.is_empty() => agents,
@@ -2914,6 +2972,17 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let resume = match start {
+        Start::New => None,
+        Start::Restarted(path) => Some((path, false)),
+        Start::Pick => match pick(&session) {
+            Some(path) => Some((path, true)),
+            None => {
+                let _ = std::fs::remove_dir(&session.dir); // nothing in it yet
+                return ExitCode::from(1);
+            }
+        },
+    };
     let name = session.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let label = match &session.branch { Some(b) => format!("{name} ({b})"), None => name };
     let saved = crate::theme::settings_all(); // read once, for the theme, the mode and auto updates
@@ -2921,19 +2990,22 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     if let Some(mode) = saved.get("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
     }
-    match resume.and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+    match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
-            let threads: Vec<(String, String)> = serde_json::from_value(before["threads"].clone()).unwrap_or_default();
-            let told: Vec<(String, String)> = serde_json::from_value(before["told"].clone()).unwrap_or_default();
-            // a shell before this change hands on no records: its conversations go on as they did
-            let records: Vec<(String, u64, String)> = serde_json::from_value(before["records"].clone()).unwrap_or_default();
-            app.s.resume(&threads, &told, &records);
             let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
             text.lines().for_each(|line| app.out.push(Out::text(line)));
             let commit = &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)];
-            app.say(format!("  Ringo restarted ({commit}); the conversations go on"));
+            match resume.as_ref().is_some_and(|(_, picked)| *picked) {
+                true => app.say("  the conversation goes on from where it was kept"),
+                false => app.say(format!("  Ringo restarted ({commit}); the conversations go on")),
+            }
         }
-        None => app.welcome(),
+        None => {
+            app.welcome();
+            if let Some((path, _)) = &resume {
+                app.say(format!("  {} could not be read, so this is a new conversation", path.display()));
+            }
+        }
     }
     let asked = app.plan_agents();
     app.read_limits(&asked, false); // for the side panel's gauges
@@ -3110,6 +3182,8 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     app.feed();
     close(&mut terminal);
     app.s.shutdown();
+    // a shell with no turn of its own leaves the conversation it went on from as it was, unless it restarts
+    let kept = (!app.s.jobs.is_empty() || app.restart).then(|| app.keep()).flatten();
     let saved = app.save();
     // an update goes in place now that this shell is done with its version
     let installed = app.staged.as_ref().map(|bin| crate::updates::install(&exe, bin));
@@ -3118,25 +3192,25 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
     }
     if app.restart {
         let next = match (&installed, &app.staged) { (Some(Err(_)), Some(bin)) => bin.clone(), _ => exe.clone() };
-        return restart(&next, &app, saved);
+        return match kept {
+            Some(kept) => restart(&next, &kept),
+            None => {
+                eprintln!("ringo: could not restart (this conversation could not be kept); run ringo --resume");
+                ExitCode::from(1)
+            }
+        };
     }
-    let saved = saved.map_or(String::new(), |p| format!("; the conversation is saved in {}", p.display()));
+    let resume = if kept.is_some() { "; ringo --resume goes on with it" } else { "" };
+    let saved = saved.map_or(String::new(), |p| format!("; the conversation is saved in {}{resume}", p.display()));
     println!("ringo: {} tokens this session{saved}", fmt_tokens(app.s.tokens()));
     ExitCode::SUCCESS
 }
 
 /// The installed `ringo` takes this terminal over (the same process on Unix), handed the agents' conversations, what
 /// each had yet to be told and this one's text, so an update applies without the conversation starting over.
-fn restart(exe: &Path, app: &App, saved: Option<PathBuf>) -> ExitCode {
-    let handed = app.s.dir.join("restart.json");
-    let before = serde_json::json!({"threads": app.s.threads(), "told": app.s.carry(), "records": app.s.carry_record(),
-                                    "conversation": saved});
-    if let Err(e) = std::fs::write(&handed, before.to_string()) {
-        eprintln!("ringo: could not restart ({}: {e}); run ringo again", handed.display());
-        return ExitCode::from(1);
-    }
+fn restart(exe: &Path, kept: &Path) -> ExitCode {
     let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--resume").arg(&handed);
+    cmd.arg("--resume").arg(kept);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
