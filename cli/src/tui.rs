@@ -2925,7 +2925,9 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
         Some(before) => {
             let threads: Vec<(String, String)> = serde_json::from_value(before["threads"].clone()).unwrap_or_default();
             let told: Vec<(String, String)> = serde_json::from_value(before["told"].clone()).unwrap_or_default();
-            app.s.resume(&threads, &told);
+            // a shell before this change hands on no records: its conversations go on as they did
+            let records: Vec<(String, u64, String)> = serde_json::from_value(before["records"].clone()).unwrap_or_default();
+            app.s.resume(&threads, &told, &records);
             let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
             text.lines().for_each(|line| app.out.push(Out::text(line)));
             let commit = &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)];
@@ -3127,7 +3129,8 @@ pub fn run(resume: Option<PathBuf>) -> ExitCode {
 /// each had yet to be told and this one's text, so an update applies without the conversation starting over.
 fn restart(exe: &Path, app: &App, saved: Option<PathBuf>) -> ExitCode {
     let handed = app.s.dir.join("restart.json");
-    let before = serde_json::json!({"threads": app.s.threads(), "told": app.s.carry(), "conversation": saved});
+    let before = serde_json::json!({"threads": app.s.threads(), "told": app.s.carry(), "records": app.s.carry_record(),
+                                    "conversation": saved});
     if let Err(e) = std::fs::write(&handed, before.to_string()) {
         eprintln!("ringo: could not restart ({}: {e}); run ringo again", handed.display());
         return ExitCode::from(1);

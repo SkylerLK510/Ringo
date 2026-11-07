@@ -498,6 +498,9 @@ pub struct Session {
     threads: HashMap<Agent, String>,
     /// What each agent is told on its first turn after a /restart: Ringo's record of the turns it had not heard.
     told: HashMap<Agent, String>,
+    /// Ringo's record of the turns before a /restart that each agent's conversation holds: a fresh start here begins
+    /// with it, so a restart neither keeps a long conversation going nor drops what came before it (see `handoff`).
+    before: HashMap<Agent, String>,
     /// How full each agent's conversation is, in tokens, as its latest call read it (see `handoff`).
     context: HashMap<Agent, u64>,
     /// The other agents' turns each agent's conversation has been told, by job id (see `unheard`).
@@ -535,6 +538,16 @@ pub struct Session {
 /// Tokens as a log line says them: 12.3k.
 fn fmt_k(n: u64) -> String {
     format!("{:.1}k", n as f64 / 1e3)
+}
+
+/// The newest `room` bytes of `record` at most, from a line's start, saying so when the earliest are cut.
+fn newest(record: &str, room: usize) -> String {
+    if record.len() <= room {
+        return record.to_string();
+    }
+    let at = (record.len() - room..record.len()).find(|&i| record.is_char_boundary(i)).unwrap_or(record.len());
+    let kept = record[at..].split_once('\n').map_or("", |(_, rest)| rest);
+    format!("(the earliest turns before the restart are cut)\n{kept}")
 }
 
 /// Files as Ringo's record names them: the first 20, then how many more.
@@ -826,7 +839,7 @@ impl Session {
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(),
+                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
@@ -933,9 +946,20 @@ impl Session {
         }).collect()
     }
 
-    /// Goes on with what the shell before a /restart handed on: each agent's conversation, and what it had yet to be
-    /// told (agents no longer set up are left out).
-    pub fn resume(&mut self, threads: &[(String, String)], told: &[(String, String)]) {
+    /// What else /restart hands the next shell, so each agent's next turn there starts fresh or goes on as it would
+    /// have here: how full its conversation is, and Ringo's record of the turns it holds. Without them, a conversation
+    /// past `handoff_at` went on after every restart (two turns re-read 98k and 155k at every call).
+    pub fn carry_record(&self) -> Vec<(String, u64, String)> {
+        Agent::all().into_iter().filter_map(|agent| {
+            let fills = self.context.get(&agent).copied().unwrap_or(0);
+            let record = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1)).0;
+            (fills > 0 || !record.is_empty()).then(|| (agent.name().to_string(), fills, record))
+        }).collect()
+    }
+
+    /// Goes on with what the shell before a /restart handed on: each agent's conversation, what it had yet to be told,
+    /// and how full that conversation is with Ringo's record of it (agents no longer set up are left out).
+    pub fn resume(&mut self, threads: &[(String, String)], told: &[(String, String)], records: &[(String, u64, String)]) {
         for (name, id) in threads {
             if let Some(agent) = Agent::from_name(name) {
                 self.threads.insert(agent, id.clone());
@@ -944,6 +968,15 @@ impl Session {
         for (name, record) in told {
             if let Some(agent) = Agent::from_name(name).filter(|_| !record.trim().is_empty()) {
                 self.told.insert(agent, record.clone());
+            }
+        }
+        for (name, fills, record) in records {
+            let Some(agent) = Agent::from_name(name) else { continue };
+            if *fills > 0 {
+                self.context.insert(agent, *fills);
+            }
+            if !record.trim().is_empty() {
+                self.before.insert(agent, record.clone());
             }
         }
     }
@@ -964,6 +997,8 @@ impl Session {
         self.threads.clear();
         self.context.clear();
         self.heard.clear();
+        self.told.clear();
+        self.before.clear();
         self.start = self.jobs.len() + 1;
     }
 
@@ -1134,8 +1169,19 @@ impl Session {
         // a fresh start that would save too little resumes, told what the others did since, as any other turn
         let picked = [resume.is_none() || fills > self.handoff_at, false].into_iter().find_map(|fresh| {
             let turns = if fresh { &lane[..] } else { &unheard[..] };
-            let (first, last) = (turns.first()?.id, turns.last()?.id);
-            let (record, whole) = self.record(turns);
+            let restarted = fresh && self.before.contains_key(&agent);
+            let span = match (turns.first(), turns.last()) {
+                (Some(f), Some(l)) if f.id == l.id => format!("#{}", f.id),
+                (Some(f), Some(l)) => format!("#{} to #{}", f.id, l.id),
+                _ if restarted => String::new(),
+                _ => return None,
+            };
+            let span = match (restarted, span.is_empty()) {
+                (true, true) => "the turns before the restart".to_string(),
+                (true, false) => format!("the turns before the restart and {span}"),
+                _ => span,
+            };
+            let (record, whole) = if fresh { self.fresh_record(agent, turns) } else { self.record(turns) };
             let head = match fresh {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
@@ -1145,9 +1191,7 @@ impl Session {
                                self.jobs[id - 1].dir.join("record.md").display(), record.trim_end());
             let about = text.len() as u64 / 4; // the owner's message goes either way
             let ids: Vec<usize> = turns.iter().map(|j| j.id).collect();
-            (!fresh || resume.is_none() || about * 2 <= fills).then(|| {
-                (fresh, text, about, if first == last { format!("#{first}") } else { format!("#{first} to #{last}") }, whole, ids)
-            })
+            (!fresh || resume.is_none() || about * 2 <= fills).then_some((fresh, text, about, span, whole, ids))
         });
         let busy = self.in_flight(id, agent);
         let heard = self.heard.entry(agent).or_default();
@@ -1173,12 +1217,27 @@ impl Session {
         if let Err(e) = fs::write(&file, whole) {
             self.jobs[id - 1].push_log(format!("the whole record could not be kept: {e}"));
         }
+        if fresh {
+            self.told.remove(&agent); // the turns before the restart it had not heard are in the record
+        }
         if fresh && let Some(old) = resume.take() {
             self.threads.remove(&agent);
             self.usage_so_far.remove(&(agent, old));
             self.context.remove(&agent);
         }
         Some((text, note))
+    }
+
+    /// Ringo's record for `agent`'s fresh start: the turns before a /restart that its conversation held, if any, then
+    /// `turns`, as `record` gives them; the older turns are cut first.
+    fn fresh_record(&self, agent: Agent, turns: &[&Job]) -> (String, String) {
+        let (record, whole) = self.record(turns);
+        let Some(before) = self.before.get(&agent) else { return (record, whole) };
+        let join = |a: &str, b: &str| match b.is_empty() {
+            true => a.trim_end().to_string(),
+            false => format!("{}\n\n(Ringo restarted here; the turns since are numbered from #1 again)\n\n{b}", a.trim_end()),
+        };
+        (join(&newest(before, RECORD_CHARS.saturating_sub(record.len())), &record), join(before, &whole))
     }
 
     /// Ringo's record of `turns`, oldest first, and the same uncut: each turn's message from the owner, word for
@@ -2627,6 +2686,17 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_carried_record_keeps_its_newest_whole_lines() {
+        let record = "#1 · the owner to claude: é\nclaude: done\n#2 · the owner to codex: ü\ncodex: done\n";
+        assert_eq!(newest(record, record.len()), record, "it fits");
+        assert_eq!(newest(record, 31), "(the earliest turns before the restart are cut)\ncodex: done\n");
+        // a cut inside a two-byte letter moves past it instead of splitting it
+        let at = record.find('ü').unwrap() + 1;
+        assert!(newest(record, record.len() - at).ends_with("codex: done\n"));
+        assert_eq!(newest(record, 0), "(the earliest turns before the restart are cut)\n");
+    }
 
     #[test]
     fn plans_read_as_the_agents_report_them() {

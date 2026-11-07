@@ -1161,9 +1161,9 @@ fn a_restart_drops_nothing_from_the_shared_conversation() {
     said(&mut s, "claude", "fix it");
     said(&mut s, "codex", "take it from here");
     // /restart: the next shell gets each conversation and what each agent had yet to hear, as this one would tell it
-    let (threads, told) = (s.threads(), s.carry());
+    let (threads, told, records) = (s.threads(), s.carry(), s.carry_record());
     let mut next = open();
-    next.resume(&threads, &told);
+    next.resume(&threads, &told, &records);
     said(&mut next, "claude", "and now");
     let (heard, resumed) = claude_heard(&claude);
     assert!(resumed && heard.starts_with("Before Ringo restarted, other turns were taken"), "{heard}");
@@ -1172,6 +1172,52 @@ fn a_restart_drops_nothing_from_the_shared_conversation() {
     assert!(heard.ends_with("The owner's new message:\nand now"), "{heard}");
     said(&mut next, "claude", "again");
     assert_eq!(claude_heard(&claude), ("again".into(), true), "told once");
+}
+
+#[test]
+fn a_long_conversation_starts_fresh_after_a_restart_and_keeps_the_turns_before_it() {
+    let r = repo("restart-long");
+    let (codex, claude) = (fake(&root(), "codex-restart-long", &codex_ok()), fake(&root(), "claude-restart-long", CLAUDE_TALKS));
+    let open = || {
+        let mut s = session(&r, agent("claude"), &claude);
+        s.programs.insert(agent("codex"), codex.clone());
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let mut s = open();
+    said(&mut s, "claude", "fix it");
+    said(&mut s, "claude", "GROW"); // its window passes 64k
+    said(&mut s, "codex", "take it from here"); // which claude has yet to hear
+    let (threads, told, records) = (s.threads(), s.carry(), s.carry_record());
+    let mut next = open();
+    next.resume(&threads, &told, &records);
+    // The first turn after the restart starts fresh, as it would have without one: the 70k conversation is not
+    // re-read at every call.
+    let id = said(&mut next, "claude", "then");
+    let (heard, resumed) = claude_heard(&claude);
+    assert!(!resumed && heard.starts_with("Ringo's record of this conversation so far, which you start fresh from"), "{heard}");
+    assert!(["#1 · the owner to claude: fix it", "#2 · the owner to claude: GROW", "#3 · the owner to codex: take it from here"]
+        .iter().all(|t| heard.contains(t)), "{heard}");
+    assert!(!heard.contains("Before Ringo restarted") && heard.matches("#3 · the owner to codex").count() == 1,
+            "the turn it had not heard is told once, in the record: {heard}");
+    assert!(heard.ends_with("The owner's new message:\nthen"), "{heard}");
+    let log = &next.job(id).unwrap().log;
+    assert!(log.iter().any(|l| l.starts_with("handoff: claude starts fresh from Ringo's record of the turns before the restart")),
+            "{log:?}");
+    said(&mut next, "claude", "after");
+    assert_eq!(claude_heard(&claude), ("after".into(), true), "the new conversation goes on");
+    // A later fresh start still holds the turns before the restart, then the ones since.
+    said(&mut next, "claude", "GROW");
+    said(&mut next, "claude", "later");
+    let (heard, resumed) = claude_heard(&claude);
+    let since = heard.find("(Ringo restarted here; the turns since are numbered from #1 again)").expect(&heard);
+    assert!(!resumed && heard[..since].contains("#3 · the owner to codex: take it from here"), "{heard}");
+    assert!(heard[since..].contains("#1 · the owner to claude: then") && heard[since..].contains("#3 · the owner to claude: GROW"),
+            "{heard}");
+    // /clear: a new conversation hears nothing from before the restart either
+    next.forget();
+    said(&mut next, "codex", "new");
+    assert_eq!(turn_text(&codex), "new");
 }
 
 #[test]
