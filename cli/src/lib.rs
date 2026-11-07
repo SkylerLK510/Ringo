@@ -25,6 +25,8 @@ pub const HANDOFF_AT: u64 = 64_000;
 /// How much of Ringo's record goes into a turn, in characters (about four a token): the turns, newest first, then
 /// the change they made.
 const RECORD_CHARS: usize = 60_000;
+/// What a shell keeps in its folder for a later one to go on from (`Session::keep`, `ringo --resume`).
+pub const KEPT: &str = "resume.json";
 /// Where an agent's conversation compacts itself mid-turn, in tokens: Claude's and Codex's (see `launch_agent`).
 const COMPACT_AT: u64 = 200_000;
 
@@ -501,6 +503,11 @@ pub struct Session {
     /// Ringo's record of the turns before a /restart that each agent's conversation holds: a fresh start here begins
     /// with it, so a restart neither keeps a long conversation going nor drops what came before it (see `handoff`).
     before: HashMap<Agent, String>,
+    /// The file this shell went on from (/restart or `ringo --resume`), whose conversation becomes this one's once it
+    /// keeps its own (see `keep`).
+    pub source: Option<PathBuf>,
+    /// The owner's latest message in the conversation it went on from: how `ringo --resume` lists it until a turn here.
+    pub about: String,
     /// How full each agent's conversation is, in tokens, as its latest call read it (see `handoff`).
     context: HashMap<Agent, u64>,
     /// The other agents' turns each agent's conversation has been told, by job id (see `unheard`).
@@ -538,6 +545,28 @@ pub struct Session {
 /// Tokens as a log line says them: 12.3k.
 fn fmt_k(n: u64) -> String {
     format!("{:.1}k", n as f64 / 1e3)
+}
+
+/// A conversation `ringo --resume` can go on with: its file, when it was kept and the owner's latest message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Kept {
+    pub path: PathBuf,
+    pub saved: u64,
+    pub about: String,
+}
+
+/// The conversations kept for `folder` (a session's `repo`) under the state `root`, newest first.
+pub fn kept(root: &Path, folder: &Path) -> Vec<Kept> {
+    let Ok(shells) = fs::read_dir(resolved(&root.join("shell"))) else { return Vec::new() }; // as `Session::new` names it
+    let mut all: Vec<Kept> = shells.flatten().filter_map(|shell| {
+        let path = shell.path().join(KEPT);
+        let kept: serde_json::Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+        (Path::new(kept["folder"].as_str()?) == folder).then(|| Kept {
+            saved: kept["saved"].as_u64().unwrap_or(0), about: kept["about"].as_str().unwrap_or_default().to_string(), path,
+        })
+    }).collect();
+    all.sort_by_key(|k| std::cmp::Reverse(k.saved));
+    all
 }
 
 /// The newest `room` bytes of `record` at most, from a line's start, saying so when the earliest are cut.
@@ -839,7 +868,7 @@ impl Session {
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(),
+                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
@@ -985,6 +1014,37 @@ impl Session {
                 self.before.insert(agent, record.clone());
             }
         }
+    }
+
+    /// Goes on from a kept conversation's file (`keep`, or what /restart handed on): each agent's conversation, what
+    /// it had yet to hear and Ringo's record of it. The file's contents, for the text it names; None if unreadable.
+    pub fn go_on(&mut self, path: &Path) -> Option<serde_json::Value> {
+        let kept: serde_json::Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+        let list = |key: &str| serde_json::from_value::<Vec<(String, String)>>(kept[key].clone()).unwrap_or_default();
+        // a shell before records were handed on has none: its conversations go on as they did
+        let records: Vec<(String, u64, String)> = serde_json::from_value(kept["records"].clone()).unwrap_or_default();
+        self.resume(&list("threads"), &list("told"), &records);
+        self.source = Some(path.to_path_buf());
+        self.about = kept["about"].as_str().unwrap_or_default().to_string();
+        Some(kept)
+    }
+
+    /// Saves what a later shell goes on from, as /restart hands it on, with this folder and the owner's latest message
+    /// for `ringo --resume` to list it by. The shell keeps it after every turn and when it ends, so a crash loses at
+    /// most the turn it cut short. The conversation it went on from is this one from then on, so that one's file goes.
+    /// ceiling: a turn cut short by a crash may have started a new conversation; the kept one is the last turn's
+    pub fn keep(&self, conversation: Option<&Path>) -> Result<PathBuf, String> {
+        let about = self.jobs.iter().rev().find(|j| matches!(j.kind, Kind::Agent { .. })).map_or(self.about.clone(), |j| j.title.clone());
+        let saved = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let kept = serde_json::json!({"threads": self.threads(), "told": self.carry(), "records": self.carry_record(),
+                                      "conversation": conversation, "folder": self.repo, "about": about, "saved": saved});
+        let (path, part) = (self.dir.join(KEPT), self.dir.join(format!("{KEPT}.part")));
+        // written whole, then renamed: a crash mid-write leaves the last one
+        fs::write(&part, kept.to_string()).and_then(|_| fs::rename(&part, &path)).map_err(|e| format!("{}: {e}", path.display()))?;
+        if let Some(from) = self.source.as_deref().and_then(Path::parent).filter(|d| *d != self.dir) {
+            let _ = fs::rename(from.join(KEPT), from.join("resumed.json"));
+        }
+        Ok(path)
     }
 
     /// `agent`'s own turn running here, which its next one waits for. The agents work side by side, together or

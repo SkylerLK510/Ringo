@@ -15,6 +15,7 @@ const USAGE: &str = "\
 ringo: Ringo's shell and harness.
 
   ringo                     open the shell (on a terminal); type /help there
+  ringo --resume            go on with a conversation from this folder: after a quit, a crash or a closed terminal
   ringo setup               add a coding agent (codex, claude, agy, grok, or one you name) and sign in
   ringo review|design|work ...
                             run a Ringo pipeline natively: the same requests as python3 ringo.py ...
@@ -32,9 +33,12 @@ fn main() -> ExitCode {
     }
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.first().and_then(|a| a.to_str()) {
-        None if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => tui::run(None),
+        None if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => tui::run(tui::Start::New),
+        Some("--resume" | "-r") if args.len() == 1 && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
+            tui::run(tui::Start::Pick)
+        }
         // what /restart hands the next shell
-        Some("--resume") if args.len() == 2 => tui::run(Some(args[1].clone().into())),
+        Some("--resume") if args.len() == 2 => tui::run(tui::Start::Restarted(args[1].clone().into())),
         None => {
             eprint!("{USAGE}");
             ExitCode::from(2)
