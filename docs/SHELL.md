@@ -171,7 +171,8 @@ running jobs, the lines queued behind the current turn, a permission request or 
 When you quit, the conversation is saved as `conversation.txt` in the session's state folder and the shell prints
 where. `ringo --resume` (`-r`) goes on with one of the folder's conversations after a quit, a crash or a closed
 terminal: after every turn and at the end, the shell keeps what /restart hands on (each agent's conversation, the turns
-it has yet to hear, its size and Ringo's record) in `resume.json`, written whole and then renamed. The list shows the
+it has yet to hear, its size and Ringo's record, whether /separate is on, and which agent's last turn called a
+connector, so a follow-up keeps them) in `resume.json`, written whole and then renamed. The list shows the
 newest ten for this folder by the owner's latest message. Once the shell that went on keeps its own, the old file is
 renamed `resumed.json`, so one conversation is listed once. /restart goes through the same file. The manual, the step-by-step [user guide](USER-GUIDE.md), is not on screen until you ask for it: `/help` (or
 `/usrman`) prints it into the conversation, followed by the settings in force, and `?` prints just its keys.

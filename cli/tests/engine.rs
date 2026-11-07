@@ -824,6 +824,15 @@ fn a_follow_up_keeps_the_connectors_the_turn_before_used() {
     };
     let safe = |s: &mut Session, task: &str| turn(s, false, task);
     assert!(!safe(&mut s, "what ClickUp tasks are mine?"), "it names a connector");
+    // after a quit or a crash, `ringo --resume` goes on with them too
+    let kept = s.keep(None).unwrap();
+    let mut next = session(&r, agent("claude"), &claude);
+    next.go_on(&kept).unwrap();
+    assert!(!safe(&mut next, "and the overdue ones?"), "the turn before the resume called one");
+    let mut cleared = session(&r, agent("claude"), &claude);
+    cleared.go_on(&kept).unwrap();
+    cleared.forget();
+    assert!(safe(&mut cleared, "and the overdue ones?"), "/clear: a new conversation, with no turn before");
     assert!(turn(&mut s, true, "fix the parser") && turn(&mut s, true, "fix the parser"),
             "an @claude! turn starts fresh in its own copy: it continues no conversation");
     assert!(!safe(&mut s, "and the overdue ones?"), "the conversation's turn before called one");
@@ -1304,6 +1313,13 @@ fn a_conversation_kept_after_each_turn_goes_on_after_a_crash() {
     again.go_on(&own).unwrap();
     let theirs = again.keep(None).unwrap();
     assert!(kept(&state, &folder).iter().any(|k| k.path == theirs && k.about == "and now"));
+    // /separate goes on as /separate: neither agent is then told what the other does
+    let mut alone = open();
+    alone.separate = true;
+    said(&mut alone, "claude", "alone");
+    let mut after = open();
+    after.go_on(&alone.keep(None).unwrap()).unwrap();
+    assert!(after.separate && !again.separate);
 }
 
 #[test]

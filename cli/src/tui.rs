@@ -2910,7 +2910,7 @@ fn pick(session: &Session) -> Option<PathBuf> {
     let root = session.dir.parent().and_then(Path::parent).unwrap_or(&session.dir);
     let kept: Vec<ringo_cli::Kept> = ringo_cli::kept(root, &session.repo).into_iter().take(10).collect();
     if kept.is_empty() {
-        eprintln!("ringo: no conversation to go on with in {}; ringo starts a new one", session.repo.display());
+        eprintln!("ringo: no conversation to go on with in {}; run ringo to start one", session.repo.display());
         return None;
     }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());

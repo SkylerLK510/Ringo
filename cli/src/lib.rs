@@ -6,7 +6,7 @@ pub mod parse;
 pub mod rt;
 
 use parse::{Note, Parser, Permission, Style, Tokens};
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
@@ -508,6 +508,8 @@ pub struct Session {
     pub source: Option<PathBuf>,
     /// The owner's latest message in the conversation it went on from: how `ringo --resume` lists it until a turn here.
     pub about: String,
+    /// The agents whose last turn in the conversation went on from called a connector: the next keeps them (`reached`).
+    reached_before: HashSet<Agent>,
     /// How full each agent's conversation is, in tokens, as its latest call read it (see `handoff`).
     context: HashMap<Agent, u64>,
     /// The other agents' turns each agent's conversation has been told, by job id (see `unheard`).
@@ -567,6 +569,11 @@ pub fn kept(root: &Path, folder: &Path) -> Vec<Kept> {
     }).collect();
     all.sort_by_key(|k| std::cmp::Reverse(k.saved));
     all
+}
+
+/// The strings in a JSON list (none if it is not one).
+fn list_names(v: &serde_json::Value) -> impl Iterator<Item = &str> {
+    v.as_array().into_iter().flatten().filter_map(|n| n.as_str())
 }
 
 /// The newest `room` bytes of `record` at most, from a line's start, saying so when the earliest are cut.
@@ -868,7 +875,7 @@ impl Session {
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(),
-                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(),
+                     ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
@@ -1026,6 +1033,8 @@ impl Session {
         self.resume(&list("threads"), &list("told"), &records);
         self.source = Some(path.to_path_buf());
         self.about = kept["about"].as_str().unwrap_or_default().to_string();
+        self.separate = kept["separate"].as_bool().unwrap_or(false);
+        self.reached_before = list_names(&kept["reached"]).filter_map(Agent::from_name).collect();
         Some(kept)
     }
 
@@ -1036,7 +1045,9 @@ impl Session {
     pub fn keep(&self, conversation: Option<&Path>) -> Result<PathBuf, String> {
         let about = self.jobs.iter().rev().find(|j| matches!(j.kind, Kind::Agent { .. })).map_or(self.about.clone(), |j| j.title.clone());
         let saved = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let reached: Vec<&str> = Agent::all().into_iter().filter(|&a| self.reached(a, self.jobs.len() + 1)).map(|a| a.name()).collect();
         let kept = serde_json::json!({"threads": self.threads(), "told": self.carry(), "records": self.carry_record(),
+                                      "separate": self.separate, "reached": reached,
                                       "conversation": conversation, "folder": self.repo, "about": about, "saved": saved});
         let (path, part) = (self.dir.join(KEPT), self.dir.join(format!("{KEPT}.part")));
         // written whole, then renamed: a crash mid-write leaves the last one
@@ -1065,6 +1076,7 @@ impl Session {
         self.heard.clear();
         self.told.clear();
         self.before.clear();
+        self.reached_before.clear();
         self.start = self.jobs.len() + 1;
     }
 
@@ -1192,6 +1204,15 @@ impl Session {
                 && (a == agent || (!self.separate && j.lane.is_none())),
             _ => false,
         }).collect()
+    }
+
+    /// Whether the last turn of `agent`'s conversation before job `upto` called a connector, here or, with none here
+    /// yet, before a restart or `ringo --resume`.
+    fn reached(&self, agent: Agent, upto: usize) -> bool {
+        match self.lane(agent, upto).last() {
+            Some(j) => j.reached,
+            None => self.reached_before.contains(&agent),
+        }
     }
 
     /// The turns in `lane` that `agent`, going on with its conversation, has not been told: the other agents'. Agents
@@ -1466,7 +1487,7 @@ impl Session {
         let mut sent = prompt.to_string();
         let heard = self.heard.get(&agent).cloned(); // put back if the turn never starts (see the handoff)
         let connectors = prompt.trim() != "/compact"
-            && (names_connector(prompt) || (!write && self.lane(agent, id).last().is_some_and(|j| j.reached)));
+            && (names_connector(prompt) || (!write && self.reached(agent, id)));
         if !write {
             self.jobs[id - 1].lane = self.separate.then_some(agent);
             if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
