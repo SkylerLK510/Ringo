@@ -65,6 +65,13 @@ pub enum Note {
     Subagent { id: String, label: String },
     SubagentEnd { id: String, ok: bool },
     Tokens(Tokens),
+    /// The conversation's running total where a turn's own count is not reported (Claude Code before 2.1.316 on a
+    /// resumed session): the job counts what it adds to the total before it.
+    TokensSoFar(Tokens),
+    /// The model the agent says it runs, for the usage record.
+    Model(String),
+    /// A finished model call that reported no token count (a Ringo pipeline's): unknown, not zero.
+    Uncounted,
     /// What a running turn has used so far, as its messages report it (Claude): shown until the turn's own count
     /// (`Tokens`) arrives, and kept if it never does (a stopped turn).
     Live(Tokens),
@@ -395,7 +402,8 @@ impl Parser {
                     turn["params"]["threadId"] = self.thread.clone().into();
                     self.writes.push(turn.to_string());
                 }
-                return vec![Note::Session(self.thread.clone())];
+                let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
+                return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
             }
             if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
                 return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
@@ -578,6 +586,9 @@ impl Parser {
                     return self.fail(format!("claude is using an API key ({source}), not the subscription login"));
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
+                if !s(e, "model").is_empty() {
+                    notes.push(Note::Model(s(e, "model").to_string()));
+                }
             }
             // What the turn does while a block is still being written, so the job's row is never seconds behind:
             // Claude Code 2.1.316 says each model request, then thinking's size about once a second (a 12 s think
@@ -630,6 +641,12 @@ impl Parser {
                 let before = e.pointer("/compact_metadata/pre_tokens").and_then(Value::as_u64).unwrap_or(0);
                 notes.push(Note::Log(format!("compacted the conversation (it held {before} tokens)")));
                 self.compacted = true;
+                if parent.is_none() {
+                    // The size it had no longer holds, and nothing later in a /compact turn reports the new one: left
+                    // as it was, a conversation past the handoff size started fresh at its next turn and the
+                    // compaction just paid for was thrown away. The next turn's calls report the real size.
+                    notes.push(Note::Context(e.pointer("/compact_metadata/post_tokens").and_then(Value::as_u64).unwrap_or(0)));
+                }
             }
             ("assistant", _) => {
                 if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
@@ -694,7 +711,7 @@ impl Parser {
                 self.seen.clear(); // a run after this one counts its own messages
                 // calls whose result never came (the turn stopped first) are shown as they were made
                 notes.extend(self.calls.drain(..).map(|(_, _, text, _)| Note::Step(format!("{UNFINISHED}{text}"))));
-                notes.push(Note::Tokens(claude_tokens(e)));
+                notes.extend(claude_tokens(e));
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
                 }
@@ -858,6 +875,10 @@ impl Parser {
             "started" | "reserved" => vec![Note::Activity { node: None, text: format!("{step}: calling {}", s(e, "backend")) }],
             status @ ("ok" | "malformed" | "error") => {
                 let usage = e.get("usage").unwrap_or(&NULL);
+                if usage.get("input").is_none() && usage.get("output").is_none() {
+                    // the call reported no counts (Ringo's own record leaves them out): unknown, not zero
+                    return vec![Note::Call, Note::Uncounted, Note::Log(format!("{step}: {status}, tokens not reported"))];
+                }
                 let tokens = Tokens { input: u(usage, "input"), cache_write: u(usage, "cache_write"),
                                       cache_read: u(usage, "cache_read"), output: u(usage, "output") };
                 vec![Note::Call, Note::Tokens(tokens), Note::Log(format!("{step}: {status}, {} tokens", tokens.total()))]
@@ -884,24 +905,28 @@ impl Parser {
 
 /// Claude's tokens for this run, every model and subagent included. A resumed session's `modelUsage` is the whole
 /// session's so far (a second turn read 452,900 where it used 433,179: the first turn's 19,721 again), so
-/// `model_usage_since_last_result`, this run's alone, comes first (Claude Code 2.1.316); `usage` is the last fallback.
-fn claude_tokens(e: &Value) -> Tokens {
-    let mut t = Tokens::default();
-    // When it is there it is this run's whole count, an empty one (a run that made no model call) included.
-    let models = match e.get("model_usage_since_last_result").and_then(Value::as_object) {
-        Some(run) => Some(run),
-        None => e.get("modelUsage").and_then(Value::as_object).filter(|m| !m.is_empty()),
-    };
-    if let Some(models) = models {
+/// `model_usage_since_last_result`, this run's alone, comes first (Claude Code 2.1.316). Without it `modelUsage` is
+/// reported as the running total it is (`TokensSoFar`), so a resumed turn is not counted with the turns before it
+/// again; `usage` is the last fallback. None when the result reports no count at all: unknown, not zero.
+fn claude_tokens(e: &Value) -> Option<Note> {
+    let sum = |models: &serde_json::Map<String, Value>| {
+        let mut t = Tokens::default();
         for m in models.values() {
             t.add(Tokens { input: u(m, "inputTokens"), cache_write: u(m, "cacheCreationInputTokens"),
                            cache_read: u(m, "cacheReadInputTokens"), output: u(m, "outputTokens") });
         }
-        return t;
+        t
+    };
+    // When it is there it is this run's whole count, an empty one (a run that made no model call) included.
+    if let Some(run) = e.get("model_usage_since_last_result").and_then(Value::as_object) {
+        return Some(Note::Tokens(sum(run)));
     }
-    let usage = e.get("usage").unwrap_or(&NULL);
-    Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
-             cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") }
+    if let Some(total) = e.get("modelUsage").and_then(Value::as_object).filter(|m| !m.is_empty()) {
+        return Some(Note::TokensSoFar(sum(total)));
+    }
+    let usage = e.get("usage").filter(|u| u.is_object())?;
+    Some(Note::Tokens(Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
+                               cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") }))
 }
 
 #[cfg(test)]
@@ -1149,9 +1174,9 @@ mod tests {
         // a resumed run that made no model call: an empty per-run count is zero, not the whole session's again
         let none = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"m":{"inputTokens":26,"outputTokens":13070}},"model_usage_since_last_result":{}}"#;
         assert!(run(Style::Claude, &[CLAUDE[0], none]).1.contains(&Note::Tokens(Tokens::default())));
-        // older Claude Code without the per-run field: modelUsage as before
+        // older Claude Code without the per-run field: modelUsage, said to be the running total it is
         let old = r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","modelUsage":{"m":{"inputTokens":5,"outputTokens":6}}}"#;
-        assert!(run(Style::Claude, &[CLAUDE[0], old]).1.contains(&Note::Tokens(Tokens { input: 5, output: 6, ..Tokens::default() })));
+        assert!(run(Style::Claude, &[CLAUDE[0], old]).1.contains(&Note::TokensSoFar(Tokens { input: 5, output: 6, ..Tokens::default() })));
     }
 
     #[test]
@@ -1198,7 +1223,7 @@ mod tests {
         assert!(notes.contains(&Note::Subagent { id: "tu1".into(), label: "Explore: find callers".into() }));
         assert!(notes.contains(&Note::Activity { node: Some("tu1".into()), text: "Grep fn parse".into() }));
         assert!(notes.contains(&Note::SubagentEnd { id: "tu1".into(), ok: true }));
-        assert!(notes.contains(&Note::Tokens(Tokens { input: 2, cache_write: 5181, cache_read: 11382, output: 4 })));
+        assert!(notes.contains(&Note::TokensSoFar(Tokens { input: 2, cache_write: 5181, cache_read: 11382, output: 4 })));
     }
 
     #[test]
@@ -1257,7 +1282,11 @@ mod tests {
     fn a_compaction_is_logged() {
         // The shape the Agent SDK documents for `/compact` on a resumed session.
         let boundary = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":41230}}"#;
-        assert_eq!(run(Style::Claude, &[boundary]).1, [Note::Log("compacted the conversation (it held 41230 tokens)".into())]);
+        // the size it held no longer holds: unknown (0) until the next turn's calls report it, or the size it says
+        assert_eq!(run(Style::Claude, &[boundary]).1,
+                   [Note::Log("compacted the conversation (it held 41230 tokens)".into()), Note::Context(0)]);
+        let sized = boundary.replace(r#""pre_tokens":41230"#, r#""pre_tokens":41230,"post_tokens":9100"#);
+        assert!(run(Style::Claude, &[sized.as_str()]).1.contains(&Note::Context(9100)));
         let done = r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#;
         let (p, _) = run(Style::Claude, &[boundary, done]);
         assert_eq!(p.finish(), Ok(()), "a compaction that says nothing is still done");

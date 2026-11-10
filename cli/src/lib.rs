@@ -399,6 +399,18 @@ pub struct Job {
     reached: bool,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
+    /// The model the agent said it runs, when it says (for the usage record).
+    pub model: Option<String>,
+    /// Whether the job reported any token count: one that finishes without is recorded as unknown, not left out.
+    counted: bool,
+    /// How many of its model calls reported no count (a pipeline's): its counts are then of the others alone.
+    uncounted: u32,
+    /// The running total its agent last reported inside this job, where a turn's own count is not reported and the
+    /// job has a conversation of its own (`Note::TokensSoFar` in a write job).
+    so_far: Tokens,
+    /// What starting this turn marked as told to its agent: the other agents' turns (job ids) and the turns before a
+    /// restart. A turn that fails before its agent takes its message in gives them back (`end_with`).
+    told_now: (Vec<usize>, Option<String>),
 }
 
 impl Job {
@@ -977,8 +989,14 @@ impl Session {
         Agent::all().into_iter().filter_map(|agent| {
             let lane = self.lane(agent, self.jobs.len() + 1);
             let turns = match self.threads.contains_key(&agent) { true => self.unheard(agent, &lane), false => lane };
-            let told = self.told.get(&agent).map_or(String::new(), |before| format!("{}\n", before.trim_end()));
-            (!turns.is_empty() || !told.is_empty()).then(|| (agent.name().to_string(), told + &self.record(&turns).0))
+            let record = self.record(&turns).0;
+            // Bounded together: each restart added a record to what the one before carried, without limit, for an
+            // agent that never took a turn in between. The newest stay, as in a fresh start's record.
+            // ceiling: the turns cut here are in no file the next shell is pointed to.
+            let told = self.told.get(&agent).map_or(String::new(), |before| {
+                format!("{}\n", newest(before.trim_end(), RECORD_CHARS.saturating_sub(record.len())))
+            });
+            (!turns.is_empty() || !told.is_empty()).then(|| (agent.name().to_string(), told + &record))
         }).collect()
     }
 
@@ -1436,7 +1454,8 @@ impl Session {
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
-                             codex_turn: None, connectors: false, reached: false });
+                             codex_turn: None, connectors: false, reached: false, model: None, counted: false,
+                             uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None) });
         Ok(id)
     }
 
@@ -1762,6 +1781,10 @@ impl Session {
             }
             return Err(e);
         }
+        // A turn that starts can still fail before its agent reads a word (`end_with` gives these back then).
+        let before = heard.unwrap_or_default();
+        let added = self.heard.get(&agent).map_or(Vec::new(), |now| now.difference(&before).copied().collect());
+        self.jobs[id - 1].told_now = (added, untold.filter(|_| !self.told.contains_key(&agent)));
         Ok(id)
     }
 
@@ -1861,7 +1884,7 @@ impl Session {
         const ROOM: usize = 12_000; // characters of them at most, the newest kept first
         let mut earlier: Vec<String> = Vec::new();
         let mut used = 0;
-        let asked = self.jobs.iter().rev()
+        let asked = self.jobs[self.start - 1..].iter().rev() // since /clear: an earlier answer is not this conversation's
             .filter(|j| matches!(&j.kind, Kind::Ringo { command } if command == "ask") && j.status == Status::Done)
             .map(|j| (j, j.reply())).filter(|(_, reply)| !reply.trim_start().starts_with("ROUTE:"));
         for (job, reply) in asked {
@@ -2068,15 +2091,54 @@ impl Session {
         // What it used, kept for /usage's last day and week (a stopped turn's messages' own counts included).
         let used = Tokens { input: job.tokens.input + job.live.input, cache_read: job.tokens.cache_read + job.live.cache_read,
                             cache_write: job.tokens.cache_write + job.live.cache_write, output: job.tokens.output + job.live.output };
-        if used.total() > 0 {
+        // A job that finished without reporting a count used tokens nobody counted: recorded as unknown, not left
+        // out. One that reported counts and added none (a resumed conversation's unchanged total) leaves no line, and
+        // neither does a pipeline that made no call.
+        let called = match job.kind { Kind::Ringo { .. } => job.calls > 0, Kind::Agent { .. } => job.pid.is_some() };
+        let unknown = !job.counted && used.total() == 0 && status == Status::Done && called;
+        if used.total() > 0 || unknown {
             let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
             let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            let record = serde_json::json!({"at": at, "agent": who, "input": used.input, "cache_read": used.cache_read,
-                                            "cache_write": used.cache_write, "output": used.output});
+            // What the counts are of: the tier (it sets the effort), the model when the agent names it, a pipeline's
+            // command, and the job's folder, where its events (a pipeline's trace: each call's model and effort) are.
+            let mut record = serde_json::json!({"at": at, "agent": who, "tier": job.tier.name(), "job": job.dir});
+            if let Some(model) = &job.model {
+                record["model"] = model.as_str().into();
+            }
+            if let Kind::Ringo { command } = &job.kind {
+                record["command"] = command.as_str().into();
+            }
+            if job.uncounted > 0 {
+                record["uncounted_calls"] = job.uncounted.into(); // the counts below are of its other calls alone
+            }
+            match unknown {
+                true => record["unknown"] = true.into(),
+                false => for (key, n) in [("input", used.input), ("cache_read", used.cache_read),
+                                          ("cache_write", used.cache_write), ("output", used.output)] {
+                    record[key] = n.into();
+                },
+            }
             if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.root.join("usage.jsonl")) {
                 let _ = writeln!(f, "{record}");
             }
         }
+        // A turn that failed before its agent counted a token, took a step or said a word never took its message
+        // in: what its start marked as told goes back, so the agent's next turn is told it again. Before, only a
+        // turn whose program could not start gave it back, and one that died while starting lost it for good.
+        let unread = matches!(status, Status::Failed(_)) && !job.counted && used.total() == 0 && job.steps.is_empty()
+            && job.reply().trim().is_empty();
+        let (added, untold) = if unread { std::mem::take(&mut job.told_now) } else { Default::default() };
+        if let (Kind::Agent { agent, .. }, true) = (job.kind.clone(), unread && (!added.is_empty() || untold.is_some())) {
+            job.push_log(format!("{} failed before it read its message, so its next turn is told the other turns again",
+                                 agent.name()));
+            if let Some(heard) = self.heard.get_mut(&agent) {
+                added.iter().for_each(|id| { heard.remove(id); });
+            }
+            if let Some(untold) = untold {
+                self.told.entry(agent).or_insert(untold);
+            }
+        }
+        let job = &mut self.jobs[id - 1];
         job.asks.clear(); // nobody is waiting for these answers any more
         job.input = None;
         job.status = status;
@@ -2175,6 +2237,7 @@ impl Session {
                 }
                 Event::Note(id, note) => {
                     let job = &mut self.jobs[id - 1];
+                    let so_far = matches!(note, Note::TokensSoFar(_));
                     match note {
                         Note::Session(_) => {}
                         Note::Activity { node: None, text } => job.activity = text,
@@ -2197,19 +2260,32 @@ impl Session {
                                 s.ended = Some(ok);
                             }
                         }
-                        Note::Tokens(t) => {
+                        Note::Model(model) => job.model = Some(model),
+                        Note::Uncounted => job.uncounted += 1,
+                        Note::Tokens(t) | Note::TokensSoFar(t) => {
                             // A resumed Codex or agy turn reports its conversation's usage so far (Codex 16,829
                             // then 34,835 input tokens for a one-word follow-up; agy 6,981 then 14,260), so only
-                            // what this turn added is counted. Claude reports each run on its own. A running total
-                            // never falls, so a result without usage (zero) keeps the last one.
+                            // what this turn added is counted. Claude reports each run on its own, and where it
+                            // cannot (`TokensSoFar`) its total is counted the same way. A running total never
+                            // falls, so a result without usage (zero) keeps the last one.
+                            job.counted = true;
                             let t = match job.kind {
                                 Kind::Agent { agent, write: false }
-                                    if matches!(agent.spec().adapter, Adapter::Codex | Adapter::Agy) =>
+                                    if so_far || matches!(agent.spec().adapter, Adapter::Codex | Adapter::Agy) =>
                                 {
                                     let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
                                     let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
                                     if t.total() >= before.total() {
                                         self.usage_so_far.insert(key, t);
+                                    }
+                                    t.since(before)
+                                }
+                                // a job with a conversation of its own (a write job) can still report its total
+                                // more than once: a line the owner sent while it worked ends in a result of its own
+                                _ if so_far => {
+                                    let before = job.so_far;
+                                    if t.total() >= before.total() {
+                                        job.so_far = t;
                                     }
                                     t.since(before)
                                 }
@@ -2222,7 +2298,10 @@ impl Session {
                                 job.live = Tokens::default();
                             }
                         }
-                        Note::Live(t) => job.live = t,
+                        Note::Live(t) => {
+                            job.counted = true;
+                            job.live = t;
+                        }
                         Note::Context(n) => {
                             if let Kind::Agent { agent, write: false } = job.kind {
                                 self.context.insert(agent, n);
