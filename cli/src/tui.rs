@@ -1901,12 +1901,15 @@ impl App {
         self.queue = keep;
         let agents: Vec<Agent> = back.iter().map(|(a, ..)| *a).collect();
         let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
-        if !queued.is_empty() && self.input.is_empty() {
-            // back to the agent they were for, though another may have spoken since (see `feed`)
-            if let Some(&agent) = agents.first().filter(|a| agents.iter().all(|b| b == *a)) {
+        if !queued.is_empty() {
+            // Back to the agent they were for, though another may have spoken since (see `feed`). A line being typed
+            // stays, for the agent it was typed for, and the waiting lines go in above it, as a returned steer line does.
+            let typed: String = self.input.iter().collect();
+            if typed.is_empty() && let Some(&agent) = agents.first().filter(|a| agents.iter().all(|b| b == *a)) {
                 self.main = agent;
             }
-            self.input = queued.join("\n").chars().collect();
+            let back = queued.join("\n");
+            self.input = if typed.is_empty() { back } else { format!("{back}\n{typed}") }.chars().collect();
             self.cursor = self.input.len();
         }
         match self.checking {
@@ -3753,6 +3756,13 @@ mod tests {
         a.main = agy;
         a.stop(id);
         assert_eq!((a.main, a.input.iter().collect::<String>()), (claude, "next".to_string()));
+        // a line being typed stays, for the agent it was typed for: the waiting line comes back above it (it was dropped)
+        a.main = agy;
+        a.input = "half typed".chars().collect();
+        a.queue.push_back((claude, "later".into(), "later".into()));
+        a.stop(id);
+        assert_eq!((a.main, a.input.iter().collect::<String>()), (agy, "later\nhalf typed".to_string()));
+        assert!(a.queue.is_empty());
         let _ = std::fs::remove_file(dir.join("claude.hold"));
         finish(&mut a);
         let _ = std::fs::remove_dir_all(&dir);
