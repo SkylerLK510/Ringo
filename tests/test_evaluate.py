@@ -117,9 +117,13 @@ class TokenLimitTest(unittest.TestCase):
         self.assertEqual(decision, ('pass', []))
 
     def test_a_call_that_reports_no_tokens_makes_the_arms_tokens_unknown(self):
-        report, decision = self.decided({'cost_usd': 0.01}, max_token_ratio=1.0)
-        self.assertEqual(report['tokens_per_review'], {'cand': None, 'base': 16.0})
-        self.assertEqual(decision, ('inconclusive', ['tokens vs base unknown']))
+        # no token fields (Codex with no usage), or every field zero (a Claude reply with a malformed usage block):
+        # either would read as a candidate that uses nothing, and pass any limit
+        for usage in ({'cost_usd': 0.01}, {**dict.fromkeys(USAGE, 0), 'cost_usd': 0.01}):
+            with self.subTest(usage=usage):
+                report, decision = self.decided(usage, max_token_ratio=1.0)
+                self.assertEqual(report['tokens_per_review'], {'cand': None, 'base': 16.0})
+                self.assertEqual(decision, ('inconclusive', ['tokens vs base unknown']))
 
 
 class FrozenGradingTest(unittest.TestCase):

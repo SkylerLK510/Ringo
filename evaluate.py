@@ -1060,11 +1060,13 @@ def _score(store, d):
         unpriced = sum(slot['unpriced_calls'] for slot in done_slots)
         report['cost_per_review'][arm] = (sum(costs) / len(costs)) if costs and not unpriced else None
         # Unknown is not zero: one call that reported no tokens makes the arm's tokens unknown, as an unpriced call
-        # does its cost.
-        counted = bool(done_slots) and all(not slot.get('untokened_calls') and all(
-            type(slot.get(k)) is int for k in harness.TOKEN_KEYS) for slot in done_slots)
-        report['tokens_per_review'][arm] = sum(slot[k] for slot in done_slots for k in harness.TOKEN_KEYS) / len(done_slots) \
-            if counted else None
+        # does its cost. So does a review counted at no tokens at all: no call reads nothing, and a Claude reply
+        # with no usable usage block is recorded as zero tokens, not as unknown (harness.claude_usage).
+        # ceiling: one such reply beside other calls in the same review (a failed attempt before its retry) is
+        # still counted as nothing; exact once claude_usage leaves the token fields out, as codex_reply does.
+        totals = [sum(slot[k] for k in harness.TOKEN_KEYS) if not slot.get('untokened_calls') and all(
+            type(slot.get(k)) is int for k in harness.TOKEN_KEYS) else 0 for slot in done_slots]
+        report['tokens_per_review'][arm] = sum(totals) / len(totals) if totals and min(totals) > 0 else None
     for g in spec['graders']:
         gdir = store / 'runs' / d / 'grades' / sha(g)[:12]
         per = {}  # (case, arm) -> [(T, W, U, R) per run]

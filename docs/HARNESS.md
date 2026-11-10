@@ -81,7 +81,7 @@ A loop that keeps whatever scores better on cases it has seen ends up fitting th
   - the lower bound of the recall gain is above zero (recall is the fraction of known defects found in each case, averaged across cases; cases with no known defects contribute zero);
   - the upper bound of extra wrong findings is below its margin;
   - the cost ratio is within its limit;
-  - with `max_token_ratio` set (it is off by default), the candidate's tokens per review (input, cached and cache-written input, and output) are within that ratio of each comparator's. The cost ratio is in dollars, and a backend that reports no price is charged `unpriced_call_usd` a call, so two plans that make the same calls cost the same whatever their tokens: only this limit sees a plan that reads or writes more. An arm with a call that reported no tokens has unknown tokens, which is inconclusive.
+  - with `max_token_ratio` set (it is off by default), the candidate's tokens per review (input, cached and cache-written input, and output) are within that ratio of each comparator's. The cost ratio is in dollars, and a backend that reports no price is charged `unpriced_call_usd` a call, so two plans that make the same calls cost the same whatever their tokens: only this limit sees a plan that reads or writes more. An arm with a call that reported no tokens, or a review counted at no tokens at all, has unknown tokens, which is inconclusive.
   - The *j*-th test decision spends *A* / (*j* (*j* + 1)) of the error budget *A*, so the total over all decisions stays below *A*.
   - The t quantile is computed numerically, including small tails from alpha spending. `min_groups` cannot be below 10. Validation/test freezing also requires `bootstrap * alpha >= min_bootstrap_tail` (default 1); this only rejects completely unresolved tails, and many more tail draws are desirable for stable estimates. The cluster methods are statistical approximations; alpha spending does not make them exact finite-sample guarantees.
 - **Fail-closed.** Any of the following makes the decision *inconclusive*, never a pass: a failed slot, a missing grade, an unknown cost, or too few repositories.
@@ -92,6 +92,7 @@ A loop that keeps whatever scores better on cases it has seen ends up fitting th
 What the guardrails cannot do:
 - **They cannot create statistical power.** Detecting a gain of one defect per review takes tens of independent repositories, and a sealed test should be larger still. That is a planning figure, not a guarantee.
 - **They cannot rule out contamination.** ReviewBench is public, so a model may have seen its pull requests; only fresh private cases check for that.
+- **The token limit cannot count tokens a backend did not report as missing.** A Claude reply with no usable usage block is recorded as zero tokens, not as unknown. A review made only of such replies has unknown tokens, but one such reply beside other calls in the same review (a failed attempt before its retry) is counted as nothing.
 - **A store the improver can read is not a boundary.** Use an external OS boundary for decisions that count; reviewers and graders also need to be unable to read keys, since they run as the evaluator user. Stores are created with 0700 and existing store roots are tightened to 0700; permissions cannot constrain another process running as the same user.
 
 ### Improvement campaigns
