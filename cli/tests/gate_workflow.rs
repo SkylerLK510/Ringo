@@ -878,6 +878,12 @@ fn feedback(r: &mut Rng) -> Value {
     if r.chance(10) {
         f.insert("previous_council".into(), json!({"decision": {"action": "escalate"}}));
     }
+    if r.chance(15) {
+        f.insert("decision".into(), r.pick(&[json!({"action": "revise", "why": "é: thin evidence"}), json!({}), json!({"action": "recommend"})]).clone());
+        if r.chance(70) {
+            f.insert("scored".into(), r.pick(&[json!([]), json!([{"criterion": "c1", "score": 0.5, "notes": null}]), json!(null)]).clone());
+        }
+    }
     Value::Object(f)
 }
 
@@ -924,6 +930,11 @@ fn text_message_and_render_feedback_match_python() {
         json!({"script": {"status": "pass", "stdout": "", "stderr": ""}}),
         json!({"script": {"status": null, "stdout": "", "stderr": ""}}),
         json!({"review": 5, "previous_review": ["x", {"y": 1.0}]}),
+        json!({"decision": "revise"}),
+        json!({"decision": 5, "scored": 2.5}),
+        json!({"decision": {"a": [1, 1.0, true, null, "é😀\u{2028}"]}, "scored": {"k": 1e16}}),
+        json!({"decision": [], "previous_council": [1, "é", {"x": -0.0}]}),
+        json!({"previous_council": "kept as text"}),
         json!({"protocol_error": [1, "é", null, true, 2.5]}),
         json!([]),
         json!({}),
@@ -1229,7 +1240,8 @@ fn backend_of(v: &Value) -> Backend {
 #[test]
 fn role_backend_matches_python() {
     let mut cases = Vec::new();
-    for name in ["codex-chatgpt", "codex-search", "codex", "claude", "claude:foo --model=a --model b", "codex:codex exec --json", "fake", "ollama:x"] {
+    for name in ["codex-chatgpt", "codex-search", "codex", "claude", "claude:foo --model=a --model b", "codex:codex exec --json", "fake", "ollama:x",
+                 "codex-chatgpt@gpt-x/xhigh", "claude@opus"] {
         for opts in [json!(null), json!({}), json!({"model": "gpt-6-luna", "effort": "low"}), json!({"model": "opus"}), json!({"effort": "high"}),
                      json!({"model": ""}), json!({"effort": ""})] {
             cases.push(json!([name, opts]));

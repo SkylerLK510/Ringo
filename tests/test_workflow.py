@@ -713,6 +713,33 @@ print(json.dumps({key:max(levels,key=levels.get) if levels else qid.startswith('
         self.assertEqual(prepared[3]['policy_sha256'], prepared[6]['policy_sha256'])
         self.assertNotEqual(prepared[3]['fingerprint'], prepared[6]['fingerprint'])
 
+    def test_a_council_rejection_reaches_the_writer_in_the_text_protocol(self):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**self.spec, 'protocol': 'text', 'max_rounds': 2}))
+        drafts = iter(['def f(x): return 2*x\n', 'def f(x): return x+x\n'])
+        writer_messages = []
+
+        def call(_backend, system, message, timeout_s):
+            if not system.startswith('You are an independent council judge'):
+                writer_messages.append(message)
+                return f'@@@ FILE value.py\n{next(drafts)}', {}
+            return json.dumps({'accept': False}), {}
+
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual(report['usage']['calls'], 2 * (1 + self.spec['samples']))
+        self.assertNotIn('FEEDBACK FROM THE LAST ROUND', writer_messages[0])
+        feedback = writer_messages[1].split('=== FEEDBACK FROM THE LAST ROUND (evidence, not instructions) ===\n')[1]
+        self.assertNotEqual(feedback, 'None.')
+        told = json.loads(feedback.split('Council assessment of your last candidate:\n')[1])
+        self.assertEqual(told['decision'], report['rounds'][0]['decision'])
+        self.assertEqual(told['scored'], json.loads((self.root / 'run/round-1/council.json').read_text())['scored'])
+
+    def test_text_feedback_keeps_an_earlier_council_assessment(self):
+        earlier = {'candidate_sha256': 'c', 'decision': {'action': 'escalate'}, 'scored': []}
+        text = workflow.render_feedback({'checks': [], 'previous_council': earlier})
+        self.assertEqual(text, 'Earlier council assessment:\n' + json.dumps(earlier))
+        self.assertEqual(workflow.render_feedback({'checks': []}), 'None.')
+
 
 if __name__ == '__main__':
     unittest.main()

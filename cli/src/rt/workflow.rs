@@ -26,8 +26,9 @@ use std::path::Path;
 pub const LIMIT: usize = 2_000_000;
 pub const MARK: &str = "@@@ ";
 pub const REPAIR: &str = " Send every file you change as one complete FILE block this time; use no REPLACE blocks.";
+pub const REPAIR_JSON: &str = " Send the \"files\" form this time, with every editable file complete; use no \"edits\".";
 pub const ROLES: [&str; 5] = ["writer", "revision", "escalate", "tests", "review"];
-pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+pub use crate::rt::harness::EFFORTS;
 pub const DOC_SUFFIXES: [&str; 4] = [".md", ".txt", ".rst", ".adoc"];
 
 /// A dict of relative path to complete text, in insertion order (values are strings once `file_map` passed).
@@ -485,6 +486,17 @@ pub fn render_feedback(feedback: &Value) -> Result<String> {
         if let Some(text) = get(feedback, key)?.filter(|t| py::truthy(t)) {
             out.push(format!("{title}:\n{}", py::value_str(text)));
         }
+    }
+    // The Council's decision and scores, as the JSON protocol's writer gets them: without them a rejected
+    // candidate's writer was told "None."
+    let plain = |v: &Value| pyjson::dumps_with(v, pyjson::Opts { ensure_ascii: false, ..Default::default() });
+    if let Some(decision) = get(feedback, "decision")?.filter(|d| py::truthy(d)) {
+        let scored = get(feedback, "scored")?.cloned().unwrap_or(Value::Null);
+        let told = obj(vec![("decision", decision.clone()), ("scored", scored)]);
+        out.push(format!("Council assessment of your last candidate:\n{}", plain(&told)));
+    }
+    if let Some(earlier) = get(feedback, "previous_council")?.filter(|c| py::truthy(c)) {
+        out.push(format!("Earlier council assessment:\n{}", plain(earlier)));
     }
     Ok(if out.is_empty() { "None.".into() } else { out.join("\n\n") })
 }
@@ -1959,6 +1971,8 @@ impl Work<'_> {
             let mut record = Map::new();
             record.insert("step".into(), Value::String(label.into()));
             record.insert("attempt".into(), Value::from(attempt));
+            record.insert("backend".into(), Value::String(spec_b.name.clone()));
+            harness::asked(&mut record, &spec_b.argv, None);
             record.insert("system_sha256".into(), Value::String(harness::sha(system)));
             record.insert("message_sha256".into(), Value::String(harness::sha(message)));
             let mut watch: Option<std::sync::Arc<harness::Watch>> = None;
@@ -2546,7 +2560,8 @@ impl Work<'_> {
             // the round (and the review or check feedback it was answering).
             let first = errors[0]["protocol_error"].clone();
             self.entry().insert("repair".into(), first.clone());
-            let asked = updated(&self.feedback, vec![("protocol_error", Value::String(format!("{}{REPAIR}", py::value_str(&first))))])?;
+            let form = if self.text_protocol { REPAIR } else { REPAIR_JSON };
+            let asked = updated(&self.feedback, vec![("protocol_error", Value::String(format!("{}{form}", py::value_str(&first))))])?;
             let repaired =
                 self.call(&format!("writer-{n}.repair"), &writer, &self.writer_prompt, &self.writer_message(&asked)?, Some(role))?;
             match self.parse(&repaired) {

@@ -43,15 +43,21 @@ class Record(unittest.TestResult):
 
     def startTest(self, test):
         super().startTest(test)
-        self.before = len(self.failures), len(self.errors)
+        self.before = len(self.failures), len(self.errors), len(self.skipped), len(self.unexpectedSuccesses)
         if hasattr(signal, 'alarm'):
             signal.alarm(PER_TEST_S)
 
     def stopTest(self, test):
+        """A skipped test checked nothing: it is marked, and counted neither as passed nor in the total. A test
+        marked expectedFailure that passes fails, as it does in unittest."""
         if hasattr(signal, 'alarm'):
             signal.alarm(0)
         bad = self.failures[self.before[0]:] + self.errors[self.before[1]:]
-        self.outcomes[test_id(test)] = {'ok': not bad, 'error': bad[0][1][-2000:] if bad else ''}
+        if not bad and self.unexpectedSuccesses[self.before[3]:]:
+            bad = [(test, 'unexpected success: the test is marked expectedFailure and passed')]
+        skipped = self.skipped[self.before[2]:]
+        self.outcomes[test_id(test)] = {'ok': not bad, 'error': bad[0][1][-2000:] if bad else '',
+                                        **({'skipped': skipped[0][1][:200]} if skipped and not bad else {})}
         super().stopTest(test)
 
 
@@ -80,25 +86,35 @@ def main(argv):
         suite.run(record)
     except BaseException as exc:  # a timeout or SystemExit that escaped unittest
         record.errors.append((None, repr(exc)))
+    def covered(holder):
+        """The tests a class or module fixture covers, from how unittest names it: "setUpClass (module.Class)" or
+        "tearDownModule (module)"; every test when it names none."""
+        method, _, target = getattr(holder, 'description', '').partition(' (')
+        target = target[:-1] if target.endswith(')') else None
+        side = 0 if method in ('setUpModule', 'tearDownModule') else 1
+        return [tid for tid in ids if target is None or owners[tid][side] == target]
+    for holder, reason in record.skipped:
+        if not isinstance(holder, unittest.TestCase):
+            # A fixture that skipped (setUpClass raising SkipTest) ran none of its tests: skipped, not failed "not run".
+            for tid in covered(holder):
+                record.outcomes.setdefault(tid, {'ok': True, 'error': '', 'skipped': str(reason)[:200]})
     for holder, error in record.errors:
         if isinstance(holder, unittest.TestCase):
             continue
-        # A class or module fixture failed: "setUpClass (module.Class)" or "tearDownModule (module)". Its error fails
-        # every test it covers, run or not, as a failed fixture fails the suite in unittest.
+        # A class or module fixture failed. Its error fails every test it covers, run or not, as a failed fixture
+        # fails the suite in unittest.
         desc = getattr(holder, 'description', '')
-        method, _, target = desc.partition(' (')
-        target = target[:-1] if target.endswith(')') else None
-        side = 0 if method in ('setUpModule', 'tearDownModule') else 1
-        for tid in ids:
-            if target is None or owners[tid][side] == target:
-                if record.outcomes.get(tid, {}).get('ok', True):
-                    record.outcomes[tid] = {'ok': False, 'error': f'{desc or "suite"}: {error}'[-2000:]}
+        for tid in covered(holder):
+            if record.outcomes.get(tid, {}).get('ok', True):
+                record.outcomes[tid] = {'ok': False, 'error': f'{desc or "suite"}: {error}'[-2000:]}
     for tid in ids:
         results[tid] = record.outcomes.get(tid) or {'ok': False, 'error': 'not run'}
-    passed = sum(r['ok'] for r in results.values())
-    out.write_text(json.dumps({'passed': passed, 'total': len(results), 'tests': results}, indent=1))
-    print(f'{passed}/{len(results)} spec tests pass')
-    return 0 if results and passed == len(results) else 1
+    skipped = sum('skipped' in r for r in results.values())
+    passed, total = sum(r['ok'] for r in results.values()) - skipped, len(results) - skipped
+    out.write_text(json.dumps({'passed': passed, 'total': total, 'tests': results,
+                               **({'skipped': skipped} if skipped else {})}, indent=1))
+    print(f'{passed}/{total} spec tests pass' + (f', {skipped} skipped' if skipped else ''))
+    return 0 if results and passed == total else 1
 
 
 if __name__ == '__main__':
