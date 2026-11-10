@@ -386,6 +386,8 @@ newest `main` in the background: one `git fetch` into Ringo's own copy of the hi
 priority into a folder of its own (`install/COMMIT`, with its prompts and pipelines). All versions share one build
 folder, and only one builds at a time, so only Ringo itself compiles again. The shell then says
 `Ringo updated to 1a2b3c4 (2 new changes) · /restart to apply`, and the hint by the input box says `update ready`.
+That line scrolls away and the hint gives way to others while a turn runs, so the head of the screen also says
+`↑ update ready · /restart` until you do.
 
 The update is put where the running `ringo` is when the shell ends or restarts. Until then the open shell, and the
 pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
@@ -403,6 +405,13 @@ Ringo leaves some builds for you to update yourself:
 - one whose checkout has moved on since it was built;
 - one from a commit that is not on `main`;
 - one run with `RINGO_HOME` set.
+
+These are told as well, when `main` has changes they lack: `Ringo 1a2b3c4 is out (2 new changes). This build does not
+update itself (it was built with changes of its own): git pull in ~/Ringo, then cargo install --path cli there`. The
+head then says `↑ update available · /update`, and `/update` says the line again. A build with no commit is compared
+from where its checkout is, and a branch that already holds main's newest hears nothing. Until 2026-11-10 these
+builds were told nothing: on one machine the shell had been installed by hand from a checkout with changes of its
+own, and the newest version its updater had built was a week behind `main`.
 
 `RINGO_NO_UPDATE_CHECK=1` turns the check off. Updating needs git and cargo (a `cargo install` needed them already).
 No model call is made, and the release gate still decides what the pipelines run (next section).

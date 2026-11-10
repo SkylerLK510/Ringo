@@ -214,11 +214,16 @@ after every turn, so a crash loses at most the turn it cut short.
 | `/setup` | add an agent and sign in to it |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens. If you use releases, it also checks whether the pipelines' release is behind this Ringo |
 | `/update approve` | move the pipelines to the release `/update` checked |
+
 | `/restart` | start the updated Ringo: it updates itself in the background and says when this applies it (quitting applies it too); the conversations go on |
 | `/tier NAME` | how hard agents think: quick, standard, deep or ultra (above) |
 | `/usage` | what you have used, and how much of your plans is left |
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
 | `/quit` | leave |
+
+When a newer Ringo is there, the top line says so until you have it: `↑ update ready · /restart` when Ringo has
+built it for you, or `↑ update available · /update` when your copy is one you update yourself, and `/update` then
+says how.
 
 ## What it costs
 

@@ -2289,7 +2289,8 @@ impl App {
                 };
                 // after an agents' update the loop starts it, so the two do not share the machine
                 let pipelines = if self.update { None } else { self.check_pipelines() };
-                [agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
+                // Ringo's own update, said again: the head points here for one that /restart does not apply
+                [self.updated.clone(), agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
             }
             Cmd::Approve if self.releasing.is_some() => Some("  the pipelines' release is still being checked".into()),
             Cmd::Approve => match self.release.take() {
@@ -3006,9 +3007,18 @@ impl App {
             .filter(|r| r.is_empty() || !r.trim().is_empty())
             .find(|r| 10 + 8 + cols(r) <= w).unwrap_or_default(); // a narrow head keeps the folder's start
         let left = one_row(&self.label, w.saturating_sub(12 + cols(&right)));
-        let pad = w.saturating_sub(10 + cols(&left) + cols(&right));
+        // A newer Ringo stays in the head until it is applied: the line that said so scrolls away, and the input's
+        // hint gives way to others while a turn runs. Built, /restart applies it; else /update says how to get it.
+        let news = match (&self.staged, &self.updated) {
+            (Some(_), _) => "  ↑ update ready · /restart",
+            (None, Some(_)) => "  ↑ update available · /update",
+            (None, None) => "",
+        };
+        let news = if 10 + cols(&left) + cols(news) + 1 + cols(&right) <= w { news } else { "" };
+        let pad = w.saturating_sub(10 + cols(&left) + cols(news) + cols(&right));
         f.render_widget(Paragraph::new(Line::from(vec![Span::raw(" ▲▲ "), Span::styled("ringo", t.brand),
-            Span::raw("  "), Span::raw(left), Span::raw(" ".repeat(pad)), Span::raw(right)])).style(t.header), head);
+            Span::raw("  "), Span::raw(left), Span::styled(news, Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(pad)), Span::raw(right)])).style(t.header), head);
         self.drawn_look = self.look();
         // the conversation, and the side panel beside it behind a bar
         let (view, split) = if live.panel {
@@ -3790,6 +3800,22 @@ mod tests {
         a.feed();
         assert_eq!(replies(&a), ["Hello, world.", "Next up:\n\n| Name | Size |\n|---|---|\n| alpha | 1"]);
         a.s.shutdown();
+    }
+
+    #[test]
+    fn the_head_says_a_newer_ringo_is_there_until_it_is_applied() {
+        let mut a = app(&["claude"]);
+        a.pending = Some(Vec::new()); // the agents' own check has answered: none to update
+        assert!(!screen(&mut a, 100, 10)[0].contains("update"), "nothing to say yet");
+        // one this build cannot apply by itself: the head points to /update, which says how to get it
+        a.updated = Some("  Ringo 1a2b3c4 is out (2 new changes). This build does not update itself".into());
+        assert!(screen(&mut a, 100, 10)[0].contains("folder  ↑ update available · /update"));
+        assert!(a.run(Cmd::Update(None), "/update").unwrap().unwrap().starts_with("  Ringo 1a2b3c4 is out (2 new changes)"));
+        // built and waiting: /restart applies it, and the head says so while a turn's hint has the input's corner
+        a.staged = Some(PathBuf::from("ringo"));
+        let rows = screen(&mut a, 100, 10);
+        assert!(rows[0].contains("folder  ↑ update ready · /restart") && rows[0].ends_with("ask mode · 0 tokens"), "{rows:#?}");
+        assert!(!screen(&mut a, 40, 10)[0].contains("update"), "a narrow head keeps the folder and the mode");
     }
 
     #[test]
