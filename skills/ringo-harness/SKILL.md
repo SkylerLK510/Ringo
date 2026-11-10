@@ -92,7 +92,8 @@ python3 ringo.py review --input MATERIAL.txt --backend codex-chatgpt --timeout 1
 python3 ringo.py design --input BRIEF.txt --backend codex-chatgpt --timeout 180 --trace NEW_DIR --out PROPOSAL.md
 ```
 
-- `--backend`: `claude` (CLI default: caches the material across passes and reports cost), `codex`, `codex-chatgpt`, `ollama:MODEL`,
+- `--backend`: `claude` (CLI default: caches the material across passes and reports cost), `codex`, `codex-chatgpt`,
+  a preset with a model and effort the owner asked for (`codex-chatgpt@MODEL/EFFORT`, `@MODEL` or `@/EFFORT`; `claude@MODEL`), `ollama:MODEL`,
   `claude:<command>` for another Claude-style command, `codex:<command>` for your own Codex command line (must pass
   `--json`; web search only if it passes `--search`), or any command that reads stdin.
 - `--findings-json FILE` (review) also writes the findings as ReviewBench contract JSON, files checked at

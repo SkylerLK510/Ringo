@@ -31,15 +31,28 @@ fn seg() -> String {
 /// A path ('/' or '\\' separated, cleaned later): segments with a final '.ext' (lower-case led, or one capital
 /// such as .R), or at least one '/', or a well-known bare file name. Not inside a longer token, and not followed by
 /// more path characters.
-pub static FILE: LazyLock<String> = LazyLock::new(|| {
+pub static FILE: LazyLock<String> = LazyLock::new(|| file(""));
+
+/// FILE, with `more` added to its alternatives.
+fn file(more: &str) -> String {
     let seg = seg();
     format!(
-        r"(?<![{W}./\\@+\-\[\]])(/?(?:{seg}+[/\\])*{seg}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z])|/?(?:{seg}+[/\\])+{seg}+|Dockerfile|Makefile|Gemfile|Rakefile|Procfile)(?![{W}@+\-\[\]/]|\.[{W}])"
+        r"(?<![{W}./\\@+\-\[\]])(/?(?:{seg}+[/\\])*{seg}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z])|/?(?:{seg}+[/\\])+{seg}+|Dockerfile|Makefile|Gemfile|Rakefile|Procfile{more})(?![{W}@+\-\[\]/]|\.[{W}])"
     )
-});
-static LOC: LazyLock<Fancy> = LazyLock::new(|| {
-    Fancy::new(&format!(r"{}`?(?:(?::L?|#L|:[{S}]*lines?[{S}]+)~?(\d+)(?:[{S}]*[-–][{S}]*L?~?(\d+))?)?", *FILE))
-        .expect("a valid pattern")
+}
+
+/// LINES: an optional line number or range after a file.
+fn lines() -> String {
+    format!(r"`?(?:(?::L?|#L|:[{S}]*lines?[{S}]+)~?(\d+)(?:[{S}]*[-–][{S}]*L?~?(\d+))?)?")
+}
+static LOC: LazyLock<Fancy> =
+    LazyLock::new(|| Fancy::new(&format!("{}{}", *FILE, lines())).expect("a valid pattern"));
+/// Where a finding states its location (the `- Location:` line, the heading's trailing parentheses), a capitalised
+/// bare name with a line number is a file too: README:12, LICENSE:1, CODEOWNERS:4. Not in prose, where Note:2 is no
+/// file.
+static NAMED: LazyLock<Fancy> = LazyLock::new(|| {
+    let bare = format!(r"|[A-Z][{W}+\-]*(?=`?(?::L?|#L)~?\d)");
+    Fancy::new(&format!("{}{}", file(&bare), lines())).expect("a valid pattern")
 });
 static FIELD_START: LazyLock<Regex> =
     LazyLock::new(|| re(&format!(r"\A([{S}]*)[-*][{S}]*\**[A-Z][{W} -]{{0,30}}\**[{S}]*:")));
@@ -135,10 +148,12 @@ pub type Entries = Vec<Map<String, Value>>;
 pub type Anchor = (String, Line, Line);
 
 /// [(file, start, end)] anchors in text, first one per file; a file without a line gets line 1. need_line keeps
-/// only anchors with a line number or a directory, which prose mentions such as `d.db` rarely have.
-pub fn locations(text: &str, need_line: bool) -> Result<Vec<Anchor>> {
+/// only anchors with a line number or a directory, which prose mentions such as `d.db` rarely have. named: text is
+/// a stated location, so NAMED's bare names count.
+pub fn locations(text: &str, need_line: bool, named: bool) -> Result<Vec<Anchor>> {
     let (mut out, mut seen) = (Vec::new(), HashSet::new());
-    for m in LOC.captures_iter(text) {
+    let pattern: &Fancy = if named { &NAMED } else { &LOC };
+    for m in pattern.captures_iter(text) {
         let m = m.map_err(|e| Error::value(e.to_string()))?;
         let path = clean(m.get(1).map_or("", |g| g.as_str()));
         let (g2, g3) = (m.get(2).map(|g| g.as_str()), m.get(3).map(|g| g.as_str()));
@@ -163,14 +178,14 @@ pub fn locations(text: &str, need_line: bool) -> Result<Vec<Anchor>> {
 /// directory (a bare `name.ext` in a title is as often code, such as `d.db`, as a file).
 pub fn heading_anchors(title: &str) -> Result<Vec<Anchor>> {
     let found = match TRAILING.captures(title) {
-        Some(m) => locations(m.get(1).map_or("", |g| g.as_str()), false)?,
+        Some(m) => locations(m.get(1).map_or("", |g| g.as_str()), false, true)?,
         None => Vec::new(),
     };
     if !found.is_empty() {
         return Ok(found);
     }
     let spans: Vec<&str> = TICKS.captures_iter(title).filter_map(|c| c.get(1).map(|g| g.as_str())).collect();
-    locations(&spans.join(" "), true)
+    locations(&spans.join(" "), true, false)
 }
 
 /// The value of the `- <name>:` bullet in body (re.M | re.I), or None when there is none or it is empty.
@@ -219,16 +234,16 @@ pub fn parse(review_text: &str) -> Result<Entries> {
         let title = caps.get(2).map_or("", |g| g.as_str()).trim_matches([' ', '*']);
         let lines = py::splitlines(rest, false);
         let mut anchors = match field(rest, "Location") {
-            Some(loc) => locations(loc, false)?,
+            Some(loc) => locations(loc, false, true)?,
             None => Vec::new(),
         };
         if anchors.is_empty() {
             anchors = heading_anchors(title)?;
         }
         if anchors.is_empty() {
-            let mut body_anchors = locations(rest, true)?;
+            let mut body_anchors = locations(rest, true, false)?;
             if body_anchors.is_empty() {
-                body_anchors = locations(rest, false)?;
+                body_anchors = locations(rest, false, false)?;
             }
             body_anchors.truncate(1);
             anchors = body_anchors;

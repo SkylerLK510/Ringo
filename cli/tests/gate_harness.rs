@@ -175,6 +175,11 @@ def pure(fn, a):
             harness.HARD_FLOOR_S = saved
     if fn == 'tool_access':
         return harness.tool_access(a[0])
+    if fn == 'backend':
+        return harness.backend(a[0])
+    if fn == 'chosen':
+        asked = harness.chosen(a[0])
+        return [asked['model'], asked['effort']]
     if fn == 'checker_pass':
         return harness.checker_pass(a[0], {'name': 'checker'} if a[1] else None)
     if fn == 'total_tokens':
@@ -623,6 +628,12 @@ const EVENTS: &[&str] = &[
     r#"{"type":"turn.completed","usage":{"input_tokens":-0,"output_tokens":0}}"#,
     r#"{"type":"turn.completed","usage":{"input_tokens":123456789012345678901234567890,"output_tokens":1}}"#,
     r#"{"type":"turn.completed","usage":{"output_tokens":4}}"#,
+    r#"{"type":"turn.completed","usage":{"input_tokens":9,"output_tokens":7,"reasoning_output_tokens":5}}"#,
+    r#"{"type":"turn.completed","usage":{"reasoning_output_tokens":3}}"#,
+    r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"reasoning_output_tokens":true}}"#,
+    r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"reasoning_output_tokens":-4}}"#,
+    r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"reasoning_output_tokens":0}}"#,
+    r#"{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":2,"reasoning_output_tokens":123456789012345678901234567890}}"#,
     r#"{"type":"turn.completed","usage":{"input_tokens":null,"cached_input_tokens":-5,"output_tokens":3}}"#,
     r#"{"type":"turn.completed","usage":{"input_tokens":2e3,"output_tokens":1}}"#,
     r#"{"type":"item.completed","item":{"type":"error","message":"skip_host_skill_discovery is unstable"}}"#,
@@ -1385,6 +1396,11 @@ fn rust_pure(fn_name: &str, a: &Value, roots: &[PathBuf]) -> Value {
         "with_model" => Ok(json!(h::with_model(&strings(&a[0]), s(1)))),
         "limit_for" => Ok(h::limit_for_floor(num(&a[0]), num(&a[1])).to_value()),
         "tool_access" => Ok(json!(h::tool_access(s(0)))),
+        "backend" => h::backend(s(0)).map(|b| b.to_value()),
+        "chosen" => {
+            let (model, effort) = h::chosen(&strings(&a[0]));
+            Ok(json!([model, effort]))
+        }
         "checker_pass" => {
             let b = Backend { name: "checker".into(), argv: vec![], style: "plain".into(), subscription_auth: None, lean: None, tools: None };
             h::checker_pass(&a[0], a[1].as_bool().unwrap().then_some(&b)).map(|_| Value::Null)
@@ -1449,8 +1465,26 @@ fn small_helpers_match_python() {
             cases.push(json!(["limit_for", [v(x), v(floor)]]));
         }
     }
-    for name in ["claude", "codex", "codex-chatgpt", "codex-search", "ollama:", "ollama:qwen3", "claude:x", "codex:x", "", "Claude"] {
+    for name in ["claude", "codex", "codex-chatgpt", "codex-search", "ollama:", "ollama:qwen3", "claude:x", "codex:x", "", "Claude",
+                 "codex-chatgpt@gpt-x/xhigh", "claude@opus", "codex@m", "codex-search@/low", "codex:x@m", "x@codex-chatgpt"] {
         cases.push(json!(["tool_access", [name]]));
+    }
+    // A preset with a model, an effort or both after '@'; anything else with an '@' is the command it always was.
+    for spec in ["claude", "codex", "codex-chatgpt", "codex-search", "codex-chatgpt@gpt-x/xhigh", "codex-chatgpt@gpt-x", "codex-chatgpt@/low",
+                 "codex-chatgpt@", "codex-chatgpt@/", "codex-chatgpt@m/", "codex-chatgpt@m/huge", "codex-chatgpt@m/x/high", "codex-chatgpt@a@b/max",
+                 "codex@m/medium", "codex-search@é m/high", "claude@opus", "claude@opus/high", "claude@/high", "claude@", "Claude@opus",
+                 "mytool@v2 --flag", "codex:codex exec --json@m", "ollama:q@x", "@m", "claude:x@m"] {
+        cases.push(json!(["backend", [spec]]));
+    }
+    for argv in [
+        json!([]), json!(["x"]), json!(["x", "--model"]), json!(["x", "--model", "a", "--model=b"]), json!(["x", "--model=b", "--model", "a"]),
+        json!(["x", "--model", "--model=c"]), json!(["x", "--model="]), json!(["-c", "model_reasoning_effort=\"high\""]),
+        json!(["x", "-c", "model_reasoning_effort=low", "-c", "model_reasoning_effort=\"xhigh\""]), json!(["x", "model_reasoning_effort=low"]),
+        json!(["x", "-c", "model_reasoning_effort=\"a\"b\""]), json!(["x", "-c", "model_reasoning_effort=\""]), json!(["x", "-c", "model_reasoning_effort="]),
+        json!(["x", "-c", "model_reasoning_effort=\"\""]), json!(["x", "-c", "model_reasoning_effort=a\""]), json!(["x", "-c", "xmodel_reasoning_effort=low"]),
+        json!(["x", "-c", "model_reasoning_effort=low\n"]), json!(["x", "--model", "-c", "model_reasoning_effort=low"]),
+    ] {
+        cases.push(json!(["chosen", [argv]]));
     }
     let plans = [
         r#"{"passes": [{"reply": "findings"}, {"reply": "verdicts"}]}"#,

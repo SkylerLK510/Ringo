@@ -886,5 +886,99 @@ class CheckerBackendTest(unittest.TestCase):
         self.assertEqual(json.loads((trace / 'summary.json').read_text())['checker_backend'], 'codex-chatgpt')
 
 
+def turn(text, **usage):
+    """Codex exec --json output for one finished turn."""
+    return '\n'.join(json.dumps(x) for x in [{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': text}},
+                                             {'type': 'turn.completed', 'usage': usage}])
+
+
+class ModelMetricsTest(unittest.TestCase):
+    """What a run records for comparing models: which model and effort it asked for, the reasoning tokens Codex
+    reports, and the task's time."""
+
+    def run_cli(self, args, output):
+        """(exit code, summary, stderr, trace records) of a review of one-line material; output is the fake
+        backend's stdout, or an exception it raises."""
+        d = Path(tempfile.mkdtemp())
+        (d / 'm').write_text('M')
+        trace = d / 'trace'
+        def isolated(argv, stdin, timeout, **kw):
+            if isinstance(output, Exception):
+                raise output
+            return output
+        with mock.patch.object(backends, 'run_isolated', side_effect=isolated), \
+                mock.patch('sys.stderr', new_callable=io.StringIO) as err, \
+                mock.patch('sys.stdout', new_callable=io.StringIO):
+            code = harness.main(['review', '--input', str(d / 'm'), '--trace', str(trace), *args])
+        lines = [line for line in err.getvalue().splitlines() if line.startswith('harness: {')]
+        records = [json.loads(line) for line in (trace / 'trace.jsonl').read_text().splitlines()]
+        return code, json.loads(lines[-1].split('harness: ', 1)[1]), err.getvalue(), records
+
+    def test_a_preset_takes_a_model_and_an_effort_after_at(self):
+        plain, chosen = harness.backend('codex-chatgpt'), harness.backend('codex-chatgpt@gpt-x/xhigh')
+        self.assertEqual(chosen['argv'], plain['argv'][:-1] + ['--model', 'gpt-x', '-c', 'model_reasoning_effort="xhigh"', '-'])
+        self.assertEqual({**chosen, 'argv': 0, 'name': 0}, {**plain, 'argv': 0, 'name': 0})  # the preset's restrictions
+        self.assertEqual(chosen['name'], 'codex-chatgpt@gpt-x/xhigh')
+        self.assertEqual(harness.backend('codex-chatgpt@/low')['argv'][-3:], ['-c', 'model_reasoning_effort="low"', '-'])
+        self.assertEqual(harness.backend('codex-chatgpt@gpt-x')['argv'][-3:], ['--model', 'gpt-x', '-'])
+        self.assertEqual(harness.backend('claude@opus')['argv'][-2:], ['--model', 'opus'])
+        self.assertEqual(harness.backend('claude@opus')['argv'].count('--model'), 1)
+        self.assertEqual([harness.tool_access(n) for n in ('codex-chatgpt@gpt-x/xhigh', 'claude@opus', 'codex@gpt-x')],
+                         ['none', 'none', 'disk'])
+        for bad in ('codex-chatgpt@', 'codex-chatgpt@/', 'claude@opus/high', 'codex@gpt-x/huge'):
+            with self.assertRaises(ValueError, msg=bad):
+                harness.backend(bad)
+        self.assertEqual(harness.backend('mytool@v2 --flag')['argv'], ['mytool@v2', '--flag'])  # not a preset: a command
+
+    def test_every_call_record_names_the_model_and_effort_asked_for(self):
+        out = turn(REVIEW, input_tokens=10, output_tokens=7, reasoning_output_tokens=5)
+        code, summary, err, records = self.run_cli(['--backend', 'codex-chatgpt@gpt-x/xhigh'], out)
+        self.assertEqual(code, 0, err)
+        self.assertEqual([(r['backend'], r['model'], r['effort']) for r in records],
+                         [('codex-chatgpt@gpt-x/xhigh', 'gpt-x', 'xhigh')] * 2)  # started, ok
+        self.assertEqual(records[-1]['usage']['reasoning_output'], 5)  # part of the 7 output tokens, not added to them
+        self.assertEqual((summary['output'], summary['reasoning_output']), (7, 5))
+        # A preset that names neither leaves both to Codex: recorded as unknown, not as a guess.
+        code, summary, err, records = self.run_cli(['--backend', 'codex-chatgpt'], turn(REVIEW, input_tokens=10, output_tokens=7))
+        self.assertEqual([(r['model'], r['effort']) for r in records], [(None, None)] * 2)
+        self.assertNotIn('reasoning_output', summary)  # no call reported it: unknown, not zero
+        self.assertNotIn('reasoning_output', records[-1]['usage'])
+        self.assertEqual(harness.chosen(harness.backend('codex')['argv']), {'model': None, 'effort': 'high'})
+        self.assertEqual(harness.chosen(harness.backend('claude')['argv']), {'model': 'sonnet', 'effort': None})
+        self.assertEqual(harness.chosen(['x', '--model=m1', '--model', 'm2', '-c', 'model_reasoning_effort=low']),
+                         {'model': 'm2', 'effort': 'low'})
+
+    def test_a_failed_run_reports_its_time_and_the_findings_export_is_inside_it(self):
+        code, summary, err, _ = self.run_cli(['--backend', 'codex-chatgpt'], backends.JudgeError('down'))
+        self.assertEqual((code, summary['calls']), (2, 2), err)
+        self.assertGreater(summary['elapsed_s'], 0)
+        def slow(args, text, run):
+            time.sleep(0.2)
+            return {'findings_unshaped': False}
+        with mock.patch.object(harness, 'write_findings', side_effect=slow):
+            code, summary, err, _ = self.run_cli(['--backend', 'codex-chatgpt', '--findings-json', os.devnull],
+                                                 turn(REVIEW, input_tokens=1, output_tokens=1))
+        self.assertEqual(code, 0, err)
+        self.assertGreaterEqual(summary['elapsed_s'], 0.2)
+        def fails(args, text, run):
+            time.sleep(0.2)
+            raise OSError('disk full')
+        with mock.patch.object(harness, 'write_findings', side_effect=fails):
+            code, summary, err, _ = self.run_cli(['--backend', 'codex-chatgpt', '--findings-json', os.devnull],
+                                                 turn(REVIEW, input_tokens=1, output_tokens=1))
+        self.assertEqual(code, 2, err)
+        self.assertGreaterEqual(summary['elapsed_s'], 0.2)  # the export that failed is inside it too
+
+    def test_a_review_that_cannot_be_read_does_not_look_like_no_findings(self):
+        for reply, unshaped, written in (('The parser drops the last row in a.py at line 3.', True, 0),
+                                         (REVIEW, False, 2), ('No defects found.', False, 0)):
+            out = Path(tempfile.mkdtemp()) / 'findings.json'
+            code, summary, err, _ = self.run_cli(['--backend', 'codex-chatgpt', '--findings-json', str(out)],
+                                                 turn(reply, input_tokens=1, output_tokens=1))
+            self.assertEqual((code, summary['calls']), (0, 1), err)  # reported, never sent again
+            self.assertEqual((summary['findings_unshaped'], summary['findings_written']), (unshaped, written), reply)
+            self.assertEqual('no numbered finding' in err, unshaped)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -145,6 +145,17 @@ def tasks(source, gate_repo):
          ['No defects found.'], {}),
         ('design-codex', ['design', '--input', '{DIR}/brief.md', '--backend', 'codex-chatgpt'],
          ['Decision\n\nDo the small thing first.\n'], {'brief.md': '# Brief\n\nDesign a cache. Budget: none.\n'}),
+        # a model and an effort chosen after '@': the same lean call with two more options, named in every record
+        ('review-codex-chatgpt-model-effort', ['review', '--input', '{DIR}/material.txt', '--backend',
+                                               'codex-chatgpt@gate-model/xhigh'], [FINDINGS], {'material.txt': material}),
+        ('review-claude-model', ['review', '--input', '{DIR}/material.txt', '--backend', 'claude@opus'],
+         [FINDINGS], {'material.txt': material}),
+        ('review-bad-effort', ['review', '--input', '{DIR}/material.txt', '--backend', 'codex-chatgpt@m/huge'],
+         [], {'material.txt': material}),
+        # a reply in prose: the findings file is empty and the summary says the reply could not be read
+        ('review-unshaped-findings', ['review', '--input', '{DIR}/material.txt', '--backend', 'codex-chatgpt',
+                                      '--findings-json', '{OUT}/findings.json'],
+         ['The parser drops the last row in x.py at line 1.'], {'material.txt': material}),
         ('review-codex-malformed-then-ok', ['review', '--input', '{DIR}/material.txt', '--backend', 'codex-chatgpt'],
          [{'stdout': 'not json\n', 'exit': 0}, FINDINGS], {'material.txt': material}),
         ('review-codex-malformed-twice', ['review', '--input', '{DIR}/material.txt', '--backend', 'codex-chatgpt'],

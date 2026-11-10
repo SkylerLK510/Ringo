@@ -19,7 +19,7 @@ def lines(anchors):
 for fn, a in json.loads(sys.stdin.read()):
     try:
         if fn == 'parse': r = findings.parse(a[0])
-        elif fn == 'locations': r = lines(findings.locations(a[0], a[1]))
+        elif fn == 'locations': r = lines(findings.locations(a[0], a[1], a[2]))
         elif fn == 'heading': r = lines(findings.heading_anchors(a[0]))
         elif fn == 'field': r = findings.field(a[0], a[1])
         elif fn == 'problem': r = findings.problem(a[0])
@@ -78,7 +78,7 @@ fn rust(case: &Value) -> String {
     let s = |i: usize| a[i].as_str().unwrap();
     result(match name {
         "parse" => f::parse(s(0)).map(|e| Value::Array(e.into_iter().map(Value::Object).collect())),
-        "locations" => f::locations(s(0), a[1].as_bool().unwrap()).map(anchors),
+        "locations" => f::locations(s(0), a[1].as_bool().unwrap(), a[2].as_bool().unwrap()).map(anchors),
         "heading" => f::heading_anchors(s(0)).map(anchors),
         "field" => Ok(f::field(s(0), s(1)).map_or(Value::Null, |x| json!(x))),
         "problem" => {
@@ -167,6 +167,9 @@ const PATHS: &[&str] = &[
     "a.b", "dir/", "foo@1.2/bar.py:3", "[x]/y.py", "a+b.py", "a-b_c.json#L2-L3", "C:\\x\\y.py", "README.md", "Dockerfile:3",
     "pkg/core.py:12–14", "d.db", "a/README.md:5", "b/src/pool.py:1", "SKILL.md:2", "pool.py:0-2", "x.PY:3", "e.Rmd:1",
     "lib/x.rs:0", "a.py:12-L15", "v1.2", "img.png", "src/", "x.py:12 -15", "(nested.py:3)",
+    // bare names, files only where a location is stated and only with a line
+    "README:12", "LICENSE:1", "CODEOWNERS:4-6", "localhost:8080", "Note:2", "Jenkinsfile#L3", "BUILD:L7", "README", "Ünï:3",
+    "HTTP:404", "A-b+c:~5", "README: line 3", "Xa.py:1",
 ];
 const TITLES: &[&str] = &[
     "Cache is read without the lock", "Off by one in `d.db` handling", "`lsmysql.New` panics on nil", "Ünïcödé title ✓",
@@ -230,8 +233,10 @@ fn parse_and_its_helpers_match_python() {
     }
     for p in PATHS {
         for text in [p.to_string(), format!("`{p}`"), format!("see {p}, then `{p}`."), format!("({p})")] {
-            cases.push(json!(["locations", [text, false]]));
-            cases.push(json!(["locations", [text, true]]));
+            for named in [false, true] {
+                cases.push(json!(["locations", [text, false, named]]));
+                cases.push(json!(["locations", [text, true, named]]));
+            }
             cases.push(json!(["heading", [format!("Title ({text})")]]));
             cases.push(json!(["heading", [format!("Title `{text}` here")]]));
         }
