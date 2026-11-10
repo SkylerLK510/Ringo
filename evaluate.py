@@ -80,10 +80,17 @@ SPEC_DEFAULTS = {'runs': 2, 'objective': 'quality', 'margins': {'U': 0.5, 'W': 0
                  'min_saving': 0.2, 'min_groups': 10, 'bootstrap': 10000, 'seed': 1, 'budget_usd': None,
                  'kind': 'review', 'sample': None, 'unpriced_call_usd': None,
                  'allow_tool_backends': False, 'grading_reserve_usd': 0, 'timeout_s': harness.TIMEOUT_S,
-                 'grade_timeout_s': 1800}
+                 'grade_timeout_s': 1800,
+                 # The most tokens a review of the candidate's may use, as a ratio of a comparator's (input, cached
+                 # and written-to-cache input, and output; None: no limit). The cost gates are in dollars, and a
+                 # backend that reports no price is charged unpriced_call_usd a call, so two plans making the same
+                 # calls cost the same whatever their tokens: only this limit sees a plan that reads or writes more.
+                 'max_token_ratio': None}
 POLICY_DEFAULTS = {'alpha': 0.05, 'max_validation_submissions': 5, 'min_superiority_U': 0.5,
                    'max_noninferiority_U': 0.5, 'max_margin_W': 0.25, 'max_cost_ratio': 2.0,
-                   'min_saving': 0.2, 'min_bootstrap_tail': 1}  # fixed in the ledger at the first split
+                   'min_saving': 0.2, 'min_bootstrap_tail': 1,
+                   'max_token_ratio': None}  # fixed in the ledger at the first split; a store split before the token
+                                             # limit existed has none
 SPEC_KEYS = {'name', 'campaign', 'split', 'arms', 'candidate', 'comparators', 'graders', *SPEC_DEFAULTS}
 
 
@@ -257,8 +264,10 @@ def split(store, seed=1, forced_dev=(), fractions=(0.2, 0.3, 0.5), resplit=False
                 or not 0 < fixed['alpha'] < 0.5 or type(fixed['max_validation_submissions']) is not int \
                 or fixed['max_validation_submissions'] < 1:
             raise EvalError('policy needs 0 < alpha < 0.5 and a positive integer validation cap')
-        if any(harness.valid_price(fixed[k]) is None for k in set(POLICY_DEFAULTS) - {'alpha', 'max_validation_submissions'}) \
-                or fixed['max_cost_ratio'] <= 0 or not 0 <= fixed['min_saving'] < 1 or fixed['min_bootstrap_tail'] < 1:
+        if any(harness.valid_price(fixed[k]) is None
+               for k in set(POLICY_DEFAULTS) - {'alpha', 'max_validation_submissions', 'max_token_ratio'}) \
+                or fixed['max_cost_ratio'] <= 0 or not 0 <= fixed['min_saving'] < 1 or fixed['min_bootstrap_tail'] < 1 \
+                or not token_limit(fixed['max_token_ratio']):
             raise EvalError('policy bounds must be finite and valid')
         if set(forced_dev) - set(pool):
             raise EvalError('forced dev cases must exist in the case pool')
@@ -306,6 +315,11 @@ def split_cases(store, name, spec=None):
 
 # ---------- spec, digest, freeze ----------
 
+def token_limit(value):
+    """Whether value is a max_token_ratio: None (no limit) or a finite number above zero."""
+    return value is None or (harness.valid_price(value) is not None and value > 0)
+
+
 def load_spec(path):
     spec = json.loads(Path(path).read_text(encoding='utf-8'))
     if not isinstance(spec, dict):
@@ -348,6 +362,8 @@ def load_spec(path):
     if harness.valid_price(spec['max_cost_ratio']) is None or spec['max_cost_ratio'] <= 0 \
             or harness.valid_price(spec['min_saving']) is None or not 0 <= spec['min_saving'] < 1:
         raise EvalError('max_cost_ratio must be positive and 0 <= min_saving < 1')
+    if not token_limit(spec['max_token_ratio']):
+        raise EvalError('max_token_ratio must be a finite number above zero, or null for no limit')
     for k in ('budget_usd', 'unpriced_call_usd'):
         if spec[k] is not None and harness.valid_price(spec[k]) is None:
             raise EvalError(f'{k} must be a finite, non-negative number')
@@ -490,6 +506,9 @@ def check_policy(spec, fixed, a):
         loose |= mu < fixed['min_superiority_U'] or spec['max_cost_ratio'] > fixed['max_cost_ratio']
     else:
         loose |= mu > fixed['max_noninferiority_U'] or spec['min_saving'] < fixed['min_saving']
+    # a store that limits tokens holds every validation and test experiment to that limit or a tighter one
+    cap, own = fixed.get('max_token_ratio'), spec.get('max_token_ratio')
+    loose |= cap is not None and (own is None or own > cap)
     if loose or spec['bootstrap'] * a < fixed['min_bootstrap_tail']:
         raise EvalError('experiment gates are looser than the store policy or bootstrap tail is unresolved')
 
@@ -799,7 +818,7 @@ def parse_grades(text, ids, gold):
     return out
 
 
-def grade(store, d, call_fn=harness.call, timeout_s=None):
+def grade(store, d, call_fn=harness.call):
     """Grade every case's outputs with every grader, blind: fresh random ids, shuffled order, no arm names; the key
     goes to keys/, outside the run folder, and is saved before each case is sent. Needs a finished run (every slot
     has a result or a recorded failure). A malformed reply is asked once more; then that grade is missing. Grading
@@ -807,7 +826,7 @@ def grade(store, d, call_fn=harness.call, timeout_s=None):
     runs at a time. The key file is always written, empty if no slot produced a review."""
     store, spec = Path(store), checked(store, d)
     with exclusive(store / 'runs' / d / '.grade.lock', 'grading'):
-        _grade(store, d, spec, call_fn, spec['grade_timeout_s'] if timeout_s is None else timeout_s)
+        _grade(store, d, spec, call_fn, spec['grade_timeout_s'])  # the frozen limit: a caller cannot give another
 
 
 def _grade(store, d, spec, call_fn, timeout_s):
@@ -1033,11 +1052,19 @@ def _score(store, d):
     done = len(list(out_dir.glob('*/*/result.md')))
     report = {'digest': d, 'split': spec['split'], 'alpha': a, 'cases': len(ids),
               'groups': len({pool[c]['group'] for c in ids}), 'expected_slots': expected, 'completed_slots': done,
-              'failed': failed, 'integrity_errors': integrity, 'graders': {}, 'cost_per_review': {}, 'cost_unknown': cost(store, d, spec)[1]}
+              'failed': failed, 'integrity_errors': integrity, 'graders': {}, 'cost_per_review': {}, 'tokens_per_review': {},
+              'cost_unknown': cost(store, d, spec)[1]}
     for arm in spec['arms']:
-        costs = [json.loads(p.read_text())['cost_usd'] for p in out_dir.glob(f'*/{arm}.*/summary.json')]
-        unpriced = sum(json.loads(p.read_text())['unpriced_calls'] for p in out_dir.glob(f'*/{arm}.*/summary.json'))
+        done_slots = [json.loads(p.read_text()) for p in out_dir.glob(f'*/{arm}.*/summary.json')]
+        costs = [slot['cost_usd'] for slot in done_slots]
+        unpriced = sum(slot['unpriced_calls'] for slot in done_slots)
         report['cost_per_review'][arm] = (sum(costs) / len(costs)) if costs and not unpriced else None
+        # Unknown is not zero: the harness counts a call that reported no tokens as untokened, and one such call makes
+        # the arm's tokens unknown, as an unpriced call does its cost. A review counted at no tokens at all is unknown
+        # too: no call reads nothing.
+        totals = [sum(slot[k] for k in harness.TOKEN_KEYS) if not slot.get('untokened_calls') and all(
+            type(slot.get(k)) is int for k in harness.TOKEN_KEYS) else 0 for slot in done_slots]
+        report['tokens_per_review'][arm] = sum(totals) / len(totals) if totals and min(totals) > 0 else None
     for g in spec['graders']:
         gdir = store / 'runs' / d / 'grades' / sha(g)[:12]
         per = {}  # (case, arm) -> [(T, W, U, R) per run]
@@ -1110,6 +1137,13 @@ def gates(spec, report):
             missing.append(f'cost vs {comp} unknown')
         elif ratio > limit:
             why.append(f'cost vs {comp}: {ratio:.2f}x (limit {limit:.2f}x)')
+        if spec.get('max_token_ratio') is not None:  # .get: an experiment frozen before the limit existed has none
+            tokens = report.get('tokens_per_review') or {}
+            ratio = cost_ratio(tokens.get(spec['candidate']), tokens.get(comp))
+            if ratio is None:
+                missing.append(f'tokens vs {comp} unknown')
+            elif ratio > spec['max_token_ratio']:
+                why.append(f"tokens vs {comp}: {ratio:.2f}x (limit {spec['max_token_ratio']:.2f}x)")
     for g, entry in report['graders'].items():
         if entry['missing_grades']:
             missing.append(f"grader {g}: missing grades for {len(entry['missing_grades'])} cases")

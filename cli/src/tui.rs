@@ -100,6 +100,88 @@ fn menu(before: &str, agents: &[(&str, bool)]) -> Vec<(String, String, String)> 
 /// Whether the terminal reports Shift-Enter apart from Enter (the kitty keyboard protocol is on).
 static SHIFT_ENTER: AtomicBool = AtomicBool::new(false);
 
+/// Set when the shell is told to end from outside: `kill` (SIGTERM) or its terminal closing (SIGHUP). The loop then
+/// ends as /quit does: running turns are stopped and counted, the conversation is kept and the terminal is put back.
+/// Before, the shell died where it stood. Each agent is in a process group of its own, so a step it was in the middle
+/// of ran on unseen (5 s of a 6 s step, in a pty with a stand-in agent), the turn never reached the usage record,
+/// nothing was kept for `ringo --resume`, and a killed shell left the terminal in raw mode on the alternate screen.
+static ENDED: AtomicBool = AtomicBool::new(false);
+
+/// For a closed terminal (`watch_the_end` sets both; -1 until then): the reading end of a pipe that stays empty, and
+/// the writing end of the pipe that wakes the watchdog.
+#[cfg(unix)]
+static IDLE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+#[cfg(unix)]
+static WAKE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// How long the shell may take to end once it is told to (its jobs are stopped within a few seconds, then it leaves).
+#[cfg(unix)]
+const END_WITHIN: Duration = Duration::from_secs(20);
+
+/// Takes SIGTERM and SIGHUP for the shell's loop (`on`), or gives them back their default: while an agent's sign-in
+/// or an update has the plain terminal, the loop is not there to see `ENDED`, and a `kill` must still end the shell.
+fn end_signals(on: bool) {
+    #[cfg(unix)]
+    {
+        extern "C" fn ended(signal: libc::c_int) {
+            ENDED.store(true, Ordering::SeqCst);
+            let (idle, wake) = (IDLE.load(Ordering::SeqCst), WAKE.load(Ordering::SeqCst));
+            // SAFETY: dup2 and write are async-signal-safe, on descriptors `watch_the_end` made.
+            unsafe {
+                // A closed terminal reads as ready and empty for ever, and the terminal library (crossterm 0.29) reads
+                // it again without end: the loop would never come round to see ENDED. The empty pipe in its place
+                // reads as "nothing yet", so the wait for a key ends at its own time limit.
+                if signal == libc::SIGHUP && idle >= 0 {
+                    libc::dup2(idle, libc::STDIN_FILENO);
+                }
+                if wake >= 0 {
+                    libc::write(wake, [0u8].as_ptr().cast(), 1);
+                }
+            }
+        }
+        let action = if on { ended as extern "C" fn(libc::c_int) as libc::sighandler_t } else { libc::SIG_DFL };
+        for signal in [libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: the handler stores to an atomic and makes async-signal-safe calls only.
+            unsafe { libc::signal(signal, action) };
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = on;
+}
+
+/// Makes what the signal handler needs when a terminal closes (see `ended`), and a watchdog: a shell told to end
+/// that is still there after END_WITHIN leaves at once, so nothing can keep it turning behind a closed terminal.
+#[cfg(unix)]
+fn watch_the_end() {
+    let pipe = || {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: `fds` is the two ints pipe fills; fcntl sets a flag on the descriptors it just made (agents'
+        // processes are not handed them).
+        unsafe {
+            (libc::pipe(fds.as_mut_ptr()) == 0).then(|| {
+                fds.iter().for_each(|&fd| { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC); });
+                (fds[0], fds[1])
+            })
+        }
+    };
+    let (Some((idle, _open)), Some((woken, wake))) = (pipe(), pipe()) else { return };
+    // SAFETY: sets a flag on a descriptor made above. Its writing end stays open, so it never reads as ended.
+    unsafe { libc::fcntl(idle, libc::F_SETFL, libc::O_NONBLOCK) };
+    IDLE.store(idle, Ordering::SeqCst);
+    WAKE.store(wake, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        let mut byte = [0u8];
+        // SAFETY: reads one byte into a one-byte buffer; blocks until the handler writes it.
+        while unsafe { libc::read(woken, byte.as_mut_ptr().cast(), 1) } < 0 {
+            if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                return;
+            }
+        }
+        std::thread::sleep(END_WITHIN);
+        std::process::exit(1);
+    });
+}
+
 /// The owner's lines, kept across sessions, newest last (private, as the rest of Ringo's state is).
 fn history_file() -> PathBuf {
     ringo_cli::state_root().join("shell-history.jsonl")
@@ -1891,7 +1973,7 @@ impl App {
     }
 
     /// Stops the turn running in this folder (or ultra's review of the last one); lines queued behind it go back into
-    /// the input, to send or change.
+    /// the input, to send or change. With a line being typed for another agent they are shown instead.
     fn stop(&mut self, id: usize) {
         let _ = self.s.kill(id);
         // the stopped agent's lines come back, the other agents' keep waiting for their own turns; ultra's review
@@ -1901,17 +1983,34 @@ impl App {
         self.queue = keep;
         let agents: Vec<Agent> = back.iter().map(|(a, ..)| *a).collect();
         let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
-        if !queued.is_empty() && self.input.is_empty() {
-            // back to the agent they were for, though another may have spoken since (see `feed`)
-            if let Some(&agent) = agents.first().filter(|a| agents.iter().all(|b| b == *a)) {
-                self.main = agent;
+        let mut unsent = Vec::new();
+        if !queued.is_empty() {
+            // Back to the agent they were for, though another may have spoken since (see `feed`). A plain line being
+            // typed for that agent stays, and the waiting lines go in above it (they were dropped). Typed for another
+            // agent, or as a command, the line is left as it is and the waiting lines are shown instead: joined to
+            // it, they would go where it goes.
+            let typed: String = self.input.iter().collect();
+            let one = agents.first().copied().filter(|a| agents.iter().all(|b| b == a));
+            let back = queued.join("\n");
+            if typed.is_empty() {
+                if let Some(agent) = one {
+                    self.main = agent;
+                }
+                self.input = back.chars().collect();
+                self.cursor = self.input.len();
+            } else if one == Some(self.main) && matches!(parse(&typed, &self.agents), Ok(Cmd::Talk(_))) {
+                self.cursor += back.chars().count() + 1; // where it was in the line being typed
+                self.input = format!("{back}\n{typed}").chars().collect();
+            } else {
+                unsent = agents.into_iter().zip(queued).collect();
             }
-            self.input = queued.join("\n").chars().collect();
-            self.cursor = self.input.len();
         }
         match self.checking {
             Some((review, turn, _)) if review == id => self.say(format!("  stopping review #{id}; #{turn}'s change stays as it is")),
             _ => self.say(format!("  stopping #{id}; what it changed so far stays (/undo takes it back)")),
+        }
+        for (agent, line) in unsent {
+            self.say(format!("  a line that waited for {} was not sent: {line}", agent.name()));
         }
     }
 
@@ -3040,8 +3139,11 @@ pub fn run(start: Start) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    #[cfg(unix)]
+    watch_the_end();
+    end_signals(true);
     let (mut dirty, mut tick) = (true, Instant::now());
-    while !app.quit {
+    while !app.quit && !ENDED.load(Ordering::SeqCst) {
         if dirty {
             if terminal.draw(|f| app.draw(f)).is_err() {
                 break;
@@ -3067,14 +3169,18 @@ pub fn run(start: Start) -> ExitCode {
                     Ok(Term::Resize(..)) => dirty = true,
                     _ => {}
                 }
-                if app.quit || app.setup || app.update || !event::poll(Duration::ZERO).unwrap_or(false) {
+                // ENDED: told to end from outside, the shell takes no more keys
+                if app.quit || app.setup || app.update || ENDED.load(Ordering::SeqCst)
+                    || !event::poll(Duration::ZERO).unwrap_or(false) {
                     break;
                 }
             }
         }
         if app.setup {
             close(&mut terminal); // the agents' own sign-in runs in the plain terminal
+            end_signals(false);
             app.agents = crate::setup::run();
+            end_signals(true);
             match open() {
                 Ok(t) => terminal = t,
                 Err(_) => break,
@@ -3139,7 +3245,9 @@ pub fn run(start: Start) -> ExitCode {
         if app.update {
             close(&mut terminal); // the updates run in the plain terminal, so their prompts and progress show
             println!("Updating agents; the shell comes back when they finish.");
+            end_signals(false);
             let (lines, left) = crate::updates::apply_here(app.pending.take().unwrap_or_default());
+            end_signals(true);
             match open() {
                 Ok(t) => terminal = t,
                 Err(_) => break,
@@ -3187,8 +3295,10 @@ pub fn run(start: Start) -> ExitCode {
     let saved = app.save();
     // an update goes in place now that this shell is done with its version
     let installed = app.staged.as_ref().map(|bin| crate::updates::install(&exe, bin));
+    // Written, not printed: a shell whose terminal closed has nowhere to print, and a print that fails panics.
+    use std::io::Write;
     if let Some(Err(e)) = &installed {
-        eprintln!("ringo: the update was not installed: {e}");
+        let _ = writeln!(std::io::stderr(), "ringo: the update was not installed: {e}");
     }
     if app.restart {
         let next = match (&installed, &app.staged) { (Some(Err(_)), Some(bin)) => bin.clone(), _ => exe.clone() };
@@ -3202,7 +3312,7 @@ pub fn run(start: Start) -> ExitCode {
     }
     let resume = if kept.is_some() { "; ringo --resume goes on with it" } else { "" };
     let saved = saved.map_or(String::new(), |p| format!("; the conversation is saved in {}{resume}", p.display()));
-    println!("ringo: {} tokens this session{saved}", fmt_tokens(app.s.tokens()));
+    let _ = writeln!(stdout(), "ringo: {} tokens this session{saved}", fmt_tokens(app.s.tokens()));
     ExitCode::SUCCESS
 }
 
@@ -3231,6 +3341,18 @@ fn restart(exe: &Path, kept: &Path) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_signal_to_end_reaches_the_loop_instead_of_killing_the_shell() {
+        end_signals(true);
+        // SAFETY: raises signals this process now handles; unhandled, either would end the test run here.
+        unsafe { libc::raise(libc::SIGTERM) };
+        assert!(ENDED.swap(false, Ordering::SeqCst), "kill: the loop sees it and ends as /quit does");
+        unsafe { libc::raise(libc::SIGHUP) };
+        assert!(ENDED.swap(false, Ordering::SeqCst), "and so for the terminal closing");
+        end_signals(false);
+    }
 
     #[test]
     fn a_reply_being_written_closes_its_open_marks() {
@@ -3753,6 +3875,24 @@ mod tests {
         a.main = agy;
         a.stop(id);
         assert_eq!((a.main, a.input.iter().collect::<String>()), (claude, "next".to_string()));
+        // a plain line being typed for that agent stays, and the waiting line comes back above it (it was dropped)
+        a.input = "half typed".chars().collect();
+        a.cursor = 4;
+        a.queue.push_back((claude, "later".into(), "later".into()));
+        a.stop(id);
+        assert_eq!((a.main, a.input.iter().collect::<String>(), a.cursor), (claude, "later\nhalf typed".to_string(), 10));
+        // typed for another agent, by the prompt or by name, the line is left as it is: joined to it, claude's line
+        // would go to that agent. The waiting line is shown, not sent and not lost from sight.
+        for (main, typed) in [(agy, "half typed"), (claude, "@agy look")] {
+            a.main = main;
+            a.input = typed.chars().collect();
+            a.queue.push_back((claude, format!("for claude, not {typed}"), format!("for claude, not {typed}")));
+            a.stop(id);
+            assert_eq!((a.main, a.input.iter().collect::<String>()), (main, typed.to_string()));
+            let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+            assert!(said.contains(&format!("a line that waited for claude was not sent: for claude, not {typed}")), "{said}");
+        }
+        assert!(a.queue.is_empty());
         let _ = std::fs::remove_file(dir.join("claude.hold"));
         finish(&mut a);
         let _ = std::fs::remove_dir_all(&dir);

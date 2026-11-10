@@ -478,20 +478,46 @@ def credits(usage):
     return sum((usage.get(k) or 0) * rate for k, rate in RATES.items()) / 1e6
 
 
-def run_credits(run):
-    """Credits of every paid call in a run's trace, a call that failed or a run that wrote no report included. A
-    trace can be read while its run appends to it, so a line that does not parse yet is skipped."""
+def paid_calls(run):
+    """The usage of every paid call in a run's trace, a call that failed or a run that wrote no report included; None
+    for a paid call that reported none. A trace can be read while its run appends to it, so a line that does not
+    parse yet is skipped."""
     import ast
     import harness
-    trace, total = run / 'trace.jsonl', 0.0
+    trace = run / 'trace.jsonl'
     for line in trace.read_text(encoding='utf-8').splitlines() if trace.is_file() else []:
         try:
             event = json.loads(line)
         except ValueError:
             continue
-        usage = event.get('usage')
-        if event.get('status') in harness.PAID_STATUSES and usage:
-            total += credits(usage if isinstance(usage, dict) else ast.literal_eval(usage))
+        if event.get('status') in harness.PAID_STATUSES:
+            usage = event.get('usage')
+            yield (usage if isinstance(usage, dict) else ast.literal_eval(usage)) if usage else None
+
+
+def run_credits(run):
+    """Credits of every paid call in a run's trace."""
+    return sum(credits(usage) for usage in paid_calls(run) if usage)
+
+
+def set_aside(runs, tasks):
+    """What an arm's attempts at these tasks that were set aside as .incomplete-N cost. They were paid for, and a
+    comparison's per-task figures are the kept runs' alone, so it says this beside them. A paid call that reported
+    no usage, or usage without token counts, is counted as unknown, not as zero."""
+    import harness
+    total = {'attempts': 0, 'tokens': 0, 'credits': 0.0, 'calls': 0, 'unknown_calls': 0}
+    for run in sorted(runs.glob('*.incomplete-*')):
+        if not run.is_dir() or task_of(run.name) not in tasks:
+            continue
+        total['attempts'] += 1
+        for usage in paid_calls(run):
+            total['calls'] += 1
+            counts = [usage.get(k) for k in harness.TOKEN_KEYS] if isinstance(usage, dict) else [None]
+            if not all(type(n) is int for n in counts):  # an old or odd trace with a field missing or null, too
+                total['unknown_calls'] += 1
+                continue
+            total['tokens'] += sum(counts)
+            total['credits'] += credits(usage)
     return total
 
 
@@ -962,7 +988,8 @@ def compare_all(out, arms, alpha):
         print('no paired graded tasks')
         return {}
     result = {'arms': [a, b], 'paired': n, 'suspect': suspect,
-              'unpaired': sorted(set(rows[a]) ^ set(rows[b]))}
+              'unpaired': sorted(set(rows[a]) ^ set(rows[b])),
+              'set_aside': {name: set_aside(out / f'runs-{name}', set(paired)) for name in arms}}
     clean = [(x, y) for t, x, y in zip(paired, A, B) if t not in suspect]  # sensitivity: suspect pairs left out
     result['pass_without_suspect'] = {a: sum(x['pass'] for x, _ in clean), b: sum(y['pass'] for _, y in clean),
                                       'paired': len(clean)}
@@ -1003,6 +1030,12 @@ def compare_all(out, arms, alpha):
         x = result[key]
         print(f"{key} per task: {a} {x[a]:,.3f}, {b} {x[b]:,.3f}; {b} - {a} = {x['diff']:+,.3f} "
               f"(95% CI [{x['diff_ci'][0]:+,.3f}, {x['diff_ci'][1]:+,.3f}])")
+    for name in arms:
+        x = result['set_aside'][name]
+        if x['attempts']:
+            unknown = f", {x['unknown_calls']} of them with unknown usage" if x['unknown_calls'] else ''
+            print(f"{name}: {x['attempts']} set-aside attempt{' of these tasks is' if x['attempts'] == 1 else 's of these tasks are'} "
+                  f"not in the per-task figures: {x['tokens']:,} tokens, {x['credits']:.3f} credits, {x['calls']} paid calls{unknown}")
     for name in arms:
         d = result[f'{name}_detail']
         print(f"{name}: statuses {d['statuses']}; stands {len(d['stands'])}; "

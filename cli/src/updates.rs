@@ -369,7 +369,13 @@ fn build(repo: &Path, new: &str, dir: &Path, bin: &Path, install: &Path, cargo: 
         None => return Err("cargo did not start or did not finish in 30 minutes".into()),
     }
     let out = target.join("release").join(bin.file_name().unwrap_or_default());
-    fs::copy(&out, bin).map(|_| ()).map_err(|e| format!("{}: {e}", out.display()))
+    // Copied beside it, then renamed: `bin` being there is what says the version is built, and a copy cut short (a
+    // full disk, a shell that ended) would leave part of a binary for the next shell to install.
+    let part = bin.with_extension(format!("part{}", std::process::id()));
+    fs::copy(&out, &part).and_then(|_| fs::rename(&part, bin)).map_err(|e| {
+        let _ = fs::remove_file(&part);
+        format!("{}: {e}", out.display())
+    })
 }
 
 /// Puts the built `new` where `exe` is (nothing to do when it is there already), renamed into place whole, so a
@@ -382,6 +388,10 @@ pub fn install(exe: &Path, new: &Path) -> Result<(), String> {
     let say = |e: std::io::Error| format!("{} could not be replaced ({e}); {} is the new one", exe.display(), new.display());
     let tmp = exe.with_extension(format!("new{}", std::process::id()));
     fs::copy(new, &tmp).map_err(say)?; // the permissions come with it
+    // Asked onto disk before it takes the old one's place: a rename can outlive a power cut that the copied bytes do
+    // not. Best effort: where the copy cannot be synced (not every filesystem can, nor every handle), the install goes
+    // on as it did before there was a sync, since the copy itself did not fail.
+    let _ = fs::File::open(&tmp).and_then(|f| f.sync_all());
     let old = exe.with_extension("old");
     if cfg!(windows) {
         let _ = fs::remove_file(&old);

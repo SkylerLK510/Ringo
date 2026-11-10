@@ -89,15 +89,20 @@ def valid_price(x):
 
 
 def claude_usage(reply):
-    """Usage from a Claude CLI JSON reply; a malformed usage block counts as zero tokens, the price stays."""
+    """Usage from a Claude CLI JSON reply. Its tokens are measured when the usage block reports input_tokens or
+    output_tokens as a non-negative int (a bool or a float is not one); a field that is not one then counts as zero.
+    Otherwise the tokens are unknown, not zero, so the usage carries no token fields and the call counts as
+    untokened, as a Codex turn without usage does. The price is kept either way."""
     u = reply.get('usage') if isinstance(reply.get('usage'), dict) else {}
     def tokens(key):
         value = u.get(key)
         return value if type(value) is int and value >= 0 else 0
     models = reply.get('modelUsage')
+    usage = {'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
+    if not any(type(u.get(k)) is int and u[k] >= 0 for k in ('input_tokens', 'output_tokens')):
+        return usage  # neither count was reported: unknown, not zero
     return {'input': tokens('input_tokens'), 'cache_write': tokens('cache_creation_input_tokens'),
-            'cache_read': tokens('cache_read_input_tokens'), 'output': tokens('output_tokens'),
-            'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
+            'cache_read': tokens('cache_read_input_tokens'), 'output': tokens('output_tokens'), **usage}
 
 
 def split_command(command):

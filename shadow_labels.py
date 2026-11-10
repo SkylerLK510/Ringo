@@ -106,10 +106,16 @@ def row(run):
 
 
 def runs(paths):
+    """The run folders at or below paths, each once: a run named twice, or under a parent that is named too, is one
+    observation, and counted again it would tighten the exact bound as an independent trial does."""
+    seen = set()
     for path in paths:
         path = Path(path)
         found = [path] if (path / 'report.json').is_file() else sorted(p.parent for p in path.rglob('report.json'))
-        yield from (p for p in found if (p / 'spec.json').is_file())
+        for p in found:
+            if (p / 'spec.json').is_file() and p.resolve() not in seen:
+                seen.add(p.resolve())
+                yield p
 
 
 def summary(rows, alpha):

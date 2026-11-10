@@ -158,6 +158,8 @@ python3 evaluate.py decide --store STORE --digest D      # exit 0 pass, 1 fail o
 - Never prepopulate review, blind-key or grade files: model results need their original ledger seals. Changed
   canary maps invalidate preregistration. The ReviewBench importer skips entire non-text cases and unsupported
   gold locations (line breaks or backticks), recording them in the import ledger's `skipped` list.
+- The cost gates are in dollars. To hold a candidate to a token limit as well, set `max_token_ratio` in the spec or
+  campaign (`1.0`: no more tokens per review than the comparator); it is off unless set, and unknown tokens are inconclusive.
 - Never describe a dev score, a single case, or any decision short of a sealed-test pass as proof that a change works.
 
 ## 5. Improvement campaigns

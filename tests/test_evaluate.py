@@ -91,6 +91,54 @@ class Store:
         return d
 
 
+class TokenLimitTest(unittest.TestCase):
+    @staticmethod
+    def call(candidate_usage):
+        def call(backend, system, message, timeout_s, model=None):
+            text, usage = fake_call(backend, system, message, timeout_s, model)
+            return text, (candidate_usage if usage and backend['argv'][0] == 'good' else usage)
+        return call
+
+    def decided(self, candidate_usage, **over):
+        s = Store()
+        d = ev.freeze(s.dir, s.spec(**over))
+        ev.run(s.dir, d, parallel=4, call_fn=self.call(candidate_usage))
+        ev.grade(s.dir, d, call_fn=fake_call)
+        return ev.score(s.dir, d), ev.decide(s.dir, d)
+
+    def test_tokens_per_review_are_scored_and_a_token_limit_decides(self):
+        more = {**USAGE, 'input': 33}  # 48 tokens a review against the comparator's 16, at the same price
+        report, decision = self.decided(more)
+        self.assertEqual(report['tokens_per_review'], {'cand': 48.0, 'base': 16.0})
+        self.assertEqual(decision, ('pass', []), 'without a limit the dollars decide, as before')
+        _, decision = self.decided(more, max_token_ratio=1.0)
+        self.assertEqual(decision, ('fail', ['tokens vs base: 3.00x (limit 1.00x)']))
+        _, decision = self.decided(dict(USAGE), max_token_ratio=1.0)
+        self.assertEqual(decision, ('pass', []))
+
+    def test_a_call_that_reports_no_tokens_makes_the_arms_tokens_unknown(self):
+        # no token fields (a Codex or Claude reply with no usage), or a backend that reports zero for every field:
+        # either would read as a candidate that uses nothing, and pass any limit
+        for usage in ({'cost_usd': 0.01}, {**dict.fromkeys(USAGE, 0), 'cost_usd': 0.01}):
+            with self.subTest(usage=usage):
+                report, decision = self.decided(usage, max_token_ratio=1.0)
+                self.assertEqual(report['tokens_per_review'], {'cand': None, 'base': 16.0})
+                self.assertEqual(decision, ('inconclusive', ['tokens vs base unknown']))
+
+
+class FrozenGradingTest(unittest.TestCase):
+    def test_grading_cannot_be_given_another_time_limit_than_the_frozen_one(self):
+        s = Store(groups=1, fractions=(1, 0, 0))
+        d = ev.freeze(s.dir, s.spec(split='dev', runs=1, graders=['grader-claude'], grade_timeout_s=1800))
+        ev.run(s.dir, d, call_fn=fake_call)
+        seen = []
+        with self.assertRaises(TypeError):  # the limit is part of what was preregistered
+            ev.grade(s.dir, d, call_fn=fake_call, timeout_s=1)
+        ev.grade(s.dir, d, call_fn=lambda backend, system, message, timeout_s, model=None:
+                 seen.append(timeout_s) or fake_call(backend, system, message, timeout_s, model))
+        self.assertEqual(set(seen), {1800})
+
+
 class LedgerAndSplitTest(unittest.TestCase):
     def test_deleting_or_emptying_the_whole_ledger_is_detected_by_its_head(self):
         for remove in (False, True):

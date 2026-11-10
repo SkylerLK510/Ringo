@@ -277,19 +277,24 @@ pub fn valid_price(x: &Value) -> Option<Num> {
     ok.then_some(n)
 }
 
-/// Usage from a Claude CLI JSON reply; a malformed usage block counts as zero tokens, the price stays.
+/// Usage from a Claude CLI JSON reply. Its tokens are measured when the usage block reports input_tokens or
+/// output_tokens as a non-negative int (a bool or a float is not one); a field that is not one then counts as zero.
+/// Otherwise the tokens are unknown, not zero, so the usage carries no token fields and the call counts as
+/// untokened, as a Codex turn without usage does. The price is kept either way.
 pub fn claude_usage(reply: &Map<String, Value>) -> Map<String, Value> {
     let empty = Map::new();
     let u = match reply.get("usage") {
         Some(Value::Object(m)) => m,
         _ => &empty,
     };
-    let tokens = |key: &str| match u.get(key) {
+    // A field that holds a count (`type(value) is int and value >= 0`), read off the number's text.
+    let count = |key: &str| match u.get(key) {
         Some(v @ Value::Number(n)) if !py::is_float_text(n.as_str()) && (!n.as_str().starts_with('-') || n.as_str() == "-0") => {
-            v.clone()
+            Some(v)
         }
-        _ => Value::from(0),
+        _ => None,
     };
+    let tokens = |key: &str| count(key).cloned().unwrap_or_else(|| Value::from(0));
     let models = match reply.get("modelUsage") {
         Some(Value::Object(m)) => {
             let mut keys: Vec<&String> = m.keys().collect();
@@ -299,10 +304,12 @@ pub fn claude_usage(reply: &Map<String, Value>) -> Map<String, Value> {
         _ => vec![],
     };
     let mut out = Map::new();
-    out.insert("input".into(), tokens("input_tokens"));
-    out.insert("cache_write".into(), tokens("cache_creation_input_tokens"));
-    out.insert("cache_read".into(), tokens("cache_read_input_tokens"));
-    out.insert("output".into(), tokens("output_tokens"));
+    if count("input_tokens").is_some() || count("output_tokens").is_some() {
+        out.insert("input".into(), tokens("input_tokens"));
+        out.insert("cache_write".into(), tokens("cache_creation_input_tokens"));
+        out.insert("cache_read".into(), tokens("cache_read_input_tokens"));
+        out.insert("output".into(), tokens("output_tokens"));
+    }
     out.insert("cost_usd".into(), reply.get("total_cost_usd").cloned().unwrap_or(Value::Null));
     out.insert("models".into(), Value::Array(models));
     out

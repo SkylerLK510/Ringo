@@ -752,6 +752,13 @@ class PipelineTest(Fixture):
         out = self.research(self.good(), self.answer('E1', 'E2'))
         self.assertIn('E2, which is not verified evidence', out.report)
 
+    def test_a_rejected_reply_cannot_send_control_characters_to_the_terminal(self):
+        # the writer's own strings are named in the reason, which is printed: an escape sequence in one drove the terminal
+        out = self.research(self.good(), self.answer('E1', '\x1b]0;owned\x07E9\u202e'))
+        self.assertEqual((out.code, out.summary['outcome']), (1, 'write_rejected'))
+        self.assertIn('\\x1b]0;owned\\x07E9\\u202e, which is not verified evidence', out.stderr)
+        self.assertFalse(set(out.stderr) & {'\x1b', '\x07', '\u202e'}, repr(out.stderr))
+
     def test_a_failed_write_call_offers_the_evidence_after_two_calls(self):
         out = self.research(self.good(), self.answer(), env={'FAKE_FAIL_WRITE': '1'})
         self.assertEqual((out.code, out.summary['outcome'], out.summary['calls'], len(out.calls)), (1, 'write_failed', 2, 2))

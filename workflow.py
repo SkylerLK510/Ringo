@@ -455,7 +455,7 @@ def write_files(root, files):
     for name, text in files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding='utf-8')
+        path.write_text(text, encoding='utf-8', newline='')  # the exact text, on every OS (evaluate reads it back)
 
 
 def bridge(spec, request, timeout):
@@ -726,10 +726,12 @@ def run(spec_path, out, call_fn=harness.call):
             observed = checks(spec, root, folder, remaining)
             # Checks may execute candidate code. Refuse changed/symlinked submitted
             # files or fixtures, including mutations that would falsify a test pass.
+            # The bytes are compared: read as text, a file with a carriage return came back with its line ends
+            # changed, and the file as written counted as mutated.
             for name, original in expected.items():
                 path = root / name
                 if any(p.is_symlink() for p in [path, *path.parents] if p != root.parent) \
-                        or not path.is_file() or path.read_text(encoding='utf-8') != original:
+                        or not path.is_file() or path.read_bytes().decode('utf-8') != original:
                     raise ValueError('a check mutated a submitted file or protected fixture')
             result = None
             if spec_suite and all(c['status'] == 'pass' for c in observed):

@@ -144,7 +144,8 @@ them with owner-only permissions.
 | `ringo` (the shell) | A full-screen session for working with several agents and running Ringo's pipelines |
 
 Run the commands with `python3 ringo.py COMMAND`, or with the `ringo` binary (`cargo install --path cli`), which
-takes the same commands. The binary doesn't run `research` yet.
+takes the same commands. `review`, `design` and `work` can run natively in the binary; `research` runs through the
+Python runtime from either.
 
 ```sh
 python3 ringo.py --help
@@ -390,7 +391,8 @@ reused. The [experiments log](docs/EXPERIMENTS.md) has the method, every study, 
 we rejected.
 
 **The current adoption rule:** a change is adopted only if it uses no more tokens than what it replaces. Cheaper
-credits do not justify more tokens.
+credits do not justify more tokens. An evaluation or improvement campaign enforces it only when its spec sets
+`max_token_ratio` (see the [harness guide](docs/HARNESS.md)): the evaluator's own cost gates are in dollars.
 
 ### Results at a glance
 

@@ -58,7 +58,10 @@ CAMPAIGN_DEFAULTS = {'backend': 'claude', 'proposer': 'claude', 'graders': ['cla
                      'dev_runs': 1, 'validation_runs': 2, 'max_prompt_growth': 1.25,
                      'allowance': [1.1, 0.4], 'budget_usd': 50, 'min_groups': 10, 'margins': {'U': 0.5, 'W': 0.25},
                      'bootstrap': 2000, 'seed': 1, 'unpriced_call_usd': None, 'allow_tool_backends': False,
-                     'timeout_s': harness.TIMEOUT_S, 'grade_timeout_s': 1800, 'proposer_timeout_s': harness.TIMEOUT_S}
+                     'timeout_s': harness.TIMEOUT_S, 'grade_timeout_s': 1800, 'proposer_timeout_s': harness.TIMEOUT_S,
+                     # the most tokens a candidate's reviews may use, as a ratio of the incumbent's (None: no limit); see
+                     # evaluate.SPEC_DEFAULTS
+                     'max_token_ratio': None}
 CONTROL_PROMPTS = {'grade.md', 'improve.md'}
 NGRAM = 8  # a proposal may not share any run of this many words with a dev answer key
 
@@ -93,6 +96,8 @@ def load_campaign(path):
         raise ValueError('set unpriced_call_usd in the campaign: every backend can have an attempt with no reported cost')
     if type(camp['allow_tool_backends']) is not bool:
         raise ValueError('allow_tool_backends must be a bool')
+    if not evaluate.token_limit(camp['max_token_ratio']):
+        raise ValueError('max_token_ratio must be a finite number above zero, or null for no limit')
     harness.check_backends([camp['backend'], camp['proposer'], *camp['graders']], camp['allow_tool_backends'])
     for key in ('timeout_s', 'grade_timeout_s', 'proposer_timeout_s'):
         if harness.valid_price(camp[key]) is None or camp[key] <= 0:
@@ -305,7 +310,8 @@ def experiment(store, ws, name, arms, split, camp, comparators=(), runs=1, sampl
             'allow_tool_backends': camp['allow_tool_backends'], 'grading_reserve_usd': grading_reserve,
             'timeout_s': camp['timeout_s'], 'grade_timeout_s': camp['grade_timeout_s'],
             'comparators': list(comparators), 'graders': camp['graders'], 'runs': runs, 'min_groups': camp['min_groups'],
-            'margins': camp['margins'], 'bootstrap': camp['bootstrap'], 'seed': camp['seed'], 'sample': sample}
+            'margins': camp['margins'], 'bootstrap': camp['bootstrap'], 'seed': camp['seed'], 'sample': sample,
+            'max_token_ratio': camp['max_token_ratio']}
     path = Path(ws) / 'specs' / f'{name}.json'
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(spec, indent=1), encoding='utf-8')
@@ -346,7 +352,8 @@ def campaign(store, campaign_path, ws, call_fn=harness.call):
     for name in [camp['backend'], camp['proposer'], *camp['graders']]:
         evaluate.identity(name, store)
     evaluate.check_policy({'split': 'validation', 'objective': 'quality', 'margins': camp['margins'],
-                           'max_cost_ratio': evaluate.SPEC_DEFAULTS['max_cost_ratio'], 'bootstrap': camp['bootstrap']},
+                           'max_cost_ratio': evaluate.SPEC_DEFAULTS['max_cost_ratio'], 'bootstrap': camp['bootstrap'],
+                           'max_token_ratio': camp['max_token_ratio']},
                           evaluate.policy(store), evaluate.alpha(store, 'validation'))
     pool = evaluate.cases(store)
     for part, selection in [('dev', {'sample': camp['dev_sample'], 'seed': camp['seed']}), ('validation', None)]:
@@ -476,6 +483,15 @@ def _campaign(store, camp, ws, call_fn):
             if len(gains) != len(camp['graders']) or not all(x['boot_lower'] > 0 for x in gains) or ratio is None or ratio > limit:
                 log.append({**entry, 'result': 'rejected', 'why': ['no clear dev gain within the cost allowance'], 'dev': dev})
                 continue
+            if camp['max_token_ratio'] is not None:
+                # Measured, where the cost allowance cannot see it: at one price per call, more tokens cost the same.
+                tokens = rep.get('tokens_per_review') or {}
+                used = evaluate.cost_ratio(tokens.get('cand'), tokens.get('inc'))
+                dev['token_ratio'] = None if used is None else round(used, 3) if math.isfinite(used) else 'inf'
+                if used is None or used > camp['max_token_ratio']:
+                    log.append({**entry, 'result': 'rejected', 'dev': dev, 'why': [
+                        f"its reviews use more tokens than {camp['max_token_ratio']}x the incumbent's, or their tokens are unknown"]})
+                    continue
             try:
                 estimate, reserve = estimated_experiment(store, d, len(evaluate.split_cases(store, 'validation')), 2, camp['validation_runs'])
                 if left() < estimate:

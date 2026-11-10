@@ -824,6 +824,19 @@ fn claude_usage_matches_python() {
         reply.push('}');
         cases.push(v(&reply));
     }
+    // input_tokens and output_tokens decide together whether the tokens are known: every pair of values, absent too
+    let values: Vec<Option<&str>> = std::iter::once(None).chain(tokens.iter().copied().map(Some)).collect();
+    for input in &values {
+        for output in &values {
+            let mut usage = String::from("\"cache_read_input_tokens\":9");
+            for (key, value) in [("input_tokens", input), ("output_tokens", output)] {
+                if let Some(value) = value {
+                    usage += &format!(",\"{key}\":{value}");
+                }
+            }
+            cases.push(v(&format!("{{\"usage\":{{{usage}}},\"total_cost_usd\":0.02}}")));
+        }
+    }
     let py = python("claude_usage", &cases);
     let rs: Vec<String> =
         cases.iter().map(|c| pyjson::dumps(&Value::Object(h::claude_usage(c.as_object().unwrap())))).collect();

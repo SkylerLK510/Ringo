@@ -1031,6 +1031,15 @@ impl Session {
         // a shell before records were handed on has none: its conversations go on as they did
         let records: Vec<(String, u64, String)> = serde_json::from_value(kept["records"].clone()).unwrap_or_default();
         self.resume(&list("threads"), &list("told"), &records);
+        // The running total each conversation had reported, so its next turn here counts only what it adds: without
+        // it a resumed Codex or agy turn was counted with all of its conversation's usage again. A shell before these
+        // were kept has none, and its first resumed turn is counted as before.
+        let totals: Vec<(String, String, [u64; 4])> = serde_json::from_value(kept["usage"].clone()).unwrap_or_default();
+        for (name, thread, [input, cache_write, cache_read, output]) in totals {
+            if let Some(agent) = Agent::from_name(&name).filter(|a| self.threads.get(a) == Some(&thread)) {
+                self.usage_so_far.insert((agent, thread), Tokens { input, cache_write, cache_read, output });
+            }
+        }
         self.source = Some(path.to_path_buf());
         self.about = kept["about"].as_str().unwrap_or_default().to_string();
         self.separate = kept["separate"].as_bool().unwrap_or(false);
@@ -1046,8 +1055,13 @@ impl Session {
         let about = self.jobs.iter().rev().find(|j| matches!(j.kind, Kind::Agent { .. })).map_or(self.about.clone(), |j| j.title.clone());
         let saved = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let reached: Vec<&str> = Agent::all().into_iter().filter(|&a| self.reached(a, self.jobs.len() + 1)).map(|a| a.name()).collect();
+        // each conversation's running total (see `go_on`), for the conversations handed on only
+        let mut usage: Vec<(&str, &str, [u64; 4])> = self.usage_so_far.iter()
+            .filter(|((agent, thread), _)| self.threads.get(agent) == Some(thread))
+            .map(|((agent, thread), t)| (agent.name(), thread.as_str(), [t.input, t.cache_write, t.cache_read, t.output])).collect();
+        usage.sort();
         let kept = serde_json::json!({"threads": self.threads(), "told": self.carry(), "records": self.carry_record(),
-                                      "separate": self.separate, "reached": reached,
+                                      "separate": self.separate, "reached": reached, "usage": usage,
                                       "conversation": conversation, "folder": self.repo, "about": about, "saved": saved});
         let (path, part) = (self.dir.join(KEPT), self.dir.join(format!("{KEPT}.part")));
         // written whole, then renamed: a crash mid-write leaves the last one
@@ -1485,7 +1499,8 @@ impl Session {
         let mut cmd = Command::new(self.program(agent));
         let mut resume = if write { None } else { self.threads.get(&agent).cloned() };
         let mut sent = prompt.to_string();
-        let heard = self.heard.get(&agent).cloned(); // put back if the turn never starts (see the handoff)
+        // put back if the turn never starts: what the handoff took as heard, and the turns before a restart it took as told
+        let (heard, untold) = (self.heard.get(&agent).cloned(), self.told.get(&agent).cloned());
         let connectors = prompt.trim() != "/compact"
             && (names_connector(prompt) || (!write && self.reached(agent, id)));
         if !write {
@@ -1742,6 +1757,9 @@ impl Session {
                 Some(heard) => self.heard.insert(agent, heard),
                 None => self.heard.remove(&agent),
             };
+            if let Some(untold) = untold {
+                self.told.insert(agent, untold);
+            }
             return Err(e);
         }
         Ok(id)
@@ -2722,15 +2740,18 @@ fn claude_window(kind: &str) -> String {
 pub fn claude_plan(r: &serde_json::Value) -> Plan {
     let mut plan = Plan { name: r["subscription_type"].as_str().unwrap_or("").to_string(), ..Plan::default() };
     let limits = r.pointer("/rate_limits/limits").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+    // A window with no figure for how much is used is left out (here and in the readers below): shown as 0% it would
+    // read as a limit with all of its room left.
     for l in &limits {
-        plan.windows.push(Window { name: claude_window(l["kind"].as_str().unwrap_or("")), percent: l["percent"].as_f64().unwrap_or(0.0),
-                                   resets: l["resets_at"].as_str().and_then(iso_secs) });
+        if let Some(percent) = l["percent"].as_f64() {
+            plan.windows.push(Window { name: claude_window(l["kind"].as_str().unwrap_or("")), percent,
+                                       resets: l["resets_at"].as_str().and_then(iso_secs) });
+        }
     }
     if limits.is_empty() {
         for key in ["five_hour", "seven_day"] {
-            if let Some(w) = r["rate_limits"].get(key).filter(|w| w.is_object()) {
-                plan.windows.push(Window { name: claude_window(key), percent: w["utilization"].as_f64().unwrap_or(0.0),
-                                           resets: w["resets_at"].as_str().and_then(iso_secs) });
+            if let Some((w, percent)) = r["rate_limits"].get(key).and_then(|w| Some((w, w["utilization"].as_f64()?))) {
+                plan.windows.push(Window { name: claude_window(key), percent, resets: w["resets_at"].as_str().and_then(iso_secs) });
             }
         }
     }
@@ -2744,9 +2765,9 @@ pub fn claude_plan(r: &serde_json::Value) -> Plan {
 pub fn claude_plan_from_event(info: &serde_json::Value) -> Plan {
     let mut plan = Plan::default();
     for key in ["five_hour", "seven_day"] {
-        if let Some(w) = info.pointer(&format!("/unifiedWindows/{key}")).filter(|w| w.is_object()) {
-            plan.windows.push(Window { name: claude_window(key), percent: w["utilization"].as_f64().unwrap_or(0.0) * 100.0,
-                                       resets: w["resetsAt"].as_u64() });
+        let window = info.pointer(&format!("/unifiedWindows/{key}")).and_then(|w| Some((w, w["utilization"].as_f64()?)));
+        if let Some((w, used)) = window {
+            plan.windows.push(Window { name: claude_window(key), percent: used * 100.0, resets: w["resetsAt"].as_u64() });
         }
     }
     plan
@@ -2758,9 +2779,7 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
     let mut plan = Plan { name: limits["planType"].as_str().unwrap_or("").to_string(), ..Plan::default() };
     for key in ["primary", "secondary"] {
         let w = &limits[key];
-        if !w.is_object() {
-            continue;
-        }
+        let Some(percent) = w["usedPercent"].as_f64() else { continue };
         let name = match w["windowDurationMins"].as_u64() {
             Some(300) => "5 hours".to_string(),
             Some(10_080) => "week".to_string(),
@@ -2768,7 +2787,7 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
             Some(m) => format!("{} hours", m / 60),
             None => key.to_string(),
         };
-        plan.windows.push(Window { name, percent: w["usedPercent"].as_f64().unwrap_or(0.0), resets: w["resetsAt"].as_u64() });
+        plan.windows.push(Window { name, percent, resets: w["resetsAt"].as_u64() });
     }
     if let Some(n) = r.pointer("/rateLimitResetCredits/availableCount").and_then(|n| n.as_u64()).filter(|n| *n > 0) {
         plan.notes.push(format!("{n} full reset{} left", if n == 1 { "" } else { "s" }));
@@ -2826,6 +2845,13 @@ mod tests {
         assert_eq!(plan.name, "plus");
         assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 41.0), ("week", 34.0)]);
         assert_eq!(plan.notes, ["2 full resets left"]);
+        // a window with no figure for how much is used is left out: unknown is not 0% used
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(claude_plan(&json(r#"{"rate_limits": {"limits": [{"kind": "session"}, {"kind": "weekly_all", "percent": 59}]}}"#))
+                       .windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["week"]);
+        assert!(claude_plan(&json(r#"{"rate_limits": {"five_hour": {"resets_at": "2026-11-02T04:30:00+00:00"}}}"#)).windows.is_empty());
+        assert!(claude_plan_from_event(&json(r#"{"unifiedWindows": {"five_hour": {"resetsAt": 1793332800}}}"#)).windows.is_empty());
+        assert!(codex_plan(&json(r#"{"rateLimits": {"primary": {"usedPercent": null, "windowDurationMins": 300}}}"#)).windows.is_empty());
     }
 
     #[test]

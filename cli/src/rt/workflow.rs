@@ -2176,12 +2176,13 @@ impl Work<'_> {
         write_files(&root, &expected)?;
         let observed = checks(&self.spec, &root, folder, &|| self.remaining())?;
         // Checks may execute candidate code. Refuse changed/symlinked submitted files or fixtures, including
-        // mutations that would falsify a test pass.
+        // mutations that would falsify a test pass. The bytes are compared: read as text, a file with a carriage
+        // return came back with its line ends changed, and the file as written counted as mutated.
         let above = root.parent().map(Path::to_path_buf);
         for (name, original) in &expected {
             let path = root.join(name);
             let linked = path.ancestors().filter(|p| Some(p.to_path_buf()) != above).any(|p| p.is_symlink());
-            if linked || !path.is_file() || Value::String(py::read_text(&path)?) != *original {
+            if linked || !path.is_file() || Value::String(py::read_exact_text(&path)?) != *original {
                 return Err(Error::value("a check mutated a submitted file or protected fixture"));
             }
         }
