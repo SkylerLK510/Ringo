@@ -202,6 +202,8 @@ one run each:
 |---------------------------|-------|------|--------|---------------|
 | "Talk this over with codex, among yourselves" | 2 | 1:46 | 155.4k | Claude looked for a way to run Codex itself, reported that it could not reach it, and gave no view of its own; Codex replied AGREED |
 | "I want you and codex to talk this over ... Your reply is shown to them and theirs come back to you here" | 3 | 0:32 | 90.0k | Claude gave its view; Codex read the files, agreed on one point and differed on another with its reason; Claude replied AGREED |
+| the same, Claude and agy (agy 1.5.5), agy told where the whole record is | 2 | 0:41 | 117.0k | agy read the project's files, then opened the record, which is outside its folder: its turn ended with no reply, 82.5k tokens in |
+| the same, agy not told where it is | 4 | 1:40 | 165.2k | agy agreed and added a point; Claude differed on it with its reason; agy replied AGREED |
 
 The first wording was dropped: an agent told to talk to another, and not told that its words are carried, goes
 looking for the other. The second is what ships. A talk is about 30k tokens a turn here, most of it each agent
@@ -210,8 +212,14 @@ reading the files for itself: it is the cost of asking each agent, without the t
 While they talk, `/separate` and taking a talker away (`/agent remove`) are refused, and `/clear` ends the talk with
 the turn then running: the conversation they talked in is gone.
 
-Not done: an agent cannot ask another on its own in the middle of a turn; a talk under way is not kept across
-`/restart`; agy has not been checked in a talk.
+agy takes part as the others do, since the third run above. Every agent that goes on in the shared conversation is
+told where the whole record of the turns it missed is kept. That file is in Ringo's state folder, and a read agy has
+no permission for ends its turn (the others are refused such a read and go on). So agy is no longer told where it
+is: it gets the record itself, as before, and nothing to open. This holds for any turn of agy's after another
+agent's, not only in a talk.
+
+Not done: an agent cannot ask another on its own in the middle of a turn. A talk under way ends with the shell: it is
+not kept across `/restart`.
 
 ### A message while it works
 

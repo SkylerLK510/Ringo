@@ -1379,9 +1379,15 @@ impl Session {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
+            // agy is not told where the whole record is: it is outside its folder, and a read agy has no permission
+            // for ends its turn with no reply (live, 11/10: it read the project's files, opened record.md and stopped,
+            // 82.5k tokens in). The others are refused such a read and go on, or may make it.
+            let whole_at = match agent.spec().adapter {
+                Adapter::Agy => String::new(),
+                _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
+            };
             let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
-                                and can be wrong; the files here are the truth). The whole record, uncut, is in {}.\n\n{}\n\n",
-                               self.jobs[id - 1].dir.join("record.md").display(), record.trim_end());
+                                and can be wrong; the files here are the truth).{whole_at}\n\n{}\n\n", record.trim_end());
             let about = text.len() as u64 / 4; // the owner's message goes either way
             let ids: Vec<usize> = turns.iter().map(|j| j.id).collect();
             (!fresh || resume.is_none() || about * 2 <= fills).then_some((fresh, text, about, span, whole, ids))

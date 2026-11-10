@@ -1925,3 +1925,24 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
     let names: Vec<&str> = kept["custom"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
     assert_eq!(names, ["own-skilled", "own-codex"]);
 }
+
+/// agy hears what the others did as any agent does, but is not pointed at the whole record: that file is outside its
+/// folder, and a read it has no permission for ends its turn with no reply. Codex, which can open it, still is.
+#[test]
+fn agy_is_not_sent_to_a_file_it_cannot_open() {
+    let r = repo("agy-record");
+    let codex = fake(&root(), "codex-agy-record", &codex_script("", &codex_done("all done", (1, 0, 1))));
+    let agy = fake(&root(), "agy-record", "#!/bin/sh\ncat > \"$0.stdin\"\n\
+        echo '{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{\"cwd\":\"x\"}}'\n\
+        echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"fine by me\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}'\n");
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("agy"), agy.clone());
+    for (name, task) in [("codex", "look at a.txt"), ("agy", "and you?"), ("codex", "so?")] {
+        let id = s.launch_agent(agent(name), false, task).unwrap();
+        assert_eq!(wait(&mut s, id), Status::Done);
+    }
+    let heard = fs::read_to_string(format!("{}.stdin", agy.display())).unwrap();
+    assert!(heard.contains("codex: all done") && heard.contains("and you?") && !heard.contains("record.md"), "{heard}");
+    let heard = turn_text(&codex);
+    assert!(heard.contains("agy: fine by me") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
+}
