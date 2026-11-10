@@ -85,32 +85,67 @@ pub fn home_path(path: &str) -> PathBuf {
 /// The most a specialist's instructions may hold: they are read on every call of its turns (about 100k tokens here).
 pub const INSTRUCTIONS_MAX: usize = 400_000;
 
+/// A specialist's file as it stands now: its standing instructions, and what its opening `---` block says of the
+/// model it runs on and the tools it uses, as an agent file made for Claude Code has them.
+#[derive(Debug, Default, PartialEq)]
+pub struct OwnFile {
+    pub text: Vec<u8>,
+    /// `model:` (not `inherit`): the model its turns run on, unless the owner chose one with /model.
+    pub model: Option<String>,
+    /// `tools:` the built-in tools it is offered, and no others (a connector's tools are not Ringo's to offer).
+    pub tools: Vec<String>,
+}
+
 /// A specialist's standing instructions (`Spec::instructions`), read anew for each turn, so an edit applies at the
 /// next one: the file's text without a leading `---` block (a Claude Code agent file opens with its name and
 /// description there). An agent that has none: None. A file that cannot be read, holds nothing or is too large is an
 /// error, never a turn without them: that turn would not be this agent's.
 pub fn instructions(spec: &Spec) -> Result<Option<Vec<u8>>, String> {
+    own_file(spec).map(|file| file.map(|f| f.text))
+}
+
+/// `instructions`, with what the file's opening block says of its model and tools.
+pub fn own_file(spec: &Spec) -> Result<Option<OwnFile>, String> {
     let Some(path) = &spec.instructions else { return Ok(None) };
     let file = home_path(path);
     let bytes = fs::read(&file).map_err(|e| format!("{}'s instructions could not be read ({}: {e})", spec.name, file.display()))?;
-    let mut body = &bytes[..];
+    let (mut body, mut head) = (&bytes[..], &bytes[..0]);
     if let Some(rest) = bytes.strip_prefix(b"---\n").or_else(|| bytes.strip_prefix(b"---\r\n")) {
         let mut at = 0;
         for line in rest.split_inclusive(|b| *b == b'\n') {
-            at += line.len();
             if line.trim_ascii_end() == b"---" {
-                body = &rest[at..];
+                (head, body) = (&rest[..at], &rest[at + line.len()..]);
                 break;
             }
+            at += line.len();
         }
     }
     let body = body.trim_ascii();
     match body.len() {
-        0 => Err(format!("{}'s instructions file has no text in it ({})", spec.name, file.display())),
-        n if n > INSTRUCTIONS_MAX => Err(format!("{}'s instructions are {n} bytes, and they are read on every call: keep them \
-                                                  under {INSTRUCTIONS_MAX} ({})", spec.name, file.display())),
-        _ => Ok(Some(body.to_vec())),
+        0 => return Err(format!("{}'s instructions file has no text in it ({})", spec.name, file.display())),
+        n if n > INSTRUCTIONS_MAX => return Err(format!("{}'s instructions are {n} bytes, and they are read on every call: \
+                                                         keep them under {INSTRUCTIONS_MAX} ({})", spec.name, file.display())),
+        _ => {}
     }
+    // The block's `model:` and `tools:` lines, the two that change how a turn runs. A value is one line, or for the
+    // tools a list: `tools: Read, Grep`, `tools: [Read, Grep]`, or `- Read` lines under it.
+    let bare = |v: &str| v.trim().trim_matches(['"', '\'']).trim().to_string();
+    let (mut model, mut tools, mut listing) = (None, Vec::new(), false);
+    for line in String::from_utf8_lossy(head).lines() {
+        if let Some(item) = line.trim_start().strip_prefix('-').filter(|_| listing) {
+            tools.push(bare(item));
+        } else if let Some(value) = line.strip_prefix("model:") {
+            listing = false;
+            model = Some(bare(value)).filter(|m| m != "inherit" && valid_model(m));
+        } else if let Some(value) = line.strip_prefix("tools:") {
+            listing = value.trim().is_empty();
+            tools = value.trim().trim_matches(['[', ']']).split(',').map(bare).collect();
+        } else if !line.trim().is_empty() {
+            listing = false;
+        }
+    }
+    tools.retain(|t| !t.is_empty() && !t.starts_with("mcp__") && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    Ok(Some(OwnFile { text: body.to_vec(), model, tools }))
 }
 
 /// A name that can be a program on PATH and go into a command line: letters, digits, `-`, `_`, `.`.
@@ -1562,7 +1597,10 @@ impl Session {
         // A turn in the owner's folder edits it, unless in read mode; a write turn edits its own copy.
         let edits = write || self.mode != Mode::Read;
         // a specialist of the owner's: what makes it one, or no turn at all
-        let own = instructions(spec)?;
+        let (own, own_model, own_tools) = match own_file(spec)? {
+            Some(file) => (Some(file.text), file.model, file.tools),
+            None => (None, None, Vec::new()),
+        };
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
         let _ = fs::write(dir.join("prompt.txt"), prompt);
@@ -1784,9 +1822,15 @@ impl Session {
                         cmd.arg("--allowedTools").args(&self.allowed);
                     }
                 }
-                // the owner's choice of model (/model): an alias or a full name, as Claude Code's --model takes it
-                if let Some(model) = self.models.get(&agent) {
+                // the owner's choice of model (/model): an alias or a full name, as Claude Code's --model takes it.
+                // With none, a specialist runs on the model its file names, as it does in Claude Code.
+                if let Some(model) = self.models.get(&agent).or(own_model.as_ref()) {
                     cmd.args(["--model", model]);
+                }
+                // A specialist's file may list the tools it uses: Claude Code then offers it those of its own and no
+                // others. It can only narrow: what this mode denies above stays denied.
+                if !own_tools.is_empty() {
+                    cmd.arg("--tools").arg(own_tools.join(","));
                 }
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", effort]);

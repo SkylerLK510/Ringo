@@ -112,6 +112,12 @@ How the instructions reach the model, each turn:
   project's `CLAUDE.md` or `AGENTS.md`. The turn stays in safe mode, as lean as any other.
 - **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
   turns they stand in for any `developer_instructions` in your Codex settings.
+- **The file's `model` and `tools` lines (Claude only):** an agent file made for Claude Code can name both in its
+  opening block. The model is the one the specialist runs on unless you chose one with `/model` (`inherit` means
+  the agent's own). The tools listed are the only built-in tools it is offered (`--tools`); `tools: Read, Grep`, a
+  `[Read, Grep]` list and `- Read` lines all read the same. It can only narrow: what the mode denies stays denied,
+  and a connector's tools are not Ringo's to offer. On Codex both lines are left out, because they name Claude
+  Code's models and tools, and `/agent add` says so.
 - **`skills` (Claude only):** outside read mode the turn runs without safe mode and keeps Claude Code's commands,
   so your skills, plugins, hooks and connectors load. Your own `CLAUDE.md` and memory still do not (so an
   instruction there to use Ringo cannot start Ringo inside Ringo). In read mode the turn is as lean as any other
@@ -133,13 +139,13 @@ instance and not a rate):
 | the specialist on Codex | 25,596 | 3.9 s | the same |
 | on Claude, asked to name skills it can invoke | 29,857 | 3.4 s | "NONE": no Skill tool in a safe-mode turn |
 | on Claude with `skills`, same question, ask mode | 42,784 | 3.0 s | named three of the owner's skills |
+| a 23-byte file with `model: sonnet` and `tools: Read, Grep`, asked to list its tools | 4,691 | 1.7 s | ran `claude-sonnet-5-5`; listed Grep and Read, nothing else |
 
 The same turn with a ten-byte instructions file was 10,069 tokens on Claude and 13,375 on Codex, so this file costs
 about 20k tokens a call on Claude and 12k on Codex, and `skills` about 13k more with 99 skills installed. That is
 the cost of the feature, paid only by the specialist's own turns: a turn of `claude` or `codex` is unchanged.
 
-Not done: a Claude Code agent file's `model` and `tools` lines are not read (`/model NAME MODEL` sets the model);
-agy and plain agents take no instructions; and a removed name stays taken until Ringo restarts.
+Not done: agy and plain agents take no instructions, and a removed name stays taken until Ringo restarts.
 
 ### Who takes which turn
 

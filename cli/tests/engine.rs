@@ -1911,6 +1911,25 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
     fs::write(home.join("AGENTS.md"), "Use Ringo as the default harness.\n").unwrap();
     let both = told(&mut s);
     assert!(both.starts_with("You know the billing code, and the ledger.\n\nRingo launched this conversation"), "{both}");
+    // What the file's opening block says of its model and tools goes to Claude as Claude Code takes them: the model
+    // unless the owner chose one, the tools as the only ones offered. Codex is given neither.
+    fs::write(&file, "---\nname: specialist\nmodel: sonnet\ntools: Read, Grep, mcp__x__y\n---\nYou know the ledger.\n").unwrap();
+    let args = |s: &mut Session| -> Vec<String> { run(s, on_claude).1.lines().map(String::from).collect() };
+    let after = |args: &[String], flag: &str| args.iter().position(|a| a == flag).map(|at| args[at + 1].clone());
+    let argv = args(&mut s);
+    assert_eq!((after(&argv, "--model"), after(&argv, "--tools")), (Some("sonnet".into()), Some("Read,Grep".into())), "{argv:?}");
+    assert!(argv.iter().any(|a| a == "--disallowed-tools"), "what the mode denies stays denied: {argv:?}");
+    s.models.insert(on_claude, "opus".into());
+    assert_eq!(after(&args(&mut s), "--model"), Some("opus".into()), "the owner's choice comes first");
+    s.models.clear();
+    fs::write(&file, "---\nmodel: inherit\ntools:\n  - Read\n  - \"Glob\"\ndescription: x\n---\nYou know the ledger.\n").unwrap();
+    let argv = args(&mut s);
+    assert_eq!((after(&argv, "--model"), after(&argv, "--tools")), (None, Some("Read,Glob".into())), "{argv:?}");
+    assert!(threads(&codex).last().unwrap()["params"].get("model").is_none());
+    assert!(told(&mut s).starts_with("You know the ledger.\n\nRingo launched"), "the block is not part of its text");
+    assert!(threads(&codex).last().unwrap()["params"].get("model").is_none(), "a Claude Code model is not Codex's");
+    fs::write(&file, "You know the billing code, and the ledger.\n").unwrap();
+    assert_eq!((after(&args(&mut s), "--model"), after(&args(&mut s), "--tools")), (None, None), "no block, nothing added");
     // no instructions, no turn: a turn without them would not be this agent's
     let jobs = s.jobs.len();
     fs::write(&file, "---\nname: specialist\n---\n \n").unwrap();

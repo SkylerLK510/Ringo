@@ -2336,7 +2336,16 @@ impl App {
         let entry = serde_json::json!({"name": name, "adapter": adapter, "program": base.spec().program, "read": true,
                                        "company": format!("your own, on {}", base.name()), "login": base.spec().login,
                                        "instructions": path, "skills": skills});
-        let size = ringo_cli::instructions(&ringo_cli::Spec::from_json(&entry, true)?)?.map_or(0, |text| text.len());
+        let file = ringo_cli::own_file(&ringo_cli::Spec::from_json(&entry, true)?)?.unwrap_or_default();
+        let size = file.text.len();
+        // what the file's opening lines say of its model and tools is Claude Code's, and goes to Claude alone
+        let lines = match (&file.model, file.tools.len(), adapter) {
+            (None, 0, _) => String::new(),
+            (_, _, "codex") => ". Its file's model and tools lines are Claude Code's, and codex goes without them".into(),
+            (model, tools, _) => format!(". From its file: {}", [model.as_ref().map(|m| format!("it runs on {m} until /model names another")),
+                (tools > 0).then(|| format!("it is offered {tools} tool{} and no others", if tools == 1 { "" } else { "s" }))]
+                .into_iter().flatten().collect::<Vec<_>>().join(", and ")),
+        };
         let agent = ringo_cli::add_custom_agent(self.s.state(), entry)?;
         if let Some(program) = self.s.programs.get(&base).cloned() {
             self.s.programs.insert(agent, program);
@@ -2344,7 +2353,7 @@ impl App {
         self.agents.push(agent);
         let saved = ringo_cli::save_agents_in(self.s.state(), &self.agents).err().map_or(String::new(), |e| format!(" (not saved: {e})"));
         Ok(format!("  {name} is an agent here now{saved}: {} with {} as its standing instructions ({size} characters, about {} \
-                    tokens more on each of its calls){}.\n  @{name} talks to it. It keeps a conversation of its own and hears \
+                    tokens more on each of its calls){}{lines}.\n  @{name} talks to it. It keeps a conversation of its own and hears \
                     what the others do, as they hear it. /model {name} NAME picks its model, an edit to the file is in its \
                     next turn, and /agent remove {name} takes it away",
                    base.name(), home_short(&path), fmt_tokens(size as u64 / 4),

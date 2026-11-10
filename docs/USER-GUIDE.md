@@ -139,7 +139,9 @@ Claude Code), it can work in Ringo under its own name:
 
 Then `@billing why is the invoice late?` talks to it, as to any agent. It keeps a conversation of its own, hears what
 the other agents did and is heard by them, shows in the side panel, and takes a model (`/model billing opus`). Edit
-the file and its next turn has the change.
+the file and its next turn has the change. If the file opens with a `model:` or a `tools:` line, as an agent made
+for Claude Code can, a specialist on Claude runs on that model (until `/model` names another) and is offered only
+those tools.
 
 It costs what the file holds: its text is read on every call of that agent's turns, and with `skills` so are the
 lists of your skills and connectors. Only that agent's turns pay for it; `@claude` stays as lean as before.
