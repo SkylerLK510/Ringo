@@ -114,8 +114,9 @@ Each agent runs on its own default model until you choose another, from those yo
 | You type | What happens |
 |---|---|
 | `/model` | who runs on what now, and the models your Codex plan offers |
-| `/model claude opus` | Claude's turns run on that model from its next turn: `fable`, `opus`, `sonnet`, `haiku`, or a model's full name |
-| `/model codex NAME` | Codex's turns run on that model: any name `/model` lists |
+| `/model` and a space | a list to pick from: Up and Down move, Enter sets it |
+| `/model opus` | that model, for the agent it belongs to: `fable`, `opus`, `sonnet`, `haiku` or a model's full name for Claude, any name `/model` lists for Codex |
+| `/model billing opus` | says whose: for an agent of your own, or when Ringo asks |
 | `/model claude default` | back to the agent's own default; its conversation starts again from Ringo's record of it |
 
 Ringo remembers your choice, and each turn's first line names the model at work (` claude  #3 · claude-opus-5-5`).

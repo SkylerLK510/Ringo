@@ -44,8 +44,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
-    ("/model", "which model each agent runs on, and the models your plans offer"),
-    ("/model AGENT NAME", "that agent's turns on that model (default: its own again)"),
+    ("/model", "which model each agent runs on; with a space after it, a list to pick from"),
+    ("/model NAME", "that model, for the agent it belongs to (/model opus); /model AGENT NAME says whose"),
     ("/agent", "your own agents: a specialist made from a file of instructions"),
     ("/agent add NAME FILE", "make one, on claude (or: codex after FILE; skills: your Claude Code skills too)"),
     ("/agent remove NAME", "take one of your own agents away"),
@@ -270,7 +270,8 @@ pub enum Cmd {
     Auto,
     /// `/tier` (None: show it) or `/tier quick|standard|deep|ultra`.
     Tier(Option<Tier>),
-    /// `/model` (None: show who runs on what) or `/model AGENT NAME`.
+    /// `/model` (None: show who runs on what), `/model AGENT NAME`, or `/model NAME` (no agent named: the one the
+    /// model belongs to).
     Model(Option<(String, String)>),
     /// `/agent` (None: the owner's own agents, and the Claude Code agent files found) or one made or taken away.
     Agent(Option<OwnAgent>),
@@ -322,6 +323,9 @@ fn listed(names: &[&str]) -> String {
     }
 }
 
+/// The names Claude Code takes for its models whatever the plan (its `--model` aliases); it has no list to read.
+const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
 /// An agent's list of models being read (/model), off the shell's own thread.
 type Listing = std::thread::JoinHandle<Result<Vec<ringo_cli::Model>, String>>;
 
@@ -369,9 +373,10 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             },
             "model" | "models" => match (words.next(), words.next(), words.next()) {
                 (None, ..) => Ok(Cmd::Model(None)),
+                (Some(model), None, _) => Ok(Cmd::Model(Some((String::new(), model.into())))),
                 (Some(agent), Some(model), None) => Ok(Cmd::Model(Some((agent.trim_start_matches('@').into(), model.into())))),
-                _ => Err("/model shows who runs on what; /model AGENT NAME sets one (/model claude opus), /model AGENT default \
-                          goes back".into()),
+                _ => Err("/model shows who runs on what; /model NAME sets one (/model opus), /model AGENT NAME says whose, and \
+                          /model AGENT default goes back".into()),
             },
             "discuss" | "talk" => {
                 let (mut agents, mut topic) = (Vec::new(), tail);
@@ -1428,7 +1433,10 @@ struct App {
     /// or only into `limits` (the side panel's gauges).
     plans: Vec<(bool, std::thread::JoinHandle<PlanRead>)>,
     /// /model's read of the models an agent's plan offers, under way (see `ringo_cli::models`).
-    listing: Option<(Agent, Listing)>,
+    listing: Option<(Agent, Listing, bool)>,
+    /// The models Codex's plan offers, as last read: /model's list to pick from. `asked`: read once for that list.
+    offered: Vec<ringo_cli::Model>,
+    asked_models: bool,
     /// Each plan's limits as last read, and when the last read began (None: never, as in tests).
     limits: Vec<(Agent, ringo_cli::Plan)>,
     limits_at: Option<Instant>,
@@ -1523,7 +1531,7 @@ impl App {
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, limits: Vec::new(),
+              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
@@ -2470,11 +2478,106 @@ impl App {
         self.plans.is_empty()
     }
 
+    /// The models an agent's turns can be given, for /model's list: Claude Code's aliases, or what Codex's plan
+    /// offered when last read, each with what to say of it; `default` first.
+    fn models_of(&self, agent: Agent) -> Vec<(String, String)> {
+        let mut models: Vec<(String, String)> = match agent.spec().adapter {
+            ringo_cli::Adapter::Claude => CLAUDE_MODELS.iter().map(|m| (m.to_string(), String::new())).collect(),
+            _ => self.offered.iter().map(|m| (m.name.clone(), match m.default {
+                true => format!("its default · {}", m.what),
+                false => m.what.clone(),
+            })).collect(),
+        };
+        models.insert(0, ("default".into(), "its own default".into()));
+        let now = self.s.models.get(&agent).map_or("default", String::as_str);
+        for (name, what) in &mut models {
+            if name == now {
+                *what = if what.is_empty() { "← now".into() } else { format!("← now · {what}") };
+            }
+        }
+        models
+    }
+
+    /// The agent a model named alone is for (`/model opus`): the one it belongs to by its name, the agent the owner
+    /// talks to before any other; `default`, or a name Ringo cannot place, is for the agent the owner talks to.
+    fn model_owner(&self, model: &str) -> Result<Agent, String> {
+        use ringo_cli::Adapter::{Claude, Codex};
+        let takers: Vec<Agent> = self.agents.iter().copied().filter(|a| ringo_cli::takes_model(*a)).collect();
+        let first = |adapter| std::iter::once(self.main).chain(takers.iter().copied())
+            .find(|a| takers.contains(a) && a.spec().adapter == adapter);
+        let kind = match model {
+            m if CLAUDE_MODELS.contains(&m) || m.starts_with("claude") => Some(Claude),
+            m if self.offered.iter().any(|o| o.name == m) || m.starts_with("gpt") || m.starts_with("codex") => Some(Codex),
+            _ => None,
+        };
+        match (kind, &takers[..]) {
+            (_, []) => Err("no agent set up here takes a model from Ringo".into()),
+            (Some(adapter), _) => first(adapter).ok_or(format!("{model} is a model for {}, which is not set up here; /setup adds it",
+                                                               if adapter == Claude { "claude" } else { "codex" })),
+            (None, _) if takers.contains(&self.main) => Ok(self.main),
+            (None, [only]) => Ok(*only),
+            (None, _) => Err(format!("whose model is {model}? /model AGENT {model}")),
+        }
+    }
+
+    /// The list under the input while /model is being typed: whose model (asked only when more than one agent
+    /// takes one), then which. A model can be named at once, by its first letters.
+    fn model_menu(&self, args: &str) -> Vec<(String, String, String)> {
+        let takers: Vec<Agent> = self.agents.iter().copied().filter(|a| ringo_cli::takes_model(*a)).collect();
+        let (first, second) = args.split_once(' ').map_or((args, None), |(a, b)| (a, Some(b)));
+        if let Some(typed) = second {
+            let agent = Agent::from_name(first.trim_start_matches('@')).filter(|a| takers.contains(a));
+            return agent.filter(|_| !typed.contains(' ')).map_or(Vec::new(), |a| {
+                self.models_of(a).into_iter().filter(|(m, _)| m.starts_with(typed)).map(|(m, what)| (m.clone(), m, what)).collect()
+            });
+        }
+        let mut entries: Vec<(String, String, String)> = Vec::new();
+        if takers.len() > 1 {
+            entries.extend(takers.iter().filter(|a| a.name().starts_with(first)).map(|a| {
+                (format!("{} ", a.name()), a.name().to_string(),
+                 format!("runs on {} · pick its model", self.s.models.get(a).map_or("its own default", String::as_str)))
+            }));
+        }
+        if takers.len() == 1 || !first.is_empty() {
+            let order = std::iter::once(self.main).filter(|a| takers.contains(a)).chain(takers.iter().copied().filter(|a| *a != self.main));
+            for agent in order {
+                for (model, what) in self.models_of(agent) {
+                    let fits = model.starts_with(first) && (takers.len() == 1 || model != "default");
+                    if fits && !entries.iter().any(|(to, ..)| *to == model) {
+                        let whose = if takers.len() == 1 { String::new() } else { format!("{} · ", agent.name()) };
+                        entries.push((model.clone(), model, format!("{whose}{what}").trim_end_matches(" · ").to_string()));
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// Reads what Codex's plan offers, once and unseen, when /model is being typed: its list needs the names.
+    fn want_models(&mut self) {
+        if self.asked_models || self.listing.is_some() || !self.input.starts_with(&['/', 'm', 'o', 'd', 'e', 'l']) {
+            return;
+        }
+        let codex = self.agents.iter().copied().find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a));
+        self.asked_models = true;
+        if let Some(agent) = codex {
+            let program = self.s.program(agent);
+            self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program)), false));
+        }
+    }
+
     /// /model's list of an agent's models, once it has answered.
     fn models_done(&mut self) -> bool {
-        let Some((agent, read)) = self.listing.take_if(|(_, read)| read.is_finished()) else { return false };
+        let Some((agent, read, said)) = self.listing.take_if(|(_, read, _)| read.is_finished()) else { return false };
         let (style, t) = (self.agent_style(agent), self.theme);
-        match read.join().unwrap_or_else(|_| Err("the read stopped".into())) {
+        let read = read.join().unwrap_or_else(|_| Err("the read stopped".into()));
+        if let Ok(models) = &read && !models.is_empty() {
+            self.offered = models.clone();
+        }
+        if !said {
+            return true; // read for the list under the input, which shows it
+        }
+        match read {
             Ok(models) if !models.is_empty() => {
                 self.out.push(agent_head(agent.name(), style, &format!(" · the models your plan offers (/model {} NAME)", agent.name()), &t));
                 let pad = models.iter().map(|m| cols(&m.name)).max().unwrap_or(0);
@@ -2733,10 +2836,19 @@ impl App {
                     .find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a)).filter(|_| self.listing.is_none());
                 if let Some(agent) = lists {
                     let program = self.s.program(agent);
-                    self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program))));
+                    self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program)), true));
                 }
-                Some(format!("  /ask, /review, /design and /research run on {} · /backend SPEC changes it, and SPEC@MODEL names a \
+                Some(format!("  to change one: /model and a space lists what to pick from, or name it (/model opus)\n  \
+                              /ask, /review, /design and /research run on {} · /backend SPEC changes it, and SPEC@MODEL names a \
                               model (claude@opus)", self.s.backend))
+            }
+            Cmd::Model(Some((name, model))) if name.is_empty() => {
+                // an agent's name alone: who runs on what
+                if Agent::from_name(model.trim_start_matches('@')).is_some_and(|a| self.agents.contains(&a)) {
+                    return self.run(Cmd::Model(None), line);
+                }
+                let agent = self.model_owner(&model)?;
+                return self.run(Cmd::Model(Some((agent.name().to_string(), model))), line);
             }
             Cmd::Model(Some((name, model))) => {
                 let agent = Agent::from_name(&name).ok_or_else(|| {
@@ -2935,6 +3047,9 @@ impl App {
 
     fn menu_entries(&self) -> Vec<(String, String, String)> {
         let before: String = self.input[..self.cursor].iter().collect();
+        if let Some(args) = before.strip_prefix("/model ").filter(|_| self.cursor == self.input.len()) {
+            return self.model_menu(args);
+        }
         let agents: Vec<(&str, bool)> = self.agents.iter().map(|a| (a.name(), a.spec().read)).collect();
         menu(&before, &agents)
     }
@@ -3056,7 +3171,15 @@ impl App {
                 KeyCode::Up if choosing => return self.pick = (pick + entries.len() - 1) % entries.len(),
                 KeyCode::Down if choosing => return self.pick = (pick + 1) % entries.len(),
                 KeyCode::Tab => return self.complete(&entries[pick].0),
-                KeyCode::Enter if !(ctrl || alt || shift || pasted || whole) => return self.complete(&entries[pick].0),
+                KeyCode::Enter if !(ctrl || alt || shift || pasted || whole) => {
+                    let to = entries[pick].0.clone();
+                    self.complete(&to);
+                    // a model picked from /model's list is the whole command: it goes as it is picked
+                    if !to.ends_with(' ') && self.input.starts_with(&['/', 'm', 'o', 'd', 'e', 'l', ' ']) {
+                        self.submit();
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -3852,6 +3975,7 @@ pub fn run(start: Start) -> ExitCode {
                 match event::read() {
                     Ok(Term::Key(k)) if k.kind == KeyEventKind::Press => {
                         app.key(k);
+                        app.want_models();
                         dirty = true;
                     }
                     Ok(Term::Paste(text)) => {
@@ -4542,6 +4666,64 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("claude".into()))), "").unwrap_err().contains("not an agent of your own"));
     }
 
+    /// The list under the input for what has been typed, as (completes to, what it says).
+    fn listed_for(a: &mut App, typed: &str) -> Vec<(String, String)> {
+        a.input = typed.chars().collect();
+        a.cursor = a.input.len();
+        a.menu_entries().into_iter().map(|(to, _, what)| (to, what)).collect()
+    }
+
+    #[test]
+    fn a_model_is_picked_from_a_list_or_named_alone() {
+        let own = |pairs: &[(&str, &str)]| -> Vec<(String, String)> { pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() };
+        // one agent takes a model: its models at once, the one it runs on marked
+        let mut a = app(&["claude", "agy", "grok"]);
+        let claude = Agent::from_name("claude").unwrap();
+        assert_eq!(listed_for(&mut a, "/model "), own(&[("default", "← now · its own default"), ("fable", ""), ("opus", ""), ("sonnet", ""), ("haiku", "")]));
+        assert_eq!(listed_for(&mut a, "/model s"), own(&[("sonnet", "")]));
+        assert!(listed_for(&mut a, "/model").iter().any(|(to, _)| to == "/model"), "without the space, the commands still");
+        // Enter on a pick sends it: no second Enter, no agent to name
+        listed_for(&mut a, "/model ");
+        a.last_key = Instant::now() - Duration::from_secs(1);
+        a.key(KeyEvent::from(KeyCode::Down));
+        a.key(KeyEvent::from(KeyCode::Down));
+        a.last_key = Instant::now() - Duration::from_secs(1);
+        a.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!((a.s.models.get(&claude).map(String::as_str), a.input.is_empty()), (Some("opus"), true));
+        assert_eq!(listed_for(&mut a, "/model o"), own(&[("opus", "← now")]));
+        // named alone, by hand: the agent it belongs to; an agent's name alone shows who runs on what
+        assert!(a.run(parse("/model sonnet", &[claude]).unwrap(), "").unwrap().unwrap().starts_with("  claude runs on sonnet from its next turn"));
+        assert!(a.run(parse("/model claude", &[claude]).unwrap(), "").unwrap().unwrap().contains("to change one: /model and a space lists what to pick from"));
+        assert!(a.run(parse("/model gpt-6-luna", &[claude]).unwrap(), "").unwrap_err().contains("is a model for codex, which is not set up here"));
+        assert!(a.run(parse("/model default", &[claude]).unwrap(), "").unwrap().unwrap().starts_with("  claude runs on its own default again"));
+        assert_eq!(a.model_owner("some-new-model"), Ok(claude), "a name Ringo cannot place is for the agent you talk to");
+
+        // two agents take one: whose first, then which; a model's first letters find it under either
+        let mut a = app(&["codex", "claude", "grok"]);
+        let codex = Agent::from_name("codex").unwrap();
+        a.offered = vec![ringo_cli::Model { name: "gpt-big".into(), what: "the large one".into(), default: true },
+                         ringo_cli::Model { name: "gpt-small".into(), what: "the quick one".into(), default: false }];
+        assert_eq!(listed_for(&mut a, "/model "), own(&[("codex ", "runs on its own default · pick its model"), ("claude ", "runs on its own default · pick its model")]));
+        assert_eq!(listed_for(&mut a, "/model c"), own(&[("codex ", "runs on its own default · pick its model"), ("claude ", "runs on its own default · pick its model")]));
+        assert_eq!(listed_for(&mut a, "/model codex "), own(&[("default", "← now · its own default"), ("gpt-big", "its default · the large one"), ("gpt-small", "the quick one")]));
+        assert_eq!(listed_for(&mut a, "/model claude s"), own(&[("sonnet", "")]));
+        assert_eq!(listed_for(&mut a, "/model gpt-s"), own(&[("gpt-small", "codex · the quick one")]));
+        assert_eq!(listed_for(&mut a, "/model o"), own(&[("opus", "claude")]));
+        assert!(listed_for(&mut a, "/model grok ").is_empty() && listed_for(&mut a, "/model codex gpt-big x").is_empty());
+        a.main = codex;
+        assert_eq!((a.model_owner("opus"), a.model_owner("gpt-small"), a.model_owner("default")), (Ok(claude), Ok(codex), Ok(codex)),
+                   "a model goes to the agent it belongs to, whoever the owner talks to; default to the one they talk to");
+        a.main = Agent::from_name("grok").unwrap();
+        assert!(a.model_owner("some-new-model").unwrap_err().contains("whose model is some-new-model? /model AGENT some-new-model"));
+        // the list is read for Codex once, unseen, when /model is being typed (here no codex is installed to ask)
+        listed_for(&mut a, "/mode");
+        a.want_models();
+        assert!(!a.asked_models);
+        listed_for(&mut a, "/model");
+        a.want_models();
+        assert!(a.asked_models);
+    }
+
     #[test]
     fn each_agent_runs_on_the_model_its_owner_chose() {
         let mut a = app(&["claude", "agy"]);
@@ -4549,7 +4731,8 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         assert_eq!((parse("/model", &[claude]), parse("/model claude opus", &[claude]), parse("/model @claude default", &[claude])),
                    (Ok(Cmd::Model(None)), Ok(Cmd::Model(Some(("claude".into(), "opus".into())))),
                     Ok(Cmd::Model(Some(("claude".into(), "default".into()))))));
-        assert!(parse("/model claude", &[claude]).is_err() && parse("/model claude a b", &[claude]).is_err());
+        assert_eq!(parse("/model opus", &[claude]), Ok(Cmd::Model(Some((String::new(), "opus".into())))), "whose it is comes later");
+        assert!(parse("/model claude a b", &[claude]).is_err());
         let set = |a: &mut App, agent: &str, model: &str| a.run(Cmd::Model(Some((agent.into(), model.into()))), "");
         assert!(set(&mut a, "claude", "opus").unwrap().unwrap().starts_with("  claude runs on opus from its next turn (saved)"));
         assert_eq!(a.s.models.get(&claude).map(String::as_str), Some("opus"));

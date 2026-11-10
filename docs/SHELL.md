@@ -325,7 +325,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
 | `/discuss TOPIC`, `/discuss`, `/discuss @A @B TOPIC` | the agents talk it over among themselves, one at a time, while you read (see [The agents' talk](#the-agents-talk)); alone, the last turn |
 | `/agent`, `/agent add NAME FILE [codex] [skills]`, `/agent remove NAME` | your own agents (see [Agents of your own](#agents-of-your-own)): a file of standing instructions makes Claude or Codex a specialist under its own name, talked to as `@NAME` |
-| `/model`, `/model AGENT NAME` | which model each agent's turns run on (see [Models](#models)): alone, who runs on what and the models your Codex plan offers; with an agent and a name, that agent's turns run on it from the next one, remembered for next time (`/model AGENT default`: its own again) |
+| `/model`, `/model NAME`, `/model AGENT NAME` | which model each agent's turns run on (see [Models](#models)): alone, who runs on what and the models your Codex plan offers; with a space after it, a list to pick from; with a name, that model for the agent it belongs to, from its next turn and remembered (`/model AGENT default`: its own again) |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
 | `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
@@ -756,6 +756,19 @@ own default until `/model AGENT NAME` names another:
   new one. `/model` asks its app-server what the plan offers (`model/list`, no thread and no model call; 0.3 s for 8
   models, codex-cli 0.167.0) and prints each name with what OpenAI says of it and which is the default.
 - **agy** and agents you add with the plain adapter choose their own: `/model` refuses a name for them and says so.
+
+Three ways to set one, the first needing nothing remembered:
+
+- **Pick it.** `/model` and a space opens a list under the input: with more than one agent that takes a model, whose
+  it is, then that agent's models (`default`, Claude Code's four aliases, or what the Codex plan offers, with
+  OpenAI's own line on each and `← now` on the one in use). Up and Down move, and Enter on a model sets it: no
+  second Enter. With one such agent the list is its models at once. Codex's models are read once, unseen, the
+  first time `/model` is typed (the same `model/list` read as above).
+- **Name it.** `/model opus` sets it for the agent the name belongs to: Claude Code's aliases and `claude-...` for a
+  Claude agent, a name the Codex plan lists or `gpt-...` for a Codex one, the agent you are talking to before any
+  other of its kind. `/model default`, or a name Ringo cannot place, is for the agent you are talking to. A few
+  letters are enough in the list: `/model so` shows `sonnet`.
+- **Say whose.** `/model AGENT NAME`, for a specialist of your own on the same plan, or when Ringo asks whose.
 
 The choice is one word that goes to the agent's own program as an argument (letters, digits and `. _ - : / [ ]`); it
 is kept in `shell-settings.json` (`"models": {"claude": "opus"}`) and applies from the agent's next turn, a running
