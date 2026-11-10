@@ -78,4 +78,26 @@ Nothing is adopted from this pilot. `review --repo` stays as it is until a confi
 
 ## Deviations
 
-None yet.
+1. **Budget counter, during set L.** The counter added the matcher calls twice and stopped the run after the sixth
+   L review at a true 36 calls. It was corrected and the run went on in the same order. No call was repeated.
+
+2. **Paging probe added, 2026-11-10, after sets S and L were scored and before any further call.** Calls so far: 43,
+   with 712,533 input tokens.
+
+   Result so far, by the blind matcher: on S, A1 retained 13 of 15 stored findings and A2 retained 13 of 15, with
+   one finding kept by each arm alone. On L, A2 retained 5 of 24. By the reading rule above the lean material is not
+   pursued as is, and the lost findings are classified: for 19 of the 21 findings A2 lost, every line the stored
+   finding cites was in the lean material. The cited code was there; what the reviewer lacked was the code around
+   it. The lean reviews say so themselves: they left 35 open questions, and a rule without a model finds the
+   definition a question names, at head, for 26 of them.
+
+   The probe, exploratory: for every L review that lost a stored finding and has an open question that rule
+   answers (9 reviews), one follow-up call through the same pipeline. Its material is the PR description, the lean
+   review's open questions, the diff hunks that name the paged symbols (at most 24,000 bytes) and the paged
+   definitions with line numbers (at most 24,000 bytes). Then one matcher call per review, the stored findings as
+   the reference set. Measures: stored findings retained by the lean review or its follow-up, and the input tokens
+   of the two calls against A0's. There is no same-material control on L, so the probe can show that paging
+   recovers findings, not how the pair compares with a second whole-file review.
+
+   The call ceiling rises from 45 to 63 for the probe. The 900,000 input-token ceiling and the plan-window stops
+   are unchanged.
