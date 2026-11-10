@@ -82,6 +82,64 @@ Fields: `name` (letters, digits, `-`, `_`, `.`), `program` (default: the name; a
 path), which then works in copies as that agent does, and in your folder too with `"read": true`. The agents Ringo ships are the same kind of entry,
 in `cli/src/agents.json`; how each protocol is spoken stays in code.
 
+### Agents of your own
+
+Claude Code and Codex let a person or a team write a specialist: a file of standing instructions (what it knows,
+how it works, what it must not do) that makes the model that agent. Until this change such a specialist could not
+work in Ringo: a Claude turn runs in safe mode, which drops custom agents with the rest of the owner's
+customizations, and nothing gave Codex one either. Now it is an agent like any other:
+
+```
+/agent add billing ~/notes/billing.md          Claude, with that file as its standing instructions
+/agent add billing ~/notes/billing.md codex    the same specialist on the Codex plan
+/agent add shop-billing                        an agent made for Claude Code, by its name
+/agent add billing ~/notes/billing.md skills   on Claude, with your Claude Code skills, plugins and connectors
+/agent                                         your own agents, and the Claude Code agent files found
+/agent remove billing                          the entry goes; the file is yours and stays
+```
+
+`/agent add` writes an entry in your `agents.json` (`"instructions": PATH`, the base agent's `adapter` and `program`,
+`"read": true`, and `"skills": true` when asked) and sets the agent up at once. A name alone, or a word that is not
+a file, is looked up as `NAME.md` in `.claude/agents` of this folder and then of your home folder, where Claude
+Code keeps agent files; `/agent` lists the ones found that are not agents here yet.
+
+How the instructions reach the model, each turn:
+
+- The file is read when the turn starts, so an edit is in the next turn. A leading `---` block (a Claude Code agent
+  file opens with its name and description there) is left out. A file that is missing, empty or over 400,000 bytes
+  stops the turn before it starts: a turn without them would not be that agent's.
+- **Claude:** appended to the system prompt (`--append-system-prompt-file`), after your `rules.md` and before the
+  project's `CLAUDE.md` or `AGENTS.md`. The turn stays in safe mode, as lean as any other.
+- **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
+  turns they stand in for any `developer_instructions` in your Codex settings.
+- **`skills` (Claude only):** the turn runs without safe mode and keeps Claude Code's commands, so your skills,
+  plugins, hooks and connectors load. Your own `CLAUDE.md` and memory still do not (so an instruction there to use
+  Ringo cannot start Ringo inside Ringo). In read mode a connector's tool that would have to ask is refused, as
+  any such tool is.
+
+A specialist is a separate agent: its own conversation, its own row in the side panel and in `/usage`, its own
+`/model`. In the conversation the agents share it hears what the others did and they hear it (see
+[One conversation](#one-conversation-and-a-fresh-start-past-64k)). It runs on the plan of the agent it is made from,
+so the plan's gauge shows once, under that agent's name.
+
+Checked live with a team's 49.6k-character agent file, one trivial read-mode turn each
+(`cargo run --example own -- REPO BASE FILE [skills]`; Claude Code 2.1.322, codex-cli 0.167.0; one run each, so an
+instance and not a rate):
+
+| Turn | Tokens | Time | What came back |
+|------|--------|------|----------------|
+| the specialist on Claude | 30,002 | 4.5 s | answered as the specialist, naming what its file says it knows |
+| the specialist on Codex | 25,596 | 3.9 s | the same |
+| on Claude, asked to name skills it can invoke | 29,857 | 3.4 s | "NONE": no Skill tool in a safe-mode turn |
+| on Claude with `skills`, same question | 42,808 | 2.4 s | named three of the owner's skills |
+
+The same turn with a ten-byte instructions file was 10,069 tokens on Claude and 13,375 on Codex, so this file costs
+about 20k tokens a call on Claude and 12k on Codex, and `skills` about 13k more with 99 skills installed. That is
+the cost of the feature, paid only by the specialist's own turns: a turn of `claude` or `codex` is unchanged.
+
+Not done: a Claude Code agent file's `model` and `tools` lines are not read (`/model NAME MODEL` sets the model);
+agy and plain agents take no instructions; and a removed name stays taken until Ringo restarts.
+
 ### Who takes which turn
 
 Claude owns writing and reading code: a plain line goes to Claude when it is set up, else to Codex, else to any
@@ -189,6 +247,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, and nothing of one is told to another. `/together` (the default): one conversation again. Either way the agents work in the folder at the same time, one turn each. Text after either is sent as a line of its own once it has switched (`/separate @codex write the README`); any other command that takes nothing refuses text after it rather than drop it. The head says `separate` while it is on |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
+| `/agent`, `/agent add NAME FILE [codex] [skills]`, `/agent remove NAME` | your own agents (see [Agents of your own](#agents-of-your-own)): a file of standing instructions makes Claude or Codex a specialist under its own name, talked to as `@NAME` |
 | `/model`, `/model AGENT NAME` | which model each agent's turns run on (see [Models](#models)): alone, who runs on what and the models your Codex plan offers; with an agent and a name, that agent's turns run on it from the next one, remembered for next time (`/model AGENT default`: its own again) |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
 | `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |

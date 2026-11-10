@@ -45,6 +45,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
     ("/model", "which model each agent runs on, and the models your plans offer"),
     ("/model AGENT NAME", "that agent's turns on that model (default: its own again)"),
+    ("/agent", "your own agents: a specialist made from a file of instructions"),
+    ("/agent add NAME FILE", "make one, on claude (or: codex after FILE; skills: your Claude Code skills too)"),
+    ("/agent remove NAME", "take one of your own agents away"),
     ("/usage", "what you have used, and how much of your plans is left"),
     ("/auto", "auto mode on"),
     ("/review #N", "review job N's change"),
@@ -213,6 +216,18 @@ fn save_history(line: &str) {
     }
 }
 
+/// `/agent add NAME [FILE] [BASE] [skills]` and `/agent remove NAME`.
+#[derive(Debug, PartialEq)]
+pub enum OwnAgent {
+    /// `file`: its instructions, or the name of an agent made for Claude Code (none: one called `name`); `base`: the
+    /// agent it runs on (none: claude when it is set up); `skills`: the owner's Claude Code skills load in its turns.
+    Add { name: String, file: Option<String>, base: Option<String>, skills: bool },
+    Remove(String),
+}
+
+const AGENT_USAGE: &str = "/agent lists your own agents; /agent add NAME FILE makes one from a file of instructions (add \
+                           codex to run it there, skills to load your Claude Code skills in its turns); /agent remove NAME";
+
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     /// A plain line: for the agent the owner is talking to.
@@ -256,6 +271,8 @@ pub enum Cmd {
     Tier(Option<Tier>),
     /// `/model` (None: show who runs on what) or `/model AGENT NAME`.
     Model(Option<(String, String)>),
+    /// `/agent` (None: the owner's own agents, and the Claude Code agent files found) or one made or taken away.
+    Agent(Option<OwnAgent>),
     Usage,
     /// `/restart`: this shell ends and the installed `ringo` takes over the conversations.
     Restart,
@@ -312,6 +329,24 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 (Some(agent), Some(model), None) => Ok(Cmd::Model(Some((agent.trim_start_matches('@').into(), model.into())))),
                 _ => Err("/model shows who runs on what; /model AGENT NAME sets one (/model claude opus), /model AGENT default \
                           goes back".into()),
+            },
+            "agent" | "agents" => match (words.next(), words.next()) {
+                (None, _) => Ok(Cmd::Agent(None)),
+                (Some("add"), Some(name)) => {
+                    let (mut file, mut base, mut skills) = (None, None, false);
+                    for w in words {
+                        match w {
+                            "skills" => skills = true,
+                            w if base.is_none() && Agent::from_name(w).is_some() => base = Some(w.to_string()),
+                            w if file.is_none() => file = Some(w.to_string()),
+                            _ => return Err(AGENT_USAGE.into()),
+                        }
+                    }
+                    Ok(Cmd::Agent(Some(OwnAgent::Add { name: name.trim_start_matches('@').into(), file, base, skills })))
+                }
+                (Some("remove" | "rm"), Some(name)) if words.next().is_none() =>
+                    Ok(Cmd::Agent(Some(OwnAgent::Remove(name.trim_start_matches('@').into())))),
+                _ => Err(AGENT_USAGE.into()),
             },
             "mode" => match words.next() {
                 None => Ok(Cmd::Mode(None)),
@@ -1978,9 +2013,157 @@ impl App {
 
     /// The agents set up here whose plan's limits can be read: Claude's and Codex's.
     fn plan_agents(&self) -> Vec<Agent> {
-        self.agents.iter().copied()
+        let mut agents: Vec<Agent> = self.agents.iter().copied()
             .filter(|a| matches!(a.spec().adapter, ringo_cli::Adapter::Claude | ringo_cli::Adapter::Codex) && self.s.installed(*a))
-            .collect()
+            .collect();
+        // a specialist of the owner's runs on the plan of the agent it is made from: one read, one gauge, under
+        // that agent's name
+        agents.sort_by_key(|a| a.spec().custom);
+        let mut seen = Vec::new();
+        agents.retain(|a| {
+            let program = self.s.program(*a);
+            let new = !seen.contains(&program);
+            seen.push(program);
+            new
+        });
+        agents
+    }
+
+    /// The agent files Claude Code would find from here: this folder's, then the owner's own.
+    fn claude_agent_files(&self) -> Vec<PathBuf> {
+        [self.s.repo.join(".claude/agents"), self.s.home.join(".claude/agents")].iter().flat_map(|dir| {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "md") && p.is_file()).collect();
+            found.sort();
+            found
+        }).collect()
+    }
+
+    /// /agent: the owner's own agents, then the agents they made for Claude Code that are not agents here yet.
+    fn own_agents(&mut self) {
+        let t = self.theme;
+        self.gap();
+        self.out.push(Out::Line(Line::from(vec![
+            Span::styled("  your own agents", t.title.add_modifier(Modifier::BOLD)),
+            Span::styled(" · /agent add NAME FILE makes one · /agent remove NAME takes one away", t.dim)]), 4));
+        let own: Vec<Agent> = Agent::all().into_iter().filter(|a| a.spec().custom).collect();
+        let pad = own.iter().map(|a| cols(a.name())).max().unwrap_or(0);
+        let mut used = Vec::new();
+        for agent in &own {
+            let spec = agent.spec();
+            let on = match spec.adapter {
+                ringo_cli::Adapter::Claude => "claude",
+                ringo_cli::Adapter::Codex => "codex",
+                ringo_cli::Adapter::Agy => "agy",
+                ringo_cli::Adapter::Plain => "a program of its own",
+            };
+            let what = match (&spec.instructions, ringo_cli::instructions(spec)) {
+                (Some(file), Ok(Some(text))) => {
+                    let file = ringo_cli::home_path(file);
+                    used.push(file.canonicalize().unwrap_or_else(|_| file.clone()));
+                    format!("on {on} · {} · {} characters, about {} tokens more on each of its calls{}", home_short(&file),
+                            text.len(), fmt_tokens(text.len() as u64 / 4),
+                            if spec.skills { " · with your Claude Code skills" } else { "" })
+                }
+                (Some(_), Err(e)) => format!("on {on} · {e}"),
+                _ => format!("on {on} · no instructions of its own"),
+            };
+            let here = if self.agents.contains(agent) { "" } else { " · not set up here (/setup)" };
+            self.out.push(Out::Line(Line::from(vec![
+                Span::raw("    "), Span::styled(format!("{:<pad$}", agent.name()), self.agent_style(*agent)),
+                Span::styled(format!("  {what}{here}"), t.dim)]), 6 + pad));
+        }
+        let found: Vec<PathBuf> = self.claude_agent_files().into_iter()
+            .filter(|p| !used.contains(&p.canonicalize().unwrap_or_else(|_| p.clone()))).collect();
+        if own.is_empty() {
+            self.out.push(Out::text("    none yet. A specialist is a file of instructions: what it knows and how it works. /agent add \
+                                     NAME FILE makes it an agent here, on claude (or on codex: add the word), and @NAME talks to it"));
+        }
+        if !found.is_empty() {
+            self.out.push(Out::Line(Line::styled("  made for Claude Code, and not agents here yet", t.dim), 4));
+            for file in found {
+                let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.out.push(Out::Line(Line::from(vec![
+                    Span::raw(format!("    {name}")),
+                    Span::styled(format!("  {} · /agent add {name}", home_short(&file)), t.dim)]), 6));
+            }
+        }
+        self.last = 0;
+    }
+
+    /// /agent add: a specialist of the owner's, made from a file of instructions and an agent set up here.
+    fn add_own_agent(&mut self, name: String, file: Option<String>, base: Option<String>, skills: bool) -> Result<String, String> {
+        use ringo_cli::Adapter;
+        if !ringo_cli::valid_name(&name) || name == "all" {
+            return Err(format!("`{name}` cannot be an agent's name: use letters, digits, - _ or ."));
+        }
+        if let Some(taken) = Agent::from_name(&name) {
+            return Err(match taken.spec().custom {
+                true => format!("you already have an agent called {name}: /agent remove {name} and then /restart free the name"),
+                false => format!("{name} is one of Ringo's own agents: give yours another name"),
+            });
+        }
+        let runs = |a: &Agent| matches!(a.spec().adapter, Adapter::Claude | Adapter::Codex) && a.spec().instructions.is_none();
+        let base = match base {
+            Some(b) => Agent::from_name(&b).filter(|a| self.agents.contains(a) && runs(a))
+                .ok_or(format!("an agent of your own runs on claude or codex, set up here, and {b} is not one"))?,
+            None => self.agents.iter().copied().filter(runs).min_by_key(|a| a.spec().adapter != Adapter::Claude)
+                .ok_or("an agent of your own runs on claude or codex, and neither is set up here: /setup adds one")?,
+        };
+        if skills && base.spec().adapter != Adapter::Claude {
+            return Err(format!("skills are Claude Code's: on {} a specialist goes without them", base.name()));
+        }
+        // the file as given, else an agent made for Claude Code by that name (this folder's first, then the owner's)
+        let wanted = file.unwrap_or_else(|| name.clone());
+        let given = ringo_cli::home_path(&wanted);
+        let given = match std::env::current_dir() {
+            Ok(cwd) if given.is_relative() => cwd.join(given),
+            _ => given,
+        };
+        let path = match given.is_file() {
+            true => given,
+            false => self.claude_agent_files().into_iter().find(|p| p.file_stem().is_some_and(|s| s.to_string_lossy() == wanted))
+                .ok_or(format!("no instructions file `{wanted}`: give its path, or the name of an agent you made for Claude \
+                                Code (/agent lists the ones found)"))?,
+        };
+        let path = path.canonicalize().unwrap_or(path);
+        let adapter = if base.spec().adapter == Adapter::Claude { "claude" } else { "codex" };
+        let entry = serde_json::json!({"name": name, "adapter": adapter, "program": base.spec().program, "read": true,
+                                       "company": format!("your own, on {}", base.name()), "login": base.spec().login,
+                                       "instructions": path, "skills": skills});
+        let size = ringo_cli::instructions(&ringo_cli::Spec::from_json(&entry, true)?)?.map_or(0, |text| text.len());
+        let agent = ringo_cli::add_custom_agent(self.s.state(), entry)?;
+        if let Some(program) = self.s.programs.get(&base).cloned() {
+            self.s.programs.insert(agent, program);
+        }
+        self.agents.push(agent);
+        let saved = ringo_cli::save_agents_in(self.s.state(), &self.agents).err().map_or(String::new(), |e| format!(" (not saved: {e})"));
+        Ok(format!("  {name} is an agent here now{saved}: {} with {} as its standing instructions ({size} characters, about {} \
+                    tokens more on each of its calls){}.\n  @{name} talks to it. It keeps a conversation of its own and hears \
+                    what the others do, as they hear it. /model {name} NAME picks its model, an edit to the file is in its \
+                    next turn, and /agent remove {name} takes it away",
+                   base.name(), home_short(&path), fmt_tokens(size as u64 / 4),
+                   if skills { ", with your Claude Code skills, plugins and connectors loaded in its turns" } else { "" }))
+    }
+
+    /// /agent remove: the entry goes; the instructions file is the owner's and stays.
+    fn remove_own_agent(&mut self, name: &str) -> Result<String, String> {
+        let agent = Agent::from_name(name).filter(|a| a.spec().custom)
+            .ok_or(format!("{name} is not an agent of your own (/agent lists them)"))?;
+        if let Some(job) = self.s.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)) {
+            return Err(format!("{name}'s #{0} is still working: wait for it, or /kill {0}", job.id));
+        }
+        if self.agents == [agent] {
+            return Err(format!("{name} is the only agent set up here: /setup adds another first"));
+        }
+        ringo_cli::remove_custom_agent(self.s.state(), name)?;
+        self.agents.retain(|a| *a != agent);
+        self.queue.retain(|(a, ..)| *a != agent);
+        if self.main == agent && let Some(next) = self.agents.first() {
+            self.main = *next;
+        }
+        Ok(format!("  {name} is gone from Ringo; its instructions file is untouched. The name is free again once Ringo \
+                    restarts (/restart)"))
     }
 
     /// Reads each agent's plan in the background (about a second each; no model call); `said`: the answers go into
@@ -2293,6 +2476,12 @@ impl App {
                 Tier::ALL.iter().filter(|t| **t != self.s.tier).map(|t| t.name()).collect::<Vec<_>>().join(", "))),
             Cmd::Tier(Some(tier)) => Some(self.set_tier(tier)),
             Cmd::Usage => self.usage(),
+            Cmd::Agent(None) => {
+                self.own_agents();
+                None
+            }
+            Cmd::Agent(Some(OwnAgent::Add { name, file, base, skills })) => Some(self.add_own_agent(name, file, base, skills)?),
+            Cmd::Agent(Some(OwnAgent::Remove(name))) => Some(self.remove_own_agent(&name)?),
             Cmd::Model(None) => {
                 let t = self.theme;
                 self.gap();
@@ -3909,6 +4098,57 @@ mod tests {
         a.feed();
         assert_eq!(replies(&a), ["Hello, world.", "Next up:\n\n| Name | Size |\n|---|---|\n| alpha | 1"]);
         a.s.shutdown();
+    }
+
+    #[test]
+    fn a_specialist_of_the_owners_own_is_an_agent_like_any_other() {
+        let mut a = app(&["codex", "claude", "agy"]);
+        let (codex, claude) = (Agent::from_name("codex").unwrap(), Agent::from_name("claude").unwrap());
+        let add = |name: &str, file: Option<&str>, base: Option<&str>, skills: bool| {
+            Cmd::Agent(Some(OwnAgent::Add { name: name.into(), file: file.map(String::from), base: base.map(String::from), skills }))
+        };
+        assert_eq!((parse("/agent", &[claude]), parse("/agent add @billing notes.md", &[claude]), parse("/agent add billing codex notes.md skills", &[claude]),
+                    parse("/agent remove billing", &[claude])),
+                   (Ok(Cmd::Agent(None)), Ok(add("billing", Some("notes.md"), None, false)), Ok(add("billing", Some("notes.md"), Some("codex"), true)),
+                    Ok(Cmd::Agent(Some(OwnAgent::Remove("billing".into()))))));
+        assert!(parse("/agent add", &[claude]).is_err() && parse("/agent add billing a.md b.md", &[claude]).is_err()
+                && parse("/agent drop billing", &[claude]).is_err());
+        // nothing of the owner's yet: how to make one, and the agents they made for Claude Code, found by name
+        let made = a.s.home.join(".claude/agents");
+        std::fs::create_dir_all(&made).unwrap();
+        std::fs::write(made.join("shop-billing.md"), "---\nname: shop-billing\n---\nYou know the billing code.\n").unwrap();
+        a.run(Cmd::Agent(None), "").unwrap();
+        let rows = screen(&mut a, 100, 16).join("\n");
+        assert!(rows.contains("none yet. A specialist is a file of instructions") && rows.contains("/agent add shop-billing"), "{rows}");
+        // refused: a name that is taken or no name, a base that cannot carry instructions, skills off Claude, no file
+        for (cmd, why) in [(add("claude", None, None, false), "one of Ringo's own agents"), (add("a b", None, None, false), "cannot be an agent's name"),
+                           (add("billing", Some("shop-billing"), Some("agy"), false), "agy is not one"),
+                           (add("billing", Some("shop-billing"), Some("codex"), true), "skills are Claude Code's"),
+                           (add("billing", None, None, false), "no instructions file `billing`")] {
+            assert!(a.run(cmd, "").unwrap_err().contains(why), "{why}");
+        }
+        // made: on claude unless another is named, from the Claude Code agent of that name
+        let said = a.run(add("shop-billing", None, None, false), "").unwrap().unwrap();
+        assert!(said.starts_with("  shop-billing is an agent here now: claude with ") && said.contains("(26 characters, about 6 tokens more"), "{said}");
+        let own = Agent::from_name("shop-billing").unwrap();
+        assert_eq!((a.agents.last(), own.spec().adapter, own.spec().read, own.spec().skills), (Some(&own), ringo_cli::Adapter::Claude, true, false));
+        assert_eq!(parse("@shop-billing why is the invoice late?", &a.agents), Ok(Cmd::Agents(vec![(own, false)], "why is the invoice late?".into())));
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(a.s.state().join("agents.json")).unwrap()).unwrap();
+        assert_eq!((kept["agents"][3].as_str(), kept["custom"][0]["name"].as_str()), (Some("shop-billing"), Some("shop-billing")), "kept for the next start");
+        // it runs on its agent's plan: one read, one gauge
+        a.s.programs.insert(claude, std::env::current_exe().unwrap());
+        a.s.programs.insert(codex, std::env::current_exe().unwrap());
+        a.s.programs.insert(own, std::env::current_exe().unwrap());
+        assert_eq!(a.plan_agents(), [codex], "one program, one plan");
+        a.run(Cmd::Agent(None), "").unwrap();
+        let rows = screen(&mut a, 120, 16).join("\n");
+        assert!(rows.contains("shop-billing  on claude · ") && rows.contains("26 characters") && !rows.contains("/agent add shop-billing"), "{rows}");
+        // the same name again, and taken away: its file stays
+        assert!(a.run(add("shop-billing", None, None, false), "").unwrap_err().contains("you already have an agent called shop-billing"));
+        a.main = own;
+        assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("shop-billing".into()))), "").unwrap().unwrap().contains("its instructions file is untouched"));
+        assert!(!a.agents.contains(&own) && a.main == codex && made.join("shop-billing.md").is_file());
+        assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("claude".into()))), "").unwrap_err().contains("not an agent of your own"));
     }
 
     #[test]

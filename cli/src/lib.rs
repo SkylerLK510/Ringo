@@ -68,6 +68,49 @@ pub struct Spec {
     pub installer: Option<String>,
     /// Added by the owner (kept in agents.json), not shipped with Ringo.
     pub custom: bool,
+    /// What makes an agent of the owner's a specialist: a file of standing instructions that goes to its every turn
+    /// (see `instructions`). A Claude or Codex agent only: Ringo has no place to give them to another.
+    pub instructions: Option<String>,
+    /// Claude only: its turns load the owner's Claude Code skills, plugins and connectors, which every other turn
+    /// goes without (see `launch_agent`).
+    pub skills: bool,
+}
+
+/// A path as its owner typed it: `~/` is their home folder.
+pub fn home_path(path: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
+    path.strip_prefix("~/").map_or_else(|| PathBuf::from(path), |rest| home.join(rest))
+}
+
+/// The most a specialist's instructions may hold: they are read on every call of its turns (about 100k tokens here).
+pub const INSTRUCTIONS_MAX: usize = 400_000;
+
+/// A specialist's standing instructions (`Spec::instructions`), read anew for each turn, so an edit applies at the
+/// next one: the file's text without a leading `---` block (a Claude Code agent file opens with its name and
+/// description there). An agent that has none: None. A file that cannot be read, holds nothing or is too large is an
+/// error, never a turn without them: that turn would not be this agent's.
+pub fn instructions(spec: &Spec) -> Result<Option<Vec<u8>>, String> {
+    let Some(path) = &spec.instructions else { return Ok(None) };
+    let file = home_path(path);
+    let bytes = fs::read(&file).map_err(|e| format!("{}'s instructions could not be read ({}: {e})", spec.name, file.display()))?;
+    let mut body = &bytes[..];
+    if let Some(rest) = bytes.strip_prefix(b"---\n").or_else(|| bytes.strip_prefix(b"---\r\n")) {
+        let mut at = 0;
+        for line in rest.split_inclusive(|b| *b == b'\n') {
+            at += line.len();
+            if line.trim_ascii_end() == b"---" {
+                body = &rest[at..];
+                break;
+            }
+        }
+    }
+    let body = body.trim_ascii();
+    match body.len() {
+        0 => Err(format!("{}'s instructions file has no text in it ({})", spec.name, file.display())),
+        n if n > INSTRUCTIONS_MAX => Err(format!("{}'s instructions are {n} bytes, and they are read on every call: keep them \
+                                                  under {INSTRUCTIONS_MAX} ({})", spec.name, file.display())),
+        _ => Ok(Some(body.to_vec())),
+    }
 }
 
 /// A name that can be a program on PATH and go into a command line: letters, digits, `-`, `_`, `.`.
@@ -101,12 +144,21 @@ impl Spec {
             return Err(format!("{name}: Ringo cannot verify a read-only mode for a plain agent, so \"read\" must be \
                                 false"));
         }
+        let instructions = text("instructions").filter(|p| !p.trim().is_empty());
+        if instructions.is_some() && !matches!(adapter, Adapter::Claude | Adapter::Codex) {
+            return Err(format!("{name}: \"instructions\" go to a claude or codex agent; Ringo has no place to give them \
+                                to another"));
+        }
+        let skills = v.get("skills").and_then(|b| b.as_bool()).unwrap_or(false);
+        if skills && adapter != Adapter::Claude {
+            return Err(format!("{name}: \"skills\" are Claude Code's, so its adapter must be claude"));
+        }
         let os = if cfg!(windows) { "windows" } else { "unix" };
         let installer = v.get("installer").and_then(|i| i.get(os)).and_then(|s| s.as_str()).map(str::to_string);
         Ok(Spec { program: text("program").unwrap_or_else(|| name.clone()),
                   company: text("company").unwrap_or_else(|| format!("{name} (added by you)")),
                   install: text("install").unwrap_or_default(), login: list("login")?, read, args: list("args")?,
-                  npm: text("npm"), self_update: text("self_update"), installer, adapter, name, custom })
+                  npm: text("npm"), self_update: text("self_update"), installer, adapter, name, custom, instructions, skills })
     }
 }
 
@@ -546,6 +598,8 @@ pub struct Session {
     pub models: HashMap<Agent, String>,
     /// Ringo's state folder, where `usage.jsonl` keeps what each finished job used.
     root: PathBuf,
+    /// The owner's home folder, where the agents they made for Claude Code are (`.claude/agents`).
+    pub home: PathBuf,
     /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
     pub claude_limits: Option<serde_json::Value>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
@@ -888,7 +942,7 @@ impl Session {
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
@@ -1166,6 +1220,11 @@ impl Session {
         let own = read("config.toml").is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
         !own && ["AGENTS.override.md", "AGENTS.md"].into_iter().filter_map(|f| read(f).ok())
             .find(|text| !text.trim().is_empty()).is_some_and(|text| text.contains("ringo"))
+    }
+
+    /// Ringo's state folder for this session: agents.json and rules.md are there.
+    pub fn state(&self) -> &Path {
+        &self.root
     }
 
     /// The owner's own rules for every Claude turn: a file they write in Ringo's state folder. With none, a turn is as
@@ -1484,9 +1543,16 @@ impl Session {
         }
         // A turn in the owner's folder edits it, unless in read mode; a write turn edits its own copy.
         let edits = write || self.mode != Mode::Read;
+        // a specialist of the owner's: what makes it one, or no turn at all
+        let own = instructions(spec)?;
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
         let _ = fs::write(dir.join("prompt.txt"), prompt);
+        if let Some(own) = &own && let Err(e) = fs::write(dir.join("agent.md"), own) {
+            let e = format!("{name}'s instructions could not be kept for its turn: {e}");
+            self.end(id, Status::Failed(e.clone()));
+            return Err(e);
+        }
         let cwd = if write {
             // The copy starts from the folder as it is now, uncommitted changes included, so its change applies
             // back onto it.
@@ -1603,9 +1669,15 @@ impl Session {
                 if let Some(model) = self.models.get(&agent) {
                     thread["model"] = model.as_str().into();
                 }
-                // Kept by the thread once it is given; given on resuming too, for a thread started without it
-                if self.codex_told_to_use_ringo() {
-                    thread["developerInstructions"] = CODEX_IN_RINGO.into();
+                // Kept by the thread once it is given; given on resuming too, for a thread started without it. A
+                // specialist's instructions go the same way, ahead of it: for its turns they stand in for any
+                // developer instructions in the owner's Codex settings, which the thread's replace.
+                let told = self.codex_told_to_use_ringo().then_some(CODEX_IN_RINGO);
+                match (&own, told) {
+                    (Some(own), told) => thread["developerInstructions"] =
+                        [&*String::from_utf8_lossy(own), told.unwrap_or("")].join("\n\n").trim_end().into(),
+                    (None, Some(told)) => thread["developerInstructions"] = told.into(),
+                    (None, None) => {}
                 }
                 let method = match &resume {
                     Some(id) => {
@@ -1631,12 +1703,17 @@ impl Session {
                 // The reply streams as it is written (--include-partial-messages); neither changes any tokens.
                 cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                           "--include-partial-messages", "--replay-user-messages"]);
-                if self.mode != Mode::Read && connectors {
+                if spec.skills || (self.mode != Mode::Read && connectors) {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
                     // Without CLAUDE.md the owner's instruction to use Ringo cannot start Ringo again either.
+                    // A specialist the owner set up with skills keeps those too, in every mode: its instructions name
+                    // them, and the owner chose their cost for this agent's turns alone.
                     cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
-                    cmd.args(["--agent", "claude", "--disable-slash-commands"]);
+                    cmd.args(["--agent", "claude"]);
+                    if !spec.skills {
+                        cmd.arg("--disable-slash-commands");
+                    }
                 } else {
                     // --safe-mode drops the owner's CLAUDE.md, skills, plugins, hooks and MCP servers: one trivial
                     // turn measured 16.6k tokens instead of 50.2k, with the subscription login and built-in subagents
@@ -1717,19 +1794,30 @@ impl Session {
                         None
                     }
                 };
-                let append = match (rules, doc) {
-                    (Some(rules), Some(doc)) => {
+                let append = match (rules, &own, doc) {
+                    (None, None, doc) => doc,
+                    (Some(_), None, None) => Some(self.rules_path()),
+                    (None, Some(_), None) => Some(dir.join("agent.md")),
+                    // the owner's rules, then what makes this agent a specialist, then the project's own file
+                    (rules, own, doc) => {
                         let both = dir.join("instructions.md");
-                        match fs::read(&doc).and_then(|text| fs::write(&both, [rules.trim_ascii_end(), b"\n\n", &text].concat())) {
+                        let joined = doc.as_ref().map(fs::read).transpose().map(|text| {
+                            [rules.as_deref().map(<[u8]>::trim_ascii_end), own.as_deref(), text.as_deref()]
+                                .into_iter().flatten().collect::<Vec<_>>().join(&b"\n\n"[..])
+                        });
+                        match joined.and_then(|bytes| fs::write(&both, bytes)) {
                             Ok(()) => Some(both),
+                            // a specialist's turn still carries what makes it one
+                            Err(e) if own.is_some() => {
+                                self.jobs[id - 1].push_log(format!("your rules.md and the project's instructions are left out of this turn: {e}"));
+                                Some(dir.join("agent.md"))
+                            }
                             Err(e) => {
                                 self.jobs[id - 1].push_log(format!("your rules.md is left out of this turn: {e}"));
-                                Some(doc)
+                                doc
                             }
                         }
                     }
-                    (Some(_), None) => Some(self.rules_path()),
-                    (None, doc) => doc,
                 };
                 if let Some(file) = append {
                     cmd.arg("--append-system-prompt-file").arg(file);
@@ -2652,6 +2740,21 @@ pub fn add_custom_agent(root: &Path, entry: serde_json::Value) -> Result<Agent, 
     Agent::register(spec)
 }
 
+/// Takes the owner's entry `name` out of `root`/agents.json, and out of the agents set up there. This process keeps
+/// knowing the name until it ends (`Agent::register`). False when there was no such entry.
+pub fn remove_custom_agent(root: &Path, name: &str) -> Result<bool, String> {
+    with_agents_lock(root, || {
+        let mut file = read_agents_file(root);
+        let named = |v: &serde_json::Value| v.as_str().or(v["name"].as_str()) == Some(name);
+        let Some(custom) = file["custom"].as_array_mut().filter(|c| c.iter().any(named)) else { return Ok(false) };
+        custom.retain(|v| !named(v));
+        if let Some(agents) = file["agents"].as_array_mut() {
+            agents.retain(|v| !named(v));
+        }
+        write_agents_file(root, &file).map(|_| true)
+    })
+}
+
 /// The agents set up with `ringo setup` (state_root()/agents.json), the owner's own entries registered first;
 /// None before the first setup.
 pub fn configured_agents() -> Option<Vec<Agent>> {
@@ -2664,11 +2767,15 @@ pub fn configured_agents() -> Option<Vec<Agent>> {
 
 /// Saves which agents are set up; the owner's own entries are kept as they are.
 pub fn save_agents(agents: &[Agent]) -> Result<(), String> {
-    let root = state_root();
-    with_agents_lock(&root, || {
-        let mut file = read_agents_file(&root);
+    save_agents_in(&state_root(), agents)
+}
+
+/// `save_agents` for the state folder `root`.
+pub fn save_agents_in(root: &Path, agents: &[Agent]) -> Result<(), String> {
+    with_agents_lock(root, || {
+        let mut file = read_agents_file(root);
         file["agents"] = agents.iter().map(|a| a.name()).collect::<Vec<_>>().into();
-        write_agents_file(&root, &file)
+        write_agents_file(root, &file)
     })
 }
 

@@ -1834,3 +1834,87 @@ fn each_agent_is_started_on_the_model_its_owner_chose() {
         assert_eq!(ringo_cli::valid_model(name), ok, "{name}");
     }
 }
+
+/// An agent of the owner's own: a file of instructions makes Claude or Codex a specialist under its own name. The
+/// text goes to its every turn the agent's own way (Claude: appended to the system prompt between the owner's rules
+/// and the project's file; Codex: the thread's developer instructions), without a Claude Code agent file's opening
+/// block, read anew each turn. A turn that cannot have them does not start. With `skills`, Claude loads the owner's
+/// skills, plugins and connectors, but still not their CLAUDE.md.
+#[test]
+fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
+    let r = repo("own-agent");
+    fs::write(r.join("AGENTS.md"), "Project rule.\n").unwrap();
+    let state = root().join("state-own-agent");
+    let file = root().join("specialist.md");
+    fs::write(&file, "---\nname: specialist\ndescription: knows the billing code\n---\n\nYou know the billing code.\n").unwrap();
+    let claude = fake(&root(), "claude-own", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\nenv > \"$0.env\"\n\
+        rm -f \"$0.appended\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --append-system-prompt-file ] && cat \"$2\" > \"$0.appended\"; shift; done\n\
+        head -n 1 > /dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-o\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let codex = fake(&root(), "codex-own", &codex_script("", &codex_done("done", (1, 0, 1))));
+    let entry = |name: &str, adapter: &str, skills: bool| serde_json::json!({"name": name, "adapter": adapter, "read": true,
+        "program": "claude", "instructions": file, "skills": skills});
+    for (bad, why) in [(serde_json::json!({"name": "own-agy", "adapter": "agy", "instructions": "x.md"}), "claude or codex"),
+                       (serde_json::json!({"name": "own-plain", "instructions": "x.md"}), "claude or codex"),
+                       (entry("own-skilled-codex", "codex", true), "Claude Code's")] {
+        let e = ringo_cli::add_custom_agent(&state, bad).unwrap_err();
+        assert!(e.contains(why), "{e}");
+    }
+    let on_claude = ringo_cli::add_custom_agent(&state, entry("own-claude", "claude", false)).unwrap();
+    let skilled = ringo_cli::add_custom_agent(&state, entry("own-skilled", "claude", true)).unwrap();
+    let on_codex = ringo_cli::add_custom_agent(&state, entry("own-codex", "codex", false)).unwrap();
+    let mut s = Session::with_state(&r, &state).unwrap();
+    for (agent, program) in [(on_claude, &claude), (skilled, &claude), (agent("claude"), &claude), (on_codex, &codex)] {
+        s.programs.insert(agent, program.clone());
+    }
+    let home = root().join("codex-home-own");
+    fs::create_dir_all(&home).unwrap();
+    s.codex_home = home.clone();
+    let run = |s: &mut Session, agent: Agent| {
+        let id = s.launch_agent(agent, false, "the task").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        (fs::read_to_string(claude.with_extension("appended")).unwrap_or_default(),
+         fs::read_to_string(format!("{}.argv", claude.display())).unwrap_or_default())
+    };
+    let (appended, argv) = run(&mut s, on_claude);
+    assert_eq!(appended, "You know the billing code.\n\nProject rule.\n", "its instructions, then the project's; no opening block");
+    assert!(argv.lines().any(|a| a == "--safe-mode"), "as lean as any Claude turn: {argv}");
+    assert_eq!(run(&mut s, agent("claude")).0, "Project rule.\n", "claude itself is not the specialist");
+    fs::write(s.rules_path(), "My rule.\n").unwrap();
+    fs::write(&file, "You know the billing code, and the ledger.\n").unwrap();
+    assert_eq!(run(&mut s, on_claude).0, "My rule.\n\nYou know the billing code, and the ledger.\n\nProject rule.\n",
+               "the owner's rules first, and an edit to the file is in the next turn");
+    fs::remove_file(r.join("AGENTS.md")).unwrap();
+    fs::remove_file(s.rules_path()).unwrap();
+    assert_eq!(run(&mut s, on_claude).0, "You know the billing code, and the ledger.", "alone");
+    // with skills: the owner's customizations load, their CLAUDE.md and memory still do not
+    let argv = run(&mut s, skilled).1;
+    let has = |flag: &str| argv.lines().any(|a| a == flag);
+    assert!(!has("--safe-mode") && !has("--disable-slash-commands") && has("--agent"), "{argv}");
+    let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
+    assert!(env.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1") && env.contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"), "{env}");
+    // Codex: the thread's developer instructions, with Ringo's own note after them when the owner's files call for it
+    let told = |s: &mut Session| {
+        let id = s.launch_agent(on_codex, false, "the task").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        threads(&codex).pop().unwrap()["params"]["developerInstructions"].as_str().map(String::from).unwrap()
+    };
+    assert_eq!(told(&mut s), "You know the billing code, and the ledger.");
+    fs::write(home.join("AGENTS.md"), "Use Ringo as the default harness.\n").unwrap();
+    let both = told(&mut s);
+    assert!(both.starts_with("You know the billing code, and the ledger.\n\nRingo launched this conversation"), "{both}");
+    // no instructions, no turn: a turn without them would not be this agent's
+    let jobs = s.jobs.len();
+    fs::write(&file, "---\nname: specialist\n---\n \n").unwrap();
+    assert!(s.launch_agent(on_claude, false, "the task").unwrap_err().contains("no text in it"));
+    fs::remove_file(&file).unwrap();
+    let e = s.launch_agent(on_codex, false, "the task").unwrap_err();
+    assert!(e.contains("own-codex's instructions could not be read") && s.jobs.len() == jobs, "{e}");
+    // taken away: out of the owner's file, the other entries as they were
+    assert_eq!(ringo_cli::remove_custom_agent(&state, "own-claude"), Ok(true));
+    assert_eq!(ringo_cli::remove_custom_agent(&state, "own-claude"), Ok(false));
+    let kept: serde_json::Value = serde_json::from_slice(&fs::read(state.join("agents.json")).unwrap()).unwrap();
+    let names: Vec<&str> = kept["custom"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!(names, ["own-skilled", "own-codex"]);
+}

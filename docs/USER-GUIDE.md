@@ -123,6 +123,27 @@ If your plan does not include a model, the turn says so when it starts, and Ring
 `/ask`, `/review`, `/design` and `/research` run on the backend, which takes a model too: `/backend claude@opus`. So
 one model can write the code and another can review it. agy chooses its own model.
 
+## Bring an agent of your own
+
+If you or your team wrote a specialist (a file that says what it knows and how it works, such as an agent made for
+Claude Code), it can work in Ringo under its own name:
+
+| You type | What happens |
+|---|---|
+| `/agent` | your own agents, and the agents you made for Claude Code that Ringo found |
+| `/agent add billing ~/notes/billing.md` | `billing` is an agent here: Claude with that file as its standing instructions |
+| `/agent add billing ~/notes/billing.md codex` | the same specialist, on your Codex plan |
+| `/agent add shop-billing` | an agent you made for Claude Code, by its name (`.claude/agents/shop-billing.md` here or in your home folder) |
+| `/agent add billing FILE skills` | on Claude, its turns also load your Claude Code skills, plugins and connectors |
+| `/agent remove billing` | it is gone from Ringo; the file is yours and stays |
+
+Then `@billing why is the invoice late?` talks to it, as to any agent. It keeps a conversation of its own, hears what
+the other agents did and is heard by them, shows in the side panel, and takes a model (`/model billing opus`). Edit
+the file and its next turn has the change.
+
+It costs what the file holds: its text is read on every call of that agent's turns, and with `skills` so are the
+lists of your skills and connectors. Only that agent's turns pay for it; `@claude` stays as lean as before.
+
 ## See what you have used
 
 `/usage` shows, as gauges (green, amber past 60% used, red past 85%):
