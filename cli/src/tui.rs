@@ -1973,7 +1973,7 @@ impl App {
     }
 
     /// Stops the turn running in this folder (or ultra's review of the last one); lines queued behind it go back into
-    /// the input, to send or change.
+    /// the input, to send or change. With a line being typed for another agent they are shown instead.
     fn stop(&mut self, id: usize) {
         let _ = self.s.kill(id);
         // the stopped agent's lines come back, the other agents' keep waiting for their own turns; ultra's review
@@ -1983,20 +1983,34 @@ impl App {
         self.queue = keep;
         let agents: Vec<Agent> = back.iter().map(|(a, ..)| *a).collect();
         let queued: Vec<String> = back.into_iter().map(|(_, _, line)| line).collect();
+        let mut unsent = Vec::new();
         if !queued.is_empty() {
-            // Back to the agent they were for, though another may have spoken since (see `feed`). A line being typed
-            // stays, for the agent it was typed for, and the waiting lines go in above it, as a returned steer line does.
+            // Back to the agent they were for, though another may have spoken since (see `feed`). A plain line being
+            // typed for that agent stays, and the waiting lines go in above it (they were dropped). Typed for another
+            // agent, or as a command, the line is left as it is and the waiting lines are shown instead: joined to
+            // it, they would go where it goes.
             let typed: String = self.input.iter().collect();
-            if typed.is_empty() && let Some(&agent) = agents.first().filter(|a| agents.iter().all(|b| b == *a)) {
-                self.main = agent;
-            }
+            let one = agents.first().copied().filter(|a| agents.iter().all(|b| b == a));
             let back = queued.join("\n");
-            self.input = if typed.is_empty() { back } else { format!("{back}\n{typed}") }.chars().collect();
-            self.cursor = self.input.len();
+            if typed.is_empty() {
+                if let Some(agent) = one {
+                    self.main = agent;
+                }
+                self.input = back.chars().collect();
+                self.cursor = self.input.len();
+            } else if one == Some(self.main) && matches!(parse(&typed, &self.agents), Ok(Cmd::Talk(_))) {
+                self.cursor += back.chars().count() + 1; // where it was in the line being typed
+                self.input = format!("{back}\n{typed}").chars().collect();
+            } else {
+                unsent = agents.into_iter().zip(queued).collect();
+            }
         }
         match self.checking {
             Some((review, turn, _)) if review == id => self.say(format!("  stopping review #{id}; #{turn}'s change stays as it is")),
             _ => self.say(format!("  stopping #{id}; what it changed so far stays (/undo takes it back)")),
+        }
+        for (agent, line) in unsent {
+            self.say(format!("  a line that waited for {} was not sent: {line}", agent.name()));
         }
     }
 
@@ -3861,12 +3875,23 @@ mod tests {
         a.main = agy;
         a.stop(id);
         assert_eq!((a.main, a.input.iter().collect::<String>()), (claude, "next".to_string()));
-        // a line being typed stays, for the agent it was typed for: the waiting line comes back above it (it was dropped)
-        a.main = agy;
+        // a plain line being typed for that agent stays, and the waiting line comes back above it (it was dropped)
         a.input = "half typed".chars().collect();
+        a.cursor = 4;
         a.queue.push_back((claude, "later".into(), "later".into()));
         a.stop(id);
-        assert_eq!((a.main, a.input.iter().collect::<String>()), (agy, "later\nhalf typed".to_string()));
+        assert_eq!((a.main, a.input.iter().collect::<String>(), a.cursor), (claude, "later\nhalf typed".to_string(), 10));
+        // typed for another agent, by the prompt or by name, the line is left as it is: joined to it, claude's line
+        // would go to that agent. The waiting line is shown, not sent and not lost from sight.
+        for (main, typed) in [(agy, "half typed"), (claude, "@agy look")] {
+            a.main = main;
+            a.input = typed.chars().collect();
+            a.queue.push_back((claude, format!("for claude, not {typed}"), format!("for claude, not {typed}")));
+            a.stop(id);
+            assert_eq!((a.main, a.input.iter().collect::<String>()), (main, typed.to_string()));
+            let said: String = a.out.iter().map(|o| format!("{o:?}")).collect();
+            assert!(said.contains(&format!("a line that waited for claude was not sent: for claude, not {typed}")), "{said}");
+        }
         assert!(a.queue.is_empty());
         let _ = std::fs::remove_file(dir.join("claude.hold"));
         finish(&mut a);

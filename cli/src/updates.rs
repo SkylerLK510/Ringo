@@ -388,7 +388,9 @@ pub fn install(exe: &Path, new: &Path) -> Result<(), String> {
     let say = |e: std::io::Error| format!("{} could not be replaced ({e}); {} is the new one", exe.display(), new.display());
     let tmp = exe.with_extension(format!("new{}", std::process::id()));
     fs::copy(new, &tmp).map_err(say)?; // the permissions come with it
-    // on disk before it takes the old one's place: a rename can outlive a power cut that the copied bytes do not
+    // Asked onto disk before it takes the old one's place: a rename can outlive a power cut that the copied bytes do
+    // not. Best effort: where the copy cannot be synced (not every filesystem can, nor every handle), the install goes
+    // on as it did before there was a sync, since the copy itself did not fail.
     let _ = fs::File::open(&tmp).and_then(|f| f.sync_all());
     let old = exe.with_extension("old");
     if cfg!(windows) {
