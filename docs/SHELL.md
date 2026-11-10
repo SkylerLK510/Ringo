@@ -159,11 +159,14 @@ times"), until another step or the reply comes; Codex's commands that only read 
 step too long for the row loses its end to `…`, and `/show N` has every step whole, each read and search too. Then
 one line when a job ends with its time, tokens and Ringo model calls, and the files it changed. A reply appears as it
 is written (Claude's and agy's text deltas, Codex's `item/agentMessage/delta`), and the whole reply replaces the
-pieces when it is complete. Replies render their
+pieces when it is complete. What has been written does not change under the reader ([details](#a-reply-as-it-is-written)). Replies render their
 markdown: headings, emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned
 columns (a long last column wraps under itself), or, when even that does not fit, as one block per row with each cell
 under its column's name. Everything is fitted again when the window's width changes. The mouse wheel and PgUp/PgDn
-scroll it, and it stays where you scrolled while new lines arrive below; typing goes back to the end. A drag over
+scroll it, and it stays where you scrolled whatever is written meanwhile, below it or above it: the place is kept as
+a row of an entry, not as a count from the end, so the reply of an agent that started first can grow above what you
+are reading of the second without moving it. The input's hint counts the rows below (`scrolled up · 14 rows below`),
+so nothing arrives unseen. Typing goes back to the end; with nothing typed, End does too, and Home goes to the start. A drag over
 the conversation selects its text alone (never the input or the status line) and copies it when you let go, with
 the system's own clipboard tool (`pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip`) or, where there is none, such as a
 server over ssh, by asking the terminal (OSC 52). `/copy` copies the last answer. Below the conversation are the
@@ -236,6 +239,35 @@ count reached 93% of the turn's own total, which replaces it at the end (a messa
 written). Codex reports its tokens only when a turn ends. When two unapplied copies edit the same file, the running
 job's row and the line it ends with say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs
 no tokens: it compares the agents' own edit events as they arrive.
+
+### A reply as it is written
+
+A reply's pieces arrive a few characters at a time, and markdown is not known until its marks close. Shown as they
+come, rows already on screen change: a word that outgrows its row moves to the next, a link loses its brackets when
+it closes, and a table's columns shift with every wider cell (and it starts as a row of bars). So three things wait
+until they are whole (`steady`), and nothing that has shown is taken back:
+
+- the word being written, until its end comes or 150 ms pass without a piece (a path or URL past 32 characters, and
+  Chinese, Japanese or Korean text, which has no spaces, show as they grow);
+- a link whose text has a space in it, until it closes;
+- a table, until a line that is not one of its rows comes or 1.5 s pass: meanwhile one line says
+  `a table is being written · 3 rows so far…`.
+
+A step, the turn's end or the pause shows everything kept back, so the last word before a tool call never waits.
+
+Measured by writing a document in pieces of 4 to 24 characters and comparing each frame's rows with the one before
+(release build, 120 columns; `measure_a_reply_being_written` prints it):
+
+| Written in pieces | Frames | Rows above the last rewritten | The last row took text back |
+|---|---|---|---|
+| the 14.8k user guide, before | 1,060 | 85 | 18 |
+| the same, now | 1,060 | 0 | 1 |
+| this 56k page, before | 4,007 | 157 | 105 |
+| the same, now | 4,007 | 3 | 10 |
+
+What is left: a code span or a link that goes on over a line end, which the last line alone does not show. A frame
+costs what it did: 0.2 ms on average for the guide and about 1 ms at the end of the 56k page, each frame parsing the whole
+reply again, so the parse was left as it is. Saving a 300-turn conversation at a turn's end took 16 ms.
 
 ## Modes and permissions
 
@@ -676,3 +708,25 @@ pipelines.
 Route suggestions (`/route on`: word rules that put the matching command in the input for a line that read like a
 task; acceptable 35 times in 38 on 100 held-out lines, covering about half of the tasks) were removed when a plain
 line became an agent turn in the folder: there was nothing left for them to suggest.
+
+Lookups by a lighter agent (2026-11-10) were built, checked live and removed. A plain line that only asked where
+something is in the code (word rules, no model call) went to agy as a turn that only read, in every mode, and was
+asked to name each place as `path:line`; `/look TEXT` asked for one outright. One run each of "where is the retry
+count configured" in a four-file repository, through that same read-only turn (agy 1.5.3 to 1.5.5: it updated itself
+meanwhile; Claude Code 2.1.322, codex-cli 0.167.0):
+
+| Agent | Time | Tokens | Answer |
+|---|---|---|---|
+| agy | 53.4 s | 32,687 | none: it started a subagent and ended its turn with "waiting for results" |
+| agy, told to use its own read tools and no subagent | 70.1 s | 183,863 | right, 2 places |
+| Claude | 10.7 s | 34,481 | right, 4 places |
+| Codex | 14.6 s | 41,519 | right, 4 places |
+
+agy began with `find` and `ls` as commands, which Ringo refuses it because it cannot ask. Told to read for itself, it
+opened files by guessed paths (9 of its 14 reads failed) over 15 calls, and none read from a cache: 8,559 to 13,448
+input tokens each. So a lookup sent to agy was slower and larger than one left with the agent you talk to. The word
+rule also took none of the 113 plain lines in one owner's shell history, and none of them was a lookup: they were
+tasks, answers and follow-ups. One run each on a toy repository is enough not to adopt it and is not a measure of
+agy. An agy turn in your folder that has to search meets the same refusals. To try again: a lighter agent that reads
+from a cache between calls and can search without a command, or a lighter model of Claude's or Codex's own, measured
+the same way.

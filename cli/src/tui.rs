@@ -479,6 +479,92 @@ fn closed(mut text: String) -> String {
     text
 }
 
+/// How long the word being written waits for its end before it shows anyway, and a table for its last row: a
+/// reply's pieces come tens of milliseconds apart, so a pause this long is the agent stopping to think or to work.
+const WORD_HOLD: Duration = Duration::from_millis(150);
+const TABLE_HOLD: Duration = Duration::from_millis(1500);
+/// A word, or a link, longer than this shows as it grows (a path, a URL, a `[` that opens no link).
+const HELD_WORD: usize = 32;
+const HELD_LINK: usize = 60;
+
+/// What shows of a reply being written (`text`, its pieces last came `age` ago), so that a row someone is reading
+/// does not change under them. Kept back until it is whole:
+/// - the word being written, which could move to the next row or close a mark, until its end comes or WORD_HOLD;
+/// - a link whose text has a space in it, until it closes (its marks would go when it does);
+/// - a table, whose columns move with every wider cell, until a line that is not one of its rows comes or
+///   TABLE_HOLD: one line stands in for it and counts its rows.
+///
+/// Nothing before `floor` is kept back: what has shown stays. Returns the text to show, how much of `text` it
+/// is, and how long after the last piece to look again (None: nothing was kept back).
+/// Measured on the 14.8k guide written in pieces of 4 to 24 characters at 120 columns: rows above the one being
+/// written changed in 85 of 1,060 frames before, and the row being written took text back in 18.
+fn steady(text: &str, age: Duration, floor: usize) -> (String, usize, Option<Duration>) {
+    let fenced = text.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+    let (mut keep, mut again, mut note) = (text.len(), None, String::new());
+    if !fenced && age < TABLE_HOLD {
+        // the lines at the end that start a table's rows; an empty line being started is not yet a line
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        let open = lines.last().is_some_and(|l| !l.is_empty());
+        if !open {
+            lines.pop();
+        }
+        let run = lines.iter().rev().take_while(|l| l.trim_start().starts_with('|')).count();
+        let start: usize = lines[..lines.len() - run].iter().map(|l| l.len() + 1).sum();
+        if run > 0 && start >= floor {
+            // its heading and the rule under it are not rows
+            let rows = (run - open as usize).saturating_sub(2);
+            note = match rows {
+                0 => "*a table is being written…*".to_string(),
+                1 => "*a table is being written · 1 row so far…*".to_string(),
+                n => format!("*a table is being written · {n} rows so far…*"),
+            };
+            (keep, again) = (start, Some(TABLE_HOLD));
+        }
+    }
+    if note.is_empty() && age < WORD_HOLD {
+        let end = text.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+        let word = &text[end..];
+        // wide characters (Chinese, Japanese, Korean) have no spaces between words: they show as they come
+        if !word.is_empty() && end >= floor && word.chars().count() <= HELD_WORD && word.chars().all(|c| c.width() != Some(2)) {
+            (keep, again) = (end, Some(WORD_HOLD));
+        }
+        let line = text[..keep].rfind('\n').map_or(0, |i| i + 1);
+        if !fenced && let Some(open) = text[line..keep].rfind('[').map(|i| line + i) {
+            let rest = &text[open..keep];
+            let whole = match rest.find(']') {
+                None => false,
+                Some(close) => match rest[close + 1..].chars().next() {
+                    None => false, // "](" may still come
+                    Some('(') => rest[close..].contains(')'),
+                    Some(_) => true, // "[x] done": no link
+                },
+            };
+            let in_code = text[line..open].matches('`').count() % 2 == 1;
+            if !whole && !in_code && open >= floor && rest.chars().count() <= HELD_LINK {
+                (keep, again) = (open, Some(WORD_HOLD));
+            }
+        }
+    }
+    let shown = closed(text[..keep].to_string());
+    let shown = match (note.is_empty(), shown.trim().is_empty()) {
+        (true, _) => shown,
+        (false, true) => note,
+        (false, false) => format!("{}\n\n{note}", shown.trim_end()),
+    };
+    (shown, keep, again)
+}
+
+/// A reply being written: its place in the conversation, its pieces as they came (cleaned whole, so a line end split
+/// across two pieces stays one), when the last piece came, how much of it has shown (see `steady`'s floor), and
+/// when to look again at what was kept back.
+struct Stream {
+    at: usize,
+    raw: String,
+    last: Instant,
+    floor: usize,
+    due: Option<Instant>,
+}
+
 /// The input as rows of at most `width` columns (a newline starts a row; a wide character takes two columns), and the
 /// cursor's (row, column).
 fn input_rows(input: &[char], cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
@@ -1147,7 +1233,6 @@ fn first_choice(agents: &[Agent]) -> Agent {
         .or_else(|| agents.iter().find(|a| a.spec().read)).copied().unwrap_or(agents[0])
 }
 
-/// A path under the home folder as `~/…`.
 /// The one git project below `top` that every file in `touched` (relative to `top`) is in, if there is one.
 fn one_project(top: &Path, touched: &std::collections::BTreeSet<String>) -> Option<PathBuf> {
     let mut found: Option<PathBuf> = None;
@@ -1163,6 +1248,7 @@ fn one_project(top: &Path, touched: &std::collections::BTreeSet<String>) -> Opti
     found
 }
 
+/// A path under the home folder as `~/…`.
 fn home_short(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     match path.strip_prefix(&home) {
@@ -1187,10 +1273,12 @@ struct App {
     out: Vec<Out>,
     fitted: Vec<Vec<Line<'static>>>,
     fitted_w: usize,
-    rows: usize,
     /// Rows scrolled up from the end (0: following it), where the conversation showed in the last frame and its
     /// first row there, and the text selected with the mouse (from, to) and whether a drag is under way.
     scroll: usize,
+    /// Scrolled up: `scroll` as the last frame left it, and the row at the top then (an entry, and a row of it).
+    scrolled: usize,
+    anchor: Option<(usize, usize)>,
     view: Rect,
     top: usize,
     sel: Option<(Spot, Spot)>,
@@ -1200,8 +1288,8 @@ struct App {
     /// How the last job ended (true: done) and when, for the cat; and the cat's look last drawn.
     ended_at: Option<(bool, Instant)>,
     drawn_look: (&'static str, usize),
-    /// Each job's reply being written: its place in `out`, and its pieces as they came.
-    streams: std::collections::HashMap<usize, (usize, String)>,
+    /// Each job's reply being written.
+    streams: std::collections::HashMap<usize, Stream>,
     /// The agent plain lines go to, and lines waiting for the turn running in this folder: (agent, task, as typed).
     main: Agent,
     queue: VecDeque<(Agent, String, String)>,
@@ -1326,7 +1414,7 @@ fn mascot(state: &str) -> Vec<Vec<&'static str>> {
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
         App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, out: Vec::new(), fitted: Vec::new(),
-              fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
+              fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
@@ -1465,26 +1553,33 @@ impl App {
                     && let Kind::Agent { agent, write: false } = self.s.jobs[i].kind {
                     self.main = agent;
                 }
+                // anything but another piece means the reply's pieces have stopped for now: what was kept back shows
+                if !matches!(said, Said::Partial(_) | Said::Reply(_)) {
+                    self.show_stream(id, Duration::MAX);
+                }
                 match said {
                     // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
-                    // ceiling: the growing reply is fitted again (its markdown parsed) for each frame it grows in.
-                    // The raw pieces are kept and cleaned whole, so a line end split across two pieces stays one.
-                    Said::Partial(text) => match self.streams.get_mut(&id) {
-                        Some((at, raw)) if *at < self.out.len() => {
-                            raw.push_str(&text);
-                            self.out[*at] = Out::Reply(closed(clean(raw)));
-                            self.fitted.truncate(*at);
+                    // The growing reply is fitted again (its markdown parsed) for each frame it grows in: 0.1 to
+                    // 0.4 ms a frame up to the 14.8k guide, about 1 ms at the end of a 56k reply (measured, release).
+                    Said::Partial(text) => {
+                        match self.streams.get_mut(&id) {
+                            Some(s) if s.at < self.out.len() => {
+                                s.raw.push_str(&text);
+                                s.last = Instant::now();
+                            }
+                            _ => {
+                                self.gap();
+                                self.out.push(Out::Reply(String::new()));
+                                self.streams.insert(id, Stream { at: self.out.len() - 1, raw: text, last: Instant::now(),
+                                                                 floor: 0, due: None });
+                            }
                         }
-                        _ => {
-                            self.gap();
-                            self.out.push(Out::Reply(closed(clean(&text))));
-                            self.streams.insert(id, (self.out.len() - 1, text));
-                        }
-                    },
+                        self.show_stream(id, Duration::ZERO);
+                    }
                     Said::Reply(text) => match self.streams.remove(&id) {
-                        Some((at, _)) if at < self.out.len() => {
-                            self.out[at] = Out::Reply(clean(&text));
-                            self.fitted.truncate(at);
+                        Some(s) if s.at < self.out.len() => {
+                            self.out[s.at] = Out::Reply(clean(&text));
+                            self.fitted.truncate(s.at);
                             self.gap();
                         }
                         _ => self.reply(&text),
@@ -1516,7 +1611,8 @@ impl App {
                 self.last = id;
             }
             if ends {
-                self.streams.remove(&id); // a reply cut off stays as far as it got
+                self.show_stream(id, Duration::MAX); // a reply cut off stays as far as it got, all of it
+                self.streams.remove(&id);
                 self.ended_at = match self.s.jobs[i].status {
                     Status::Done => Some((true, Instant::now())),
                     Status::Failed(_) => Some((false, Instant::now())),
@@ -1536,6 +1632,30 @@ impl App {
         if any {
             self.keep();
         }
+    }
+
+    /// Shows job `id`'s reply being written as it stands `age` after its last piece (see `steady`). True when what
+    /// shows changed.
+    fn show_stream(&mut self, id: usize, age: Duration) -> bool {
+        let Some(s) = self.streams.get_mut(&id).filter(|s| s.at < self.out.len()) else { return false };
+        let (text, kept, again) = steady(&clean(&s.raw), age, s.floor);
+        s.floor = s.floor.max(kept);
+        s.due = again.map(|after| s.last + after);
+        if matches!(&self.out[s.at], Out::Reply(shown) if *shown == text) {
+            return false;
+        }
+        self.out[s.at] = Out::Reply(text);
+        self.fitted.truncate(s.at);
+        true
+    }
+
+    /// What replies being written kept back shows once their pieces pause (the word after WORD_HOLD, a table after
+    /// TABLE_HOLD), so the end of a sentence never waits on the next one. True when a row changed.
+    fn settle(&mut self) -> bool {
+        let now = Instant::now();
+        let due: Vec<(usize, Duration)> = self.streams.iter().filter(|(_, s)| s.due.is_some_and(|at| at <= now))
+            .map(|(id, s)| (*id, now - s.last)).collect();
+        due.into_iter().fold(false, |changed, (id, age)| self.show_stream(id, age) | changed)
     }
 
     /// Keeps this conversation for `ringo --resume` (see `Session::keep`), its text with it.
@@ -2432,7 +2552,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::PageUp => self.scroll += page,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(page),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(page),
             // the line-editing keys of a shell: to the line's start or end, a word back or on, and cutting either way
             KeyCode::Char('u') if ctrl => {
@@ -2452,6 +2572,9 @@ impl App {
             }
             KeyCode::Char('a') if ctrl => self.cursor = line_bounds(&self.input, self.cursor).0,
             KeyCode::Char('e') if ctrl => self.cursor = line_bounds(&self.input, self.cursor).1,
+            // with nothing typed there is no line to move in: the conversation's own start and end
+            KeyCode::Home if self.input.is_empty() => self.scroll = usize::MAX,
+            KeyCode::End if self.input.is_empty() => self.scroll = 0,
             KeyCode::Home => self.cursor = line_bounds(&self.input, self.cursor).0,
             KeyCode::End => self.cursor = line_bounds(&self.input, self.cursor).1,
             KeyCode::Char('b') if alt => self.cursor = word_start(&self.input, self.cursor),
@@ -2513,7 +2636,7 @@ impl App {
         let row = m.row.clamp(v.y, (v.y + v.height).saturating_sub(1));
         let spot = (self.top + (row - v.y) as usize, m.column.saturating_sub(v.x) as usize);
         match m.kind {
-            MouseEventKind::ScrollUp => self.scroll += 3,
+            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
             MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let inside = m.row >= v.y && m.row < v.y + v.height && m.column >= v.x && m.column < v.x + v.width;
@@ -2566,10 +2689,10 @@ impl App {
             let extra = self.out.len() - KEEP;
             self.out.drain(..extra);
             self.fitted.drain(..extra.min(self.fitted.len()));
-            self.streams.retain(|_, (at, _)| at.checked_sub(extra).map(|n| *at = n).is_some());
+            self.streams.retain(|_, s| s.at.checked_sub(extra).map(|n| s.at = n).is_some());
+            self.anchor = self.anchor.and_then(|(entry, row)| Some((entry.checked_sub(extra)?, row)));
         }
-        let same = width == self.fitted_w;
-        if !same {
+        if width != self.fitted_w {
             self.fitted.clear();
             self.fitted_w = width;
         }
@@ -2577,20 +2700,30 @@ impl App {
             let rows = self.out[self.fitted.len()].rows(width, &self.theme);
             self.fitted.push(rows);
         }
-        let rows = self.fitted.iter().map(Vec::len).sum();
-        if same && self.scroll > 0 {
-            self.scroll += rows - self.rows.min(rows); // rows added below keep what is on screen still
-        }
-        self.rows = rows;
-        rows
+        self.fitted.iter().map(Vec::len).sum()
     }
 
-    /// The conversation's rows that fit `area`, scrolled as set, with the selection shown.
+    /// The conversation's rows that fit `area`, scrolled as set, with the selection shown. Scrolled up, the row at
+    /// the top stays the one it was whatever is written meanwhile, below it or above it (with two agents at work, the
+    /// reply of the one that started first grows above what the other writes): the place is kept as an entry and a
+    /// row of it, not as a count of rows from the end.
     fn conversation(&mut self, f: &mut Frame, area: Rect, panel: bool) {
         let total = self.fit_to(area.width as usize);
         let h = area.height as usize;
+        // `scroll` as the last frame left it: no key or wheel moved it since, so the place it kept still holds
+        if self.scroll > 0 && self.scroll == self.scrolled && let Some((entry, row)) = self.anchor
+            && let Some(rows) = self.fitted.get(entry) {
+            let top = self.fitted[..entry].iter().map(Vec::len).sum::<usize>() + row.min(rows.len().saturating_sub(1));
+            self.scroll = total.saturating_sub(h + top);
+        }
         self.scroll = self.scroll.min(total.saturating_sub(h));
         let top = total.saturating_sub(h + self.scroll);
+        self.scrolled = self.scroll;
+        self.anchor = (self.scroll > 0).then(|| {
+            let mut row = top;
+            let entry = self.fitted.iter().position(|rows| row.checked_sub(rows.len()).map(|rest| row = rest).is_none());
+            (entry.unwrap_or(0), row)
+        });
         let shown: Vec<Line<'static>> = self.fitted.iter().flatten().skip(top).take(h).cloned().collect();
         f.render_widget(Paragraph::new(shown), area);
         // until the owner says something: where to start, centred a third of the way down, under any notes
@@ -2908,7 +3041,8 @@ impl App {
         if live.typing {
             let hint = match &self.toast {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
-                _ if self.scroll > 0 => "scrolled up · PgDn goes back".into(),
+                // the count grows as lines are written below: nothing arrives unseen
+                _ if self.scroll > 0 => format!("scrolled up · {} rows below · End goes back", self.scroll),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
                 _ if self.staged.is_some() => "update ready · /restart".into(),
                 _ if self.release.is_some() => "pipelines ready · /update approve".into(),
@@ -3274,6 +3408,7 @@ pub fn run(start: Start) -> ExitCode {
             update_ringo(updated.clone(), exe.clone());
         }
         app.feed();
+        dirty |= app.settle();
         dirty |= app.fitted.len() != app.out.len();
         if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST) {
             app.toast = None;
@@ -3594,21 +3729,136 @@ mod tests {
         a.talk(a.main, "hi".into(), "hi".into()).unwrap();
         let replies = |a: &App| a.out.iter().filter_map(|o| match o { Out::Reply(t) => Some(t.clone()), _ => None })
             .collect::<Vec<_>>();
+        // time passing with no new piece
+        let pause = |a: &mut App, by: Duration| {
+            let s = a.streams.get_mut(&1).unwrap();
+            (s.last, s.due) = (s.last - by, s.due.map(|at| at - by));
+            a.settle()
+        };
         a.s.jobs[0].fresh = vec![Said::Partial("Hel".into()), Said::Partial("lo".into())];
         a.feed();
-        assert_eq!(replies(&a), ["Hello"], "the pieces grow one reply");
-        screen(&mut a, 60, 12);
+        assert_eq!(replies(&a), [""], "the word being written waits for its end");
         a.s.jobs[0].fresh = vec![Said::Partial(", wor".into())];
         a.feed();
-        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"), "and it shows as it grows");
+        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello,"), "and shows once it has ended");
+        assert!(pause(&mut a, WORD_HOLD), "a pause shows what was kept back");
+        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"));
+        assert!(!a.settle(), "and then there is nothing left to show");
         a.s.jobs[0].fresh = vec![Said::Partial("ld\r".into()), Said::Partial("\nmore".into())];
         a.feed();
-        assert_eq!(replies(&a), ["Hello, world\nmore"], "a line end split across pieces stays one");
+        assert_eq!(replies(&a), ["Hello, world\n"], "a line end split across pieces stays one");
+        a.s.jobs[0].fresh = vec![Said::Step("Read a.rs · 2 lines".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world\nmore"], "a step means the pieces have stopped: nothing waits behind it");
         a.s.jobs[0].fresh = vec![Said::Reply("Hello, world.".into()), Said::Step("Read a.rs · 2 lines".into()),
                                  Said::Partial("Next".into())];
         a.feed();
-        assert_eq!(replies(&a), ["Hello, world.", "Next"], "the whole reply replaces its pieces; the next block opens anew");
+        assert_eq!(replies(&a), ["Hello, world.", ""], "the whole reply replaces its pieces; the next block opens anew");
+        // a turn that ends mid-reply shows all it wrote
+        a.s.kill(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.s.jobs[0].running() && Instant::now() < deadline {
+            a.s.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world.", "Next"]);
         a.s.shutdown();
+    }
+
+    #[test]
+    fn a_reply_being_written_keeps_back_what_would_change() {
+        let now = Duration::ZERO;
+        let show = |text: &str| steady(text, now, 0).0;
+        // the word being written waits for its end; a pause lets it through, and so does having shown already
+        assert_eq!(show("The quick bro"), "The quick ");
+        assert_eq!(steady("The quick bro", WORD_HOLD, 0), ("The quick bro".into(), 13, None));
+        assert_eq!(steady("The quick bro", now, 11).0, "The quick bro", "what has shown stays");
+        assert_eq!(show("\u{6f22}\u{5b57}"), "\u{6f22}\u{5b57}", "wide characters have no spaces to wait for");
+        let long = format!("see {}", "x".repeat(HELD_WORD + 1));
+        assert_eq!(show(&long), long, "a path or a URL shows as it grows");
+        // a link shows once it is whole; a box, or a bracket in code, is no link
+        assert_eq!((show("see [the "), show("see [the guide](GUIDE.md")), ("see ".into(), "see ".into()));
+        assert_eq!(show("see [the guide](GUIDE.md) for "), "see [the guide](GUIDE.md) for ");
+        assert_eq!((show("- [x] done "), show("use `a[i ")), ("- [x] done ".into(), "use `a[i` ".into()));
+        // a table shows once a line that is not one of its rows comes; until then one line counts its rows
+        let table = "Sizes:\n\n| Name | Size |\n|---|---|\n| a | 1 |\n| b";
+        assert_eq!(steady(table, now, 0), ("Sizes:\n\n*a table is being written · 1 row so far…*".into(), 8, Some(TABLE_HOLD)));
+        assert_eq!(show("| Name"), "*a table is being written…*");
+        assert_eq!(show(&format!("{table} | 2 |\n")), "Sizes:\n\n*a table is being written · 2 rows so far…*");
+        assert_eq!(show(&format!("{table} | 2 |\n\nDone. ")), format!("{table} | 2 |\n\nDone. "));
+        assert_eq!(steady(table, TABLE_HOLD, 0).0, table, "a long pause shows it as far as it is");
+        assert!(steady(table, now, 9).0.starts_with("Sizes:\n\n| Name"), "and once it shows, it stays");
+        assert_eq!(show("```\n| a | b"), "```\n| a | ", "in a code block a bar is only a bar");
+    }
+
+    /// An agent's reply with what replies have: emphasis, code, a link, a list, a table and a code block.
+    const SAMPLE_REPLY: &str = "I found the cause in **`client.rs`**: the request is sent once and a timeout is never retried, \
+so one slow response fails the whole sync. See [the retry notes](docs/RETRY.md) for the policy the team agreed on.\n\n\
+What I changed:\n\n\
+- `send` now retries up to 3 times, backing off 100 ms and then doubling each time\n\
+- the new `retry_count` setting defaults to 3, and 0 turns retries off entirely\n\
+- a test covers the case where the second attempt succeeds\n\n\
+| File | Change | Lines |\n|---|---|---|\n\
+| src/client.rs | wrap the send in a retry loop with backoff | +14 −2 |\n\
+| src/config.rs | read `retry_count` from the settings file | +6 |\n\
+| tests/client_test.rs | a response that fails once and then succeeds | +31 |\n\n\
+The loop itself is short:\n\n\
+```rust\nfor attempt in 0..=retries {\n    match self.http.send(req.clone()) {\n        Ok(resp) => return Ok(resp),\n\
+        Err(e) if attempt == retries => return Err(e),\n        Err(_) => sleep(backoff(attempt)),\n    }\n}\n```\n\n\
+All 42 tests pass. Nothing else in the client changed, and `/undo` takes this back if you would rather not keep it.\n";
+
+    #[test]
+    fn rows_already_written_do_not_change_as_a_reply_grows() {
+        let theme = Theme::named("mono", crate::theme::Depth::Mono).unwrap();
+        for width in [48, 78, 118] {
+            let (mut text, mut floor, mut prev) = (String::new(), 0, Vec::<String>::new());
+            for piece in pieces(SAMPLE_REPLY) {
+                text.push_str(&piece);
+                let (shown, kept, _) = steady(&text, Duration::ZERO, floor);
+                floor = floor.max(kept);
+                let cur = plain(&markdown(&shown, width, &theme));
+                if let Some(last) = prev.len().checked_sub(1) {
+                    assert_eq!(cur.get(..last), Some(&prev[..last]), "{width} columns: a row above the one being written changed");
+                    assert!(prev[last].contains("a table is being written") || cur[last].starts_with(prev[last].as_str()),
+                            "{width} columns: the row being written took text back: {:?} became {:?}", prev[last], cur[last]);
+                }
+                prev = cur;
+            }
+            assert_eq!(plain(&markdown(&steady(&text, WORD_HOLD.max(TABLE_HOLD), floor).0, width, &theme)),
+                       plain(&markdown(SAMPLE_REPLY, width, &theme)), "and it ends as the whole reply reads");
+        }
+    }
+
+    #[test]
+    fn scrolled_up_the_rows_stay_put_whatever_is_written_meanwhile() {
+        let mut a = app(&["claude"]);
+        a.out.push(Out::Reply("first".into())); // an agent's reply, still being written
+        for i in 0..30 {
+            a.say(format!("line {i}"));
+        }
+        screen(&mut a, 60, 10);
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        let before = screen(&mut a, 60, 10);
+        assert_eq!(before[7], "line 25");
+        // that reply grows by four rows above what is on screen, and a line arrives below it
+        a.out[0] = Out::Reply("first\n\nsecond\n\nthird".into());
+        a.fitted.clear();
+        a.say("line 30");
+        let after = screen(&mut a, 60, 10);
+        assert_eq!(after[2..8], before[2..8], "what was being read has not moved");
+        assert!(after[9].contains("scrolled up · 5 rows below"), "and the count says a line arrived: {after:#?}");
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(screen(&mut a, 60, 10)[7], "line 21", "and PgUp still moves from there");
+        a.key(KeyEvent::from(KeyCode::End));
+        assert_eq!(screen(&mut a, 60, 10)[7], "line 30", "End, with nothing typed, goes back to the end");
+        a.key(KeyEvent::from(KeyCode::Home));
+        a.key(KeyEvent::from(KeyCode::PageUp)); // past the start is the start
+        assert_eq!(screen(&mut a, 60, 10)[2].trim(), "first", "and Home to the start");
+        a.input = "x".chars().collect();
+        a.cursor = 1;
+        a.key(KeyEvent::from(KeyCode::Home));
+        assert_eq!((a.cursor, screen(&mut a, 60, 10)[2].trim().to_string()), (0, "first".to_string()), "typed, Home is the line's");
     }
 
     #[cfg(unix)]
@@ -4193,5 +4443,121 @@ mod tests {
         assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
         assert_eq!([base64(b"hi"), base64(b"hey"), base64(b"heya")], ["aGk=", "aGV5", "aGV5YQ=="]);
         assert_eq!(slice_cols("a漢字b", 1, 3), "漢", "a wide character counts where it starts");
+    }
+
+    /// Pieces of 4 to 24 characters, as an agent's text deltas come (the same pieces every run).
+    fn pieces(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let (mut out, mut i, mut seed) = (Vec::new(), 0, 12345u32);
+        while i < chars.len() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = 4 + (seed >> 16) as usize % 21;
+            out.push(chars[i..(i + n).min(chars.len())].iter().collect());
+            i += n;
+        }
+        out
+    }
+
+    /// Not a check: prints what the path a reply is written through costs and how still its rows stay.
+    /// cargo test --release measure_ -- --ignored --nocapture --test-threads 1
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn measure_a_reply_being_written() {
+        use std::os::unix::fs::PermissionsExt;
+        const SHELL_DOC: &str = include_str!("../../docs/SHELL.md");
+        let fake = std::env::temp_dir().join(format!("ringo-tui-fake-measure-{}", std::process::id()));
+        std::fs::write(&fake, "#!/bin/sh\nsleep 120\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (claude, codex) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
+        let start = |fake: &Path| {
+            let mut a = app(&["claude", "codex"]);
+            a.s.programs.insert(claude, fake.to_path_buf());
+            a.s.programs.insert(codex, fake.to_path_buf());
+            a.talk(claude, "go".into(), "go".into()).unwrap();
+            a
+        };
+        let stats = |name: &str, mut us: Vec<u128>, extra: String| {
+            let n = us.len().max(1);
+            let late = us[n - n / 10 - 1..].iter().sum::<u128>() / (n / 10 + 1) as u128;
+            let total: u128 = us.iter().sum();
+            us.sort();
+            println!("{name:<44} frames {n:>5} · mean {:>6} µs · p95 {:>6} µs · max {:>6} µs · last tenth {late:>6} µs · \
+                      total {:>5} ms{extra}", total / n as u128, us[n * 95 / 100], us[n - 1], total / 1000);
+        };
+        let short: String = MANUAL.chars().take(3000).collect();
+        for (name, text, w, h) in [("a 3,000-character reply at 80x24", short.as_str(), 80, 24),
+                                   ("a 3,000-character reply at 120x40", short.as_str(), 120, 40),
+                                   ("the 14.8k guide as a reply at 120x40", MANUAL, 120, 40),
+                                   ("the 56k shell page as a reply at 120x40", SHELL_DOC, 120, 40)] {
+            let mut a = start(&fake);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            let (mut us, mut prev, mut above, mut back): (Vec<u128>, Vec<String>, usize, usize) = (Vec::new(), Vec::new(), 0, 0);
+            for piece in pieces(text) {
+                a.s.jobs[0].fresh = vec![Said::Partial(piece)];
+                let at = Instant::now();
+                a.feed();
+                terminal.draw(|f| a.draw(f)).unwrap();
+                us.push(at.elapsed().as_micros());
+                let cur = plain(&a.fitted[a.streams[&1].at]);
+                if let Some(last) = prev.len().checked_sub(1) {
+                    let show = std::env::var_os("RINGO_MEASURE_SHOW").is_some();
+                    if let Some(i) = (0..last).find(|&i| cur.get(i) != Some(&prev[i])) {
+                        above += 1; // a row above the one being written changed
+                        if show {
+                            println!("  above, {} rows up: {:?}\n      became {:?}", last - i, prev[i], cur.get(i));
+                        }
+                    } else if !prev[last].contains("a table is being written")
+                        && !cur.get(last).is_some_and(|row| row.starts_with(prev[last].as_str())) {
+                        back += 1; // the row being written took text back
+                        if show {
+                            println!("  back: {:?}\n      became {:?}", prev[last], cur.get(last));
+                        }
+                    }
+                }
+                prev = cur;
+            }
+            stats(name, us, format!(" · rows above rewritten in {above} frames, the last row took text back in {back}"));
+            a.s.shutdown();
+        }
+        // two agents side by side: claude's reply opened first and still grows, with codex's steps and reply under it
+        let mut a = start(&fake);
+        a.talk(codex, "docs".into(), "@codex docs".into()).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        a.s.jobs[0].fresh = vec![Said::Partial("Starting. ".into())];
+        a.feed();
+        a.s.jobs[1].fresh = (0..300).map(|i| Said::Step(format!("Edit src/file{i}.rs · 2 lines\n- old\n+ new"))).collect();
+        a.s.jobs[1].fresh.push(Said::Partial(MANUAL.chars().take(6000).collect()));
+        a.feed();
+        let mut us = Vec::new();
+        for piece in pieces(&short) {
+            a.s.jobs[0].fresh = vec![Said::Partial(piece)];
+            let at = Instant::now();
+            a.feed();
+            terminal.draw(|f| a.draw(f)).unwrap();
+            us.push(at.elapsed().as_micros());
+        }
+        stats("the first of two agents writing, 120x40", us, String::new());
+        a.s.shutdown();
+        // a long conversation: what a turn's end costs (the text kept for --resume) and a frame with nothing new
+        let mut a = start(&fake);
+        for i in 0..300 {
+            a.echo(&format!("request {i}"));
+            a.out.extend((0..10).map(|k| Out::Step(format!("Read src/file{k}.rs · 40 lines"))));
+            a.reply(&short);
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        let at = Instant::now();
+        a.save();
+        println!("{:<44} {} µs for {} entries", "saving a 300-turn conversation", at.elapsed().as_micros(), a.out.len());
+        let us = (0..200).map(|_| {
+            let at = Instant::now();
+            terminal.draw(|f| a.draw(f)).unwrap();
+            at.elapsed().as_micros()
+        }).collect();
+        stats("a frame of it with nothing new", us, String::new());
+        a.s.shutdown();
+        let _ = std::fs::remove_file(&fake);
     }
 }

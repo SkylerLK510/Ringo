@@ -25,9 +25,10 @@ add a dark mode switch to the settings page
 
 - The agent you are talking to (Claude, or Codex when Claude is not set up) reads the files in this folder, changes
   them if that is what you asked for, and answers.
-- Its reply appears as it is written. Each step it takes shows as a line in plain words ("run the tests"), and each
-  edit shows the lines it changed: removed in red, added in green. Reading and searching files are counted on one
-  line ("read 6 files, searched 4 times"); `/show N` lists each one.
+- Its reply appears as it is written, a word at a time, and what you have read does not move: a table shows once
+  it is whole (one line counts its rows until then). Each step it takes shows as a line in plain words ("run the
+  tests"), and each edit shows the lines it changed: removed in red, added in green. Reading and searching files are
+  counted on one line ("read 6 files, searched 4 times"); `/show N` lists each one.
 - While it works, the row above the box (or the side panel, in a wide window) shows its time, the tokens it has used
   and what it is doing now, as it happens: "thinking (~1.3k tokens)" while Claude thinks, the tool it is calling as
   soon as it starts one, and a big file's size as Claude writes it. Press Esc to stop it.
@@ -189,7 +190,8 @@ Every turn and pipeline is a numbered job.
 | Esc | clear the input; with it empty, stop the turn |
 | Up, Down | move between lines, then through earlier messages |
 | `/` or `@` | a menu of commands or agents: Up and Down choose, Tab or Enter completes |
-| PgUp, PgDn | scroll the conversation (the mouse wheel does too) |
+| PgUp, PgDn | scroll the conversation (the mouse wheel does too); what you are reading then stays where it is while agents write, and the box counts the rows below |
+| Home, End | with nothing typed, the conversation's start and end |
 | drag | select text in the conversation and copy it |
 | Ctrl-A, Ctrl-E | the start or end of the line; Ctrl-U and Ctrl-K cut to either |
 | Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W cuts the word before |
