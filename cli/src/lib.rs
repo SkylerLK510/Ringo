@@ -2740,15 +2740,18 @@ fn claude_window(kind: &str) -> String {
 pub fn claude_plan(r: &serde_json::Value) -> Plan {
     let mut plan = Plan { name: r["subscription_type"].as_str().unwrap_or("").to_string(), ..Plan::default() };
     let limits = r.pointer("/rate_limits/limits").and_then(|l| l.as_array()).cloned().unwrap_or_default();
+    // A window with no figure for how much is used is left out (here and in the readers below): shown as 0% it would
+    // read as a limit with all of its room left.
     for l in &limits {
-        plan.windows.push(Window { name: claude_window(l["kind"].as_str().unwrap_or("")), percent: l["percent"].as_f64().unwrap_or(0.0),
-                                   resets: l["resets_at"].as_str().and_then(iso_secs) });
+        if let Some(percent) = l["percent"].as_f64() {
+            plan.windows.push(Window { name: claude_window(l["kind"].as_str().unwrap_or("")), percent,
+                                       resets: l["resets_at"].as_str().and_then(iso_secs) });
+        }
     }
     if limits.is_empty() {
         for key in ["five_hour", "seven_day"] {
-            if let Some(w) = r["rate_limits"].get(key).filter(|w| w.is_object()) {
-                plan.windows.push(Window { name: claude_window(key), percent: w["utilization"].as_f64().unwrap_or(0.0),
-                                           resets: w["resets_at"].as_str().and_then(iso_secs) });
+            if let Some((w, percent)) = r["rate_limits"].get(key).and_then(|w| Some((w, w["utilization"].as_f64()?))) {
+                plan.windows.push(Window { name: claude_window(key), percent, resets: w["resets_at"].as_str().and_then(iso_secs) });
             }
         }
     }
@@ -2762,9 +2765,9 @@ pub fn claude_plan(r: &serde_json::Value) -> Plan {
 pub fn claude_plan_from_event(info: &serde_json::Value) -> Plan {
     let mut plan = Plan::default();
     for key in ["five_hour", "seven_day"] {
-        if let Some(w) = info.pointer(&format!("/unifiedWindows/{key}")).filter(|w| w.is_object()) {
-            plan.windows.push(Window { name: claude_window(key), percent: w["utilization"].as_f64().unwrap_or(0.0) * 100.0,
-                                       resets: w["resetsAt"].as_u64() });
+        let window = info.pointer(&format!("/unifiedWindows/{key}")).and_then(|w| Some((w, w["utilization"].as_f64()?)));
+        if let Some((w, used)) = window {
+            plan.windows.push(Window { name: claude_window(key), percent: used * 100.0, resets: w["resetsAt"].as_u64() });
         }
     }
     plan
@@ -2776,9 +2779,7 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
     let mut plan = Plan { name: limits["planType"].as_str().unwrap_or("").to_string(), ..Plan::default() };
     for key in ["primary", "secondary"] {
         let w = &limits[key];
-        if !w.is_object() {
-            continue;
-        }
+        let Some(percent) = w["usedPercent"].as_f64() else { continue };
         let name = match w["windowDurationMins"].as_u64() {
             Some(300) => "5 hours".to_string(),
             Some(10_080) => "week".to_string(),
@@ -2786,7 +2787,7 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
             Some(m) => format!("{} hours", m / 60),
             None => key.to_string(),
         };
-        plan.windows.push(Window { name, percent: w["usedPercent"].as_f64().unwrap_or(0.0), resets: w["resetsAt"].as_u64() });
+        plan.windows.push(Window { name, percent, resets: w["resetsAt"].as_u64() });
     }
     if let Some(n) = r.pointer("/rateLimitResetCredits/availableCount").and_then(|n| n.as_u64()).filter(|n| *n > 0) {
         plan.notes.push(format!("{n} full reset{} left", if n == 1 { "" } else { "s" }));
@@ -2844,6 +2845,13 @@ mod tests {
         assert_eq!(plan.name, "plus");
         assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 41.0), ("week", 34.0)]);
         assert_eq!(plan.notes, ["2 full resets left"]);
+        // a window with no figure for how much is used is left out: unknown is not 0% used
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(claude_plan(&json(r#"{"rate_limits": {"limits": [{"kind": "session"}, {"kind": "weekly_all", "percent": 59}]}}"#))
+                       .windows.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(), ["week"]);
+        assert!(claude_plan(&json(r#"{"rate_limits": {"five_hour": {"resets_at": "2026-11-02T04:30:00+00:00"}}}"#)).windows.is_empty());
+        assert!(claude_plan_from_event(&json(r#"{"unifiedWindows": {"five_hour": {"resetsAt": 1793332800}}}"#)).windows.is_empty());
+        assert!(codex_plan(&json(r#"{"rateLimits": {"primary": {"usedPercent": null, "windowDurationMins": 300}}}"#)).windows.is_empty());
     }
 
     #[test]
