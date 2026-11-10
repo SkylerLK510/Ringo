@@ -388,6 +388,38 @@ class ArmTest(unittest.TestCase):
                 study.grade_all(out)
             self.assertFalse((run / 'grade.json').exists())
 
+    def test_compare_says_what_the_set_aside_attempts_of_its_tasks_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for arm in ('a', 'b'):
+                run = out / f'runs-{arm}' / 'Mbpp-1'
+                run.mkdir(parents=True)
+                (run / 'report.json').write_text(json.dumps({'status': 'ready_for_review', 'rounds': [],
+                                                             'usage': {'input': 100, 'output': 0, 'calls': 1}}))
+                (run / 'grade.json').write_text(json.dumps({'round1_pass': True, 'delivered_pass': True, 'suspect': False}))
+            # arm a's first try at the task was set aside after three paid calls: they are not in the run that was kept
+            aside = out / 'runs-a' / 'Mbpp-1.incomplete-0'
+            aside.mkdir()
+            calls = [{'status': 'started'},
+                     {'status': 'ok', 'usage': {'input': 700, 'cache_read': 200, 'cache_write': 0, 'output': 50}},
+                     {'status': 'error', 'usage': {'input': 40, 'cache_read': 0, 'cache_write': 0, 'output': 10}},
+                     {'status': 'ok'}]  # paid, and it reported no usage: unknown, not zero
+            (aside / 'trace.jsonl').write_text(''.join(json.dumps(c) + '\n' for c in calls))
+            other = out / 'runs-a' / 'Mbpp-9.incomplete-0'  # a task outside the pairs is not this comparison's
+            other.mkdir()
+            (other / 'trace.jsonl').write_text(json.dumps({'status': 'ok', 'usage': {'input': 5, 'output': 5}}) + '\n')
+            with unittest.mock.patch('sys.stdout') as printed:
+                result = study.compare_all(out, ['a', 'b'], .05)
+            self.assertEqual(result['tokens']['a'], 100, "the per-task figures are the kept runs', as before")
+            aside_a = result['set_aside']['a']
+            self.assertEqual({k: aside_a[k] for k in ('attempts', 'tokens', 'calls', 'unknown_calls')},
+                             {'attempts': 1, 'tokens': 1000, 'calls': 3, 'unknown_calls': 1})
+            self.assertAlmostEqual(aside_a['credits'], study.credits(calls[1]['usage']) + study.credits(calls[2]['usage']))
+            self.assertEqual(result['set_aside']['b'], {'attempts': 0, 'tokens': 0, 'credits': 0.0, 'calls': 0, 'unknown_calls': 0})
+            said = ''.join(str(c.args[0]) for c in printed.write.call_args_list)
+            self.assertIn('a: 1 set-aside attempt of these tasks is not in the per-task figures: 1,000 tokens', said)
+            self.assertEqual(study.spent(out / 'runs-a'), study.run_credits(aside) + study.run_credits(other))
+
     def test_compare_pairs_graded_tasks_and_counts_gains_harms_and_stands(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
