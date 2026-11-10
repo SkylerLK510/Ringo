@@ -92,7 +92,6 @@ A loop that keeps whatever scores better on cases it has seen ends up fitting th
 What the guardrails cannot do:
 - **They cannot create statistical power.** Detecting a gain of one defect per review takes tens of independent repositories, and a sealed test should be larger still. That is a planning figure, not a guarantee.
 - **They cannot rule out contamination.** ReviewBench is public, so a model may have seen its pull requests; only fresh private cases check for that.
-- **The token limit cannot count tokens a backend did not report as missing.** A Claude reply with no usable usage block is recorded as zero tokens, not as unknown. A review made only of such replies has unknown tokens, but one such reply beside other calls in the same review (a failed attempt before its retry) is counted as nothing.
 - **A store the improver can read is not a boundary.** Use an external OS boundary for decisions that count; reviewers and graders also need to be unable to read keys, since they run as the evaluator user. Stores are created with 0700 and existing store roots are tightened to 0700; permissions cannot constrain another process running as the same user.
 
 ### Improvement campaigns

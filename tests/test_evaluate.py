@@ -117,7 +117,7 @@ class TokenLimitTest(unittest.TestCase):
         self.assertEqual(decision, ('pass', []))
 
     def test_a_call_that_reports_no_tokens_makes_the_arms_tokens_unknown(self):
-        # no token fields (Codex with no usage), or every field zero (a Claude reply with a malformed usage block):
+        # no token fields (a Codex or Claude reply with no usage), or a backend that reports zero for every field:
         # either would read as a candidate that uses nothing, and pass any limit
         for usage in ({'cost_usd': 0.01}, {**dict.fromkeys(USAGE, 0), 'cost_usd': 0.01}):
             with self.subTest(usage=usage):
