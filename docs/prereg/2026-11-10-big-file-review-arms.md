@@ -84,4 +84,28 @@ review.
 
 ## Deviations
 
-None yet.
+None.
+
+## Close
+
+The run ended on 2026-11-10 after 15 launcher calls and the one tooling check: 906,120 uncached input tokens,
+883,072 cached and 12,104 output, under both ceilings. Neither plan-window stop was reached.
+
+| Arm | Stored findings kept (blind matcher) | Same file within 10 lines | Uncached input | Cached input | Output | Weighted | 5-hour window |
+|---|---|---|---|---|---|---|---|
+| A1, control | 10 of 13 = 77% [50%, 92%] | 10 of 13 | 678,036 | 0 | 3,085 | 693,461 | +17 points |
+| A2, tool reading | 9 of 13 = 69% [42%, 87%] | 8 of 13 | 215,886 | 864,640 | 8,189 | 300,063 | +10 points |
+| The pilot's lean arm, same reviews | 3 of 13 = 23% [8%, 50%] | | 93,156 | 0 | | | |
+
+- A1 against A2 per stored finding: 2 kept only by A1, 1 only by A2, exact McNemar p = 1.0 (by the rule without a
+  model: 3 and 1, p = 0.625). A1 against the lean arm: 7 and 0, p = 0.016, exploratory. Two stored findings were kept
+  by no arm.
+- Among the 10 stored findings a later commit acted on, A1 kept 8 and A2 kept 7.
+- A2 made 4 to 9 shell reads a review and took 36 to 75 seconds against A1's 17 to 25. Its volume (uncached plus
+  cached plus output) was 1,088,715 tokens against A1's 681,121.
+- Findings that match no stored finding: A1 3, A2 6. They were not verified.
+
+By the reading rule: A1 keeps more than half of the stored findings, so retention is usable on these reviews. A2 is
+within 20 points of A1 at a lower weighted cost and goes to a confirmatory study. Its volume is above A1's, which
+conflicts with this repository's rule that an adopted change must not add token volume; the owner decides. Nothing is
+adopted.
