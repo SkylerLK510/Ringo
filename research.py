@@ -90,6 +90,13 @@ class Blocked(Exception):
     """A destination the verifier refuses to contact."""
 
 
+def terminal_safe(text):
+    """text for the terminal: every control or format character but newline and tab shown escaped. A model's reply
+    and a fetched page's quote are named in what is printed, and an escape sequence in one would drive the terminal
+    (its title, its clipboard, the order its text reads in)."""
+    return ''.join(c if c in '\n\t' or c.isprintable() else c.encode('unicode_escape').decode('ascii') for c in text)
+
+
 class Refused(Exception):
     """A response the verifier refuses to read: oversized, malformed or a broken redirect."""
 
@@ -1552,13 +1559,13 @@ def task(args, net, codex=None):
         (run.trace / 'summary.json').write_text(json.dumps(summary, indent=1), encoding='utf-8')
         Path(args.out).write_text(outcome['report'], encoding='utf-8')
     except OSError as exc:
-        print(outcome['report'])
+        print(terminal_safe(outcome['report']))
         print(f'harness: research cannot write the result: {exc}', file=sys.stderr)
         print(f'harness: {json.dumps(summary)}', file=sys.stderr)
         run.state('failed', error=f'cannot write the result: {exc}'[:500], outcome=outcome['outcome'])
         return 2
     if outcome['error']:
-        print(f'harness: research {outcome["outcome"]}: {outcome["error"]}', file=sys.stderr)
+        print(f'harness: research {outcome["outcome"]}: {terminal_safe(outcome["error"])}', file=sys.stderr)
     print(f'harness: {json.dumps(summary)}', file=sys.stderr)
     run.state('done' if outcome['exit'] == 0 else 'failed', outcome=outcome['outcome'],
               error=outcome['error'][:500] if outcome['error'] else None,
