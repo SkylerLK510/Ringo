@@ -3098,8 +3098,6 @@ impl App {
         }
     }
 
-    /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
-    /// blank row, and the answers (or how to reach them while a line is being typed).
     /// Whom the line being typed goes to, as its prompt shows: the agent plain lines go to, or the one its @ names
     /// (all, for @all). A command, or an @ word that names no agent yet, shows no one.
     fn target(&self) -> Option<(&'static str, Style)> {
@@ -3115,6 +3113,8 @@ impl App {
         }
     }
 
+    /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
+    /// blank row, and the answers (or how to reach them while a line is being typed).
     fn prompt_lines(&self, width: usize) -> Option<(String, Vec<Line<'static>>)> {
         let (id, p) = self.s.pending()?;
         let job = self.s.job(id).ok()?;
@@ -3761,7 +3761,10 @@ mod tests {
         assert!(pause(&mut a, WORD_HOLD), "a pause shows what was kept back");
         assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"));
         assert!(!a.settle(), "and then there is nothing left to show");
-        a.s.jobs[0].fresh = vec![Said::Partial("ld\r".into()), Said::Partial("\nmore".into())];
+        a.s.jobs[0].fresh = vec![Said::Partial("l".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, worl"], "what has shown is not taken back when its word goes on");
+        a.s.jobs[0].fresh = vec![Said::Partial("d\r".into()), Said::Partial("\nmore".into())];
         a.feed();
         assert_eq!(replies(&a), ["Hello, world\n"], "a line end split across pieces stays one");
         a.s.jobs[0].fresh = vec![Said::Step("Read a.rs · 2 lines".into())];
@@ -3804,6 +3807,8 @@ mod tests {
         assert_eq!((show("see [the "), show("see [the guide](GUIDE.md")), ("see ".into(), "see ".into()));
         assert_eq!(show("see [the guide](GUIDE.md) for "), "see [the guide](GUIDE.md) for ");
         assert_eq!((show("- [x] done "), show("use `a[i ")), ("- [x] done ".into(), "use `a[i` ".into()));
+        let open = format!("the range [0, {} ", "9".repeat(HELD_LINK));
+        assert_eq!(show(&open), open, "a bracket that closes nothing does not hold the line back for long");
         // a table shows once a line that is not one of its rows comes; until then one line counts its rows
         let table = "Sizes:\n\n| Name | Size |\n|---|---|\n| a | 1 |\n| b";
         assert_eq!(steady(table, now, 0), ("Sizes:\n\n*a table is being written · 1 row so far…*".into(), 8, Some(TABLE_HOLD)));
