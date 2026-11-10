@@ -1257,8 +1257,10 @@ fn home_short(path: &Path) -> String {
     }
 }
 
-/// A spot in the conversation: (row, column).
+/// A spot in the conversation as it is fitted now: (row, column).
 type Spot = (usize, usize);
+/// A place in the conversation that holds while entries before it grow: an entry, a row of it, and a column.
+type Mark = (usize, usize, usize);
 
 /// How many entries the conversation keeps on screen before the oldest go (all of it is saved when the shell ends).
 const KEEP: usize = 20_000;
@@ -1281,7 +1283,7 @@ struct App {
     anchor: Option<(usize, usize)>,
     view: Rect,
     top: usize,
-    sel: Option<(Spot, Spot)>,
+    sel: Option<(Mark, Mark)>,
     dragging: bool,
     /// A short note at the input's right end (copied, could not copy) and when it appeared.
     toast: Option<(String, Instant)>,
@@ -2630,11 +2632,27 @@ impl App {
         }
     }
 
+    /// The entry a row of the fitted conversation is in, and which of its rows it is (a row past the end: past the
+    /// last entry).
+    fn place(&self, mut row: usize) -> (usize, usize) {
+        let entry = self.fitted.iter().position(|rows| row.checked_sub(rows.len()).map(|rest| row = rest).is_none());
+        (entry.unwrap_or(self.fitted.len()), row)
+    }
+
+    /// The row of the fitted conversation that a row of an entry is now; a row its entry no longer has (fitted
+    /// again, it came out shorter) is its last.
+    fn row_of(&self, (entry, row): (usize, usize)) -> usize {
+        let before: usize = self.fitted.iter().take(entry).map(Vec::len).sum();
+        before + self.fitted.get(entry).map_or(row, |rows| row.min(rows.len().saturating_sub(1)))
+    }
+
     /// The wheel scrolls the conversation; a drag over it selects its text and copies it when the button comes up.
+    /// The selection's ends are kept as places in entries, so they stay on their text while an agent writes above.
     fn mouse(&mut self, m: MouseEvent) -> bool {
         let v = self.view;
         let row = m.row.clamp(v.y, (v.y + v.height).saturating_sub(1));
-        let spot = (self.top + (row - v.y) as usize, m.column.saturating_sub(v.x) as usize);
+        let (entry, at) = self.place(self.top + (row - v.y) as usize);
+        let spot = (entry, at, m.column.saturating_sub(v.x) as usize);
         match m.kind {
             MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
             MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
@@ -2664,9 +2682,10 @@ impl App {
         true
     }
 
-    /// The selection, first spot first.
+    /// The selection as rows of the conversation as it is fitted now, first spot first.
     fn selection(&self) -> Option<(Spot, Spot)> {
-        let (a, b) = self.sel?;
+        let spot = |(entry, row, col): Mark| (self.row_of((entry, row)), col);
+        let (a, b) = self.sel.map(|(a, b)| (spot(a), spot(b)))?;
         Some(if a <= b { (a, b) } else { (b, a) })
     }
 
@@ -2691,6 +2710,7 @@ impl App {
             self.fitted.drain(..extra.min(self.fitted.len()));
             self.streams.retain(|_, s| s.at.checked_sub(extra).map(|n| s.at = n).is_some());
             self.anchor = self.anchor.and_then(|(entry, row)| Some((entry.checked_sub(extra)?, row)));
+            self.sel = self.sel.and_then(|(a, b)| Some(((a.0.checked_sub(extra)?, a.1, a.2), (b.0.checked_sub(extra)?, b.1, b.2))));
         }
         if width != self.fitted_w {
             self.fitted.clear();
@@ -2711,19 +2731,13 @@ impl App {
         let total = self.fit_to(area.width as usize);
         let h = area.height as usize;
         // `scroll` as the last frame left it: no key or wheel moved it since, so the place it kept still holds
-        if self.scroll > 0 && self.scroll == self.scrolled && let Some((entry, row)) = self.anchor
-            && let Some(rows) = self.fitted.get(entry) {
-            let top = self.fitted[..entry].iter().map(Vec::len).sum::<usize>() + row.min(rows.len().saturating_sub(1));
-            self.scroll = total.saturating_sub(h + top);
+        if self.scroll > 0 && self.scroll == self.scrolled && let Some(at) = self.anchor {
+            self.scroll = total.saturating_sub(h + self.row_of(at));
         }
         self.scroll = self.scroll.min(total.saturating_sub(h));
         let top = total.saturating_sub(h + self.scroll);
         self.scrolled = self.scroll;
-        self.anchor = (self.scroll > 0).then(|| {
-            let mut row = top;
-            let entry = self.fitted.iter().position(|rows| row.checked_sub(rows.len()).map(|rest| row = rest).is_none());
-            (entry.unwrap_or(0), row)
-        });
+        self.anchor = (self.scroll > 0).then(|| self.place(top));
         let shown: Vec<Line<'static>> = self.fitted.iter().flatten().skip(top).take(h).cloned().collect();
         f.render_widget(Paragraph::new(shown), area);
         // until the owner says something: where to start, centred a third of the way down, under any notes
@@ -3130,7 +3144,10 @@ impl App {
 
     /// The conversation as plain text, saved in the session's folder when the shell ends.
     fn save(&self) -> Option<PathBuf> {
-        let text: Vec<String> = self.out.iter().flat_map(|o| o.rows(100, &self.theme))
+        // a reply still being written goes in whole: what the screen keeps back for now (see `steady`) was received
+        let whole: std::collections::HashMap<usize, Out> = self.streams.values()
+            .map(|s| (s.at, Out::Reply(closed(clean(&s.raw))))).collect();
+        let text: Vec<String> = self.out.iter().enumerate().flat_map(|(i, o)| whole.get(&i).unwrap_or(o).rows(100, &self.theme))
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect();
         let path = self.s.dir.join("conversation.txt");
         std::fs::write(&path, text.join("\n") + "\n").ok().map(|_| path)
@@ -3754,6 +3771,12 @@ mod tests {
                                  Said::Partial("Next".into())];
         a.feed();
         assert_eq!(replies(&a), ["Hello, world.", ""], "the whole reply replaces its pieces; the next block opens anew");
+        // kept back on screen, it was still received: the saved conversation has it, and a table as far as it got
+        a.s.jobs[0].fresh = vec![Said::Partial(" up:\n\n| Name | Size |\n|---|---|\n| alpha | 1".into())];
+        a.feed();
+        assert_eq!(replies(&a)[1], "Next up:\n\n*a table is being written…*");
+        let saved = std::fs::read_to_string(a.save().unwrap()).unwrap();
+        assert!(saved.contains("Next up:") && saved.contains("alpha") && !saved.contains("is being written"), "{saved}");
         // a turn that ends mid-reply shows all it wrote
         a.s.kill(1).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3762,7 +3785,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         a.feed();
-        assert_eq!(replies(&a), ["Hello, world.", "Next"]);
+        assert_eq!(replies(&a), ["Hello, world.", "Next up:\n\n| Name | Size |\n|---|---|\n| alpha | 1"]);
         a.s.shutdown();
     }
 
@@ -3848,6 +3871,14 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         let after = screen(&mut a, 60, 10);
         assert_eq!(after[2..8], before[2..8], "what was being read has not moved");
         assert!(after[9].contains("scrolled up · 5 rows below"), "and the count says a line arrived: {after:#?}");
+        // text selected there stays selected while the reply above grows again
+        let (from, to) = (a.place(a.top + 4), a.place(a.top + 5));
+        a.sel = Some(((from.0, from.1, 2), (to.0, to.1, 5)));
+        assert_eq!(a.selected(), "ne 24\nline 2");
+        a.out[0] = Out::Reply("first\n\nsecond\n\nthird\n\nfourth".into());
+        a.fitted.clear();
+        assert_eq!((screen(&mut a, 60, 10)[2..8].to_vec(), a.selected()), (before[2..8].to_vec(), "ne 24\nline 2".to_string()));
+        a.sel = None;
         a.key(KeyEvent::from(KeyCode::PageUp));
         assert_eq!(screen(&mut a, 60, 10)[7], "line 21", "and PgUp still moves from there");
         a.key(KeyEvent::from(KeyCode::End));
@@ -4332,7 +4363,8 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         a.key(KeyEvent::from(KeyCode::Char('x')));
         assert_eq!(screen(&mut a, 30, 10)[7], "line 30", "typing goes back to the end");
         // a drag from "ne 29" through "line 3" (screen rows 6 and 7) selects just that text
-        a.sel = Some(((a.top + 4, 2), (a.top + 5, 5)));
+        let (from, to) = (a.place(a.top + 4), a.place(a.top + 5));
+        a.sel = Some(((from.0, from.1, 2), (to.0, to.1, 5)));
         assert_eq!(a.selected(), "ne 29\nline 3");
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
         terminal.draw(|f| a.draw(f)).unwrap();
