@@ -144,7 +144,8 @@ them with owner-only permissions.
 | `ringo` (the shell) | A full-screen session for working with several agents and running Ringo's pipelines |
 
 Run the commands with `python3 ringo.py COMMAND`, or with the `ringo` binary (`cargo install --path cli`), which
-takes the same commands. The binary doesn't run `research` yet.
+takes the same commands. `review`, `design` and `work` can run natively in the binary; `research` runs through the
+Python runtime from either.
 
 ```sh
 python3 ringo.py --help
