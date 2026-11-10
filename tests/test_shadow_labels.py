@@ -82,6 +82,14 @@ class ShadowLabelTest(unittest.TestCase):
         self.work([GOOD], CLEAN)
         self.assertEqual(len(list(shadow_labels.runs([self.root]))), 2)
 
+    def test_a_run_named_twice_is_one_trial(self):
+        # the same run again, or a parent beside it, would count one observation as several and tighten the bound
+        run = self.work([GOOD], CLEAN)
+        self.work([GOOD], CLEAN)
+        found = list(shadow_labels.runs([run, self.root, run, self.root / '.' / run.name]))
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[0], run)
+
 
 if __name__ == '__main__':
     unittest.main()
