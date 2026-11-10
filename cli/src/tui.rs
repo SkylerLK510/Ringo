@@ -40,6 +40,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "shrink a long conversation so later turns cost less"),
     ("/separate", "a conversation of its own for each agent, so none is told what the others do"),
     ("/together", "the agents back in one conversation, still working side by side"),
+    ("/discuss TOPIC", "the agents talk it over among themselves, in turn, while you read (alone: the last turn)"),
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
@@ -273,10 +274,52 @@ pub enum Cmd {
     Model(Option<(String, String)>),
     /// `/agent` (None: the owner's own agents, and the Claude Code agent files found) or one made or taken away.
     Agent(Option<OwnAgent>),
+    /// `/discuss [@AGENT ...] [TOPIC]`: those agents (none named: every one that works in this folder) talk the
+    /// topic over (none: the last turn).
+    Discuss(Vec<Agent>, String),
     Usage,
     /// `/restart`: this shell ends and the installed `ringo` takes over the conversations.
     Restart,
     Quit,
+}
+
+/// How many times each agent speaks in a talk (/discuss) at most, a line of the owner's aside: with `n` agents a talk
+/// is at most `n * TALK_ROUNDS` turns.
+const TALK_ROUNDS: usize = 2;
+
+/// The agents' talk under way (/discuss): they take turns in the conversation they share, each answering what the
+/// others said, until none has more to add or each has spoken TALK_ROUNDS times.
+struct Talk {
+    order: Vec<Agent>,
+    /// Whose turn runs now (in `order`), and its job.
+    at: usize,
+    job: usize,
+    /// Its turns so far, the running one included, and the most it may take: a line of the owner's adds a round.
+    jobs: Vec<usize>,
+    limit: usize,
+    /// Replies in a row that added nothing.
+    passes: usize,
+    /// The owner's lines since the running turn began, which the next speaker hears.
+    said: Vec<String>,
+    started: Instant,
+}
+
+/// What a talk's first speaker is told of how it works, so it writes its part and leaves the carrying to Ringo.
+const TALK_RELAY: &str = "Your reply is shown to them and theirs come back to you here, so write only your own part: do not \
+                          try to reach them, and do not speak for them.";
+
+/// Whether a reply in a talk adds nothing: the one word its turn was asked for.
+fn agreed(reply: &str) -> bool {
+    reply.trim().trim_end_matches(['.', '!']).eq_ignore_ascii_case("agreed")
+}
+
+/// Names as a sentence lists them: a, b and c.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [most @ .., last] => format!("{} and {last}", most.join(", ")),
+    }
 }
 
 /// An agent's list of models being read (/model), off the shell's own thread.
@@ -330,6 +373,14 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 _ => Err("/model shows who runs on what; /model AGENT NAME sets one (/model claude opus), /model AGENT default \
                           goes back".into()),
             },
+            "discuss" | "talk" => {
+                let (mut agents, mut topic) = (Vec::new(), tail);
+                while let Some(word) = topic.split_whitespace().next().filter(|w| w.starts_with('@')) {
+                    agents.push(Agent::from_name(&word[1..]).ok_or(format!("no agent {}", &word[1..]))?);
+                    topic = topic[word.len()..].trim_start();
+                }
+                Ok(Cmd::Discuss(agents, topic.to_string()))
+            }
             "agent" | "agents" => match (words.next(), words.next()) {
                 (None, _) => Ok(Cmd::Agent(None)),
                 (Some("add"), Some(name)) => {
@@ -1388,6 +1439,8 @@ struct App {
     /// Ultra: Ringo's review under way of a turn here (review job, turn, its agent), during which lines wait; the
     /// revision it asked for (its task, while queued) and that revision's job, which no review follows.
     checking: Option<(usize, usize, Agent)>,
+    /// The agents' talk under way (/discuss).
+    talking: Option<Talk>,
     revision: Option<String>,
     revision_id: Option<usize>,
     /// Ultra: the plan read a turn here started (the turn, the read), then its answer (see `reviewer`).
@@ -1471,7 +1524,7 @@ impl App {
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, limits: Vec::new(),
-              limits_at: None, spoke: false, pointed: false, checking: None,
+              limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
 
@@ -1675,7 +1728,11 @@ impl App {
                     Status::Failed(_) => Some((false, Instant::now())),
                     _ => None,
                 };
-                let lines = self.job_end(&self.s.jobs[i]);
+                // a turn of the agents' talk that ended well has no row of its own: the talk's last row counts them all
+                let lines = match (self.s.jobs[i].talk, &self.s.jobs[i].status) {
+                    (true, Status::Done) => Vec::new(),
+                    _ => self.job_end(&self.s.jobs[i]),
+                };
                 self.out.extend(lines.into_iter().map(|l| Out::Line(l, 2)));
                 self.ended[i] = true;
                 self.last = 0;
@@ -1809,6 +1866,151 @@ impl App {
         SPIN[(self.started.elapsed().as_millis() / SPIN_MS) as usize % SPIN.len()]
     }
 
+    /// /discuss: the agents talk a topic over among themselves, in the conversation they share. One speaks at a
+    /// time, and each hears what the others said since it last spoke (Ringo's record, as for any turn it was away
+    /// for), so nothing is sent twice. Its turns look and do not touch, whatever the mode. It costs a turn of each
+    /// agent's a round, and ends when a round adds nothing or after TALK_ROUNDS rounds.
+    fn discuss(&mut self, named: Vec<Agent>, topic: String) -> Result<Option<String>, String> {
+        if self.talking.is_some() {
+            return Err("the agents are talking already: Esc stops them, and a line of yours joins in".into());
+        }
+        if self.s.separate {
+            return Err("the agents work separately here, so none hears the others: /together first".into());
+        }
+        let mut order: Vec<Agent> = if named.is_empty() { self.agents.iter().copied().filter(|a| a.spec().read).collect() } else { Vec::new() };
+        for agent in named {
+            if !self.agents.contains(&agent) {
+                return Err(format!("{} is not set up here; /setup adds it", agent.name()));
+            }
+            if !agent.spec().read {
+                return Err(format!("{0} works only in its own copy of the folder, where it hears no one: a talk is for agents \
+                                    that work here", agent.name()));
+            }
+            if !order.contains(&agent) {
+                order.push(agent);
+            }
+        }
+        if order.len() < 2 {
+            return Err(format!("a talk takes two agents that work in this folder, and here there is {}: /setup adds another, \
+                                /agent add makes a specialist of your own",
+                               order.first().map_or("none".to_string(), |a| format!("only {}", a.name()))));
+        }
+        if topic.is_empty() && !order.iter().any(|a| self.s.has_conversation(*a)) {
+            return Err("say what they should talk over: /discuss TOPIC (alone, it is the last turn, and there is none yet)".into());
+        }
+        // The agent the owner talks to opens a topic. With none it is the last turn they talk over, which that
+        // agent took, so the others answer it first.
+        let main = order.iter().position(|a| *a == self.main);
+        let opens = match (main, topic.is_empty()) {
+            (Some(at), false) => at,
+            (Some(at), true) => (at + 1) % order.len(),
+            (None, _) => 0,
+        };
+        order.rotate_left(opens);
+        let first = order[0];
+        if self.must_wait(first) {
+            return Err(format!("{} is at work here: the talk can start when its turn ends (Esc stops it)", first.name()));
+        }
+        let names: Vec<&str> = order.iter().map(|a| a.name()).collect();
+        let others = listed(&names[1..]);
+        // Said outright that the replies are carried: asked only to "talk it over with codex", Claude went looking
+        // for a way to run Codex itself (live, 11/10: 1:46 and 155k tokens for two turns, and no view of its own).
+        let prompt = match topic.is_empty() {
+            false => format!("I want you and {others} to talk this over; I am reading along: {topic}\n\n{TALK_RELAY} You \
+                              speak first. Say what you think and what you would do, in a few short paragraphs. Look at the \
+                              files if it helps; change nothing."),
+            true => format!("I want you and {others} to talk the last turn above over; I am reading along.\n\n{TALK_RELAY} \
+                             You speak first. Say where you agree with it, where you differ and why, and what you would do, \
+                             in a few short paragraphs. Look at the files if it helps; change nothing."),
+        };
+        let job = self.talk_turn(first, &prompt)?;
+        let limit = order.len() * TALK_ROUNDS;
+        self.talking = Some(Talk { order, at: 0, job, jobs: vec![job], limit, passes: 0, said: Vec::new(), started: Instant::now() });
+        Ok(Some(format!("  {} talk it over, one at a time, looking but not touching · at most {TALK_ROUNDS} turns each · a line \
+                         of yours joins in · Esc stops them", listed(&names))))
+    }
+
+    /// One turn of the agents' talk: in read mode whatever the session's (a running turn keeps its own), its reply
+    /// heard whole by the others. What it was told is in its log (/show N), not in the conversation.
+    fn talk_turn(&mut self, agent: Agent, prompt: &str) -> Result<usize, String> {
+        let prompt = self.s.expand(prompt)?;
+        let mode = std::mem::replace(&mut self.s.mode, Mode::Read);
+        let started = self.s.launch_agent(agent, false, &prompt);
+        self.s.mode = mode;
+        let id = started?;
+        let job = &mut self.s.jobs[id - 1];
+        job.talk = true;
+        job.fresh.retain(|said| !matches!(said, Said::Line(_)));
+        Ok(id)
+    }
+
+    /// The talk after its turn `id` ended: the next agent answers, or the talk is over (a turn that failed or was
+    /// stopped, a round that added nothing, every round taken, or the next agent at work on something else).
+    fn talk_on(&mut self, id: usize) {
+        let Some(mut talk) = self.talking.take() else { return };
+        let job = &self.s.jobs[id - 1];
+        let (done, speaker) = (job.status == Status::Done, talk.order[talk.at]);
+        talk.passes = if done && agreed(&job.reply()) { talk.passes + 1 } else { 0 };
+        let rounds = talk.limit / talk.order.len();
+        let mut over = match &job.status {
+            Status::Done if !talk.said.is_empty() => None, // the owner spoke: the next one answers them
+            Status::Done if talk.passes + 1 >= talk.order.len() => Some("no one has more to add".to_string()),
+            Status::Done if talk.jobs.len() >= talk.limit =>
+                Some(format!("each has spoken {}", match rounds { 1 => "once".into(), 2 => "twice".into(), n => format!("{n} times") })),
+            Status::Done => None,
+            Status::Cancelled => Some("stopped".into()),
+            _ => Some(format!("{}'s turn failed", speaker.name())),
+        };
+        if over.is_none() {
+            talk.at = (talk.at + 1) % talk.order.len();
+            let next = talk.order[talk.at];
+            let others: Vec<&str> = talk.order.iter().filter(|a| **a != next).map(|a| a.name()).collect();
+            let said = std::mem::take(&mut talk.said);
+            let adds = if said.is_empty() { String::new() } else { format!("I add: {}\n\n", said.join("\n")) };
+            let prompt = format!("{adds}Go on with the talk: answer what {} said above{}. Write only your own part: where \
+                                  you agree, where you differ and why, what you would do, in a few short paragraphs; change \
+                                  nothing. If you have nothing to add, reply with the one word AGREED.", listed(&others),
+                                 if said.is_empty() { "" } else { ", and what I add" });
+            let started = match self.must_wait(next) {
+                true => Err(format!("{} is at work on something else", next.name())),
+                false => self.talk_turn(next, &prompt),
+            };
+            match started {
+                Ok(job) => {
+                    talk.job = job;
+                    talk.jobs.push(job);
+                    if !said.is_empty() {
+                        talk.passes = 0;
+                    }
+                }
+                Err(why) => over = Some(why),
+            }
+        }
+        let Some(why) = over else {
+            self.talking = Some(talk);
+            return;
+        };
+        let t = self.theme;
+        let tokens: u64 = talk.jobs.iter().map(|id| self.s.jobs[id - 1].tokens_so_far()).sum();
+        let turns = match talk.jobs.len() { 1 => "1 turn".to_string(), n => format!("{n} turns") };
+        self.gap();
+        self.out.push(Out::Line(Line::from(vec![
+            Span::styled("── ", t.border), Span::styled(format!("the talk is over: {why}"), t.ok),
+            Span::styled(format!(" · {turns} · {} · {} tokens · /discuss goes on with it", fmt_age(talk.started.elapsed()),
+                                 fmt_tokens(tokens)), t.dim)]), 2));
+        self.last = 0;
+    }
+
+    /// A plain line of the owner's while the agents talk: the next one to speak hears it, and each may answer once
+    /// more.
+    fn join_talk(&mut self, line: String) -> String {
+        let Some(talk) = &mut self.talking else { return String::new() };
+        talk.said.push(line);
+        talk.limit = talk.limit.max(talk.jobs.len() + talk.order.len());
+        let next = talk.order[(talk.at + 1) % talk.order.len()];
+        format!("  ↳ {} hears this next, and the talk goes on", next.name())
+    }
+
     /// A line for `agent` in this folder, continuing their conversation: now, or next while a turn runs here (as it
     /// was typed, `line`, it shows when it starts). An agent that works only in its own copy takes it there.
     fn talk(&mut self, agent: Agent, task: String, line: String) -> Result<Option<String>, String> {
@@ -1877,6 +2079,9 @@ impl App {
         if self.limits_at.is_some_and(|at| at.elapsed() > LIMITS_FRESH) && self.plans.is_empty() {
             let asked = self.plan_agents();
             self.read_limits(&asked, false);
+        }
+        if self.talking.as_ref().is_some_and(|talk| talk.job == id) {
+            return self.talk_on(id);
         }
         let job = &self.s.jobs[id - 1];
         // From the home folder, a turn whose edits all went to one project points there, once (11/03: a whole project
@@ -2366,6 +2571,10 @@ impl App {
 
     /// Whether a line would wait in the queue: a line for an agent in this folder while a turn runs here.
     fn waits(&self, cmd: &Result<Cmd, String>) -> bool {
+        // while the agents talk, a plain line joins in at once
+        if self.talking.is_some() && matches!(cmd, Ok(Cmd::Talk(_))) {
+            return false;
+        }
         let agent = match cmd {
             Ok(Cmd::Talk(_) | Cmd::Compact) => Some(self.main),
             Ok(Cmd::Agents(agents, _)) => match agents[..] { [(a, false)] => Some(a), _ => None },
@@ -2417,7 +2626,9 @@ impl App {
     /// there as they come.
     fn run(&mut self, cmd: Cmd, line: &str) -> Result<Option<String>, String> {
         Ok(match cmd {
+            Cmd::Talk(text) if self.talking.is_some() => Some(self.join_talk(text)),
             Cmd::Talk(text) => return self.talk(self.main, text, line.to_string()),
+            Cmd::Discuss(agents, topic) => return self.discuss(agents, topic),
             Cmd::Help => {
                 let intro = self.intro();
                 self.say(intro);
@@ -3358,6 +3569,7 @@ impl App {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
                 // the count grows as lines are written below: nothing arrives unseen
                 _ if self.scroll > 0 => format!("scrolled up · {} rows below · End goes back", self.scroll),
+                _ if self.talking.is_some() => "the agents are talking · a line of yours joins in · Esc stops them".into(),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
                 _ if self.staged.is_some() => "update ready · /restart".into(),
                 _ if self.release.is_some() => "pipelines ready · /update approve".into(),
@@ -4098,6 +4310,147 @@ mod tests {
         a.feed();
         assert_eq!(replies(&a), ["Hello, world.", "Next up:\n\n| Name | Size |\n|---|---|\n| alpha | 1"]);
         a.s.shutdown();
+    }
+
+    /// A stand-in Claude Code for a talk: each run keeps the message it was sent (`.in.N`) and its arguments, waits a
+    /// moment, and replies with its Nth word of `replies` (the last one from then on).
+    #[cfg(unix)]
+    fn talker(name: &str, replies: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ringo-tui-talker-{}-{name}", std::process::id()));
+        let cases: Vec<String> = replies.iter().enumerate().map(|(i, r)| format!("{}) reply='{r}';;", i + 1)).collect();
+        let script = r##"#!/bin/sh
+n=$(($(cat "$0.n" 2>/dev/null || echo 0) + 1)); echo $n > "$0.n"
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+head -n 1 > "$0.in.$n"
+sleep 0.15
+echo '{"type":"system","subtype":"init","session_id":"s-NAME","apiKeySource":"none"}'
+case $n in CASES *) reply='LAST';; esac
+printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"m$n\",\"content\":[{\"type\":\"text\",\"text\":\"$reply\"}],\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}"
+printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"$reply\"}"
+"##.replace("NAME", name).replace("CASES", &cases.join(" ")).replace("LAST", replies.last().unwrap());
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(format!("{}.n", path.display()));
+        path
+    }
+
+    /// What the stand-in's Nth run was sent.
+    #[cfg(unix)]
+    fn sent(talker: &Path, n: usize) -> String {
+        let line = std::fs::read_to_string(format!("{}.in.{n}", talker.display())).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["message"]["content"].as_str().unwrap().to_string()
+    }
+
+    /// Runs the shell's loop until the agents' talk is over; `each` sees the app once a pass.
+    #[cfg(unix)]
+    fn until_talked(a: &mut App, mut each: impl FnMut(&mut App)) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while a.talking.is_some() {
+            assert!(Instant::now() < deadline, "the talk did not end");
+            a.s.pump();
+            a.feed();
+            each(a);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_talk_a_topic_over_among_themselves() {
+        let mut a = app(&["claude", "codex", "grok"]);
+        let (claude, codex) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
+        assert_eq!((parse("/discuss", &[claude]), parse("/discuss split the parser?", &[claude]), parse("/talk @codex @claude why", &[claude])),
+                   (Ok(Cmd::Discuss(vec![], String::new())), Ok(Cmd::Discuss(vec![], "split the parser?".into())),
+                    Ok(Cmd::Discuss(vec![codex, claude], "why".into()))));
+        assert!(parse("/discuss @nobody x", &[claude]).unwrap_err().contains("no agent nobody"));
+        // a specialist of the owner's takes part as any agent does; both stand-ins speak Claude Code's protocol
+        let file = a.s.home.join("reviewer.md");
+        std::fs::write(&file, "You review plans.\n").unwrap();
+        let entry = serde_json::json!({"name": "talk-reviewer", "adapter": "claude", "program": "claude", "read": true, "instructions": file});
+        let reviewer = Agent::register(ringo_cli::Spec::from_json(&entry, true).unwrap()).unwrap();
+        // refused: nothing to talk over yet, one agent, an agent that only works in its own copy, /separate
+        assert!(a.discuss(vec![], String::new()).unwrap_err().contains("say what they should talk over"));
+        assert!(a.discuss(vec![claude], "x".into()).unwrap_err().contains("there is only claude"));
+        assert!(a.discuss(vec![claude, Agent::from_name("grok").unwrap()], "x".into()).unwrap_err().contains("works only in its own copy"));
+        assert!(a.discuss(vec![claude, reviewer], "x".into()).unwrap_err().contains("talk-reviewer is not set up here"));
+        a.agents = vec![claude, reviewer];
+        a.s.separate = true;
+        assert!(a.discuss(vec![], "x".into()).unwrap_err().contains("/together first"));
+        a.s.separate = false;
+
+        // neither runs out of things to say: each speaks TALK_ROUNDS times, and that is all
+        let (one, two) = (talker("one", &["Split the parser first."]), talker("two", &["The lexer first, I think."]));
+        a.s.programs.insert(claude, one.clone());
+        a.s.programs.insert(reviewer, two.clone());
+        a.s.mode = Mode::Auto;
+        a.send("/discuss should we split the parser?");
+        assert_eq!(a.s.mode, Mode::Auto, "the session's mode is its own");
+        let rows = screen(&mut a, 180, 30).join("\n");
+        assert!(rows.contains("claude and talk-reviewer talk it over, one at a time, looking but not touching · at most 2 turns each"), "{rows}");
+        assert!(rows.contains("the agents are talking · a line of yours joins in · Esc stops them"), "{rows}");
+        assert!(a.discuss(vec![], "y".into()).unwrap_err().contains("talking already"));
+        until_talked(&mut a, |_| {});
+        assert_eq!(a.s.jobs.len(), 2 * TALK_ROUNDS, "two agents, TALK_ROUNDS turns each, and not one more");
+        assert!(a.s.jobs.iter().all(|j| j.talk && j.status == Status::Done));
+        let kinds: Vec<Agent> = a.s.jobs.iter().filter_map(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None }).collect();
+        assert_eq!(kinds, [claude, reviewer, claude, reviewer], "in turn, the one the owner talks to first");
+        // the topic once; each hears what the other said, whole, and is asked to answer it
+        assert!(sent(&one, 1).starts_with("I want you and talk-reviewer to talk this over; I am reading along: should we split the parser?\n\nYour reply is shown to them"));
+        let (second, third) = (sent(&two, 1), sent(&one, 2));
+        assert!(second.contains("claude: Split the parser first.") && second.contains("should we split the parser?")
+                && second.contains("Go on with the talk: answer what claude said above."), "{second}");
+        assert!(third.contains("talk-reviewer: The lexer first, I think.") && !third.contains("should we split the parser?")
+                && third.contains("If you have nothing to add, reply with the one word AGREED."), "{third}");
+        // a talk looks and does not touch, whatever the mode
+        let argv = std::fs::read_to_string(format!("{}.argv", one.display())).unwrap();
+        assert!(argv.contains("--permission-prompts\nnone") && argv.lines().any(|l| l == "Edit"), "{argv}");
+        let rows = screen(&mut a, 180, 40);
+        let text = rows.join("\n");
+        assert!(text.contains("the talk is over: each has spoken twice · 4 turns") && text.contains("/discuss goes on with it"), "{text}");
+        assert!(!text.contains("✓ done") && !text.contains("told claude"), "a talk's turns have no rows of their own: {text}");
+        assert_eq!(rows.iter().filter(|r| r.contains("The lexer first, I think.")).count(), 2, "{text}");
+        if std::env::var_os("RINGO_MEASURE_SHOW").is_some() {
+            eprintln!("{}", screen(&mut a, 100, 30).join("\n"));
+        }
+
+        // a round that adds nothing ends it; alone, /discuss is about the last turn, which the others answer first
+        a.main = reviewer;
+        let (one, two) = (talker("one", &["AGREED."]), talker("two", &["never asked"]));
+        a.s.programs.insert(claude, one.clone());
+        a.s.programs.insert(reviewer, two.clone());
+        a.send("/discuss");
+        until_talked(&mut a, |_| {});
+        assert_eq!(a.s.jobs.len(), 2 * TALK_ROUNDS + 1, "one agreed of two: over");
+        assert!(sent(&one, 1).contains("I want you and talk-reviewer to talk the last turn above over") && sent(&one, 1).contains("do not try to reach them"));
+        assert!(screen(&mut a, 180, 40).join("\n").contains("the talk is over: no one has more to add · 1 turn ·"));
+
+        // a line of the owner's joins in: the next one hears it, and each may answer once more
+        let (one, two) = (talker("one", &["One thing more."]), talker("two", &["And another."]));
+        a.s.programs.insert(claude, one.clone());
+        a.s.programs.insert(reviewer, two.clone());
+        let before = a.s.jobs.len();
+        a.send("/discuss @claude @talk-reviewer what about the tests?");
+        let mut joined = false;
+        until_talked(&mut a, |a| {
+            if !joined && a.talking.as_ref().is_some_and(|t| t.jobs.len() == 2 * TALK_ROUNDS) {
+                joined = true;
+                a.send("keep the old tests");
+                assert!(a.queue.is_empty(), "it joins the talk, and does not wait for a turn of its own");
+            }
+        });
+        assert_eq!(a.s.jobs.len() - before, 2 * TALK_ROUNDS + 2, "the owner's line adds one round, and only one");
+        let heard = sent(&one, 3);
+        assert!(heard.contains("I add: keep the old tests") && heard.contains("answer what talk-reviewer said above, and what I add"), "{heard}");
+        assert!(screen(&mut a, 180, 60).join("\n").contains("↳ claude hears this next, and the talk goes on"));
+
+        // stopped: Esc ends the turn and the talk with it
+        a.send("/discuss once more");
+        let id = a.holding().unwrap();
+        a.stop(id);
+        until_talked(&mut a, |_| {});
+        assert!(screen(&mut a, 180, 60).join("\n").contains("the talk is over: stopped · 1 turn"));
+        assert!(agreed(" Agreed.\n") && agreed("AGREED") && !agreed("AGREED, but the lexer worries me") && !agreed(""));
     }
 
     #[test]

@@ -453,6 +453,8 @@ pub struct Job {
     cancel: Arc<AtomicBool>,
     /// The model the agent said it runs, when it says (for the usage record).
     pub model: Option<String>,
+    /// A turn in the agents' talk (the shell's /discuss): the others hear all of its reply, not its first lines.
+    pub talk: bool,
     /// Whether the job reported any token count: one that finishes without is recorded as unknown, not left out.
     counted: bool,
     /// How many of its model calls reported no count (a pipeline's): its counts are then of the others alone.
@@ -1471,7 +1473,7 @@ impl Session {
         let mut kept = Vec::new();
         let mut used = 0;
         for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, i + 1 == turns.len(), false);
+            let part = render(j, i + 1 == turns.len() || j.talk, false);
             if used + part.len() > RECORD_CHARS && !kept.is_empty() {
                 kept.push(format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1));
                 break;
@@ -1516,7 +1518,7 @@ impl Session {
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
-                             codex_turn: None, connectors: false, reached: false, model: None, counted: false,
+                             codex_turn: None, connectors: false, reached: false, model: None, talk: false, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None) });
         Ok(id)
     }

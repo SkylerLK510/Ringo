@@ -170,6 +170,26 @@ The agents work side by side: while Claude works, `@codex write the README` star
 is still doing and which files it has edited so far, so it leaves that alone, and each hears how the other's turn
 ended at its next one. Each agent still takes one turn at a time: a message for a busy agent goes into its turn.
 
+## Let the agents talk it over
+
+Instead of asking each agent in turn and carrying the answers between them yourself, let them talk:
+
+| You type | What happens |
+|---|---|
+| `/discuss should we split the parser first?` | the agents that work in this folder talk it over, one at a time: each reads what the others said and answers it |
+| `/discuss` | they talk over the last turn: the other agents answer the one that took it |
+| `/discuss @claude @codex TOPIC` | only those agents talk |
+
+- You read along as they write. A line you type joins in: the next agent to speak hears it, and each may answer
+  once more. Esc stops them.
+- A talk looks and does not touch: its turns run in read mode, whatever your mode is. When it is over, say what you
+  want done (`@claude do it`): every agent has heard the whole talk.
+- It ends when a round adds nothing (an agent with nothing to add says AGREED) or when each has spoken twice.
+  `/discuss` again goes on with it.
+- It costs a turn of each agent's a round, on that agent's own plan. The talk's last row counts its turns, time and
+  tokens.
+- An agent of your own (`/agent`) takes part like any other.
+
 ## Give each agent its own task
 
 Type `/separate`, then give each agent its task: `@claude fix the login bug`, then `@codex write the README`

@@ -151,6 +151,64 @@ It is one conversation: an agent is told what the others did since its last turn
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)). Codex owns the abstract work: Ringo's pipelines (`/research`,
 `/design`, `/review`) and `/ask` run on it.
 
+### The agents' talk
+
+Working with several agents used to mean asking one, reading its answer, then typing `@codex what do you think?`
+and carrying each view to the next agent by hand. `/discuss TOPIC` has them talk it over among themselves while you
+read:
+
+```
+ you  /discuss Is this folder's layout fine as it is, or would you move anything?
+  claude and codex talk it over, one at a time, looking but not touching · at most 2 turns each · a line of
+  yours joins in · Esc stops them
+
+ claude  #1 · claude-fable-5-2
+  The layout is fine as it is and I would not move any file: ...
+
+ codex  #2 · gpt-6.1-sol
+  I agree with keeping the layout ... I'd keep the timeout default in Client::new() for now, because ...
+
+ claude  #3 · claude-fable-5-2
+  AGREED
+
+── the talk is over: no one has more to add · 3 turns · 0:32 · 90.0k tokens · /discuss goes on with it
+```
+
+How it works:
+
+- **Who:** every agent set up that works in this folder, or the ones named (`/discuss @claude @codex TOPIC`). An
+  agent of your own takes part like any other; one that works only in its own copy hears no one and is refused. It
+  needs the conversation the agents share, so `/separate` refuses it.
+- **Order:** one speaks at a time. The agent you talk to opens a topic. With no topic (`/discuss` alone) they talk
+  over the last turn, so the others answer the agent that took it.
+- **What each hears:** Ringo's record of the turns it was away for, as for any turn in the shared conversation
+  (see [One conversation](#one-conversation-and-a-fresh-start-past-64k)), so nothing is sent twice and no call
+  summarises anything. A talk's replies are heard whole (up to 6,000 characters), not by their first paragraph.
+  The topic is said once, to the first speaker; the others read it in the record.
+- **Read mode:** a talk's turns look and do not touch, whatever the session's mode. Acting on the outcome is your
+  next line.
+- **You:** a plain line typed while they talk joins in: the next speaker is sent it (`I add: ...`), and each agent
+  may answer once more. Esc stops the running turn and the talk. `@agent ...` still goes to that agent alone.
+- **The end:** a reply that is the one word AGREED adds nothing, and when every agent but the last to say
+  something has agreed, the talk is over. Otherwise it ends when each has spoken twice: with `n` agents a talk is
+  at most `2n` turns, and each line of yours adds at most `n`. It also ends when a turn fails or the next agent
+  is at work on something else. Its turns have no `done` rows of their own: the last row counts them all.
+
+Checked live through the real shell in a pty, Claude Code 2.1.322 and codex-cli 0.167.0 on a small Rust project,
+one run each:
+
+| Wording of the first turn | Turns | Time | Tokens | What happened |
+|---------------------------|-------|------|--------|---------------|
+| "Talk this over with codex, among yourselves" | 2 | 1:46 | 155.4k | Claude looked for a way to run Codex itself, reported that it could not reach it, and gave no view of its own; Codex replied AGREED |
+| "I want you and codex to talk this over ... Your reply is shown to them and theirs come back to you here" | 3 | 0:32 | 90.0k | Claude gave its view; Codex read the files, agreed on one point and differed on another with its reason; Claude replied AGREED |
+
+The first wording was dropped: an agent told to talk to another, and not told that its words are carried, goes
+looking for the other. The second is what ships. A talk is about 30k tokens a turn here, most of it each agent
+reading the files for itself: it is the cost of asking each agent, without the typing in between.
+
+Not done: an agent cannot ask another on its own in the middle of a turn; a talk under way is not kept across
+`/restart`; agy has not been checked in a talk.
+
 ### A message while it works
 
 A line you send to the agent whose turn is running in the folder goes into that turn, as Claude Code and Codex take
@@ -247,6 +305,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, and nothing of one is told to another. `/together` (the default): one conversation again. Either way the agents work in the folder at the same time, one turn each. Text after either is sent as a line of its own once it has switched (`/separate @codex write the README`); any other command that takes nothing refuses text after it rather than drop it. The head says `separate` while it is on |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
+| `/discuss TOPIC`, `/discuss`, `/discuss @A @B TOPIC` | the agents talk it over among themselves, one at a time, while you read (see [The agents' talk](#the-agents-talk)); alone, the last turn |
 | `/agent`, `/agent add NAME FILE [codex] [skills]`, `/agent remove NAME` | your own agents (see [Agents of your own](#agents-of-your-own)): a file of standing instructions makes Claude or Codex a specialist under its own name, talked to as `@NAME` |
 | `/model`, `/model AGENT NAME` | which model each agent's turns run on (see [Models](#models)): alone, who runs on what and the models your Codex plan offers; with an agent and a name, that agent's turns run on it from the next one, remembered for next time (`/model AGENT default`: its own again) |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
