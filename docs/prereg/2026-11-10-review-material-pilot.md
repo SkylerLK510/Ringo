@@ -101,3 +101,20 @@ Nothing is adopted from this pilot. `review --repo` stays as it is until a confi
 
    The call ceiling rises from 45 to 63 for the probe. The 900,000 input-token ceiling and the plan-window stops
    are unchanged.
+
+3. **One matcher result corrected.** The first matcher pass ran while set L was still running and read one L
+   review's output file before it was written, so it recorded "no shared file" for that review without making a
+   call. The file was complete and shared a file with the stored review. The matcher was run for it once. Set L's
+   retention is 6 of 24 with that call (5 of 20 without the review).
+
+4. **Slice arm added, 2026-11-10, after the paging probe and before any further call.** Calls so far: 56, with
+   777,888 input tokens. Probe result: 9 follow-up calls (59,504 input tokens) recovered 1 more stored finding, so
+   the lean review with its follow-up kept 7 of 24 at 19.5% of A0's tokens. The follow-ups left 26 new open
+   questions: each paged definition led to the next thing not shown.
+
+   The arm, exploratory: A3 is the lean material plus numbered lines from the changed files: the definition of
+   every name the changed lines use, and the lines around other uses of the names the change defines. These are
+   the two rules of the trace study, fixed before the pilot. It runs on the L reviews where A2 kept no stored
+   finding, smallest A3 material first, as many as fit under the 900,000-token ceiling with their matcher calls
+   (two reviews, three stored findings). The question is only whether showing one hop of definitions and uses up
+   front recovers what paging them in afterwards did not.
