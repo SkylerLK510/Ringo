@@ -503,7 +503,8 @@ def run_credits(run):
 def set_aside(runs, tasks):
     """What an arm's attempts at these tasks that were set aside as .incomplete-N cost. They were paid for, and a
     comparison's per-task figures are the kept runs' alone, so it says this beside them. A paid call that reported
-    no usage is counted as unknown, not as zero."""
+    no usage, or usage without token counts, is counted as unknown, not as zero."""
+    import harness
     total = {'attempts': 0, 'tokens': 0, 'credits': 0.0, 'calls': 0, 'unknown_calls': 0}
     for run in sorted(runs.glob('*.incomplete-*')):
         if not run.is_dir() or task_of(run.name) not in tasks:
@@ -511,10 +512,11 @@ def set_aside(runs, tasks):
         total['attempts'] += 1
         for usage in paid_calls(run):
             total['calls'] += 1
-            if usage is None:
+            counts = [usage.get(k) for k in harness.TOKEN_KEYS] if isinstance(usage, dict) else [None]
+            if not all(type(n) is int for n in counts):  # an old or odd trace with a field missing or null, too
                 total['unknown_calls'] += 1
                 continue
-            total['tokens'] += sum(usage.get(k) or 0 for k in ('input', 'cache_read', 'cache_write', 'output'))
+            total['tokens'] += sum(counts)
             total['credits'] += credits(usage)
     return total
 
