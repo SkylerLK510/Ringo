@@ -71,8 +71,8 @@ pub struct Spec {
     /// What makes an agent of the owner's a specialist: a file of standing instructions that goes to its every turn
     /// (see `instructions`). A Claude or Codex agent only: Ringo has no place to give them to another.
     pub instructions: Option<String>,
-    /// Claude only: its turns load the owner's Claude Code skills, plugins and connectors, which every other turn
-    /// goes without (see `launch_agent`).
+    /// Claude only: outside read mode its turns load the owner's Claude Code skills, plugins and connectors, which
+    /// every other turn goes without (see `launch_agent`).
     pub skills: bool,
 }
 
@@ -1160,6 +1160,16 @@ impl Session {
         self.threads.contains_key(&agent)
     }
 
+    /// `agent`'s next turn starts its conversation again from Ringo's record of it (see `handoff`), not from the one
+    /// its program keeps: for what that one holds on to, as its model does (checked live, Claude Code 2.1.322 and
+    /// codex-cli 0.167.0: resumed with no model named, each ran the model it was last given). False when it had none.
+    pub fn start_over(&mut self, agent: Agent) -> bool {
+        let Some(old) = self.threads.remove(&agent) else { return false };
+        self.usage_so_far.remove(&(agent, old));
+        self.context.remove(&agent);
+        true
+    }
+
     /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
     pub fn forget(&mut self) {
         self.threads.clear();
@@ -1705,12 +1715,14 @@ impl Session {
                 // The reply streams as it is written (--include-partial-messages); neither changes any tokens.
                 cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                           "--include-partial-messages", "--replay-user-messages"]);
-                if spec.skills || (self.mode != Mode::Read && connectors) {
+                if self.mode != Mode::Read && (spec.skills || connectors) {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
                     // Without CLAUDE.md the owner's instruction to use Ringo cannot start Ringo again either.
-                    // A specialist the owner set up with skills keeps those too, in every mode: its instructions name
-                    // them, and the owner chose their cost for this agent's turns alone.
+                    // A specialist the owner set up with skills keeps those too: its instructions name them, and the
+                    // owner chose their cost for this agent's turns alone. Not in read mode, where no turn loads the
+                    // owner's customizations: a connector's tool their own settings allow could write, and read
+                    // mode's promise is that nothing can.
                     cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
                     cmd.args(["--agent", "claude"]);
                     if !spec.skills {

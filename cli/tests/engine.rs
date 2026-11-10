@@ -1819,8 +1819,10 @@ fn each_agent_is_started_on_the_model_its_owner_chose() {
     assert_eq!(run(&mut s), ("thread/resume".into(), Some("gpt-test".into()), Some("opus".into())), "a conversation goes on with it");
     s.forget();
     assert_eq!(run(&mut s), ("thread/start".into(), Some("gpt-test".into()), Some("opus".into())), "and a new one starts on it");
+    // back to its own: no model is named, and the conversation starts again, because one under way keeps its model
     s.models.clear();
-    assert_eq!(run(&mut s).1, None, "back to its own");
+    assert!(s.start_over(agent("codex")) && s.start_over(agent("claude")) && !s.start_over(agent("claude")));
+    assert_eq!(run(&mut s), ("thread/start".into(), None, None));
 
     let lister = fake(&root(), "codex-model-list", "#!/bin/sh\nread -r hello; read -r ready; read -r ask\n\
         echo '{\"id\":1,\"result\":{}}'\n\
@@ -1894,6 +1896,11 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
     assert!(!has("--safe-mode") && !has("--disable-slash-commands") && has("--agent"), "{argv}");
     let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
     assert!(env.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1") && env.contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"), "{env}");
+    // read mode's promise holds for it too: nothing of the owner's loads that could write
+    s.mode = ringo_cli::Mode::Read;
+    let argv = run(&mut s, skilled).1;
+    assert!(argv.lines().any(|a| a == "--safe-mode") && argv.lines().any(|a| a == "--disable-slash-commands"), "{argv}");
+    s.mode = ringo_cli::Mode::Ask;
     // Codex: the thread's developer instructions, with Ringo's own note after them when the owner's files call for it
     let told = |s: &mut Session| {
         let id = s.launch_agent(on_codex, false, "the task").unwrap();

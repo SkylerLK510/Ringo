@@ -116,7 +116,7 @@ Each agent runs on its own default model until you choose another, from those yo
 | `/model` | who runs on what now, and the models your Codex plan offers |
 | `/model claude opus` | Claude's turns run on that model from its next turn: `fable`, `opus`, `sonnet`, `haiku`, or a model's full name |
 | `/model codex NAME` | Codex's turns run on that model: any name `/model` lists |
-| `/model claude default` | back to the agent's own default |
+| `/model claude default` | back to the agent's own default; its conversation starts again from Ringo's record of it |
 
 Ringo remembers your choice, and each turn's first line names the model at work (` claude  #3 · claude-opus-5-5`).
 If your plan does not include a model, the turn says so when it starts, and Ringo says which choice it came from.
@@ -134,7 +134,7 @@ Claude Code), it can work in Ringo under its own name:
 | `/agent add billing ~/notes/billing.md` | `billing` is an agent here: Claude with that file as its standing instructions |
 | `/agent add billing ~/notes/billing.md codex` | the same specialist, on your Codex plan |
 | `/agent add shop-billing` | an agent you made for Claude Code, by its name (`.claude/agents/shop-billing.md` here or in your home folder) |
-| `/agent add billing FILE skills` | on Claude, its turns also load your Claude Code skills, plugins and connectors |
+| `/agent add billing FILE skills` | on Claude, its turns also load your Claude Code skills, plugins and connectors (not in read mode) |
 | `/agent remove billing` | it is gone from Ringo; the file is yours and stays |
 
 Then `@billing why is the invoice late?` talks to it, as to any agent. It keeps a conversation of its own, hears what

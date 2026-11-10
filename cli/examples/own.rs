@@ -1,7 +1,7 @@
 //! Live check of an agent of the owner's own against the real agent CLI (spends one small turn):
 //! `cargo run --example own -- REPO BASE FILE [skills] [-- PROMPT]` makes BASE (claude or codex) a specialist from
-//! the instructions in FILE, for this process only, runs one read-mode turn in a scratch git repository and prints
-//! how it ended, what it used and the start of its reply.
+//! the instructions in FILE, for this process only, runs one turn in a scratch git repository (read mode; ask mode
+//! with `skills`, which read mode leaves out) and prints how it ended, what it used and the start of its reply.
 use ringo_cli::{Agent, Session, Spec};
 use std::time::Duration;
 
@@ -20,7 +20,7 @@ fn main() {
     let own = Agent::register(Spec::from_json(&entry, true).unwrap()).unwrap();
     let size = ringo_cli::instructions(own.spec()).unwrap().map_or(0, |text| text.len());
     let mut s = Session::new(std::path::Path::new(repo)).unwrap();
-    s.mode = ringo_cli::Mode::Read;
+    s.mode = if skills { ringo_cli::Mode::Ask } else { ringo_cli::Mode::Read };
     let id = s.launch_agent(own, false, &prompt).unwrap();
     while s.job(id).unwrap().running() {
         s.pump();

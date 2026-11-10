@@ -112,10 +112,11 @@ How the instructions reach the model, each turn:
   project's `CLAUDE.md` or `AGENTS.md`. The turn stays in safe mode, as lean as any other.
 - **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
   turns they stand in for any `developer_instructions` in your Codex settings.
-- **`skills` (Claude only):** the turn runs without safe mode and keeps Claude Code's commands, so your skills,
-  plugins, hooks and connectors load. Your own `CLAUDE.md` and memory still do not (so an instruction there to use
-  Ringo cannot start Ringo inside Ringo). In read mode a connector's tool that would have to ask is refused, as
-  any such tool is.
+- **`skills` (Claude only):** outside read mode the turn runs without safe mode and keeps Claude Code's commands,
+  so your skills, plugins, hooks and connectors load. Your own `CLAUDE.md` and memory still do not (so an
+  instruction there to use Ringo cannot start Ringo inside Ringo). In read mode the turn is as lean as any other
+  and loads none of it: a connector's tool that your own settings allow could write, and read mode's promise is
+  that nothing can. So a specialist in a talk (`/discuss`, always read mode) goes without its skills.
 
 A specialist is a separate agent: its own conversation, its own row in the side panel and in `/usage`, its own
 `/model`. In the conversation the agents share it hears what the others did and they hear it (see
@@ -131,7 +132,7 @@ instance and not a rate):
 | the specialist on Claude | 30,002 | 4.5 s | answered as the specialist, naming what its file says it knows |
 | the specialist on Codex | 25,596 | 3.9 s | the same |
 | on Claude, asked to name skills it can invoke | 29,857 | 3.4 s | "NONE": no Skill tool in a safe-mode turn |
-| on Claude with `skills`, same question | 42,808 | 2.4 s | named three of the owner's skills |
+| on Claude with `skills`, same question, ask mode | 42,784 | 3.0 s | named three of the owner's skills |
 
 The same turn with a ten-byte instructions file was 10,069 tokens on Claude and 13,375 on Codex, so this file costs
 about 20k tokens a call on Claude and 12k on Codex, and `skills` about 13k more with 99 skills installed. That is
@@ -205,6 +206,9 @@ one run each:
 The first wording was dropped: an agent told to talk to another, and not told that its words are carried, goes
 looking for the other. The second is what ships. A talk is about 30k tokens a turn here, most of it each agent
 reading the files for itself: it is the cost of asking each agent, without the typing in between.
+
+While they talk, `/separate` and taking a talker away (`/agent remove`) are refused, and `/clear` ends the talk with
+the turn then running: the conversation they talked in is gone.
 
 Not done: an agent cannot ask another on its own in the middle of a turn; a talk under way is not kept across
 `/restart`; agy has not been checked in a talk.
@@ -741,7 +745,10 @@ own default until `/model AGENT NAME` names another:
 
 The choice is one word that goes to the agent's own program as an argument (letters, digits and `. _ - : / [ ]`); it
 is kept in `shell-settings.json` (`"models": {"claude": "opus"}`) and applies from the agent's next turn, a running
-turn keeping its own. Ringo does not check a name against the plan: the agent does, when the turn starts. A turn
+turn keeping its own. A conversation under way moves to a newly named model as it is. Going back
+(`/model AGENT default`) names none, and a conversation resumed with no model named keeps the one it was last
+given, so the agent's next turn starts its conversation again from Ringo's record of it (see
+[One conversation](#one-conversation-and-a-fresh-start-past-64k)). Ringo does not check a name against the plan: the agent does, when the turn starts. A turn
 that fails on a chosen model ends with `it ran on NAME, your choice for claude: /model claude default goes back to
 its own`. Each turn's first line names the model its agent reports (` claude  #3 · claude-opus-5-5`), chosen or
 not, so which model did a piece of work is on screen and in `usage.jsonl`.
@@ -759,6 +766,17 @@ codex-cli 0.167.0, one run each, so the times are an instance and not a rate):
 | claude `no-such-model-xyz` | failed in 1.1 s | | 0 | none: "There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it." |
 
 A name the plan does not have costs no tokens: the agent refuses it before any model call.
+
+The same conversation, one more trivial turn after the first (`... MODEL then=OTHER` and `... MODEL then-default`):
+
+| First turn on | Then | The second turn ran |
+|---------------|------|---------------------|
+| codex `gpt-6-luna` | changed to `gpt-5.6-luna` | `gpt-5.6-luna` |
+| claude `sonnet` | changed to `haiku` | `claude-haiku-5-5` |
+| codex `gpt-6-luna` | no model named | `gpt-6-luna` still |
+| claude `sonnet` | no model named | `claude-sonnet-5-5` still |
+
+The last two rows are why going back to the default starts the conversation again.
 
 ## Usage
 

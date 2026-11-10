@@ -2358,6 +2358,9 @@ impl App {
         if let Some(job) = self.s.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)) {
             return Err(format!("{name}'s #{0} is still working: wait for it, or /kill {0}", job.id));
         }
+        if self.talking.as_ref().is_some_and(|talk| talk.order.contains(&agent)) {
+            return Err(format!("{name} is in the talk under way: Esc stops the talk first"));
+        }
         if self.agents == [agent] {
             return Err(format!("{name} is the only agent set up here: /setup adds another first"));
         }
@@ -2653,7 +2656,9 @@ impl App {
                 self.streams.clear();
                 self.scroll = 0;
                 self.sel = None;
-                Some("  a new conversation: each agent's next turn starts fresh".into())
+                // what the agents said to each other went with it: the turn now running is the talk's last
+                let talk = if self.talking.take().is_some() { "; the agents' talk ends with the turn now running" } else { "" };
+                Some(format!("  a new conversation: each agent's next turn starts fresh{talk}"))
             }
             Cmd::Compact => {
                 // Claude's own compaction, which the Agent SDK documents for a resumed session: `/compact` as the
@@ -2673,6 +2678,8 @@ impl App {
                 true => "  the agents already work separately; /together puts them back in one conversation".into(),
                 false => "  the agents already share one conversation; /separate gives each a task of its own".into(),
             }),
+            Cmd::Separate(true) if self.talking.is_some() =>
+                return Err("the agents are talking, which takes the conversation they share: Esc stops them first".into()),
             Cmd::Separate(on) => {
                 self.s.separate = on;
                 Some(match on {
@@ -2736,16 +2743,23 @@ impl App {
                 if !own && !ringo_cli::valid_model(&model) {
                     return Err("a model's name is one word, as its agent takes it: /model claude opus, /model codex gpt-6-astra".into());
                 }
-                match own {
+                // A conversation under way keeps the model it was last given when none is named, so going back to
+                // the agent's own starts it again from Ringo's record. A named model moves it as it is.
+                let was = match own {
                     true => self.s.models.remove(&agent),
                     false => self.s.models.insert(agent, model.clone()),
                 };
+                let again = own && was.is_some() && self.s.start_over(agent);
                 let all: serde_json::Map<String, serde_json::Value> = self.s.models.iter()
                     .map(|(a, m)| (a.name().to_string(), serde_json::json!(m))).collect();
                 let saved = crate::theme::set_setting("models", all.into()).err()
                     .map_or(" (saved)".to_string(), |e| format!(" (not saved: {e})"));
                 Some(match own {
-                    true => format!("  {name} runs on its own default again from its next turn{saved}"),
+                    true => format!("  {name} runs on its own default again from its next turn{saved}{}", match again {
+                        true => ". Its conversation would keep the model it was on, so that turn starts it again from \
+                                 Ringo's record of it",
+                        false => "",
+                    }),
                     false => format!("  {name} runs on {model} from its next turn{saved}. If your plan does not include it, the \
                                       turn says so when it starts; /model {name} default goes back"),
                 })
@@ -4390,6 +4404,9 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         assert!(rows.contains("claude and talk-reviewer talk it over, one at a time, looking but not touching · at most 2 turns each"), "{rows}");
         assert!(rows.contains("the agents are talking · a line of yours joins in · Esc stops them"), "{rows}");
         assert!(a.discuss(vec![], "y".into()).unwrap_err().contains("talking already"));
+        // while they talk: the conversation they share stays shared, and no one in the talk is taken away
+        assert!(a.run(Cmd::Separate(true), "").unwrap_err().contains("the agents are talking") && !a.s.separate);
+        assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("talk-reviewer".into()))), "").unwrap_err().contains("is in the talk under way"));
         until_talked(&mut a, |_| {});
         assert_eq!(a.s.jobs.len(), 2 * TALK_ROUNDS, "two agents, TALK_ROUNDS turns each, and not one more");
         assert!(a.s.jobs.iter().all(|j| j.talk && j.status == Status::Done));
@@ -4451,6 +4468,18 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         until_talked(&mut a, |_| {});
         assert!(screen(&mut a, 180, 60).join("\n").contains("the talk is over: stopped · 1 turn"));
         assert!(agreed(" Agreed.\n") && agreed("AGREED") && !agreed("AGREED, but the lexer worries me") && !agreed(""));
+        // /clear takes the conversation they talked in: the turn now running is the talk's last
+        let before = a.s.jobs.len();
+        a.send("/discuss and again");
+        assert!(a.run(Cmd::Clear, "").unwrap().unwrap().ends_with("the agents' talk ends with the turn now running"));
+        assert!(a.talking.is_none());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while a.s.running() > 0 && Instant::now() < deadline {
+            a.s.pump();
+            a.feed();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!((a.s.running(), a.s.jobs.len() - before), (0, 1), "no one answers a talk that was cleared away");
     }
 
     #[test]
