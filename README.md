@@ -390,7 +390,8 @@ reused. The [experiments log](docs/EXPERIMENTS.md) has the method, every study, 
 we rejected.
 
 **The current adoption rule:** a change is adopted only if it uses no more tokens than what it replaces. Cheaper
-credits do not justify more tokens.
+credits do not justify more tokens. An evaluation or improvement campaign enforces it only when its spec sets
+`max_token_ratio` (see the [harness guide](docs/HARNESS.md)): the evaluator's own cost gates are in dollars.
 
 ### Results at a glance
 

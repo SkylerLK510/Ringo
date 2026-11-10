@@ -36,7 +36,7 @@ USAGE = {'input': 1, 'cache_write': 10, 'cache_read': 0, 'output': 5, 'cost_usd'
 
 
 class World:
-    def __init__(self, proposals):
+    def __init__(self, proposals, policy=None):
         self.dir = Path(tempfile.mkdtemp())
         pool = {}
         for k in range(24):
@@ -49,7 +49,7 @@ class World:
         self.store = self.dir / 'store'
         (self.store / 'cases.json').write_text(json.dumps({'cases': pool}), encoding='utf-8')
         (self.store / 'canaries.json').write_text(json.dumps({f'case{k}': f'canary{k:028d}' for k in range(24)}))
-        ev.split(self.store, seed=2, fractions=(0.5, 0.5, 0))
+        ev.split(self.store, seed=2, fractions=(0.5, 0.5, 0), new_policy=policy)
         (self.dir / 'prompts').mkdir()
         (self.dir / 'prompts' / 'review.md').write_text(BASE_PROMPT, encoding='utf-8')
         self.plan = self.dir / 'plan.json'
@@ -82,6 +82,39 @@ def edit(text):
 
 
 class CampaignTest(unittest.TestCase):
+    def test_a_token_limit_rejects_a_dev_gain_bought_with_more_tokens(self):
+        better = edit(BASE_PROMPT + ' For each defect, state the failing input first.')
+
+        def wordy(w):
+            def call(backend, system, message, timeout_s, model=None):
+                text, usage = w.call(backend, system, message, timeout_s, model)
+                if backend['argv'][0] == 'reviewer' and 'state the failing input first' in message:
+                    usage = {**usage, 'output': 50}  # the candidate's reviews write ten times as much: 61 tokens against 16
+                return text, usage
+            return call
+        # without a limit the same candidate goes on to validation: its price per call is the incumbent's
+        w = World([better] * 3)
+        log = im.campaign(w.store, w.campaign, w.dir / 'ws', call_fn=wordy(w))
+        self.assertEqual(log[0]['result'], 'validation pass')
+        self.assertNotIn('token_ratio', log[0]['dev'])
+        w = World([better] * 3)
+        w.campaign.write_text(json.dumps({**json.loads(w.campaign.read_text()), 'max_token_ratio': 1.0, 'max_proposals': 1}))
+        log = im.campaign(w.store, w.campaign, w.dir / 'ws', call_fn=wordy(w))
+        self.assertEqual((log[0]['result'], log[0]['dev']['token_ratio']), ('rejected', 3.812))
+        self.assertIn('more tokens', log[0]['why'][0])
+        self.assertFalse(any(r['kind'] == 'prereg' and r['spec']['split'] == 'validation' for r in ev.ledger(w.store)))
+        for bad in (0, 'x', True):
+            w.campaign.write_text(json.dumps({**json.loads(w.campaign.read_text()), 'max_token_ratio': bad}))
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'max_token_ratio'):
+                im.load_campaign(w.campaign)
+
+    def test_a_store_that_limits_tokens_refuses_a_campaign_that_does_not_before_any_call(self):
+        w = World([], policy={'max_token_ratio': 1.0})
+        calls = []
+        with self.assertRaisesRegex(ev.EvalError, 'looser than the store policy'):
+            im.campaign(w.store, w.campaign, w.dir / 'ws', call_fn=lambda *a: calls.append(a))
+        self.assertEqual(calls, [])
+
     def test_an_existing_campaign_cannot_reset_its_budget_in_another_workspace(self):
         w = World([edit(BASE_PROMPT + ' Be thorough.')] * 3)
         im.campaign(w.store, w.campaign, w.dir / 'ws', call_fn=w.call)
