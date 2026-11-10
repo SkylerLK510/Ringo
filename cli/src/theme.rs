@@ -217,7 +217,13 @@ pub fn set_setting(key: &str, value: serde_json::Value) -> Result<(), String> {
         .filter(|v| v.is_object()).unwrap_or_else(|| serde_json::json!({}));
     all[key] = value;
     std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-    std::fs::write(&path, format!("{all}\n")).map_err(|e| e.to_string())
+    // Written whole, then renamed: a shell that ends mid-write left half a file, which reads as no settings at all
+    // (the mode back to ask, the theme and auto updates forgotten).
+    let part = path.with_extension(format!("json.part{}", std::process::id()));
+    std::fs::write(&part, format!("{all}\n")).and_then(|_| std::fs::rename(&part, &path)).map_err(|e| {
+        let _ = std::fs::remove_file(&part);
+        e.to_string()
+    })
 }
 
 /// Remembers the theme for the next start.
