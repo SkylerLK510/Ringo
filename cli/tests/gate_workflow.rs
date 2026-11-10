@@ -1886,7 +1886,10 @@ fn run_cases(dir: &Path) -> Vec<RunCase> {
         RunCase { watch: false, name: "judge-error", spec: base.clone(), replies: vec![proposal(good), raise("JudgeError", "the judge failed", json!({}))] },
         RunCase { watch: false, name: "key-error", spec: base.clone(), replies: vec![raise("KeyError", "k", json!({}))] },
         RunCase { watch: false, name: "mutation", spec: base.clone(), replies: vec![proposal("from pathlib import Path\nPath('check.py').write_text('pass')\ndef f(x): return 2*x\n")] },
-        RunCase { watch: false, name: "crlf", spec: base.clone(), replies: vec![proposal("def f(x):\r\n    return 2*x\r\n")] },
+        // carriage returns are the file's own: written and read back as they are, they are not a check's mutation
+        RunCase { watch: false, name: "crlf", spec: base.clone(), replies: vec![proposal("def f(x):\r\n    return 2*x\r\n"), accept(true), accept(true)] },
+        RunCase { watch: false, name: "crlf-fixture", spec: with(&base, json!({"fixtures": {"check.py": CHECK_PY, "notes.txt": "kept\r\nas given\r"}})),
+            replies: vec![proposal(good), accept(true), accept(true)] },
         RunCase { watch: false, name: "timeout", spec: with(&base, json!({"checks": [{"name": "slow", "argv": ["{python}", "-c", "import time; time.sleep(5)"], "timeout_s": 0.3}], "max_rounds": 1})),
             replies: vec![proposal(good)] },
         RunCase { watch: false, name: "all-fail", spec: with(&base, json!({"max_rounds": 2})), replies: vec![proposal("def f(x): return x\n"), proposal("def f(x): return 3*x\n")] },

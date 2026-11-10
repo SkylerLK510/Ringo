@@ -771,6 +771,11 @@ pub fn write_file(p: &Path, data: &[u8]) -> Result<()> {
 /// `Path(p).read_text(encoding='utf-8')`: strict UTF-8 (UnicodeDecodeError's text) and universal newlines. Opening
 /// it names `str(path)`, a folder included (IsADirectoryError); a failed read does not.
 pub fn read_text(p: &Path) -> Result<String> {
+    Ok(universal_newlines(read_exact_text(p)?))
+}
+
+/// `Path(p).read_bytes().decode('utf-8')`: the text as it is on disk, its line ends untouched.
+pub fn read_exact_text(p: &Path) -> Result<String> {
     use std::io::Read;
     let p = &path(p);
     let mut f = std::fs::File::open(p).map_err(|e| path_error(&e, p))?;
@@ -780,7 +785,7 @@ pub fn read_text(p: &Path) -> Result<String> {
     }
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes)?;
-    Ok(universal_newlines(decode_utf8(bytes)?))
+    decode_utf8(bytes)
 }
 
 /// tempfile's `_RandomNameSequence`: eight characters of [a-z0-9_].

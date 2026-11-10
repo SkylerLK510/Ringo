@@ -473,6 +473,15 @@ print(json.dumps(out))
         self.assertEqual(report['usage']['calls'], 1)
         self.assertIsNone(report['final'])
 
+    def test_carriage_returns_in_a_file_or_fixture_are_not_a_mutation(self):
+        # read back with newline translation, a file given with CRLF (or a lone CR) never equalled itself
+        code = 'def f(x):\r\n    return 2*x\r\n'
+        report, _ = self.execute([self.proposal(code)],
+                                 fixtures={**self.spec['fixtures'], 'notes.txt': 'kept\r\nas given\r'})
+        self.assertEqual(report['status'], 'ready_for_review', report.get('error'))
+        self.assertEqual((self.root / 'run/final/value.py').read_bytes(), code.encode())
+        self.assertEqual((self.root / 'run/round-1/candidate/notes.txt').read_bytes(), b'kept\r\nas given\r')
+
     def test_extra_files_or_path_traversal_are_rejected(self):
         for name in ('../escape.py', '/tmp/escape.py', '.git/config', 'extra.py'):
             with self.subTest(name=name):
