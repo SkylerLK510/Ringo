@@ -1529,3 +1529,60 @@ fn separate_agents_work_at_once_and_undo_keeps_their_work_apart() {
     said(&mut s, "codex", "together");
     assert_eq!(turn_text(&codex), "together");
 }
+
+#[test]
+fn a_conversation_that_goes_on_after_a_restart_counts_only_what_each_turn_added() {
+    let r = repo("usage-restart");
+    // A resumed thread reports its usage so far, as the real Codex does: 12 after the first turn, 24 after the second.
+    let events = format!("case \"$thread\" in *thread/resume*)\n{}\n;; *)\n{}\n;; esac",
+                         codex_done("all done", (20, 8, 4)), codex_done("all done", (10, 4, 2)));
+    let codex = fake(&root(), "codex-usage-restart", &codex_script("", &events));
+    let open = || {
+        let mut s = session(&r, agent("codex"), &codex);
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let mut s = open();
+    let first = said(&mut s, "codex", "what is a.txt?");
+    assert_eq!(s.job(first).unwrap().tokens.total(), 12);
+    let kept = s.keep(None).unwrap();
+    drop(s); // a /restart, a quit or a crash: the next shell goes on from what was kept
+    let mut next = open();
+    next.go_on(&kept).unwrap();
+    let second = said(&mut next, "codex", "and then?");
+    assert_eq!(next.job(second).unwrap().tokens.total(), 12, "the 12 counted before the restart are not counted again");
+    // a conversation that is no longer the agent's (a /clear, a fresh start) hands on no total
+    next.forget();
+    let cleared = next.keep(None).unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(cleared).unwrap()).unwrap()["usage"], serde_json::json!([]));
+}
+
+#[test]
+fn a_turn_that_cannot_start_after_a_restart_is_still_told_the_turns_before_it() {
+    let r = repo("no-start-restart");
+    let (codex, claude) = (fake(&root(), "codex-no-start-restart", &codex_ok()),
+                           fake(&root(), "claude-no-start-restart", CLAUDE_TALKS));
+    let open = || {
+        let mut s = session(&r, agent("claude"), &claude);
+        s.programs.insert(agent("codex"), codex.clone());
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let mut s = open();
+    said(&mut s, "claude", "fix it");
+    said(&mut s, "codex", "take it from here");
+    let kept = s.keep(None).unwrap();
+    drop(s);
+    let mut next = open();
+    next.go_on(&kept).unwrap();
+    // Claude's program is there but cannot run: the turn does not start, so it was told nothing
+    let broken = root().join("claude-not-executable-restart");
+    fs::write(&broken, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o644)).unwrap();
+    next.programs.insert(agent("claude"), broken);
+    assert!(next.launch_agent(agent("claude"), false, "and now").is_err());
+    next.programs.insert(agent("claude"), claude.clone());
+    said(&mut next, "claude", "and now");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.contains("#2 · the owner to codex: take it from here"), "{told}");
+}
