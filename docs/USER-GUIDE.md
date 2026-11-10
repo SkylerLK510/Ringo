@@ -107,6 +107,22 @@ tasks it was tried on, while one review and one fix did, so `ultra` is the tier 
 used up a limit, it runs on Claude instead. Ringo checks both plans as the turn starts (no tokens), and when neither
 has room it says so then, so you can stop the turn or let it run without a review.
 
+## Choose which model does what
+
+Each agent runs on its own default model until you choose another, from those your own plan includes:
+
+| You type | What happens |
+|---|---|
+| `/model` | who runs on what now, and the models your Codex plan offers |
+| `/model claude opus` | Claude's turns run on that model from its next turn: `fable`, `opus`, `sonnet`, `haiku`, or a model's full name |
+| `/model codex NAME` | Codex's turns run on that model: any name `/model` lists |
+| `/model claude default` | back to the agent's own default |
+
+Ringo remembers your choice, and each turn's first line names the model at work (` claude  #3 · claude-opus-5-5`).
+If your plan does not include a model, the turn says so when it starts, and Ringo says which choice it came from.
+`/ask`, `/review`, `/design` and `/research` run on the backend, which takes a model too: `/backend claude@opus`. So
+one model can write the code and another can review it. agy chooses its own model.
+
 ## See what you have used
 
 `/usage` shows, as gauges (green, amber past 60% used, red past 85%):

@@ -201,6 +201,10 @@ impl Theme {
 }
 
 fn settings() -> std::path::PathBuf {
+    // a test's settings are its own: one that saved a setting wrote it into the owner's shell
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("ringo-test-settings-{}.json", std::process::id()));
+    }
     ringo_cli::state_root().join("shell-settings.json")
 }
 

@@ -189,6 +189,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, and nothing of one is told to another. `/together` (the default): one conversation again. Either way the agents work in the folder at the same time, one turn each. Text after either is sent as a line of its own once it has switched (`/separate @codex write the README`); any other command that takes nothing refuses text after it rather than drop it. The head says `separate` while it is on |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
+| `/model`, `/model AGENT NAME` | which model each agent's turns run on (see [Models](#models)): alone, who runs on what and the models your Codex plan offers; with an agent and a name, that agent's turns run on it from the next one, remembered for next time (`/model AGENT default`: its own again) |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
 | `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
@@ -607,6 +608,39 @@ review (`{#R}`); no review follows that turn. Where `/undo` is off there is no b
 `/tier ultra` says so. The revision is Ringo's line, so the conversation does not show it as yours. Claude Code's own
 `ultracode` setting is not used: it runs Claude Code's dynamic workflows, which
 `--safe-mode` turns off and which Ringo does not measure.
+
+## Models
+
+Each person's plan includes different models, so which model does what is theirs to set. A turn runs on its agent's
+own default until `/model AGENT NAME` names another:
+
+- **Claude:** `--model NAME`, an alias (`fable`, `opus`, `sonnet`, `haiku`) or a model's full name. Claude Code has
+  no list of a plan's models to read.
+- **Codex:** `model` in the thread's `thread/start` and `thread/resume`, so a conversation under way goes on with the
+  new one. `/model` asks its app-server what the plan offers (`model/list`, no thread and no model call; 0.3 s for 8
+  models, codex-cli 0.167.0) and prints each name with what OpenAI says of it and which is the default.
+- **agy** and agents you add with the plain adapter choose their own: `/model` refuses a name for them and says so.
+
+The choice is one word that goes to the agent's own program as an argument (letters, digits and `. _ - : / [ ]`); it
+is kept in `shell-settings.json` (`"models": {"claude": "opus"}`) and applies from the agent's next turn, a running
+turn keeping its own. Ringo does not check a name against the plan: the agent does, when the turn starts. A turn
+that fails on a chosen model ends with `it ran on NAME, your choice for claude: /model claude default goes back to
+its own`. Each turn's first line names the model its agent reports (` claude  #3 · claude-opus-5-5`), chosen or
+not, so which model did a piece of work is on screen and in `usage.jsonl`.
+
+The pipelines' model is the backend's: `/backend claude@opus` or `/backend codex-chatgpt@MODEL/EFFORT` sets it for
+`/ask`, `/review`, `/design`, `/research` and ultra's review. So turns and reviews can run on different models.
+
+Checked live, one trivial read-mode turn each (`cargo run --example model -- REPO AGENT MODEL`; Claude Code 2.1.322,
+codex-cli 0.167.0, one run each, so the times are an instance and not a rate):
+
+| Asked for | Ended | Time | Tokens | Model the agent reported |
+|-----------|-------|------|--------|--------------------------|
+| claude `sonnet` | done | 4.4 s | 8,541 | `claude-sonnet-5-5` |
+| codex `gpt-6-luna` | done | 2.9 s | 12,643 | `gpt-6-luna` |
+| claude `no-such-model-xyz` | failed in 1.1 s | | 0 | none: "There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it." |
+
+A name the plan does not have costs no tokens: the agent refuses it before any model call.
 
 ## Usage
 

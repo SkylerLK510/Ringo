@@ -43,6 +43,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
+    ("/model", "which model each agent runs on, and the models your plans offer"),
+    ("/model AGENT NAME", "that agent's turns on that model (default: its own again)"),
     ("/usage", "what you have used, and how much of your plans is left"),
     ("/auto", "auto mode on"),
     ("/review #N", "review job N's change"),
@@ -252,11 +254,16 @@ pub enum Cmd {
     Auto,
     /// `/tier` (None: show it) or `/tier quick|standard|deep|ultra`.
     Tier(Option<Tier>),
+    /// `/model` (None: show who runs on what) or `/model AGENT NAME`.
+    Model(Option<(String, String)>),
     Usage,
     /// `/restart`: this shell ends and the installed `ringo` takes over the conversations.
     Restart,
     Quit,
 }
+
+/// An agent's list of models being read (/model), off the shell's own thread.
+type Listing = std::thread::JoinHandle<Result<Vec<ringo_cli::Model>, String>>;
 
 fn job_number(word: Option<&str>) -> Result<usize, String> {
     word.map(|w| w.trim_start_matches('#')).and_then(|w| w.parse().ok()).ok_or("give a job number, e.g. 3".into())
@@ -299,6 +306,12 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 None => Ok(Cmd::Tier(None)),
                 Some(t) => Tier::from_name(t).map(|t| Cmd::Tier(Some(t)))
                     .ok_or("/tier quick, /tier standard, /tier deep or /tier ultra".into()),
+            },
+            "model" | "models" => match (words.next(), words.next(), words.next()) {
+                (None, ..) => Ok(Cmd::Model(None)),
+                (Some(agent), Some(model), None) => Ok(Cmd::Model(Some((agent.trim_start_matches('@').into(), model.into())))),
+                _ => Err("/model shows who runs on what; /model AGENT NAME sets one (/model claude opus), /model AGENT default \
+                          goes back".into()),
             },
             "mode" => match words.next() {
                 None => Ok(Cmd::Mode(None)),
@@ -1328,6 +1341,8 @@ struct App {
     /// Plan reads under way, one thread an agent, each with whether its answer goes into the conversation (/usage)
     /// or only into `limits` (the side panel's gauges).
     plans: Vec<(bool, std::thread::JoinHandle<PlanRead>)>,
+    /// /model's read of the models an agent's plan offers, under way (see `ringo_cli::models`).
+    listing: Option<(Agent, Listing)>,
     /// Each plan's limits as last read, and when the last read began (None: never, as in tests).
     limits: Vec<(Agent, ringo_cli::Plan)>,
     limits_at: Option<Instant>,
@@ -1420,7 +1435,7 @@ impl App {
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), limits: Vec::new(),
+              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
@@ -1503,7 +1518,10 @@ impl App {
 
     /// The settings in force, printed under the manual.
     fn settings(&self) -> String {
-        format!("  now: mode {} · tier {} · talking to {} · agents {} · questions and pipelines on {} · theme {}\n  private state: {}",
+        let chosen: Vec<String> = self.agents.iter().filter_map(|a| Some(format!("{} {}", a.name(), self.s.models.get(a)?))).collect();
+        let models = if chosen.is_empty() { "each agent's own".to_string() } else { chosen.join(", ") };
+        format!("  now: mode {} · tier {} · talking to {} · agents {} · models {models} (/model) · questions and pipelines on {} · \
+                 theme {}\n  private state: {}",
                 self.s.mode.name(), self.s.tier.name(), self.main.name(), if self.s.separate { "separate" } else { "together" },
                 self.s.backend, self.theme.name, self.s.dir.display())
     }
@@ -1545,8 +1563,10 @@ impl App {
             let (who, style) = self.who(&self.s.jobs[i]);
             if !fresh.is_empty() && self.last != id {
                 self.gap();
+                // with the model at work, as its agent reports it: which model does what is on screen, not assumed
+                let model = self.s.jobs[i].model.as_ref().map_or(String::new(), |m| format!(" · {m}"));
                 self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who} "), style.add_modifier(Modifier::BOLD | Modifier::REVERSED)),
-                                                        Span::styled(format!(" #{id}"), self.theme.dim)]), 0));
+                                                        Span::styled(format!(" #{id}{model}"), self.theme.dim)]), 0));
             }
             for said in fresh {
                 // The owner answers what they read last: an agent's words in this folder make it the one plain lines
@@ -1701,6 +1721,11 @@ impl App {
             .map(|(other, files)| format!("#{other} {}", files.join(", "))).collect();
         if !overlaps.is_empty() {
             lines.push(Line::styled(format!("  ⚠ same files as {}", overlaps.join("; ")), t.warn));
+        }
+        // a plan that does not include the model chosen fails the turn: say where the choice came from
+        if matches!(job.status, Status::Failed(_)) && let Kind::Agent { agent, .. } = job.kind
+            && let Some(model) = self.s.models.get(&agent) {
+            lines.push(Line::styled(format!("  it ran on {model}, your choice for {0}: /model {0} default goes back to its own", agent.name()), t.dim));
         }
         lines
     }
@@ -2045,6 +2070,26 @@ impl App {
         self.plans.is_empty()
     }
 
+    /// /model's list of an agent's models, once it has answered.
+    fn models_done(&mut self) -> bool {
+        let Some((agent, read)) = self.listing.take_if(|(_, read)| read.is_finished()) else { return false };
+        let (style, t) = (self.agent_style(agent), self.theme);
+        match read.join().unwrap_or_else(|_| Err("the read stopped".into())) {
+            Ok(models) if !models.is_empty() => {
+                self.out.push(agent_head(agent.name(), style, &format!(" · the models your plan offers (/model {} NAME)", agent.name()), &t));
+                let pad = models.iter().map(|m| cols(&m.name)).max().unwrap_or(0);
+                for m in models {
+                    let what = if m.default { format!("its default · {}", m.what) } else { m.what };
+                    self.out.push(Out::Line(Line::from(vec![Span::raw(format!("    {:<pad$}  ", m.name)), Span::styled(what, t.dim)]), 6 + pad));
+                }
+            }
+            Ok(_) => self.out.push(agent_head(agent.name(), style, " · it listed no models", &t)),
+            Err(e) => self.out.push(agent_head(agent.name(), style, &format!(" · its models could not be read: {e}"), &t)),
+        }
+        self.last = 0;
+        true
+    }
+
     /// Ultra's plan read, once it has answered: which backend the turn's review will run on. When no plan has room,
     /// the owner hears it while the turn still runs, so they can stop it.
     fn quota_done(&mut self) -> bool {
@@ -2248,6 +2293,63 @@ impl App {
                 Tier::ALL.iter().filter(|t| **t != self.s.tier).map(|t| t.name()).collect::<Vec<_>>().join(", "))),
             Cmd::Tier(Some(tier)) => Some(self.set_tier(tier)),
             Cmd::Usage => self.usage(),
+            Cmd::Model(None) => {
+                let t = self.theme;
+                self.gap();
+                self.out.push(Out::Line(Line::from(vec![
+                    Span::styled("  who runs on what", t.title.add_modifier(Modifier::BOLD)),
+                    Span::styled(" · /model AGENT NAME changes it · /model AGENT default goes back", t.dim)]), 4));
+                let pad = self.agents.iter().map(|a| cols(a.name())).max().unwrap_or(0);
+                for agent in self.agents.clone() {
+                    let (runs, how) = match (self.s.models.get(&agent), agent.spec().adapter) {
+                        (Some(model), _) => (model.clone(), "your choice"),
+                        (None, ringo_cli::Adapter::Claude) => ("its own default".into(), "takes fable, opus, sonnet, haiku or a model's full name"),
+                        (None, ringo_cli::Adapter::Codex) => ("its own default".into(), "takes a model your plan offers"),
+                        (None, _) => ("its own".into(), "it takes no model from Ringo"),
+                    };
+                    self.out.push(Out::Line(Line::from(vec![
+                        Span::raw("    "), Span::styled(format!("{:<pad$}", agent.name()), self.agent_style(agent)),
+                        Span::raw(format!("  {runs}")), Span::styled(format!("  · {how}"), t.dim)]), 6 + pad));
+                }
+                self.last = 0;
+                // Codex lists what the plan offers (no model call, a fraction of a second); Claude Code has no list
+                let lists = self.agents.iter().copied()
+                    .find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a)).filter(|_| self.listing.is_none());
+                if let Some(agent) = lists {
+                    let program = self.s.program(agent);
+                    self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program))));
+                }
+                Some(format!("  /ask, /review, /design and /research run on {} · /backend SPEC changes it, and SPEC@MODEL names a \
+                              model (claude@opus)", self.s.backend))
+            }
+            Cmd::Model(Some((name, model))) => {
+                let agent = Agent::from_name(&name).ok_or_else(|| {
+                    format!("no agent {name}: {}", self.agents.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "))
+                })?;
+                if !self.agents.contains(&agent) {
+                    return Err(format!("{name} is not set up here; /setup adds it"));
+                }
+                if !ringo_cli::takes_model(agent) {
+                    return Err(format!("{name} chooses its own model: it takes none from Ringo"));
+                }
+                let own = matches!(model.as_str(), "default" | "own" | "none");
+                if !own && !ringo_cli::valid_model(&model) {
+                    return Err("a model's name is one word, as its agent takes it: /model claude opus, /model codex gpt-6-astra".into());
+                }
+                match own {
+                    true => self.s.models.remove(&agent),
+                    false => self.s.models.insert(agent, model.clone()),
+                };
+                let all: serde_json::Map<String, serde_json::Value> = self.s.models.iter()
+                    .map(|(a, m)| (a.name().to_string(), serde_json::json!(m))).collect();
+                let saved = crate::theme::set_setting("models", all.into()).err()
+                    .map_or(" (saved)".to_string(), |e| format!(" (not saved: {e})"));
+                Some(match own {
+                    true => format!("  {name} runs on its own default again from its next turn{saved}"),
+                    false => format!("  {name} runs on {model} from its next turn{saved}. If your plan does not include it, the \
+                                      turn says so when it starts; /model {name} default goes back"),
+                })
+            }
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
             // on, never a toggle: typed with auto already on (a mode is remembered), it would turn auto off unseen
@@ -3250,6 +3352,12 @@ pub fn run(start: Start) -> ExitCode {
     if let Some(mode) = saved.get("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
     }
+    // the model each agent runs on, where the owner chose one (/model)
+    for (name, model) in saved.get("models").and_then(|v| v.as_object()).into_iter().flatten() {
+        if let (Some(agent), Some(model)) = (Agent::from_name(name), model.as_str().filter(|m| ringo_cli::valid_model(m))) {
+            app.s.models.insert(agent, model.to_string());
+        }
+    }
     match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
             let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
@@ -3314,7 +3422,7 @@ pub fn run(start: Start) -> ExitCode {
         // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
         // while jobs run (a pump is a few microseconds; redraws still happen only when something changed). Every event
         // already queued is taken before the next redraw.
-        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() { 25 } else { 250 };
+        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() || app.listing.is_some() { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             loop {
                 match event::read() {
@@ -3376,6 +3484,7 @@ pub fn run(start: Start) -> ExitCode {
             dirty = true;
         }
         dirty |= app.release_done();
+        dirty |= app.models_done();
         let asking = app.s.pending().map(|(_, p)| p.id.clone());
         if asking != app.asked.as_ref().map(|(id, _)| id.clone()) {
             app.asked = asking.map(|id| (id, Instant::now()));
@@ -3799,6 +3908,53 @@ mod tests {
         }
         a.feed();
         assert_eq!(replies(&a), ["Hello, world.", "Next up:\n\n| Name | Size |\n|---|---|\n| alpha | 1"]);
+        a.s.shutdown();
+    }
+
+    #[test]
+    fn each_agent_runs_on_the_model_its_owner_chose() {
+        let mut a = app(&["claude", "agy"]);
+        let claude = Agent::from_name("claude").unwrap();
+        assert_eq!((parse("/model", &[claude]), parse("/model claude opus", &[claude]), parse("/model @claude default", &[claude])),
+                   (Ok(Cmd::Model(None)), Ok(Cmd::Model(Some(("claude".into(), "opus".into())))),
+                    Ok(Cmd::Model(Some(("claude".into(), "default".into()))))));
+        assert!(parse("/model claude", &[claude]).is_err() && parse("/model claude a b", &[claude]).is_err());
+        let set = |a: &mut App, agent: &str, model: &str| a.run(Cmd::Model(Some((agent.into(), model.into()))), "");
+        assert!(set(&mut a, "claude", "opus").unwrap().unwrap().starts_with("  claude runs on opus from its next turn (saved)"));
+        assert_eq!(a.s.models.get(&claude).map(String::as_str), Some("opus"));
+        assert_eq!(crate::theme::settings_all()["models"]["claude"], "opus", "remembered for the next start");
+        // an agent that takes none, one not set up, a name that is not one, and a model that is not one word
+        assert!(set(&mut a, "agy", "x").unwrap_err().contains("chooses its own model"));
+        assert!(set(&mut a, "codex", "x").unwrap_err().contains("not set up here"));
+        assert!(set(&mut a, "nobody", "x").unwrap_err().contains("no agent nobody: claude, agy"));
+        assert!(set(&mut a, "claude", "--bare").unwrap_err().contains("one word") && a.s.models[&claude] == "opus");
+        // /model shows who runs on what, and the settings line names the choice
+        assert!(a.run(Cmd::Model(None), "").unwrap().unwrap().contains("/ask, /review, /design and /research run on codex-chatgpt"));
+        let rows = screen(&mut a, 90, 16);
+        assert!(rows.iter().any(|r| r.trim() == "claude  opus  · your choice"), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.trim() == "agy     its own  · it takes no model from Ringo"), "{rows:#?}");
+        assert!(a.listing.is_none() && a.settings().contains("models claude opus (/model)"), "no codex here to ask for its list");
+        // a turn that fails on a chosen model says where the choice came from
+        let job = std::env::temp_dir().join(format!("ringo-tui-fake-model-{}", std::process::id()));
+        std::fs::write(&job, "#!/bin/sh\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o755)).unwrap();
+            a.s.programs.insert(claude, job);
+            a.talk(claude, "hi".into(), "hi".into()).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while a.s.running() > 0 && Instant::now() < deadline {
+                a.s.pump();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            a.feed();
+            let rows = screen(&mut a, 110, 30);
+            assert!(rows.iter().any(|r| r.contains("it ran on opus, your choice for claude: /model claude default goes back")), "{rows:#?}");
+        }
+        assert!(set(&mut a, "claude", "default").unwrap().unwrap().contains("claude runs on its own default again"));
+        assert!(a.s.models.is_empty() && crate::theme::settings_all()["models"].get("claude").is_none());
+        assert!(a.settings().contains("models each agent's own (/model)"));
         a.s.shutdown();
     }
 

@@ -541,6 +541,9 @@ pub struct Session {
     pub mode: Mode,
     /// How hard they think (see `Tier`).
     pub tier: Tier,
+    /// The model each agent's turns run on, where the owner chose one (`/model`): a name the agent's own program
+    /// takes (Claude Code's `--model`, Codex's thread `model`). None for an agent: its own default.
+    pub models: HashMap<Agent, String>,
     /// Ringo's state folder, where `usage.jsonl` keeps what each finished job used.
     root: PathBuf,
     /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
@@ -886,7 +889,7 @@ impl Session {
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
-                     backend: "codex-chatgpt".into(),
+                     backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
                      returned: Vec::new(), start: 1,
@@ -1596,6 +1599,10 @@ impl Session {
                 if auto {
                     thread["approvalsReviewer"] = "auto_review".into();
                 }
+                // the owner's choice of model (/model); given on resuming too, so a conversation goes on with it
+                if let Some(model) = self.models.get(&agent) {
+                    thread["model"] = model.as_str().into();
+                }
                 // Kept by the thread once it is given; given on resuming too, for a thread started without it
                 if self.codex_told_to_use_ringo() {
                     thread["developerInstructions"] = CODEX_IN_RINGO.into();
@@ -1679,6 +1686,10 @@ impl Session {
                     if !self.allowed.is_empty() {
                         cmd.arg("--allowedTools").args(&self.allowed);
                     }
+                }
+                // the owner's choice of model (/model): an alias or a full name, as Claude Code's --model takes it
+                if let Some(model) = self.models.get(&agent) {
+                    cmd.args(["--model", model]);
                 }
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", effort]);
@@ -2805,6 +2816,56 @@ pub fn plan(agent: Agent, program: &Path) -> Result<Plan, String> {
         }
         Adapter::Agy | Adapter::Plain => Err("reports no plan usage".into()),
     }
+}
+
+/// A model an agent's plan offers: the name its program takes, what its maker says of it, and whether it is the one
+/// the agent runs when none is chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model {
+    pub name: String,
+    pub what: String,
+    pub default: bool,
+}
+
+/// Whether an agent's turns can be given a model (`Session::models`): Claude Code and Codex take one; agy and a
+/// plain agent choose their own.
+pub fn takes_model(agent: Agent) -> bool {
+    matches!(agent.spec().adapter, Adapter::Claude | Adapter::Codex)
+}
+
+/// A model's name as it can go to an agent's program: one word of letters, digits and `. _ - : / [ ]`.
+pub fn valid_model(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 80 && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-:/[]".contains(c))
+        && !name.starts_with('-')
+}
+
+/// The models an agent's plan offers, asked of the agent with no model call. Codex's app-server lists them
+/// (`model/list`, about 0.3 s); Claude Code has no such list, so its models are named by alias or full name.
+pub fn models(agent: Agent, program: &Path) -> Result<Vec<Model>, String> {
+    if agent.spec().adapter != Adapter::Codex {
+        return Err("has no list of its models to read".into());
+    }
+    let mut cmd = Command::new(program);
+    cmd.args(["app-server", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"",
+              "-c", "analytics.enabled=false"]);
+    let hello = serde_json::json!({"id": 1, "method": "initialize",
+                                   "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
+    let ask = serde_json::json!({"id": 2, "method": "model/list", "params": {}});
+    let v = ask_once(cmd, &[hello, serde_json::json!({"method": "initialized"}), ask], |v| v["id"] == 2,
+                     Duration::from_secs(15))?;
+    if let Some(e) = v.get("error") {
+        return Err(parse::short(e["message"].as_str().unwrap_or("an error"), 120));
+    }
+    Ok(codex_models(&v["result"]))
+}
+
+/// Codex's `model/list` answer (codex-cli 0.167.0): the models it shows, the default first as it sends them.
+pub fn codex_models(r: &serde_json::Value) -> Vec<Model> {
+    r["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true)
+        .filter_map(|m| Some(Model { name: m["model"].as_str().or(m["id"].as_str())?.to_string(),
+                                     what: m["description"].as_str().unwrap_or("").to_string(),
+                                     default: m["isDefault"] == true }))
+        .collect()
 }
 
 fn claude_window(kind: &str) -> String {

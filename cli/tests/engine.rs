@@ -1790,3 +1790,47 @@ fn an_older_claude_write_job_counts_a_repeated_running_total_once() {
     assert_eq!(wait(&mut s, id), Status::Done);
     assert_eq!(s.job(id).unwrap().tokens.total(), 150, "100 then 150 is 150 in all, not 250");
 }
+
+/// /model: the owner's choice of model goes to each agent its own way, on a new conversation and on one it goes on
+/// with; an agent with no choice is started as it always was. Codex's list of models is read from its own answer.
+#[test]
+fn each_agent_is_started_on_the_model_its_owner_chose() {
+    let r = repo("models");
+    let codex = fake(&root(), "codex-models", &codex_script("", &codex_done("done", (1, 0, 1))));
+    let claude = fake(&root(), "claude-models", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
+        head -n 1 > /dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-m\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("claude"), claude.clone());
+    let run = |s: &mut Session| {
+        for name in ["codex", "claude"] {
+            let id = s.launch_agent(agent(name), false, "the task").unwrap();
+            assert_eq!(wait(s, id), Status::Done);
+        }
+        let thread = threads(&codex).pop().unwrap();
+        let argv: Vec<String> = fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().map(String::from).collect();
+        let chosen = argv.iter().position(|a| a == "--model").map(|at| argv[at + 1].clone());
+        (thread["method"].as_str().unwrap().to_string(), thread["params"]["model"].as_str().map(String::from), chosen)
+    };
+    assert_eq!(run(&mut s), ("thread/start".into(), None, None), "no choice: each on its own default");
+    s.models.insert(agent("codex"), "gpt-test".into());
+    s.models.insert(agent("claude"), "opus".into());
+    assert_eq!(run(&mut s), ("thread/resume".into(), Some("gpt-test".into()), Some("opus".into())), "a conversation goes on with it");
+    s.forget();
+    assert_eq!(run(&mut s), ("thread/start".into(), Some("gpt-test".into()), Some("opus".into())), "and a new one starts on it");
+    s.models.clear();
+    assert_eq!(run(&mut s).1, None, "back to its own");
+
+    let lister = fake(&root(), "codex-model-list", "#!/bin/sh\nread -r hello; read -r ready; read -r ask\n\
+        echo '{\"id\":1,\"result\":{}}'\n\
+        echo '{\"id\":2,\"result\":{\"data\":[{\"id\":\"a\",\"model\":\"m-big\",\"description\":\"the big one\",\"isDefault\":true},\
+              {\"id\":\"b\",\"model\":\"m-hidden\",\"hidden\":true},{\"id\":\"m-small\",\"description\":\"small\"}]}}'\n");
+    let listed: Vec<(String, String, bool)> = ringo_cli::models(agent("codex"), &lister).unwrap()
+        .into_iter().map(|m| (m.name, m.what, m.default)).collect();
+    assert_eq!(listed, [("m-big".to_string(), "the big one".to_string(), true), ("m-small".into(), "small".into(), false)]);
+    assert!(ringo_cli::models(agent("claude"), &claude).is_err(), "Claude Code has no list to read");
+    for (name, ok) in [("opus", true), ("claude-fable-5-2[1m]", true), ("gpt-6.1-sol", true), ("-p", false), ("a b", false), ("", false)] {
+        assert_eq!(ringo_cli::valid_model(name), ok, "{name}");
+    }
+}
