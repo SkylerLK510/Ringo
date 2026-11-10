@@ -118,3 +118,18 @@ Nothing is adopted from this pilot. `review --repo` stays as it is until a confi
    finding, smallest A3 material first, as many as fit under the 900,000-token ceiling with their matcher calls
    (two reviews, three stored findings). The question is only whether showing one hop of definitions and uses up
    front recovers what paging them in afterwards did not.
+
+5. **Close of the pilot, and what was not done.** The slice arm kept 1 of 3 stored findings (two reviews, 58,448
+   input tokens). The pilot ended at 59 calls and 837,699 input tokens, under the token ceiling.
+
+   The hand check of the findings that match no stored finding (11 of them) has not been done. They are kept,
+   unverified, with the private run records.
+
+   The 20 stored findings A2 lost are classified there as the reading rule asks. For 4, the lean review left an
+   open question about the same defect. For 3, by the author's own reading and not the blind matcher's, the lean
+   review reported the defect under another file or in other words. For 13 the cause is unknown: the cited lines
+   were shown and the finding was not made.
+
+   The size of the changed files separates set S from set L in this sample: they hide at most 2,068 lines from the
+   lean material on S and at least 4,615 on L. A gate on that figure is a hypothesis fitted to these 19 reviews.
+   It is not a result of this pilot.
