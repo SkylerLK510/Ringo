@@ -25,9 +25,10 @@ add a dark mode switch to the settings page
 
 - The agent you are talking to (Claude, or Codex when Claude is not set up) reads the files in this folder, changes
   them if that is what you asked for, and answers.
-- Its reply appears as it is written. Each step it takes shows as a line in plain words ("run the tests"), and each
-  edit shows the lines it changed: removed in red, added in green. Reading and searching files are counted on one
-  line ("read 6 files, searched 4 times"); `/show N` lists each one.
+- Its reply appears as it is written, a word at a time, and what you have read does not move: a table shows once
+  it is whole (one line counts its rows until then). Each step it takes shows as a line in plain words ("run the
+  tests"), and each edit shows the lines it changed: removed in red, added in green. Reading and searching files are
+  counted on one line ("read 6 files, searched 4 times"); `/show N` lists each one.
 - While it works, the row above the box (or the side panel, in a wide window) shows its time, the tokens it has used
   and what it is doing now, as it happens: "thinking (~1.3k tokens)" while Claude thinks, the tool it is calling as
   soon as it starts one, and a big file's size as Claude writes it. Press Esc to stop it.
@@ -106,6 +107,46 @@ tasks it was tried on, while one review and one fix did, so `ultra` is the tier 
 used up a limit, it runs on Claude instead. Ringo checks both plans as the turn starts (no tokens), and when neither
 has room it says so then, so you can stop the turn or let it run without a review.
 
+## Choose which model does what
+
+Each agent runs on its own default model until you choose another, from those your own plan includes:
+
+| You type | What happens |
+|---|---|
+| `/model` | who runs on what now, and the models your Codex plan offers |
+| `/model` and a space | a list to pick from: Up and Down move, Enter sets it |
+| `/model opus` | that model, for the agent it belongs to: `fable`, `opus`, `sonnet`, `haiku` or a model's full name for Claude, any name `/model` lists for Codex |
+| `/model billing opus` | says whose: for an agent of your own, or when Ringo asks |
+| `/model claude default` | back to the agent's own default; its conversation starts again from Ringo's record of it |
+
+Ringo remembers your choice, and each turn's first line names the model at work (` claude  #3 · claude-opus-5-5`).
+If your plan does not include a model, the turn says so when it starts, and Ringo says which choice it came from.
+`/ask`, `/review`, `/design` and `/research` run on the backend, which takes a model too: `/backend claude@opus`. So
+one model can write the code and another can review it. agy chooses its own model.
+
+## Bring an agent of your own
+
+If you or your team wrote a specialist (a file that says what it knows and how it works, such as an agent made for
+Claude Code), it can work in Ringo under its own name:
+
+| You type | What happens |
+|---|---|
+| `/agent` | your own agents, and the agents you made for Claude Code that Ringo found |
+| `/agent add billing ~/notes/billing.md` | `billing` is an agent here: Claude with that file as its standing instructions |
+| `/agent add billing ~/notes/billing.md codex` | the same specialist, on your Codex plan |
+| `/agent add shop-billing` | an agent you made for Claude Code, by its name (`.claude/agents/shop-billing.md` here or in your home folder) |
+| `/agent add billing FILE skills` | on Claude, its turns also load your Claude Code skills, plugins and connectors (not in read mode) |
+| `/agent remove billing` | it is gone from Ringo; the file is yours and stays |
+
+Then `@billing why is the invoice late?` talks to it, as to any agent. It keeps a conversation of its own, hears what
+the other agents did and is heard by them, shows in the side panel, and takes a model (`/model billing opus`). Edit
+the file and its next turn has the change. If the file opens with a `model:` or a `tools:` line, as an agent made
+for Claude Code can, a specialist on Claude runs on that model (until `/model` names another) and is offered only
+those tools.
+
+It costs what the file holds: its text is read on every call of that agent's turns, and with `skills` so are the
+lists of your skills and connectors. Only that agent's turns pay for it; `@claude` stays as lean as before.
+
 ## See what you have used
 
 `/usage` shows, as gauges (green, amber past 60% used, red past 85%):
@@ -131,6 +172,31 @@ changed, so `@codex take it from here` carries on the same work.
 The agents work side by side: while Claude works, `@codex write the README` starts at once. Codex is told what Claude
 is still doing and which files it has edited so far, so it leaves that alone, and each hears how the other's turn
 ended at its next one. Each agent still takes one turn at a time: a message for a busy agent goes into its turn.
+
+## Let the agents talk it over
+
+Instead of asking each agent in turn and carrying the answers between them yourself, let them talk:
+
+| You type | What happens |
+|---|---|
+| `/discuss should we split the parser first?` | the agents that work in this folder talk it over, one at a time: each reads what the others said and answers it |
+| `/discuss` | they talk over the last turn: the other agents answer the one that took it |
+| `/discuss @claude @codex TOPIC` | only those agents talk |
+
+- You read along as they write. A line you type joins in: the next agent to speak hears it, and each may answer
+  once more. Esc stops them.
+- A talk looks and does not touch: its turns run in read mode, whatever your mode is. When it is over, say what you
+  want done (`@claude do it`): every agent has heard the whole talk.
+- It ends when a round adds nothing (an agent with nothing to add says AGREED) or when each has spoken twice.
+  `/discuss` again goes on with it.
+- It costs a turn of each agent's a round, on that agent's own plan. The talk's last row counts its turns, time and
+  tokens.
+- An agent of your own (`/agent`) takes part like any other.
+
+For one question and not a whole talk, name the agent to consult in your message:
+`@claude would you move the timeout into config.rs? ask codex first`. Claude asks Codex in the middle of its turn,
+Codex's answer shows under its own name, and Claude goes on with it. The turn it asks for looks and does not
+touch, and one turn asks at most three times.
 
 ## Give each agent its own task
 
@@ -189,7 +255,8 @@ Every turn and pipeline is a numbered job.
 | Esc | clear the input; with it empty, stop the turn |
 | Up, Down | move between lines, then through earlier messages |
 | `/` or `@` | a menu of commands or agents: Up and Down choose, Tab or Enter completes |
-| PgUp, PgDn | scroll the conversation (the mouse wheel does too) |
+| PgUp, PgDn | scroll the conversation (the mouse wheel does too); what you are reading then stays where it is while agents write, and the box counts the rows below |
+| Home, End | with nothing typed, the conversation's start and end |
 | drag | select text in the conversation and copy it |
 | Ctrl-A, Ctrl-E | the start or end of the line; Ctrl-U and Ctrl-K cut to either |
 | Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W cuts the word before |
@@ -212,11 +279,16 @@ after every turn, so a crash loses at most the turn it cut short.
 | `/setup` | add an agent and sign in to it |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens. If you use releases, it also checks whether the pipelines' release is behind this Ringo |
 | `/update approve` | move the pipelines to the release `/update` checked |
+
 | `/restart` | start the updated Ringo: it updates itself in the background and says when this applies it (quitting applies it too); the conversations go on |
 | `/tier NAME` | how hard agents think: quick, standard, deep or ultra (above) |
 | `/usage` | what you have used, and how much of your plans is left |
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
 | `/quit` | leave |
+
+When a newer Ringo is there, the top line says so until you have it: `↑ update ready · /restart` when Ringo has
+built it for you, or `↑ update available · /update` when your copy is one you update yourself, and `/update` then
+says how.
 
 ## What it costs
 

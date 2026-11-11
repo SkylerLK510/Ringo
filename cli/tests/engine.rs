@@ -1790,3 +1790,288 @@ fn an_older_claude_write_job_counts_a_repeated_running_total_once() {
     assert_eq!(wait(&mut s, id), Status::Done);
     assert_eq!(s.job(id).unwrap().tokens.total(), 150, "100 then 150 is 150 in all, not 250");
 }
+
+/// /model: the owner's choice of model goes to each agent its own way, on a new conversation and on one it goes on
+/// with; an agent with no choice is started as it always was. Codex's list of models is read from its own answer.
+#[test]
+fn each_agent_is_started_on_the_model_its_owner_chose() {
+    let r = repo("models");
+    let codex = fake(&root(), "codex-models", &codex_script("", &codex_done("done", (1, 0, 1))));
+    let claude = fake(&root(), "claude-models", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
+        head -n 1 > /dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-m\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("claude"), claude.clone());
+    let run = |s: &mut Session| {
+        for name in ["codex", "claude"] {
+            let id = s.launch_agent(agent(name), false, "the task").unwrap();
+            assert_eq!(wait(s, id), Status::Done);
+        }
+        let thread = threads(&codex).pop().unwrap();
+        let argv: Vec<String> = fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().map(String::from).collect();
+        let chosen = argv.iter().position(|a| a == "--model").map(|at| argv[at + 1].clone());
+        (thread["method"].as_str().unwrap().to_string(), thread["params"]["model"].as_str().map(String::from), chosen)
+    };
+    assert_eq!(run(&mut s), ("thread/start".into(), None, None), "no choice: each on its own default");
+    s.models.insert(agent("codex"), "gpt-test".into());
+    s.models.insert(agent("claude"), "opus".into());
+    assert_eq!(run(&mut s), ("thread/resume".into(), Some("gpt-test".into()), Some("opus".into())), "a conversation goes on with it");
+    s.forget();
+    assert_eq!(run(&mut s), ("thread/start".into(), Some("gpt-test".into()), Some("opus".into())), "and a new one starts on it");
+    // back to its own: no model is named, and the conversation starts again, because one under way keeps its model
+    s.models.clear();
+    assert!(s.start_over(agent("codex")) && s.start_over(agent("claude")) && !s.start_over(agent("claude")));
+    assert_eq!(run(&mut s), ("thread/start".into(), None, None));
+
+    let lister = fake(&root(), "codex-model-list", "#!/bin/sh\nread -r hello; read -r ready; read -r ask\n\
+        echo '{\"id\":1,\"result\":{}}'\n\
+        echo '{\"id\":2,\"result\":{\"data\":[{\"id\":\"a\",\"model\":\"m-big\",\"description\":\"the big one\",\"isDefault\":true},\
+              {\"id\":\"b\",\"model\":\"m-hidden\",\"hidden\":true},{\"id\":\"m-small\",\"description\":\"small\"}]}}'\n");
+    let listed: Vec<(String, String, bool)> = ringo_cli::models(agent("codex"), &lister).unwrap()
+        .into_iter().map(|m| (m.name, m.what, m.default)).collect();
+    assert_eq!(listed, [("m-big".to_string(), "the big one".to_string(), true), ("m-small".into(), "small".into(), false)]);
+    assert!(ringo_cli::models(agent("claude"), &claude).is_err(), "Claude Code has no list to read");
+    for (name, ok) in [("opus", true), ("claude-fable-5-2[1m]", true), ("gpt-6.1-sol", true), ("-p", false), ("a b", false), ("", false)] {
+        assert_eq!(ringo_cli::valid_model(name), ok, "{name}");
+    }
+}
+
+/// An agent of the owner's own: a file of instructions makes Claude or Codex a specialist under its own name. The
+/// text goes to its every turn the agent's own way (Claude: appended to the system prompt between the owner's rules
+/// and the project's file; Codex: the thread's developer instructions), without a Claude Code agent file's opening
+/// block, read anew each turn. A turn that cannot have them does not start. With `skills`, Claude loads the owner's
+/// skills, plugins and connectors, but still not their CLAUDE.md.
+#[test]
+fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
+    let r = repo("own-agent");
+    fs::write(r.join("AGENTS.md"), "Project rule.\n").unwrap();
+    let state = root().join("state-own-agent");
+    let file = root().join("specialist.md");
+    fs::write(&file, "---\nname: specialist\ndescription: knows the billing code\n---\n\nYou know the billing code.\n").unwrap();
+    let claude = fake(&root(), "claude-own", "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\nenv > \"$0.env\"\n\
+        rm -f \"$0.appended\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --append-system-prompt-file ] && cat \"$2\" > \"$0.appended\"; shift; done\n\
+        head -n 1 > /dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-o\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"ok\"}'\n");
+    let codex = fake(&root(), "codex-own", &codex_script("", &codex_done("done", (1, 0, 1))));
+    let entry = |name: &str, adapter: &str, skills: bool| serde_json::json!({"name": name, "adapter": adapter, "read": true,
+        "program": "claude", "instructions": file, "skills": skills});
+    for (bad, why) in [(serde_json::json!({"name": "own-agy", "adapter": "agy", "instructions": "x.md"}), "claude or codex"),
+                       (serde_json::json!({"name": "own-plain", "instructions": "x.md"}), "claude or codex"),
+                       (entry("own-skilled-codex", "codex", true), "Claude Code's")] {
+        let e = ringo_cli::add_custom_agent(&state, bad).unwrap_err();
+        assert!(e.contains(why), "{e}");
+    }
+    let on_claude = ringo_cli::add_custom_agent(&state, entry("own-claude", "claude", false)).unwrap();
+    let skilled = ringo_cli::add_custom_agent(&state, entry("own-skilled", "claude", true)).unwrap();
+    let on_codex = ringo_cli::add_custom_agent(&state, entry("own-codex", "codex", false)).unwrap();
+    let mut s = Session::with_state(&r, &state).unwrap();
+    for (agent, program) in [(on_claude, &claude), (skilled, &claude), (agent("claude"), &claude), (on_codex, &codex)] {
+        s.programs.insert(agent, program.clone());
+    }
+    let home = root().join("codex-home-own");
+    fs::create_dir_all(&home).unwrap();
+    s.codex_home = home.clone();
+    let run = |s: &mut Session, agent: Agent| {
+        let id = s.launch_agent(agent, false, "the task").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        (fs::read_to_string(claude.with_extension("appended")).unwrap_or_default(),
+         fs::read_to_string(format!("{}.argv", claude.display())).unwrap_or_default())
+    };
+    let (appended, argv) = run(&mut s, on_claude);
+    assert_eq!(appended, "You know the billing code.\n\nProject rule.\n", "its instructions, then the project's; no opening block");
+    assert!(argv.lines().any(|a| a == "--safe-mode"), "as lean as any Claude turn: {argv}");
+    assert_eq!(run(&mut s, agent("claude")).0, "Project rule.\n", "claude itself is not the specialist");
+    fs::write(s.rules_path(), "My rule.\n").unwrap();
+    fs::write(&file, "You know the billing code, and the ledger.\n").unwrap();
+    assert_eq!(run(&mut s, on_claude).0, "My rule.\n\nYou know the billing code, and the ledger.\n\nProject rule.\n",
+               "the owner's rules first, and an edit to the file is in the next turn");
+    fs::remove_file(r.join("AGENTS.md")).unwrap();
+    fs::remove_file(s.rules_path()).unwrap();
+    assert_eq!(run(&mut s, on_claude).0, "You know the billing code, and the ledger.", "alone");
+    // with skills: the owner's customizations load, their CLAUDE.md and memory still do not
+    let argv = run(&mut s, skilled).1;
+    let has = |flag: &str| argv.lines().any(|a| a == flag);
+    assert!(!has("--safe-mode") && !has("--disable-slash-commands") && has("--agent"), "{argv}");
+    let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
+    assert!(env.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1") && env.contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1"), "{env}");
+    // read mode's promise holds for it too: nothing of the owner's loads that could write
+    s.mode = ringo_cli::Mode::Read;
+    let argv = run(&mut s, skilled).1;
+    assert!(argv.lines().any(|a| a == "--safe-mode") && argv.lines().any(|a| a == "--disable-slash-commands"), "{argv}");
+    s.mode = ringo_cli::Mode::Ask;
+    // Codex: the thread's developer instructions, with Ringo's own note after them when the owner's files call for it
+    let told = |s: &mut Session| {
+        let id = s.launch_agent(on_codex, false, "the task").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        threads(&codex).pop().unwrap()["params"]["developerInstructions"].as_str().map(String::from).unwrap()
+    };
+    assert_eq!(told(&mut s), "You know the billing code, and the ledger.");
+    fs::write(home.join("AGENTS.md"), "Use Ringo as the default harness.\n").unwrap();
+    let both = told(&mut s);
+    assert!(both.starts_with("You know the billing code, and the ledger.\n\nRingo launched this conversation"), "{both}");
+    // What the file's opening block says of its model and tools goes to Claude as Claude Code takes them: the model
+    // unless the owner chose one, the tools as the only ones offered. Codex is given neither.
+    fs::write(&file, "---\nname: specialist\nmodel: sonnet\ntools: Read, Grep, mcp__x__y\n---\nYou know the ledger.\n").unwrap();
+    let args = |s: &mut Session| -> Vec<String> { run(s, on_claude).1.lines().map(String::from).collect() };
+    let after = |args: &[String], flag: &str| args.iter().position(|a| a == flag).map(|at| args[at + 1].clone());
+    let argv = args(&mut s);
+    assert_eq!((after(&argv, "--model"), after(&argv, "--tools")), (Some("sonnet".into()), Some("Read,Grep".into())), "{argv:?}");
+    assert!(argv.iter().any(|a| a == "--disallowed-tools"), "what the mode denies stays denied: {argv:?}");
+    s.models.insert(on_claude, "opus".into());
+    assert_eq!(after(&args(&mut s), "--model"), Some("opus".into()), "the owner's choice comes first");
+    s.models.clear();
+    fs::write(&file, "---\nmodel: inherit\ntools:\n  - Read\n  - \"Glob\"\ndescription: x\n---\nYou know the ledger.\n").unwrap();
+    let argv = args(&mut s);
+    assert_eq!((after(&argv, "--model"), after(&argv, "--tools")), (None, Some("Read,Glob".into())), "{argv:?}");
+    assert!(threads(&codex).last().unwrap()["params"].get("model").is_none());
+    assert!(told(&mut s).starts_with("You know the ledger.\n\nRingo launched"), "the block is not part of its text");
+    assert!(threads(&codex).last().unwrap()["params"].get("model").is_none(), "a Claude Code model is not Codex's");
+    // a tools line that names nothing Ringo can pass on offers nothing: written to narrow, it must not widen
+    for none in ["tools: []", "tools:", "tools: mcp__x__y, --bare"] {
+        fs::write(&file, format!("---\n{none}\n---\nYou know the ledger.\n")).unwrap();
+        assert_eq!(after(&args(&mut s), "--tools"), Some(String::new()), "{none}");
+    }
+    fs::write(&file, "---\ntools: Read, default\n---\nYou know the ledger.\n").unwrap();
+    assert_eq!(after(&args(&mut s), "--tools"), None, "Claude Code's word for its whole set: no restriction");
+    fs::write(&file, "You know the billing code, and the ledger.\n").unwrap();
+    assert_eq!((after(&args(&mut s), "--model"), after(&args(&mut s), "--tools")), (None, None), "no block, nothing added");
+    // no instructions, no turn: a turn without them would not be this agent's
+    let jobs = s.jobs.len();
+    fs::write(&file, "---\nname: specialist\n---\n \n").unwrap();
+    assert!(s.launch_agent(on_claude, false, "the task").unwrap_err().contains("no text in it"));
+    fs::remove_file(&file).unwrap();
+    let e = s.launch_agent(on_codex, false, "the task").unwrap_err();
+    assert!(e.contains("own-codex's instructions could not be read") && s.jobs.len() == jobs, "{e}");
+    // taken away: out of the owner's file, the other entries as they were
+    assert_eq!(ringo_cli::remove_custom_agent(&state, "own-claude"), Ok(true));
+    assert_eq!(ringo_cli::remove_custom_agent(&state, "own-claude"), Ok(false));
+    let kept: serde_json::Value = serde_json::from_slice(&fs::read(state.join("agents.json")).unwrap()).unwrap();
+    let names: Vec<&str> = kept["custom"].as_array().unwrap().iter().filter_map(|c| c["name"].as_str()).collect();
+    assert_eq!(names, ["own-skilled", "own-codex"]);
+}
+
+/// agy hears what the others did as any agent does, but is not pointed at the whole record: that file is outside its
+/// folder, and a read it has no permission for ends its turn with no reply. Codex, which can open it, still is.
+#[test]
+fn agy_is_not_sent_to_a_file_it_cannot_open() {
+    let r = repo("agy-record");
+    let codex = fake(&root(), "codex-agy-record", &codex_script("", &codex_done("all done", (1, 0, 1))));
+    let agy = fake(&root(), "agy-record", "#!/bin/sh\ncat > \"$0.stdin\"\n\
+        echo '{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{\"cwd\":\"x\"}}'\n\
+        echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"fine by me\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}'\n");
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("agy"), agy.clone());
+    for (name, task) in [("codex", "look at a.txt"), ("agy", "and you?"), ("codex", "so?")] {
+        let id = s.launch_agent(agent(name), false, task).unwrap();
+        assert_eq!(wait(&mut s, id), Status::Done);
+    }
+    let heard = fs::read_to_string(format!("{}.stdin", agy.display())).unwrap();
+    assert!(heard.contains("codex: all done") && heard.contains("and you?") && !heard.contains("record.md"), "{heard}");
+    let heard = turn_text(&codex);
+    assert!(heard.contains("agy: fine by me") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
+}
+
+/// A stand-in Claude Code that asks other agents as the real one does: it finds the ask server in its `--mcp-config`
+/// and calls it, once for each `agent|question` line in its `.asks` file, with the environment Ringo gave it. Its
+/// reply is what it heard.
+const CLAUDE_ASKS_AGENTS: &str = r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+env > "$0.env"
+cfg=""; while [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && cfg="$2"; shift; done
+head -n 1 > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s-asks","apiKeySource":"none"}'
+said=""
+if [ -n "$cfg" ] && [ -f "$0.asks" ]; then
+  ringo=$(printf '%s' "$cfg" | sed 's/.*"command":"\([^"]*\)".*/\1/')
+  dir=$(printf '%s' "$cfg" | sed 's/.*"ask-server","\([^"]*\)".*/\1/')
+  n=0
+  while IFS='|' read -r who what; do
+    n=$((n+1))
+    printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"ask_agent","arguments":{"agent":"%s","question":"%s"}}}\n' "$n" "$who" "$what"
+  done < "$0.asks" | "$ringo" ask-server "$dir" codex > "$0.answers"
+  said=$(sed 's/.*"text":"\([^"]*\)".*/\1/' "$0.answers" | tr '\n' '/')
+fi
+printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"heard: $said\"}"
+"#;
+
+/// An agent asks another a question in the middle of its own turn: its program is given one tool, served by
+/// `ringo ask-server` from the turn's own folder, and the shell that runs the turn starts the other agent's. That
+/// turn looks and does not touch whatever the mode, is told who asks, cannot ask in its turn, and its reply is the
+/// answer. One turn asks at most MAX_ASKS times, and an ask that cannot be served is answered with the reason.
+#[test]
+fn an_agent_asks_another_in_the_middle_of_its_turn() {
+    let r = repo("asks");
+    let codex = fake(&root(), "codex-asked", &codex_script("", &codex_done("all done", (1, 0, 1))));
+    let claude = fake(&root(), "claude-asks-agents", CLAUDE_ASKS_AGENTS);
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("claude"), claude.clone());
+    s.asker = env!("CARGO_BIN_EXE_ringo").into();
+    let asks = format!("{}.asks", claude.display());
+    fs::write(&asks, "codex|is a.txt fine?\n").unwrap();
+    let turn = |s: &mut Session, write: bool| -> (usize, Vec<String>) {
+        let id = s.launch_agent(agent("claude"), write, "Check a.txt, and ask Codex what it thinks.").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        (id, fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().map(String::from).collect())
+    };
+    // no other agent set up to ask: the turn is as it always was
+    let (id, argv) = turn(&mut s, false);
+    assert!(argv.iter().any(|a| a == "--safe-mode") && !argv.iter().any(|a| a == "--mcp-config"), "{argv:?}");
+    assert!(!s.job(id).unwrap().can_ask && s.job(id).unwrap().reply() == "heard: ");
+    // with one that the message does not name: still as it always was, to the argument
+    s.peers = vec![agent("claude"), agent("codex")];
+    let plain = s.launch_agent(agent("claude"), false, "the task, with no one named (codexes is another word)").unwrap();
+    assert_eq!(wait(&mut s, plain), Status::Done);
+    let unnamed = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+    assert!(unnamed.lines().any(|a| a == "--safe-mode") && !unnamed.contains("--mcp-config") && !s.job(plain).unwrap().can_ask, "{unnamed}");
+    // named: the tool, and what safe mode would drop is dropped piece by piece (safe mode drops the tool too), with
+    // the owner's settings files still read, as safe mode reads them
+    let (id, argv) = turn(&mut s, false);
+    let has = |flag: &str| argv.iter().any(|a| a == flag);
+    assert!(!has("--safe-mode") && has("--mcp-config") && has("--strict-mcp-config") && !has("--setting-sources")
+            && has("--disable-slash-commands") && has("mcp__ringo__ask_agent"), "{argv:?}");
+    assert!(argv.iter().any(|a| a.contains("\"disableAllHooks\":true")) && argv.windows(2).any(|w| w == ["--agent", "claude"]), "{argv:?}");
+    let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
+    assert!(env.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1") && env.contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1")
+            && env.contains("RINGO_CHILD=1"), "the server runs inside a turn Ringo launched: {env}");
+    assert_eq!(s.job(id).unwrap().reply(), "heard: all done/", "what codex said came back into the turn");
+    assert!(s.job(id).unwrap().log.iter().any(|l| l == "asks codex: is a.txt fine?"), "{:?}", s.job(id).unwrap().log);
+    // the turn it asked for: codex's own, read-only though the session edits, told who asks, with no means to ask on
+    let asked = s.jobs.last().unwrap();
+    assert_eq!((asked.id, &asked.kind, &asked.status, asked.can_ask), (id + 1, &ringo_cli::Kind::Agent { agent: agent("codex"), write: false }, &Status::Done, false));
+    assert_eq!(asked.asked_by.as_ref().map(|(by, _)| *by), Some(id));
+    assert_eq!((threads(&codex).last().unwrap()["params"]["sandbox"].as_str(), s.mode), (Some("read-only"), Mode::Ask));
+    let heard = turn_text(&codex);
+    assert!(heard.contains("claude is in the middle of a turn for me and asks you:\n\nis a.txt fine?\n\nAnswer claude directly"), "{heard}");
+    // at most MAX_ASKS of them a turn: the next is told so, and no turn starts for it
+    let before = s.jobs.len();
+    fs::write(&asks, "codex|one\ncodex|two\ncodex|three\ncodex|four\n").unwrap();
+    let (id, _) = turn(&mut s, false);
+    assert_eq!(s.jobs.len() - before, 1 + ringo_cli::MAX_ASKS, "its own turn and MAX_ASKS more, never another");
+    assert_eq!(s.job(id).unwrap().reply(), "heard: all done/all done/all done/this turn has asked 3 times already: go on with what you have/");
+    // an agent that is not here to ask: the reason comes back, and the turn goes on
+    let before = s.jobs.len();
+    fs::write(&asks, "nobody|x\nclaude|y\n").unwrap();
+    let (id, _) = turn(&mut s, false);
+    assert_eq!(s.job(id).unwrap().reply(), "heard: there is no agent nobody to ask here: codex/there is no agent claude to ask here: codex/");
+    assert_eq!(s.jobs.len() - before, 1);
+    // Codex is given the same server, in its settings for the run
+    let id = s.launch_agent(agent("codex"), false, "the task").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let argv = fs::read_to_string(format!("{}.argv", codex.display())).unwrap();
+    let dir = s.job(id).unwrap().dir.display().to_string();
+    assert!(argv.contains(&format!("mcp_servers.ringo.command=\"{}\"", env!("CARGO_BIN_EXE_ringo")))
+            && argv.contains(&format!("mcp_servers.ringo.args=[\"ask-server\",\"{dir}\",\"claude\"]"))
+            && argv.contains("mcp_servers.ringo.default_tools_approval_mode=\"approve\"") && s.job(id).unwrap().can_ask, "{argv}");
+    // a turn in its own copy hears no one, and is given no one to ask
+    let (id, argv) = turn(&mut s, true);
+    assert!(!argv.iter().any(|a| a == "--mcp-config") && !s.job(id).unwrap().can_ask, "{argv:?}");
+    // Ringo still does not start inside a turn it launched: only its ask server does
+    let run = |arg: &str| Command::new(env!("CARGO_BIN_EXE_ringo")).arg(arg).env("RINGO_CHILD", "1").stdin(std::process::Stdio::null())
+        .output().unwrap().status.code();
+    assert_eq!((run("--version"), run("ask-server")), (Some(2), Some(2)), "refused; and the server wants its folder");
+    let served = Command::new(env!("CARGO_BIN_EXE_ringo")).args(["ask-server", "/nonexistent", "codex"]).env("RINGO_CHILD", "1")
+        .stdin(std::process::Stdio::null()).output().unwrap();
+    assert_eq!(served.status.code(), Some(0), "with nothing asked it ends when its input does");
+}

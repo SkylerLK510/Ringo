@@ -40,9 +40,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/compact", "shrink a long conversation so later turns cost less"),
     ("/separate", "a conversation of its own for each agent, so none is told what the others do"),
     ("/together", "the agents back in one conversation, still working side by side"),
+    ("/discuss TOPIC", "the agents talk it over among themselves, in turn, while you read (alone: the last turn)"),
     ("/ask TEXT", "a quick answer from one cheap call, without your files"),
     ("/mode ask|auto|read", "what agents may do without asking"),
     ("/tier quick|standard|deep|ultra", "how hard agents think; ultra also reviews each change and fixes what it finds"),
+    ("/model", "which model each agent runs on; with a space after it, a list to pick from"),
+    ("/model NAME", "that model, for the agent it belongs to (/model opus); /model AGENT NAME says whose"),
+    ("/agent", "your own agents: a specialist made from a file of instructions"),
+    ("/agent add NAME FILE", "make one, on claude (or: codex after FILE; skills: your Claude Code skills too)"),
+    ("/agent remove NAME", "take one of your own agents away"),
     ("/usage", "what you have used, and how much of your plans is left"),
     ("/auto", "auto mode on"),
     ("/review #N", "review job N's change"),
@@ -211,6 +217,18 @@ fn save_history(line: &str) {
     }
 }
 
+/// `/agent add NAME [FILE] [BASE] [skills]` and `/agent remove NAME`.
+#[derive(Debug, PartialEq)]
+pub enum OwnAgent {
+    /// `file`: its instructions, or the name of an agent made for Claude Code (none: one called `name`); `base`: the
+    /// agent it runs on (none: claude when it is set up); `skills`: the owner's Claude Code skills load in its turns.
+    Add { name: String, file: Option<String>, base: Option<String>, skills: bool },
+    Remove(String),
+}
+
+const AGENT_USAGE: &str = "/agent lists your own agents; /agent add NAME FILE makes one from a file of instructions (add \
+                           codex to run it there, skills to load your Claude Code skills in its turns); /agent remove NAME";
+
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
     /// A plain line: for the agent the owner is talking to.
@@ -252,11 +270,64 @@ pub enum Cmd {
     Auto,
     /// `/tier` (None: show it) or `/tier quick|standard|deep|ultra`.
     Tier(Option<Tier>),
+    /// `/model` (None: show who runs on what), `/model AGENT NAME`, or `/model NAME` (no agent named: the one the
+    /// model belongs to).
+    Model(Option<(String, String)>),
+    /// `/agent` (None: the owner's own agents, and the Claude Code agent files found) or one made or taken away.
+    Agent(Option<OwnAgent>),
+    /// `/discuss [@AGENT ...] [TOPIC]`: those agents (none named: every one that works in this folder) talk the
+    /// topic over (none: the last turn).
+    Discuss(Vec<Agent>, String),
     Usage,
     /// `/restart`: this shell ends and the installed `ringo` takes over the conversations.
     Restart,
     Quit,
 }
+
+/// How many times each agent speaks in a talk (/discuss) at most, a line of the owner's aside: with `n` agents a talk
+/// is at most `n * TALK_ROUNDS` turns.
+const TALK_ROUNDS: usize = 2;
+
+/// The agents' talk under way (/discuss): they take turns in the conversation they share, each answering what the
+/// others said, until none has more to add or each has spoken TALK_ROUNDS times.
+struct Talk {
+    order: Vec<Agent>,
+    /// Whose turn runs now (in `order`), and its job.
+    at: usize,
+    job: usize,
+    /// Its turns so far, the running one included, and the most it may take: a line of the owner's adds a round.
+    jobs: Vec<usize>,
+    limit: usize,
+    /// Replies in a row that added nothing.
+    passes: usize,
+    /// The owner's lines since the running turn began, which the next speaker hears.
+    said: Vec<String>,
+    started: Instant,
+}
+
+/// What a talk's first speaker is told of how it works, so it writes its part and leaves the carrying to Ringo.
+const TALK_RELAY: &str = "Your reply is shown to them and theirs come back to you here, so write only your own part: do not \
+                          try to reach them, and do not speak for them.";
+
+/// Whether a reply in a talk adds nothing: the one word its turn was asked for.
+fn agreed(reply: &str) -> bool {
+    reply.trim().trim_end_matches(['.', '!']).eq_ignore_ascii_case("agreed")
+}
+
+/// Names as a sentence lists them: a, b and c.
+fn listed(names: &[&str]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.to_string(),
+        [most @ .., last] => format!("{} and {last}", most.join(", ")),
+    }
+}
+
+/// The names Claude Code takes for its models whatever the plan (its `--model` aliases); it has no list to read.
+const CLAUDE_MODELS: [&str; 4] = ["fable", "opus", "sonnet", "haiku"];
+
+/// An agent's list of models being read (/model), off the shell's own thread.
+type Listing = std::thread::JoinHandle<Result<Vec<ringo_cli::Model>, String>>;
 
 fn job_number(word: Option<&str>) -> Result<usize, String> {
     word.map(|w| w.trim_start_matches('#')).and_then(|w| w.parse().ok()).ok_or("give a job number, e.g. 3".into())
@@ -299,6 +370,39 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
                 None => Ok(Cmd::Tier(None)),
                 Some(t) => Tier::from_name(t).map(|t| Cmd::Tier(Some(t)))
                     .ok_or("/tier quick, /tier standard, /tier deep or /tier ultra".into()),
+            },
+            "model" | "models" => match (words.next(), words.next(), words.next()) {
+                (None, ..) => Ok(Cmd::Model(None)),
+                (Some(model), None, _) => Ok(Cmd::Model(Some((String::new(), model.into())))),
+                (Some(agent), Some(model), None) => Ok(Cmd::Model(Some((agent.trim_start_matches('@').into(), model.into())))),
+                _ => Err("/model shows who runs on what; /model NAME sets one (/model opus), /model AGENT NAME says whose, and \
+                          /model AGENT default goes back".into()),
+            },
+            "discuss" | "talk" => {
+                let (mut agents, mut topic) = (Vec::new(), tail);
+                while let Some(word) = topic.split_whitespace().next().filter(|w| w.starts_with('@')) {
+                    agents.push(Agent::from_name(&word[1..]).ok_or(format!("no agent {}", &word[1..]))?);
+                    topic = topic[word.len()..].trim_start();
+                }
+                Ok(Cmd::Discuss(agents, topic.to_string()))
+            }
+            "agent" | "agents" => match (words.next(), words.next()) {
+                (None, _) => Ok(Cmd::Agent(None)),
+                (Some("add"), Some(name)) => {
+                    let (mut file, mut base, mut skills) = (None, None, false);
+                    for w in words {
+                        match w {
+                            "skills" => skills = true,
+                            w if base.is_none() && Agent::from_name(w).is_some() => base = Some(w.to_string()),
+                            w if file.is_none() => file = Some(w.to_string()),
+                            _ => return Err(AGENT_USAGE.into()),
+                        }
+                    }
+                    Ok(Cmd::Agent(Some(OwnAgent::Add { name: name.trim_start_matches('@').into(), file, base, skills })))
+                }
+                (Some("remove" | "rm"), Some(name)) if words.next().is_none() =>
+                    Ok(Cmd::Agent(Some(OwnAgent::Remove(name.trim_start_matches('@').into())))),
+                _ => Err(AGENT_USAGE.into()),
             },
             "mode" => match words.next() {
                 None => Ok(Cmd::Mode(None)),
@@ -477,6 +581,92 @@ fn closed(mut text: String) -> String {
         text.insert_str(text.trim_end().len(), mark);
     }
     text
+}
+
+/// How long the word being written waits for its end before it shows anyway, and a table for its last row: a
+/// reply's pieces come tens of milliseconds apart, so a pause this long is the agent stopping to think or to work.
+const WORD_HOLD: Duration = Duration::from_millis(150);
+const TABLE_HOLD: Duration = Duration::from_millis(1500);
+/// A word, or a link, longer than this shows as it grows (a path, a URL, a `[` that opens no link).
+const HELD_WORD: usize = 32;
+const HELD_LINK: usize = 60;
+
+/// What shows of a reply being written (`text`, its pieces last came `age` ago), so that a row someone is reading
+/// does not change under them. Kept back until it is whole:
+/// - the word being written, which could move to the next row or close a mark, until its end comes or WORD_HOLD;
+/// - a link whose text has a space in it, until it closes (its marks would go when it does);
+/// - a table, whose columns move with every wider cell, until a line that is not one of its rows comes or
+///   TABLE_HOLD: one line stands in for it and counts its rows.
+///
+/// Nothing before `floor` is kept back: what has shown stays. Returns the text to show, how much of `text` it
+/// is, and how long after the last piece to look again (None: nothing was kept back).
+/// Measured on the 14.8k guide written in pieces of 4 to 24 characters at 120 columns: rows above the one being
+/// written changed in 85 of 1,060 frames before, and the row being written took text back in 18.
+fn steady(text: &str, age: Duration, floor: usize) -> (String, usize, Option<Duration>) {
+    let fenced = text.lines().filter(|l| l.trim_start().starts_with("```")).count() % 2 == 1;
+    let (mut keep, mut again, mut note) = (text.len(), None, String::new());
+    if !fenced && age < TABLE_HOLD {
+        // the lines at the end that start a table's rows; an empty line being started is not yet a line
+        let mut lines: Vec<&str> = text.split('\n').collect();
+        let open = lines.last().is_some_and(|l| !l.is_empty());
+        if !open {
+            lines.pop();
+        }
+        let run = lines.iter().rev().take_while(|l| l.trim_start().starts_with('|')).count();
+        let start: usize = lines[..lines.len() - run].iter().map(|l| l.len() + 1).sum();
+        if run > 0 && start >= floor {
+            // its heading and the rule under it are not rows
+            let rows = (run - open as usize).saturating_sub(2);
+            note = match rows {
+                0 => "*a table is being written…*".to_string(),
+                1 => "*a table is being written · 1 row so far…*".to_string(),
+                n => format!("*a table is being written · {n} rows so far…*"),
+            };
+            (keep, again) = (start, Some(TABLE_HOLD));
+        }
+    }
+    if note.is_empty() && age < WORD_HOLD {
+        let end = text.char_indices().rev().find(|(_, c)| c.is_whitespace()).map_or(0, |(i, c)| i + c.len_utf8());
+        let word = &text[end..];
+        // wide characters (Chinese, Japanese, Korean) have no spaces between words: they show as they come
+        if !word.is_empty() && end >= floor && word.chars().count() <= HELD_WORD && word.chars().all(|c| c.width() != Some(2)) {
+            (keep, again) = (end, Some(WORD_HOLD));
+        }
+        let line = text[..keep].rfind('\n').map_or(0, |i| i + 1);
+        if !fenced && let Some(open) = text[line..keep].rfind('[').map(|i| line + i) {
+            let rest = &text[open..keep];
+            let whole = match rest.find(']') {
+                None => false,
+                Some(close) => match rest[close + 1..].chars().next() {
+                    None => false, // "](" may still come
+                    Some('(') => rest[close..].contains(')'),
+                    Some(_) => true, // "[x] done": no link
+                },
+            };
+            let in_code = text[line..open].matches('`').count() % 2 == 1;
+            if !whole && !in_code && open >= floor && rest.chars().count() <= HELD_LINK {
+                (keep, again) = (open, Some(WORD_HOLD));
+            }
+        }
+    }
+    let shown = closed(text[..keep].to_string());
+    let shown = match (note.is_empty(), shown.trim().is_empty()) {
+        (true, _) => shown,
+        (false, true) => note,
+        (false, false) => format!("{}\n\n{note}", shown.trim_end()),
+    };
+    (shown, keep, again)
+}
+
+/// A reply being written: its place in the conversation, its pieces as they came (cleaned whole, so a line end split
+/// across two pieces stays one), when the last piece came, how much of it has shown (see `steady`'s floor), and
+/// when to look again at what was kept back.
+struct Stream {
+    at: usize,
+    raw: String,
+    last: Instant,
+    floor: usize,
+    due: Option<Instant>,
 }
 
 /// The input as rows of at most `width` columns (a newline starts a row; a wide character takes two columns), and the
@@ -1147,7 +1337,6 @@ fn first_choice(agents: &[Agent]) -> Agent {
         .or_else(|| agents.iter().find(|a| a.spec().read)).copied().unwrap_or(agents[0])
 }
 
-/// A path under the home folder as `~/…`.
 /// The one git project below `top` that every file in `touched` (relative to `top`) is in, if there is one.
 fn one_project(top: &Path, touched: &std::collections::BTreeSet<String>) -> Option<PathBuf> {
     let mut found: Option<PathBuf> = None;
@@ -1163,6 +1352,7 @@ fn one_project(top: &Path, touched: &std::collections::BTreeSet<String>) -> Opti
     found
 }
 
+/// A path under the home folder as `~/…`.
 fn home_short(path: &Path) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     match path.strip_prefix(&home) {
@@ -1171,8 +1361,10 @@ fn home_short(path: &Path) -> String {
     }
 }
 
-/// A spot in the conversation: (row, column).
+/// A spot in the conversation as it is fitted now: (row, column).
 type Spot = (usize, usize);
+/// A place in the conversation that holds while entries before it grow: an entry, a row of it, and a column.
+type Mark = (usize, usize, usize);
 
 /// How many entries the conversation keeps on screen before the oldest go (all of it is saved when the shell ends).
 const KEEP: usize = 20_000;
@@ -1187,21 +1379,23 @@ struct App {
     out: Vec<Out>,
     fitted: Vec<Vec<Line<'static>>>,
     fitted_w: usize,
-    rows: usize,
     /// Rows scrolled up from the end (0: following it), where the conversation showed in the last frame and its
     /// first row there, and the text selected with the mouse (from, to) and whether a drag is under way.
     scroll: usize,
+    /// Scrolled up: `scroll` as the last frame left it, and the row at the top then (an entry, and a row of it).
+    scrolled: usize,
+    anchor: Option<(usize, usize)>,
     view: Rect,
     top: usize,
-    sel: Option<(Spot, Spot)>,
+    sel: Option<(Mark, Mark)>,
     dragging: bool,
     /// A short note at the input's right end (copied, could not copy) and when it appeared.
     toast: Option<(String, Instant)>,
     /// How the last job ended (true: done) and when, for the cat; and the cat's look last drawn.
     ended_at: Option<(bool, Instant)>,
     drawn_look: (&'static str, usize),
-    /// Each job's reply being written: its place in `out`, and its pieces as they came.
-    streams: std::collections::HashMap<usize, (usize, String)>,
+    /// Each job's reply being written.
+    streams: std::collections::HashMap<usize, Stream>,
     /// The agent plain lines go to, and lines waiting for the turn running in this folder: (agent, task, as typed).
     main: Agent,
     queue: VecDeque<(Agent, String, String)>,
@@ -1238,6 +1432,11 @@ struct App {
     /// Plan reads under way, one thread an agent, each with whether its answer goes into the conversation (/usage)
     /// or only into `limits` (the side panel's gauges).
     plans: Vec<(bool, std::thread::JoinHandle<PlanRead>)>,
+    /// /model's read of the models an agent's plan offers, under way (see `ringo_cli::models`).
+    listing: Option<(Agent, Listing, bool)>,
+    /// The models Codex's plan offers, as last read: /model's list to pick from. `asked`: read once for that list.
+    offered: Vec<ringo_cli::Model>,
+    asked_models: bool,
     /// Each plan's limits as last read, and when the last read began (None: never, as in tests).
     limits: Vec<(Agent, ringo_cli::Plan)>,
     limits_at: Option<Instant>,
@@ -1248,6 +1447,8 @@ struct App {
     /// Ultra: Ringo's review under way of a turn here (review job, turn, its agent), during which lines wait; the
     /// revision it asked for (its task, while queued) and that revision's job, which no review follows.
     checking: Option<(usize, usize, Agent)>,
+    /// The agents' talk under way (/discuss).
+    talking: Option<Talk>,
     revision: Option<String>,
     revision_id: Option<usize>,
     /// Ultra: the plan read a turn here started (the turn, the read), then its answer (see `reviewer`).
@@ -1326,12 +1527,12 @@ fn mascot(state: &str) -> Vec<Vec<&'static str>> {
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
         App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, out: Vec::new(), fitted: Vec::new(),
-              fitted_w: 0, rows: 0, scroll: 0, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
+              fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), limits: Vec::new(),
-              limits_at: None, spoke: false, pointed: false, checking: None,
+              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
+              limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
               revision: None, revision_id: None, quota: None, reviewer: None }
     }
 
@@ -1413,7 +1614,10 @@ impl App {
 
     /// The settings in force, printed under the manual.
     fn settings(&self) -> String {
-        format!("  now: mode {} · tier {} · talking to {} · agents {} · questions and pipelines on {} · theme {}\n  private state: {}",
+        let chosen: Vec<String> = self.agents.iter().filter_map(|a| Some(format!("{} {}", a.name(), self.s.models.get(a)?))).collect();
+        let models = if chosen.is_empty() { "each agent's own".to_string() } else { chosen.join(", ") };
+        format!("  now: mode {} · tier {} · talking to {} · agents {} · models {models} (/model) · questions and pipelines on {} · \
+                 theme {}\n  private state: {}",
                 self.s.mode.name(), self.s.tier.name(), self.main.name(), if self.s.separate { "separate" } else { "together" },
                 self.s.backend, self.theme.name, self.s.dir.display())
     }
@@ -1455,8 +1659,10 @@ impl App {
             let (who, style) = self.who(&self.s.jobs[i]);
             if !fresh.is_empty() && self.last != id {
                 self.gap();
+                // with the model at work, as its agent reports it: which model does what is on screen, not assumed
+                let model = self.s.jobs[i].model.as_ref().map_or(String::new(), |m| format!(" · {m}"));
                 self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who} "), style.add_modifier(Modifier::BOLD | Modifier::REVERSED)),
-                                                        Span::styled(format!(" #{id}"), self.theme.dim)]), 0));
+                                                        Span::styled(format!(" #{id}{model}"), self.theme.dim)]), 0));
             }
             for said in fresh {
                 // The owner answers what they read last: an agent's words in this folder make it the one plain lines
@@ -1465,26 +1671,33 @@ impl App {
                     && let Kind::Agent { agent, write: false } = self.s.jobs[i].kind {
                     self.main = agent;
                 }
+                // anything but another piece means the reply's pieces have stopped for now: what was kept back shows
+                if !matches!(said, Said::Partial(_) | Said::Reply(_)) {
+                    self.show_stream(id, Duration::MAX);
+                }
                 match said {
                     // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
-                    // ceiling: the growing reply is fitted again (its markdown parsed) for each frame it grows in.
-                    // The raw pieces are kept and cleaned whole, so a line end split across two pieces stays one.
-                    Said::Partial(text) => match self.streams.get_mut(&id) {
-                        Some((at, raw)) if *at < self.out.len() => {
-                            raw.push_str(&text);
-                            self.out[*at] = Out::Reply(closed(clean(raw)));
-                            self.fitted.truncate(*at);
+                    // The growing reply is fitted again (its markdown parsed) for each frame it grows in: 0.1 to
+                    // 0.4 ms a frame up to the 14.8k guide, about 1 ms at the end of a 56k reply (measured, release).
+                    Said::Partial(text) => {
+                        match self.streams.get_mut(&id) {
+                            Some(s) if s.at < self.out.len() => {
+                                s.raw.push_str(&text);
+                                s.last = Instant::now();
+                            }
+                            _ => {
+                                self.gap();
+                                self.out.push(Out::Reply(String::new()));
+                                self.streams.insert(id, Stream { at: self.out.len() - 1, raw: text, last: Instant::now(),
+                                                                 floor: 0, due: None });
+                            }
                         }
-                        _ => {
-                            self.gap();
-                            self.out.push(Out::Reply(closed(clean(&text))));
-                            self.streams.insert(id, (self.out.len() - 1, text));
-                        }
-                    },
+                        self.show_stream(id, Duration::ZERO);
+                    }
                     Said::Reply(text) => match self.streams.remove(&id) {
-                        Some((at, _)) if at < self.out.len() => {
-                            self.out[at] = Out::Reply(clean(&text));
-                            self.fitted.truncate(at);
+                        Some(s) if s.at < self.out.len() => {
+                            self.out[s.at] = Out::Reply(clean(&text));
+                            self.fitted.truncate(s.at);
                             self.gap();
                         }
                         _ => self.reply(&text),
@@ -1516,13 +1729,18 @@ impl App {
                 self.last = id;
             }
             if ends {
-                self.streams.remove(&id); // a reply cut off stays as far as it got
+                self.show_stream(id, Duration::MAX); // a reply cut off stays as far as it got, all of it
+                self.streams.remove(&id);
                 self.ended_at = match self.s.jobs[i].status {
                     Status::Done => Some((true, Instant::now())),
                     Status::Failed(_) => Some((false, Instant::now())),
                     _ => None,
                 };
-                let lines = self.job_end(&self.s.jobs[i]);
+                // a turn of the agents' talk that ended well has no row of its own: the talk's last row counts them all
+                let lines = match (self.s.jobs[i].talk, &self.s.jobs[i].status) {
+                    (true, Status::Done) => Vec::new(),
+                    _ => self.job_end(&self.s.jobs[i]),
+                };
                 self.out.extend(lines.into_iter().map(|l| Out::Line(l, 2)));
                 self.ended[i] = true;
                 self.last = 0;
@@ -1536,6 +1754,30 @@ impl App {
         if any {
             self.keep();
         }
+    }
+
+    /// Shows job `id`'s reply being written as it stands `age` after its last piece (see `steady`). True when what
+    /// shows changed.
+    fn show_stream(&mut self, id: usize, age: Duration) -> bool {
+        let Some(s) = self.streams.get_mut(&id).filter(|s| s.at < self.out.len()) else { return false };
+        let (text, kept, again) = steady(&clean(&s.raw), age, s.floor);
+        s.floor = s.floor.max(kept);
+        s.due = again.map(|after| s.last + after);
+        if matches!(&self.out[s.at], Out::Reply(shown) if *shown == text) {
+            return false;
+        }
+        self.out[s.at] = Out::Reply(text);
+        self.fitted.truncate(s.at);
+        true
+    }
+
+    /// What replies being written kept back shows once their pieces pause (the word after WORD_HOLD, a table after
+    /// TABLE_HOLD), so the end of a sentence never waits on the next one. True when a row changed.
+    fn settle(&mut self) -> bool {
+        let now = Instant::now();
+        let due: Vec<(usize, Duration)> = self.streams.iter().filter(|(_, s)| s.due.is_some_and(|at| at <= now))
+            .map(|(id, s)| (*id, now - s.last)).collect();
+        due.into_iter().fold(false, |changed, (id, age)| self.show_stream(id, age) | changed)
     }
 
     /// Keeps this conversation for `ringo --resume` (see `Session::keep`), its text with it.
@@ -1579,6 +1821,11 @@ impl App {
             .map(|(other, files)| format!("#{other} {}", files.join(", "))).collect();
         if !overlaps.is_empty() {
             lines.push(Line::styled(format!("  ⚠ same files as {}", overlaps.join("; ")), t.warn));
+        }
+        // a plan that does not include the model chosen fails the turn: say where the choice came from
+        if matches!(job.status, Status::Failed(_)) && let Kind::Agent { agent, .. } = job.kind
+            && let Some(model) = self.s.models.get(&agent) {
+            lines.push(Line::styled(format!("  it ran on {model}, your choice for {0}: /model {0} default goes back to its own", agent.name()), t.dim));
         }
         lines
     }
@@ -1625,6 +1872,152 @@ impl App {
 
     fn spinner(&self) -> &'static str {
         SPIN[(self.started.elapsed().as_millis() / SPIN_MS) as usize % SPIN.len()]
+    }
+
+    /// /discuss: the agents talk a topic over among themselves, in the conversation they share. One speaks at a
+    /// time, and each hears what the others said since it last spoke (Ringo's record, as for any turn it was away
+    /// for), so nothing is sent twice. Its turns look and do not touch, whatever the mode. It costs a turn of each
+    /// agent's a round, and ends when a round adds nothing or after TALK_ROUNDS rounds.
+    fn discuss(&mut self, named: Vec<Agent>, topic: String) -> Result<Option<String>, String> {
+        if self.talking.is_some() {
+            return Err("the agents are talking already: Esc stops them, and a line of yours joins in".into());
+        }
+        if self.s.separate {
+            return Err("the agents work separately here, so none hears the others: /together first".into());
+        }
+        let mut order: Vec<Agent> = if named.is_empty() { self.agents.iter().copied().filter(|a| a.spec().read).collect() } else { Vec::new() };
+        for agent in named {
+            if !self.agents.contains(&agent) {
+                return Err(format!("{} is not set up here; /setup adds it", agent.name()));
+            }
+            if !agent.spec().read {
+                return Err(format!("{0} works only in its own copy of the folder, where it hears no one: a talk is for agents \
+                                    that work here", agent.name()));
+            }
+            if !order.contains(&agent) {
+                order.push(agent);
+            }
+        }
+        if order.len() < 2 {
+            return Err(format!("a talk takes two agents that work in this folder, and here there is {}: /setup adds another, \
+                                /agent add makes a specialist of your own",
+                               order.first().map_or("none".to_string(), |a| format!("only {}", a.name()))));
+        }
+        if topic.is_empty() && !order.iter().any(|a| self.s.has_conversation(*a)) {
+            return Err("say what they should talk over: /discuss TOPIC (alone, it is the last turn, and there is none yet)".into());
+        }
+        // The agent the owner talks to opens a topic. With none it is the last turn they talk over, which that
+        // agent took, so the others answer it first.
+        let main = order.iter().position(|a| *a == self.main);
+        let opens = match (main, topic.is_empty()) {
+            (Some(at), false) => at,
+            (Some(at), true) => (at + 1) % order.len(),
+            (None, _) => 0,
+        };
+        order.rotate_left(opens);
+        let first = order[0];
+        if self.must_wait(first) {
+            return Err(format!("{} is at work here: the talk can start when its turn ends (Esc stops it)", first.name()));
+        }
+        let names: Vec<&str> = order.iter().map(|a| a.name()).collect();
+        let others = listed(&names[1..]);
+        // Said outright that the replies are carried: asked only to "talk it over with codex", Claude went looking
+        // for a way to run Codex itself (live, 11/10: 1:46 and 155k tokens for two turns, and no view of its own).
+        let prompt = match topic.is_empty() {
+            false => format!("I want you and {others} to talk this over; I am reading along: {topic}\n\n{TALK_RELAY} You \
+                              speak first. Say what you think and what you would do, in a few short paragraphs. Look at the \
+                              files if it helps; change nothing."),
+            true => format!("I want you and {others} to talk the last turn above over; I am reading along.\n\n{TALK_RELAY} \
+                             You speak first. Say where you agree with it, where you differ and why, and what you would do, \
+                             in a few short paragraphs. Look at the files if it helps; change nothing."),
+        };
+        let job = self.talk_turn(first, &prompt)?;
+        let limit = order.len() * TALK_ROUNDS;
+        self.talking = Some(Talk { order, at: 0, job, jobs: vec![job], limit, passes: 0, said: Vec::new(), started: Instant::now() });
+        Ok(Some(format!("  {} talk it over, one at a time, looking but not touching · at most {TALK_ROUNDS} turns each · a line \
+                         of yours joins in · Esc stops them", listed(&names))))
+    }
+
+    /// One turn of the agents' talk: in read mode whatever the session's (a running turn keeps its own), its reply
+    /// heard whole by the others. What it was told is in its log (/show N), not in the conversation.
+    fn talk_turn(&mut self, agent: Agent, prompt: &str) -> Result<usize, String> {
+        let prompt = self.s.expand(prompt)?;
+        // in a talk the agents already hear each other: no turn of it asks another on the side
+        let (mode, peers) = (std::mem::replace(&mut self.s.mode, Mode::Read), std::mem::take(&mut self.s.peers));
+        let started = self.s.launch_agent(agent, false, &prompt);
+        (self.s.mode, self.s.peers) = (mode, peers); // a turn already running keeps whom it may ask
+        let id = started?;
+        let job = &mut self.s.jobs[id - 1];
+        job.talk = true;
+        job.fresh.retain(|said| !matches!(said, Said::Line(_)));
+        Ok(id)
+    }
+
+    /// The talk after its turn `id` ended: the next agent answers, or the talk is over (a turn that failed or was
+    /// stopped, a round that added nothing, every round taken, or the next agent at work on something else).
+    fn talk_on(&mut self, id: usize) {
+        let Some(mut talk) = self.talking.take() else { return };
+        let job = &self.s.jobs[id - 1];
+        let (done, speaker) = (job.status == Status::Done, talk.order[talk.at]);
+        talk.passes = if done && agreed(&job.reply()) { talk.passes + 1 } else { 0 };
+        let rounds = talk.limit / talk.order.len();
+        let mut over = match &job.status {
+            Status::Done if !talk.said.is_empty() => None, // the owner spoke: the next one answers them
+            Status::Done if talk.passes + 1 >= talk.order.len() => Some("no one has more to add".to_string()),
+            Status::Done if talk.jobs.len() >= talk.limit =>
+                Some(format!("each has spoken {}", match rounds { 1 => "once".into(), 2 => "twice".into(), n => format!("{n} times") })),
+            Status::Done => None,
+            Status::Cancelled => Some("stopped".into()),
+            _ => Some(format!("{}'s turn failed", speaker.name())),
+        };
+        if over.is_none() {
+            talk.at = (talk.at + 1) % talk.order.len();
+            let next = talk.order[talk.at];
+            let others: Vec<&str> = talk.order.iter().filter(|a| **a != next).map(|a| a.name()).collect();
+            let said = std::mem::take(&mut talk.said);
+            let adds = if said.is_empty() { String::new() } else { format!("I add: {}\n\n", said.join("\n")) };
+            let prompt = format!("{adds}Go on with the talk: answer what {} said above{}. Write only your own part: where \
+                                  you agree, where you differ and why, what you would do, in a few short paragraphs; change \
+                                  nothing. If you have nothing to add, reply with the one word AGREED.", listed(&others),
+                                 if said.is_empty() { "" } else { ", and what I add" });
+            let started = match self.must_wait(next) {
+                true => Err(format!("{} is at work on something else", next.name())),
+                false => self.talk_turn(next, &prompt),
+            };
+            match started {
+                Ok(job) => {
+                    talk.job = job;
+                    talk.jobs.push(job);
+                    if !said.is_empty() {
+                        talk.passes = 0;
+                    }
+                }
+                Err(why) => over = Some(why),
+            }
+        }
+        let Some(why) = over else {
+            self.talking = Some(talk);
+            return;
+        };
+        let t = self.theme;
+        let tokens: u64 = talk.jobs.iter().map(|id| self.s.jobs[id - 1].tokens_so_far()).sum();
+        let turns = match talk.jobs.len() { 1 => "1 turn".to_string(), n => format!("{n} turns") };
+        self.gap();
+        self.out.push(Out::Line(Line::from(vec![
+            Span::styled("── ", t.border), Span::styled(format!("the talk is over: {why}"), t.ok),
+            Span::styled(format!(" · {turns} · {} · {} tokens · /discuss goes on with it", fmt_age(talk.started.elapsed()),
+                                 fmt_tokens(tokens)), t.dim)]), 2));
+        self.last = 0;
+    }
+
+    /// A plain line of the owner's while the agents talk: the next one to speak hears it, and each may answer once
+    /// more.
+    fn join_talk(&mut self, line: String) -> String {
+        let Some(talk) = &mut self.talking else { return String::new() };
+        talk.said.push(line);
+        talk.limit = talk.limit.max(talk.jobs.len() + talk.order.len());
+        let next = talk.order[(talk.at + 1) % talk.order.len()];
+        format!("  ↳ {} hears this next, and the talk goes on", next.name())
     }
 
     /// A line for `agent` in this folder, continuing their conversation: now, or next while a turn runs here (as it
@@ -1695,6 +2088,9 @@ impl App {
         if self.limits_at.is_some_and(|at| at.elapsed() > LIMITS_FRESH) && self.plans.is_empty() {
             let asked = self.plan_agents();
             self.read_limits(&asked, false);
+        }
+        if self.talking.as_ref().is_some_and(|talk| talk.job == id) {
+            return self.talk_on(id);
         }
         let job = &self.s.jobs[id - 1];
         // From the home folder, a turn whose edits all went to one project points there, once (11/03: a whole project
@@ -1831,9 +2227,173 @@ impl App {
 
     /// The agents set up here whose plan's limits can be read: Claude's and Codex's.
     fn plan_agents(&self) -> Vec<Agent> {
-        self.agents.iter().copied()
+        let mut agents: Vec<Agent> = self.agents.iter().copied()
             .filter(|a| matches!(a.spec().adapter, ringo_cli::Adapter::Claude | ringo_cli::Adapter::Codex) && self.s.installed(*a))
-            .collect()
+            .collect();
+        // a specialist of the owner's runs on the plan of the agent it is made from: one read, one gauge, under
+        // that agent's name
+        agents.sort_by_key(|a| a.spec().custom);
+        let mut seen = Vec::new();
+        agents.retain(|a| {
+            let program = self.s.program(*a);
+            let new = !seen.contains(&program);
+            seen.push(program);
+            new
+        });
+        agents
+    }
+
+    /// The agent files Claude Code would find from here: this folder's, then the owner's own.
+    fn claude_agent_files(&self) -> Vec<PathBuf> {
+        [self.s.repo.join(".claude/agents"), self.s.home.join(".claude/agents")].iter().flat_map(|dir| {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "md") && p.is_file()).collect();
+            found.sort();
+            found
+        }).collect()
+    }
+
+    /// /agent: the owner's own agents, then the agents they made for Claude Code that are not agents here yet.
+    fn own_agents(&mut self) {
+        let t = self.theme;
+        self.gap();
+        self.out.push(Out::Line(Line::from(vec![
+            Span::styled("  your own agents", t.title.add_modifier(Modifier::BOLD)),
+            Span::styled(" · /agent add NAME FILE makes one · /agent remove NAME takes one away", t.dim)]), 4));
+        let own: Vec<Agent> = Agent::all().into_iter().filter(|a| a.spec().custom).collect();
+        let pad = own.iter().map(|a| cols(a.name())).max().unwrap_or(0);
+        let mut used = Vec::new();
+        for agent in &own {
+            let spec = agent.spec();
+            let on = match spec.adapter {
+                ringo_cli::Adapter::Claude => "claude",
+                ringo_cli::Adapter::Codex => "codex",
+                ringo_cli::Adapter::Agy => "agy",
+                ringo_cli::Adapter::Plain => "a program of its own",
+            };
+            let what = match (&spec.instructions, ringo_cli::instructions(spec)) {
+                (Some(file), Ok(Some(text))) => {
+                    let file = ringo_cli::home_path(file);
+                    used.push(file.canonicalize().unwrap_or_else(|_| file.clone()));
+                    format!("on {on} · {} · {} characters, about {} tokens more on each of its calls{}", home_short(&file),
+                            text.len(), fmt_tokens(text.len() as u64 / 4),
+                            if spec.skills { " · with your Claude Code skills" } else { "" })
+                }
+                (Some(_), Err(e)) => format!("on {on} · {e}"),
+                _ => format!("on {on} · no instructions of its own"),
+            };
+            let here = if self.agents.contains(agent) { "" } else { " · not set up here (/setup)" };
+            self.out.push(Out::Line(Line::from(vec![
+                Span::raw("    "), Span::styled(format!("{:<pad$}", agent.name()), self.agent_style(*agent)),
+                Span::styled(format!("  {what}{here}"), t.dim)]), 6 + pad));
+        }
+        let found: Vec<PathBuf> = self.claude_agent_files().into_iter()
+            .filter(|p| !used.contains(&p.canonicalize().unwrap_or_else(|_| p.clone()))).collect();
+        if own.is_empty() {
+            self.out.push(Out::text("    none yet. A specialist is a file of instructions: what it knows and how it works. /agent add \
+                                     NAME FILE makes it an agent here, on claude (or on codex: add the word), and @NAME talks to it"));
+        }
+        if !found.is_empty() {
+            self.out.push(Out::Line(Line::styled("  made for Claude Code, and not agents here yet", t.dim), 4));
+            for file in found {
+                let name = file.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                self.out.push(Out::Line(Line::from(vec![
+                    Span::raw(format!("    {name}")),
+                    Span::styled(format!("  {} · /agent add {name}", home_short(&file)), t.dim)]), 6));
+            }
+        }
+        self.last = 0;
+    }
+
+    /// /agent add: a specialist of the owner's, made from a file of instructions and an agent set up here.
+    fn add_own_agent(&mut self, name: String, file: Option<String>, base: Option<String>, skills: bool) -> Result<String, String> {
+        use ringo_cli::Adapter;
+        if !ringo_cli::valid_name(&name) || name == "all" {
+            return Err(format!("`{name}` cannot be an agent's name: use letters, digits, - _ or ."));
+        }
+        if let Some(taken) = Agent::from_name(&name) {
+            return Err(match taken.spec().custom {
+                true => format!("you already have an agent called {name}: /agent remove {name} and then /restart free the name"),
+                false => format!("{name} is one of Ringo's own agents: give yours another name"),
+            });
+        }
+        let runs = |a: &Agent| matches!(a.spec().adapter, Adapter::Claude | Adapter::Codex) && a.spec().instructions.is_none();
+        let base = match base {
+            Some(b) => Agent::from_name(&b).filter(|a| self.agents.contains(a) && runs(a))
+                .ok_or(format!("an agent of your own runs on claude or codex, set up here, and {b} is not one"))?,
+            None => self.agents.iter().copied().filter(runs).min_by_key(|a| a.spec().adapter != Adapter::Claude)
+                .ok_or("an agent of your own runs on claude or codex, and neither is set up here: /setup adds one")?,
+        };
+        if skills && base.spec().adapter != Adapter::Claude {
+            return Err(format!("skills are Claude Code's: on {} a specialist goes without them", base.name()));
+        }
+        // the file as given, else an agent made for Claude Code by that name (this folder's first, then the owner's)
+        let wanted = file.unwrap_or_else(|| name.clone());
+        let given = ringo_cli::home_path(&wanted);
+        let given = match std::env::current_dir() {
+            Ok(cwd) if given.is_relative() => cwd.join(given),
+            _ => given,
+        };
+        let path = match given.is_file() {
+            true => given,
+            false => self.claude_agent_files().into_iter().find(|p| p.file_stem().is_some_and(|s| s.to_string_lossy() == wanted))
+                .ok_or(format!("no instructions file `{wanted}`: give its path, or the name of an agent you made for Claude \
+                                Code (/agent lists the ones found)"))?,
+        };
+        let path = path.canonicalize().unwrap_or(path);
+        let adapter = if base.spec().adapter == Adapter::Claude { "claude" } else { "codex" };
+        let entry = serde_json::json!({"name": name, "adapter": adapter, "program": base.spec().program, "read": true,
+                                       "company": format!("your own, on {}", base.name()), "login": base.spec().login,
+                                       "instructions": path, "skills": skills});
+        let file = ringo_cli::own_file(&ringo_cli::Spec::from_json(&entry, true)?)?.unwrap_or_default();
+        let size = file.text.len();
+        // what the file's opening lines say of its model and tools is Claude Code's, and goes to Claude alone
+        let offered = file.tools.as_ref().map(|tools| match tools.len() {
+            0 => "it is offered none of Claude Code's tools".to_string(),
+            1 => "it is offered 1 tool and no others".to_string(),
+            n => format!("it is offered {n} tools and no others"),
+        });
+        let lines = match (&file.model, offered, adapter) {
+            (None, None, _) => String::new(),
+            (_, _, "codex") => ". Its file's model and tools lines are Claude Code's, and codex goes without them".into(),
+            (model, offered, _) => format!(". From its file: {}", [model.as_ref().map(|m| format!("it runs on {m} until /model names another")), offered]
+                .into_iter().flatten().collect::<Vec<_>>().join(", and ")),
+        };
+        let agent = ringo_cli::add_custom_agent(self.s.state(), entry)?;
+        if let Some(program) = self.s.programs.get(&base).cloned() {
+            self.s.programs.insert(agent, program);
+        }
+        self.agents.push(agent);
+        let saved = ringo_cli::save_agents_in(self.s.state(), &self.agents).err().map_or(String::new(), |e| format!(" (not saved: {e})"));
+        Ok(format!("  {name} is an agent here now{saved}: {} with {} as its standing instructions ({size} characters, about {} \
+                    tokens more on each of its calls){}{lines}.\n  @{name} talks to it. It keeps a conversation of its own and hears \
+                    what the others do, as they hear it. /model {name} NAME picks its model, an edit to the file is in its \
+                    next turn, and /agent remove {name} takes it away",
+                   base.name(), home_short(&path), fmt_tokens(size as u64 / 4),
+                   if skills { ", with your Claude Code skills, plugins and connectors loaded in its turns" } else { "" }))
+    }
+
+    /// /agent remove: the entry goes; the instructions file is the owner's and stays.
+    fn remove_own_agent(&mut self, name: &str) -> Result<String, String> {
+        let agent = Agent::from_name(name).filter(|a| a.spec().custom)
+            .ok_or(format!("{name} is not an agent of your own (/agent lists them)"))?;
+        if let Some(job) = self.s.jobs.iter().find(|j| j.running() && matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)) {
+            return Err(format!("{name}'s #{0} is still working: wait for it, or /kill {0}", job.id));
+        }
+        if self.talking.as_ref().is_some_and(|talk| talk.order.contains(&agent)) {
+            return Err(format!("{name} is in the talk under way: Esc stops the talk first"));
+        }
+        if self.agents == [agent] {
+            return Err(format!("{name} is the only agent set up here: /setup adds another first"));
+        }
+        ringo_cli::remove_custom_agent(self.s.state(), name)?;
+        self.agents.retain(|a| *a != agent);
+        self.queue.retain(|(a, ..)| *a != agent);
+        if self.main == agent && let Some(next) = self.agents.first() {
+            self.main = *next;
+        }
+        Ok(format!("  {name} is gone from Ringo; its instructions file is untouched. The name is free again once Ringo \
+                    restarts (/restart)"))
     }
 
     /// Reads each agent's plan in the background (about a second each; no model call); `said`: the answers go into
@@ -1923,6 +2483,125 @@ impl App {
         self.plans.is_empty()
     }
 
+    /// The models an agent's turns can be given, for /model's list: Claude Code's aliases, or what Codex's plan
+    /// offered when last read, each with what to say of it; `default` first.
+    fn models_of(&self, agent: Agent) -> Vec<(String, String)> {
+        let mut models: Vec<(String, String)> = match agent.spec().adapter {
+            ringo_cli::Adapter::Claude => CLAUDE_MODELS.iter().map(|m| (m.to_string(), String::new())).collect(),
+            _ => self.offered.iter().map(|m| (m.name.clone(), match m.default {
+                true => format!("its default · {}", m.what),
+                false => m.what.clone(),
+            })).collect(),
+        };
+        models.insert(0, ("default".into(), "its own default".into()));
+        let now = self.s.models.get(&agent).map_or("default", String::as_str);
+        for (name, what) in &mut models {
+            if name == now {
+                *what = if what.is_empty() { "← now".into() } else { format!("← now · {what}") };
+            }
+        }
+        models
+    }
+
+    /// The agent a model named alone is for (`/model opus`): the one it belongs to by its name, the agent the owner
+    /// talks to before any other; `default`, or a name Ringo cannot place, is for the agent the owner talks to.
+    fn model_owner(&self, model: &str) -> Result<Agent, String> {
+        use ringo_cli::Adapter::{Claude, Codex};
+        let takers: Vec<Agent> = self.agents.iter().copied().filter(|a| ringo_cli::takes_model(*a)).collect();
+        let first = |adapter| std::iter::once(self.main).chain(takers.iter().copied())
+            .find(|a| takers.contains(a) && a.spec().adapter == adapter);
+        let kind = match model {
+            m if CLAUDE_MODELS.contains(&m) || m.starts_with("claude") => Some(Claude),
+            m if self.offered.iter().any(|o| o.name == m) || m.starts_with("gpt") || m.starts_with("codex") => Some(Codex),
+            _ => None,
+        };
+        match (kind, &takers[..]) {
+            (_, []) => Err("no agent set up here takes a model from Ringo".into()),
+            (Some(adapter), _) => first(adapter).ok_or(format!("{model} is a model for {}, which is not set up here; /setup adds it",
+                                                               if adapter == Claude { "claude" } else { "codex" })),
+            (None, _) if takers.contains(&self.main) => Ok(self.main),
+            (None, [only]) => Ok(*only),
+            (None, _) => Err(format!("whose model is {model}? /model AGENT {model}")),
+        }
+    }
+
+    /// The list under the input while /model is being typed: whose model (asked only when more than one agent
+    /// takes one), then which. A model can be named at once, by its first letters.
+    fn model_menu(&self, args: &str) -> Vec<(String, String, String)> {
+        let takers: Vec<Agent> = self.agents.iter().copied().filter(|a| ringo_cli::takes_model(*a)).collect();
+        let (first, second) = args.split_once(' ').map_or((args, None), |(a, b)| (a, Some(b)));
+        if let Some(typed) = second {
+            let agent = Agent::from_name(first.trim_start_matches('@')).filter(|a| takers.contains(a));
+            return agent.filter(|_| !typed.contains(' ')).map_or(Vec::new(), |a| {
+                self.models_of(a).into_iter().filter(|(m, _)| m.starts_with(typed)).map(|(m, what)| (m.clone(), m, what)).collect()
+            });
+        }
+        let mut entries: Vec<(String, String, String)> = Vec::new();
+        if takers.len() > 1 {
+            entries.extend(takers.iter().filter(|a| a.name().starts_with(first)).map(|a| {
+                (format!("{} ", a.name()), a.name().to_string(),
+                 format!("runs on {} · pick its model", self.s.models.get(a).map_or("its own default", String::as_str)))
+            }));
+        }
+        if takers.len() == 1 || !first.is_empty() {
+            let order = std::iter::once(self.main).filter(|a| takers.contains(a)).chain(takers.iter().copied().filter(|a| *a != self.main));
+            for agent in order {
+                for (model, what) in self.models_of(agent) {
+                    let fits = model.starts_with(first) && (takers.len() == 1 || model != "default");
+                    if fits && !entries.iter().any(|(to, ..)| *to == model) {
+                        let whose = if takers.len() == 1 { String::new() } else { format!("{} · ", agent.name()) };
+                        entries.push((model.clone(), model, format!("{whose}{what}").trim_end_matches(" · ").to_string()));
+                    }
+                }
+            }
+        }
+        entries
+    }
+
+    /// Reads what Codex's plan offers, once and unseen, when /model is being typed: its list needs the names.
+    fn want_models(&mut self) {
+        if self.asked_models || self.listing.is_some() || !self.input.starts_with(&['/', 'm', 'o', 'd', 'e', 'l']) {
+            return;
+        }
+        let codex = self.agents.iter().copied().find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a));
+        self.asked_models = true;
+        if let Some(agent) = codex {
+            let program = self.s.program(agent);
+            self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program)), false));
+        }
+    }
+
+    /// /model's list of an agent's models, once it has answered.
+    fn models_done(&mut self) -> bool {
+        let Some((agent, read, said)) = self.listing.take_if(|(_, read, _)| read.is_finished()) else { return false };
+        let read = read.join().unwrap_or_else(|_| Err("the read stopped".into()));
+        if let Ok(models) = &read && !models.is_empty() {
+            self.offered = models.clone();
+        }
+        if said {
+            self.say_models(agent, read); // else it was read for the list under the input, which shows it
+        }
+        true
+    }
+
+    /// The models an agent's plan offers, into the conversation (/model).
+    fn say_models(&mut self, agent: Agent, read: Result<Vec<ringo_cli::Model>, String>) {
+        let (style, t) = (self.agent_style(agent), self.theme);
+        match read {
+            Ok(models) if !models.is_empty() => {
+                self.out.push(agent_head(agent.name(), style, &format!(" · the models your plan offers (/model {} NAME)", agent.name()), &t));
+                let pad = models.iter().map(|m| cols(&m.name)).max().unwrap_or(0);
+                for m in models {
+                    let what = if m.default { format!("its default · {}", m.what) } else { m.what };
+                    self.out.push(Out::Line(Line::from(vec![Span::raw(format!("    {:<pad$}  ", m.name)), Span::styled(what, t.dim)]), 6 + pad));
+                }
+            }
+            Ok(_) => self.out.push(agent_head(agent.name(), style, " · it listed no models", &t)),
+            Err(e) => self.out.push(agent_head(agent.name(), style, &format!(" · its models could not be read: {e}"), &t)),
+        }
+        self.last = 0;
+    }
+
     /// Ultra's plan read, once it has answered: which backend the turn's review will run on. When no plan has room,
     /// the owner hears it while the turn still runs, so they can stop it.
     fn quota_done(&mut self) -> bool {
@@ -1941,6 +2620,8 @@ impl App {
             return Err(format!("{} has no conversation here to compact", agent.name()));
         }
         let expanded = self.s.expand(task)?;
+        // whom this turn may ask in the middle of its work: the agents set up here
+        self.s.peers = self.agents.clone();
         let id = self.s.launch_agent(agent, false, &expanded)?;
         // Ultra: the plans are read while the turn runs (about a second, no model call), so its review can go to
         // a plan with room, and when none has any the owner hears it now, not after the turn.
@@ -2016,6 +2697,10 @@ impl App {
 
     /// Whether a line would wait in the queue: a line for an agent in this folder while a turn runs here.
     fn waits(&self, cmd: &Result<Cmd, String>) -> bool {
+        // while the agents talk, a plain line joins in at once
+        if self.talking.is_some() && matches!(cmd, Ok(Cmd::Talk(_))) {
+            return false;
+        }
         let agent = match cmd {
             Ok(Cmd::Talk(_) | Cmd::Compact) => Some(self.main),
             Ok(Cmd::Agents(agents, _)) => match agents[..] { [(a, false)] => Some(a), _ => None },
@@ -2067,7 +2752,9 @@ impl App {
     /// there as they come.
     fn run(&mut self, cmd: Cmd, line: &str) -> Result<Option<String>, String> {
         Ok(match cmd {
+            Cmd::Talk(text) if self.talking.is_some() => Some(self.join_talk(text)),
             Cmd::Talk(text) => return self.talk(self.main, text, line.to_string()),
+            Cmd::Discuss(agents, topic) => return self.discuss(agents, topic),
             Cmd::Help => {
                 let intro = self.intro();
                 self.say(intro);
@@ -2092,7 +2779,9 @@ impl App {
                 self.streams.clear();
                 self.scroll = 0;
                 self.sel = None;
-                Some("  a new conversation: each agent's next turn starts fresh".into())
+                // what the agents said to each other went with it: the turn now running is the talk's last
+                let talk = if self.talking.take().is_some() { "; the agents' talk ends with the turn now running" } else { "" };
+                Some(format!("  a new conversation: each agent's next turn starts fresh{talk}"))
             }
             Cmd::Compact => {
                 // Claude's own compaction, which the Agent SDK documents for a resumed session: `/compact` as the
@@ -2112,6 +2801,8 @@ impl App {
                 true => "  the agents already work separately; /together puts them back in one conversation".into(),
                 false => "  the agents already share one conversation; /separate gives each a task of its own".into(),
             }),
+            Cmd::Separate(true) if self.talking.is_some() =>
+                return Err("the agents are talking, which takes the conversation they share: Esc stops them first".into()),
             Cmd::Separate(on) => {
                 self.s.separate = on;
                 Some(match on {
@@ -2126,6 +2817,91 @@ impl App {
                 Tier::ALL.iter().filter(|t| **t != self.s.tier).map(|t| t.name()).collect::<Vec<_>>().join(", "))),
             Cmd::Tier(Some(tier)) => Some(self.set_tier(tier)),
             Cmd::Usage => self.usage(),
+            Cmd::Agent(None) => {
+                self.own_agents();
+                None
+            }
+            Cmd::Agent(Some(OwnAgent::Add { name, file, base, skills })) => Some(self.add_own_agent(name, file, base, skills)?),
+            Cmd::Agent(Some(OwnAgent::Remove(name))) => Some(self.remove_own_agent(&name)?),
+            Cmd::Model(None) => {
+                let t = self.theme;
+                self.gap();
+                self.out.push(Out::Line(Line::from(vec![
+                    Span::styled("  who runs on what", t.title.add_modifier(Modifier::BOLD)),
+                    Span::styled(" · /model AGENT NAME changes it · /model AGENT default goes back", t.dim)]), 4));
+                let pad = self.agents.iter().map(|a| cols(a.name())).max().unwrap_or(0);
+                for agent in self.agents.clone() {
+                    let (runs, how) = match (self.s.models.get(&agent), agent.spec().adapter) {
+                        (Some(model), _) => (model.clone(), "your choice"),
+                        (None, ringo_cli::Adapter::Claude) => ("its own default".into(), "takes fable, opus, sonnet, haiku or a model's full name"),
+                        (None, ringo_cli::Adapter::Codex) => ("its own default".into(), "takes a model your plan offers"),
+                        (None, _) => ("its own".into(), "it takes no model from Ringo"),
+                    };
+                    self.out.push(Out::Line(Line::from(vec![
+                        Span::raw("    "), Span::styled(format!("{:<pad$}", agent.name()), self.agent_style(agent)),
+                        Span::raw(format!("  {runs}")), Span::styled(format!("  · {how}"), t.dim)]), 6 + pad));
+                }
+                self.last = 0;
+                // Codex lists what the plan offers (no model call, a fraction of a second); Claude Code has no list
+                let lists = self.agents.iter().copied()
+                    .find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a));
+                match (&mut self.listing, lists) {
+                    (Some((.., said)), _) => *said = true, // being read for the list under the input: shown when it is in
+                    (None, Some(agent)) if !self.offered.is_empty() => self.say_models(agent, Ok(self.offered.clone())),
+                    (None, Some(agent)) => {
+                        let program = self.s.program(agent);
+                        self.asked_models = true;
+                        self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program)), true));
+                    }
+                    (None, None) => {}
+                }
+                Some(format!("  to change one: /model and a space lists what to pick from, or name it (/model opus)\n  \
+                              /ask, /review, /design and /research run on {} · /backend SPEC changes it, and SPEC@MODEL names a \
+                              model (claude@opus)", self.s.backend))
+            }
+            Cmd::Model(Some((name, model))) if name.is_empty() => {
+                // an agent's name alone: who runs on what
+                if Agent::from_name(model.trim_start_matches('@')).is_some_and(|a| self.agents.contains(&a)) {
+                    return self.run(Cmd::Model(None), line);
+                }
+                let agent = self.model_owner(&model)?;
+                return self.run(Cmd::Model(Some((agent.name().to_string(), model))), line);
+            }
+            Cmd::Model(Some((name, model))) => {
+                let agent = Agent::from_name(&name).ok_or_else(|| {
+                    format!("no agent {name}: {}", self.agents.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "))
+                })?;
+                if !self.agents.contains(&agent) {
+                    return Err(format!("{name} is not set up here; /setup adds it"));
+                }
+                if !ringo_cli::takes_model(agent) {
+                    return Err(format!("{name} chooses its own model: it takes none from Ringo"));
+                }
+                let own = matches!(model.as_str(), "default" | "own" | "none");
+                if !own && !ringo_cli::valid_model(&model) {
+                    return Err("a model's name is one word, as its agent takes it: /model claude opus, /model codex gpt-6-astra".into());
+                }
+                // A conversation under way keeps the model it was last given when none is named, so going back to
+                // the agent's own starts it again from Ringo's record. A named model moves it as it is.
+                let was = match own {
+                    true => self.s.models.remove(&agent),
+                    false => self.s.models.insert(agent, model.clone()),
+                };
+                let again = own && was.is_some() && self.s.start_over(agent);
+                let all: serde_json::Map<String, serde_json::Value> = self.s.models.iter()
+                    .map(|(a, m)| (a.name().to_string(), serde_json::json!(m))).collect();
+                let saved = crate::theme::set_setting("models", all.into()).err()
+                    .map_or(" (saved)".to_string(), |e| format!(" (not saved: {e})"));
+                Some(match own {
+                    true => format!("  {name} runs on its own default again from its next turn{saved}{}", match again {
+                        true => ". Its conversation would keep the model it was on, so that turn starts it again from \
+                                 Ringo's record of it",
+                        false => "",
+                    }),
+                    false => format!("  {name} runs on {model} from its next turn{saved}. If your plan does not include it, the \
+                                      turn says so when it starts; /model {name} default goes back"),
+                })
+            }
             Cmd::Mode(None) => Some(format!("  mode: {} (Shift-Tab cycles ask, auto, read)", self.s.mode.name())),
             Cmd::Mode(Some(mode)) => Some(self.set_mode(mode)),
             // on, never a toggle: typed with auto already on (a mode is remembered), it would turn auto off unseen
@@ -2167,7 +2943,8 @@ impl App {
                 };
                 // after an agents' update the loop starts it, so the two do not share the machine
                 let pipelines = if self.update { None } else { self.check_pipelines() };
-                [agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
+                // Ringo's own update, said again: the head points here for one that /restart does not apply
+                [self.updated.clone(), agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
             }
             Cmd::Approve if self.releasing.is_some() => Some("  the pipelines' release is still being checked".into()),
             Cmd::Approve => match self.release.take() {
@@ -2287,6 +3064,9 @@ impl App {
 
     fn menu_entries(&self) -> Vec<(String, String, String)> {
         let before: String = self.input[..self.cursor].iter().collect();
+        if let Some(args) = before.strip_prefix("/model ").filter(|_| self.cursor == self.input.len()) {
+            return self.model_menu(args);
+        }
         let agents: Vec<(&str, bool)> = self.agents.iter().map(|a| (a.name(), a.spec().read)).collect();
         menu(&before, &agents)
     }
@@ -2408,7 +3188,15 @@ impl App {
                 KeyCode::Up if choosing => return self.pick = (pick + entries.len() - 1) % entries.len(),
                 KeyCode::Down if choosing => return self.pick = (pick + 1) % entries.len(),
                 KeyCode::Tab => return self.complete(&entries[pick].0),
-                KeyCode::Enter if !(ctrl || alt || shift || pasted || whole) => return self.complete(&entries[pick].0),
+                KeyCode::Enter if !(ctrl || alt || shift || pasted || whole) => {
+                    let to = entries[pick].0.clone();
+                    self.complete(&to);
+                    // a model picked from /model's list is the whole command: it goes as it is picked
+                    if !to.ends_with(' ') && self.input.starts_with(&['/', 'm', 'o', 'd', 'e', 'l', ' ']) {
+                        self.submit();
+                    }
+                    return;
+                }
                 _ => {}
             }
         }
@@ -2432,7 +3220,7 @@ impl App {
                     });
                 }
             }
-            KeyCode::PageUp => self.scroll += page,
+            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(page),
             KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(page),
             // the line-editing keys of a shell: to the line's start or end, a word back or on, and cutting either way
             KeyCode::Char('u') if ctrl => {
@@ -2452,6 +3240,9 @@ impl App {
             }
             KeyCode::Char('a') if ctrl => self.cursor = line_bounds(&self.input, self.cursor).0,
             KeyCode::Char('e') if ctrl => self.cursor = line_bounds(&self.input, self.cursor).1,
+            // with nothing typed there is no line to move in: the conversation's own start and end
+            KeyCode::Home if self.input.is_empty() => self.scroll = usize::MAX,
+            KeyCode::End if self.input.is_empty() => self.scroll = 0,
             KeyCode::Home => self.cursor = line_bounds(&self.input, self.cursor).0,
             KeyCode::End => self.cursor = line_bounds(&self.input, self.cursor).1,
             KeyCode::Char('b') if alt => self.cursor = word_start(&self.input, self.cursor),
@@ -2507,13 +3298,29 @@ impl App {
         }
     }
 
+    /// The entry a row of the fitted conversation is in, and which of its rows it is (a row past the end: past the
+    /// last entry).
+    fn place(&self, mut row: usize) -> (usize, usize) {
+        let entry = self.fitted.iter().position(|rows| row.checked_sub(rows.len()).map(|rest| row = rest).is_none());
+        (entry.unwrap_or(self.fitted.len()), row)
+    }
+
+    /// The row of the fitted conversation that a row of an entry is now; a row its entry no longer has (fitted
+    /// again, it came out shorter) is its last.
+    fn row_of(&self, (entry, row): (usize, usize)) -> usize {
+        let before: usize = self.fitted.iter().take(entry).map(Vec::len).sum();
+        before + self.fitted.get(entry).map_or(row, |rows| row.min(rows.len().saturating_sub(1)))
+    }
+
     /// The wheel scrolls the conversation; a drag over it selects its text and copies it when the button comes up.
+    /// The selection's ends are kept as places in entries, so they stay on their text while an agent writes above.
     fn mouse(&mut self, m: MouseEvent) -> bool {
         let v = self.view;
         let row = m.row.clamp(v.y, (v.y + v.height).saturating_sub(1));
-        let spot = (self.top + (row - v.y) as usize, m.column.saturating_sub(v.x) as usize);
+        let (entry, at) = self.place(self.top + (row - v.y) as usize);
+        let spot = (entry, at, m.column.saturating_sub(v.x) as usize);
         match m.kind {
-            MouseEventKind::ScrollUp => self.scroll += 3,
+            MouseEventKind::ScrollUp => self.scroll = self.scroll.saturating_add(3),
             MouseEventKind::ScrollDown => self.scroll = self.scroll.saturating_sub(3),
             MouseEventKind::Down(MouseButton::Left) => {
                 let inside = m.row >= v.y && m.row < v.y + v.height && m.column >= v.x && m.column < v.x + v.width;
@@ -2541,9 +3348,10 @@ impl App {
         true
     }
 
-    /// The selection, first spot first.
+    /// The selection as rows of the conversation as it is fitted now, first spot first.
     fn selection(&self) -> Option<(Spot, Spot)> {
-        let (a, b) = self.sel?;
+        let spot = |(entry, row, col): Mark| (self.row_of((entry, row)), col);
+        let (a, b) = self.sel.map(|(a, b)| (spot(a), spot(b)))?;
         Some(if a <= b { (a, b) } else { (b, a) })
     }
 
@@ -2566,10 +3374,11 @@ impl App {
             let extra = self.out.len() - KEEP;
             self.out.drain(..extra);
             self.fitted.drain(..extra.min(self.fitted.len()));
-            self.streams.retain(|_, (at, _)| at.checked_sub(extra).map(|n| *at = n).is_some());
+            self.streams.retain(|_, s| s.at.checked_sub(extra).map(|n| s.at = n).is_some());
+            self.anchor = self.anchor.and_then(|(entry, row)| Some((entry.checked_sub(extra)?, row)));
+            self.sel = self.sel.and_then(|(a, b)| Some(((a.0.checked_sub(extra)?, a.1, a.2), (b.0.checked_sub(extra)?, b.1, b.2))));
         }
-        let same = width == self.fitted_w;
-        if !same {
+        if width != self.fitted_w {
             self.fitted.clear();
             self.fitted_w = width;
         }
@@ -2577,20 +3386,24 @@ impl App {
             let rows = self.out[self.fitted.len()].rows(width, &self.theme);
             self.fitted.push(rows);
         }
-        let rows = self.fitted.iter().map(Vec::len).sum();
-        if same && self.scroll > 0 {
-            self.scroll += rows - self.rows.min(rows); // rows added below keep what is on screen still
-        }
-        self.rows = rows;
-        rows
+        self.fitted.iter().map(Vec::len).sum()
     }
 
-    /// The conversation's rows that fit `area`, scrolled as set, with the selection shown.
+    /// The conversation's rows that fit `area`, scrolled as set, with the selection shown. Scrolled up, the row at
+    /// the top stays the one it was whatever is written meanwhile, below it or above it (with two agents at work, the
+    /// reply of the one that started first grows above what the other writes): the place is kept as an entry and a
+    /// row of it, not as a count of rows from the end.
     fn conversation(&mut self, f: &mut Frame, area: Rect, panel: bool) {
         let total = self.fit_to(area.width as usize);
         let h = area.height as usize;
+        // `scroll` as the last frame left it: no key or wheel moved it since, so the place it kept still holds
+        if self.scroll > 0 && self.scroll == self.scrolled && let Some(at) = self.anchor {
+            self.scroll = total.saturating_sub(h + self.row_of(at));
+        }
         self.scroll = self.scroll.min(total.saturating_sub(h));
         let top = total.saturating_sub(h + self.scroll);
+        self.scrolled = self.scroll;
+        self.anchor = (self.scroll > 0).then(|| self.place(top));
         let shown: Vec<Line<'static>> = self.fitted.iter().flatten().skip(top).take(h).cloned().collect();
         f.render_widget(Paragraph::new(shown), area);
         // until the owner says something: where to start, centred a third of the way down, under any notes
@@ -2859,9 +3672,18 @@ impl App {
             .filter(|r| r.is_empty() || !r.trim().is_empty())
             .find(|r| 10 + 8 + cols(r) <= w).unwrap_or_default(); // a narrow head keeps the folder's start
         let left = one_row(&self.label, w.saturating_sub(12 + cols(&right)));
-        let pad = w.saturating_sub(10 + cols(&left) + cols(&right));
+        // A newer Ringo stays in the head until it is applied: the line that said so scrolls away, and the input's
+        // hint gives way to others while a turn runs. Built, /restart applies it; else /update says how to get it.
+        let news = match (&self.staged, &self.updated) {
+            (Some(_), _) => "  ↑ update ready · /restart",
+            (None, Some(_)) => "  ↑ update available · /update",
+            (None, None) => "",
+        };
+        let news = if 10 + cols(&left) + cols(news) + 1 + cols(&right) <= w { news } else { "" };
+        let pad = w.saturating_sub(10 + cols(&left) + cols(news) + cols(&right));
         f.render_widget(Paragraph::new(Line::from(vec![Span::raw(" ▲▲ "), Span::styled("ringo", t.brand),
-            Span::raw("  "), Span::raw(left), Span::raw(" ".repeat(pad)), Span::raw(right)])).style(t.header), head);
+            Span::raw("  "), Span::raw(left), Span::styled(news, Style::new().add_modifier(Modifier::BOLD)),
+            Span::raw(" ".repeat(pad)), Span::raw(right)])).style(t.header), head);
         self.drawn_look = self.look();
         // the conversation, and the side panel beside it behind a bar
         let (view, split) = if live.panel {
@@ -2908,7 +3730,9 @@ impl App {
         if live.typing {
             let hint = match &self.toast {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
-                _ if self.scroll > 0 => "scrolled up · PgDn goes back".into(),
+                // the count grows as lines are written below: nothing arrives unseen
+                _ if self.scroll > 0 => format!("scrolled up · {} rows below · End goes back", self.scroll),
+                _ if self.talking.is_some() => "the agents are talking · a line of yours joins in · Esc stops them".into(),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
                 _ if self.staged.is_some() => "update ready · /restart".into(),
                 _ if self.release.is_some() => "pipelines ready · /update approve".into(),
@@ -2950,8 +3774,6 @@ impl App {
         }
     }
 
-    /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
-    /// blank row, and the answers (or how to reach them while a line is being typed).
     /// Whom the line being typed goes to, as its prompt shows: the agent plain lines go to, or the one its @ names
     /// (all, for @all). A command, or an @ word that names no agent yet, shows no one.
     fn target(&self) -> Option<(&'static str, Style)> {
@@ -2967,6 +3789,8 @@ impl App {
         }
     }
 
+    /// A waiting permission request as the screen shows it: its title, then every line of the action, wrapped, a
+    /// blank row, and the answers (or how to reach them while a line is being typed).
     fn prompt_lines(&self, width: usize) -> Option<(String, Vec<Line<'static>>)> {
         let (id, p) = self.s.pending()?;
         let job = self.s.job(id).ok()?;
@@ -2996,7 +3820,10 @@ impl App {
 
     /// The conversation as plain text, saved in the session's folder when the shell ends.
     fn save(&self) -> Option<PathBuf> {
-        let text: Vec<String> = self.out.iter().flat_map(|o| o.rows(100, &self.theme))
+        // a reply still being written goes in whole: what the screen keeps back for now (see `steady`) was received
+        let whole: std::collections::HashMap<usize, Out> = self.streams.values()
+            .map(|s| (s.at, Out::Reply(closed(clean(&s.raw))))).collect();
+        let text: Vec<String> = self.out.iter().enumerate().flat_map(|(i, o)| whole.get(&i).unwrap_or(o).rows(100, &self.theme))
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect();
         let path = self.s.dir.join("conversation.txt");
         std::fs::write(&path, text.join("\n") + "\n").ok().map(|_| path)
@@ -3089,6 +3916,12 @@ pub fn run(start: Start) -> ExitCode {
     if let Some(mode) = saved.get("mode").and_then(|v| v.as_str().and_then(Mode::from_name)) {
         app.s.mode = mode;
     }
+    // the model each agent runs on, where the owner chose one (/model)
+    for (name, model) in saved.get("models").and_then(|v| v.as_object()).into_iter().flatten() {
+        if let (Some(agent), Some(model)) = (Agent::from_name(name), model.as_str().filter(|m| ringo_cli::valid_model(m))) {
+            app.s.models.insert(agent, model.to_string());
+        }
+    }
     match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
             let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
@@ -3153,12 +3986,13 @@ pub fn run(start: Start) -> ExitCode {
         // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
         // while jobs run (a pump is a few microseconds; redraws still happen only when something changed). Every event
         // already queued is taken before the next redraw.
-        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() { 25 } else { 250 };
+        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() || app.listing.is_some() { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             loop {
                 match event::read() {
                     Ok(Term::Key(k)) if k.kind == KeyEventKind::Press => {
                         app.key(k);
+                        app.want_models();
                         dirty = true;
                     }
                     Ok(Term::Paste(text)) => {
@@ -3215,6 +4049,7 @@ pub fn run(start: Start) -> ExitCode {
             dirty = true;
         }
         dirty |= app.release_done();
+        dirty |= app.models_done();
         let asking = app.s.pending().map(|(_, p)| p.id.clone());
         if asking != app.asked.as_ref().map(|(id, _)| id.clone()) {
             app.asked = asking.map(|id| (id, Instant::now()));
@@ -3274,6 +4109,7 @@ pub fn run(start: Start) -> ExitCode {
             update_ringo(updated.clone(), exe.clone());
         }
         app.feed();
+        dirty |= app.settle();
         dirty |= app.fitted.len() != app.out.len();
         if app.toast.as_ref().is_some_and(|(_, at)| at.elapsed() >= TOAST) {
             app.toast = None;
@@ -3594,21 +4430,506 @@ mod tests {
         a.talk(a.main, "hi".into(), "hi".into()).unwrap();
         let replies = |a: &App| a.out.iter().filter_map(|o| match o { Out::Reply(t) => Some(t.clone()), _ => None })
             .collect::<Vec<_>>();
+        // time passing with no new piece
+        let pause = |a: &mut App, by: Duration| {
+            let s = a.streams.get_mut(&1).unwrap();
+            (s.last, s.due) = (s.last - by, s.due.map(|at| at - by));
+            a.settle()
+        };
         a.s.jobs[0].fresh = vec![Said::Partial("Hel".into()), Said::Partial("lo".into())];
         a.feed();
-        assert_eq!(replies(&a), ["Hello"], "the pieces grow one reply");
-        screen(&mut a, 60, 12);
+        assert_eq!(replies(&a), [""], "the word being written waits for its end");
         a.s.jobs[0].fresh = vec![Said::Partial(", wor".into())];
         a.feed();
-        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"), "and it shows as it grows");
-        a.s.jobs[0].fresh = vec![Said::Partial("ld\r".into()), Said::Partial("\nmore".into())];
+        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello,"), "and shows once it has ended");
+        assert!(pause(&mut a, WORD_HOLD), "a pause shows what was kept back");
+        assert!(screen(&mut a, 60, 12).iter().any(|r| r.trim() == "Hello, wor"));
+        assert!(!a.settle(), "and then there is nothing left to show");
+        a.s.jobs[0].fresh = vec![Said::Partial("l".into())];
         a.feed();
-        assert_eq!(replies(&a), ["Hello, world\nmore"], "a line end split across pieces stays one");
+        assert_eq!(replies(&a), ["Hello, worl"], "what has shown is not taken back when its word goes on");
+        a.s.jobs[0].fresh = vec![Said::Partial("d\r".into()), Said::Partial("\nmore".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world\n"], "a line end split across pieces stays one");
+        a.s.jobs[0].fresh = vec![Said::Step("Read a.rs · 2 lines".into())];
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world\nmore"], "a step means the pieces have stopped: nothing waits behind it");
         a.s.jobs[0].fresh = vec![Said::Reply("Hello, world.".into()), Said::Step("Read a.rs · 2 lines".into()),
                                  Said::Partial("Next".into())];
         a.feed();
-        assert_eq!(replies(&a), ["Hello, world.", "Next"], "the whole reply replaces its pieces; the next block opens anew");
+        assert_eq!(replies(&a), ["Hello, world.", ""], "the whole reply replaces its pieces; the next block opens anew");
+        // kept back on screen, it was still received: the saved conversation has it, and a table as far as it got
+        a.s.jobs[0].fresh = vec![Said::Partial(" up:\n\n| Name | Size |\n|---|---|\n| alpha | 1".into())];
+        a.feed();
+        assert_eq!(replies(&a)[1], "Next up:\n\n*a table is being written…*");
+        let saved = std::fs::read_to_string(a.save().unwrap()).unwrap();
+        assert!(saved.contains("Next up:") && saved.contains("alpha") && !saved.contains("is being written"), "{saved}");
+        // a turn that ends mid-reply shows all it wrote
+        a.s.kill(1).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while a.s.jobs[0].running() && Instant::now() < deadline {
+            a.s.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        a.feed();
+        assert_eq!(replies(&a), ["Hello, world.", "Next up:\n\n| Name | Size |\n|---|---|\n| alpha | 1"]);
         a.s.shutdown();
+    }
+
+    /// A stand-in Claude Code for a talk: each run keeps the message it was sent (`.in.N`) and its arguments, waits a
+    /// moment, and replies with its Nth word of `replies` (the last one from then on).
+    #[cfg(unix)]
+    fn talker(name: &str, replies: &[&str]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!("ringo-tui-talker-{}-{name}", std::process::id()));
+        let cases: Vec<String> = replies.iter().enumerate().map(|(i, r)| format!("{}) reply='{r}';;", i + 1)).collect();
+        let script = r##"#!/bin/sh
+n=$(($(cat "$0.n" 2>/dev/null || echo 0) + 1)); echo $n > "$0.n"
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+head -n 1 > "$0.in.$n"
+sleep 0.15
+echo '{"type":"system","subtype":"init","session_id":"s-NAME","apiKeySource":"none"}'
+case $n in CASES *) reply='LAST';; esac
+printf '%s\n' "{\"type\":\"assistant\",\"message\":{\"id\":\"m$n\",\"content\":[{\"type\":\"text\",\"text\":\"$reply\"}],\"usage\":{\"input_tokens\":100,\"output_tokens\":5}}}"
+printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"$reply\"}"
+"##.replace("NAME", name).replace("CASES", &cases.join(" ")).replace("LAST", replies.last().unwrap());
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_file(format!("{}.n", path.display()));
+        path
+    }
+
+    /// What the stand-in's Nth run was sent.
+    #[cfg(unix)]
+    fn sent(talker: &Path, n: usize) -> String {
+        let line = std::fs::read_to_string(format!("{}.in.{n}", talker.display())).unwrap();
+        serde_json::from_str::<serde_json::Value>(&line).unwrap()["message"]["content"].as_str().unwrap().to_string()
+    }
+
+    /// Runs the shell's loop until the agents' talk is over; `each` sees the app once a pass.
+    #[cfg(unix)]
+    fn until_talked(a: &mut App, mut each: impl FnMut(&mut App)) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while a.talking.is_some() {
+            assert!(Instant::now() < deadline, "the talk did not end");
+            a.s.pump();
+            a.feed();
+            each(a);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_agents_talk_a_topic_over_among_themselves() {
+        let mut a = app(&["claude", "codex", "grok"]);
+        let (claude, codex) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
+        assert_eq!((parse("/discuss", &[claude]), parse("/discuss split the parser?", &[claude]), parse("/talk @codex @claude why", &[claude])),
+                   (Ok(Cmd::Discuss(vec![], String::new())), Ok(Cmd::Discuss(vec![], "split the parser?".into())),
+                    Ok(Cmd::Discuss(vec![codex, claude], "why".into()))));
+        assert!(parse("/discuss @nobody x", &[claude]).unwrap_err().contains("no agent nobody"));
+        // a specialist of the owner's takes part as any agent does; both stand-ins speak Claude Code's protocol
+        let file = a.s.home.join("reviewer.md");
+        std::fs::write(&file, "You review plans.\n").unwrap();
+        let entry = serde_json::json!({"name": "talk-reviewer", "adapter": "claude", "program": "claude", "read": true, "instructions": file});
+        let reviewer = Agent::register(ringo_cli::Spec::from_json(&entry, true).unwrap()).unwrap();
+        // refused: nothing to talk over yet, one agent, an agent that only works in its own copy, /separate
+        assert!(a.discuss(vec![], String::new()).unwrap_err().contains("say what they should talk over"));
+        assert!(a.discuss(vec![claude], "x".into()).unwrap_err().contains("there is only claude"));
+        assert!(a.discuss(vec![claude, Agent::from_name("grok").unwrap()], "x".into()).unwrap_err().contains("works only in its own copy"));
+        assert!(a.discuss(vec![claude, reviewer], "x".into()).unwrap_err().contains("talk-reviewer is not set up here"));
+        a.agents = vec![claude, reviewer];
+        a.s.separate = true;
+        assert!(a.discuss(vec![], "x".into()).unwrap_err().contains("/together first"));
+        a.s.separate = false;
+
+        // neither runs out of things to say: each speaks TALK_ROUNDS times, and that is all
+        let (one, two) = (talker("one", &["Split the parser first."]), talker("two", &["The lexer first, I think."]));
+        a.s.programs.insert(claude, one.clone());
+        a.s.programs.insert(reviewer, two.clone());
+        a.s.mode = Mode::Auto;
+        a.s.peers = a.agents.clone();
+        a.send("/discuss should we split the parser?");
+        assert_eq!(a.s.mode, Mode::Auto, "the session's mode is its own");
+        assert_eq!(a.s.peers, a.agents, "and a turn already running keeps whom it may ask");
+        let rows = screen(&mut a, 180, 30).join("\n");
+        assert!(rows.contains("claude and talk-reviewer talk it over, one at a time, looking but not touching · at most 2 turns each"), "{rows}");
+        assert!(rows.contains("the agents are talking · a line of yours joins in · Esc stops them"), "{rows}");
+        assert!(a.discuss(vec![], "y".into()).unwrap_err().contains("talking already"));
+        // while they talk: the conversation they share stays shared, and no one in the talk is taken away
+        assert!(a.run(Cmd::Separate(true), "").unwrap_err().contains("the agents are talking") && !a.s.separate);
+        assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("talk-reviewer".into()))), "").unwrap_err().contains("is in the talk under way"));
+        until_talked(&mut a, |_| {});
+        assert_eq!(a.s.jobs.len(), 2 * TALK_ROUNDS, "two agents, TALK_ROUNDS turns each, and not one more");
+        assert!(a.s.jobs.iter().all(|j| j.talk && !j.can_ask && j.status == Status::Done), "in a talk no turn asks on the side");
+        let kinds: Vec<Agent> = a.s.jobs.iter().filter_map(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None }).collect();
+        assert_eq!(kinds, [claude, reviewer, claude, reviewer], "in turn, the one the owner talks to first");
+        // the topic once; each hears what the other said, whole, and is asked to answer it
+        assert!(sent(&one, 1).starts_with("I want you and talk-reviewer to talk this over; I am reading along: should we split the parser?\n\nYour reply is shown to them"));
+        let (second, third) = (sent(&two, 1), sent(&one, 2));
+        assert!(second.contains("claude: Split the parser first.") && second.contains("should we split the parser?")
+                && second.contains("Go on with the talk: answer what claude said above."), "{second}");
+        assert!(third.contains("talk-reviewer: The lexer first, I think.") && !third.contains("should we split the parser?")
+                && third.contains("If you have nothing to add, reply with the one word AGREED."), "{third}");
+        // a talk looks and does not touch, whatever the mode
+        let argv = std::fs::read_to_string(format!("{}.argv", one.display())).unwrap();
+        assert!(argv.contains("--permission-prompts\nnone") && argv.lines().any(|l| l == "Edit"), "{argv}");
+        let rows = screen(&mut a, 180, 40);
+        let text = rows.join("\n");
+        assert!(text.contains("the talk is over: each has spoken twice · 4 turns") && text.contains("/discuss goes on with it"), "{text}");
+        assert!(!text.contains("✓ done") && !text.contains("told claude"), "a talk's turns have no rows of their own: {text}");
+        assert_eq!(rows.iter().filter(|r| r.contains("The lexer first, I think.")).count(), 2, "{text}");
+        if std::env::var_os("RINGO_MEASURE_SHOW").is_some() {
+            eprintln!("{}", screen(&mut a, 100, 30).join("\n"));
+        }
+
+        // a round that adds nothing ends it; alone, /discuss is about the last turn, which the others answer first
+        a.main = reviewer;
+        let (one, two) = (talker("one", &["AGREED."]), talker("two", &["never asked"]));
+        a.s.programs.insert(claude, one.clone());
+        a.s.programs.insert(reviewer, two.clone());
+        a.send("/discuss");
+        until_talked(&mut a, |_| {});
+        assert_eq!(a.s.jobs.len(), 2 * TALK_ROUNDS + 1, "one agreed of two: over");
+        assert!(sent(&one, 1).contains("I want you and talk-reviewer to talk the last turn above over") && sent(&one, 1).contains("do not try to reach them"));
+        assert!(screen(&mut a, 180, 40).join("\n").contains("the talk is over: no one has more to add · 1 turn ·"));
+
+        // a line of the owner's joins in: the next one hears it, and each may answer once more
+        let (one, two) = (talker("one", &["One thing more."]), talker("two", &["And another."]));
+        a.s.programs.insert(claude, one.clone());
+        a.s.programs.insert(reviewer, two.clone());
+        let before = a.s.jobs.len();
+        a.send("/discuss @claude @talk-reviewer what about the tests?");
+        let mut joined = false;
+        until_talked(&mut a, |a| {
+            if !joined && a.talking.as_ref().is_some_and(|t| t.jobs.len() == 2 * TALK_ROUNDS) {
+                joined = true;
+                a.send("keep the old tests");
+                assert!(a.queue.is_empty(), "it joins the talk, and does not wait for a turn of its own");
+            }
+        });
+        assert_eq!(a.s.jobs.len() - before, 2 * TALK_ROUNDS + 2, "the owner's line adds one round, and only one");
+        let heard = sent(&one, 3);
+        assert!(heard.contains("I add: keep the old tests") && heard.contains("answer what talk-reviewer said above, and what I add"), "{heard}");
+        assert!(screen(&mut a, 180, 60).join("\n").contains("↳ claude hears this next, and the talk goes on"));
+
+        // stopped: Esc ends the turn and the talk with it
+        a.send("/discuss once more");
+        let id = a.holding().unwrap();
+        a.stop(id);
+        until_talked(&mut a, |_| {});
+        assert!(screen(&mut a, 180, 60).join("\n").contains("the talk is over: stopped · 1 turn"));
+        assert!(agreed(" Agreed.\n") && agreed("AGREED") && !agreed("AGREED, but the lexer worries me") && !agreed(""));
+        // /clear takes the conversation they talked in: the turn now running is the talk's last
+        let before = a.s.jobs.len();
+        a.send("/discuss and again");
+        assert!(a.run(Cmd::Clear, "").unwrap().unwrap().ends_with("the agents' talk ends with the turn now running"));
+        assert!(a.talking.is_none());
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while a.s.running() > 0 && Instant::now() < deadline {
+            a.s.pump();
+            a.feed();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!((a.s.running(), a.s.jobs.len() - before), (0, 1), "no one answers a talk that was cleared away");
+    }
+
+    #[test]
+    fn a_specialist_of_the_owners_own_is_an_agent_like_any_other() {
+        let mut a = app(&["codex", "claude", "agy"]);
+        let (codex, claude) = (Agent::from_name("codex").unwrap(), Agent::from_name("claude").unwrap());
+        let add = |name: &str, file: Option<&str>, base: Option<&str>, skills: bool| {
+            Cmd::Agent(Some(OwnAgent::Add { name: name.into(), file: file.map(String::from), base: base.map(String::from), skills }))
+        };
+        assert_eq!((parse("/agent", &[claude]), parse("/agent add @billing notes.md", &[claude]), parse("/agent add billing codex notes.md skills", &[claude]),
+                    parse("/agent remove billing", &[claude])),
+                   (Ok(Cmd::Agent(None)), Ok(add("billing", Some("notes.md"), None, false)), Ok(add("billing", Some("notes.md"), Some("codex"), true)),
+                    Ok(Cmd::Agent(Some(OwnAgent::Remove("billing".into()))))));
+        assert!(parse("/agent add", &[claude]).is_err() && parse("/agent add billing a.md b.md", &[claude]).is_err()
+                && parse("/agent drop billing", &[claude]).is_err());
+        // nothing of the owner's yet: how to make one, and the agents they made for Claude Code, found by name
+        let made = a.s.home.join(".claude/agents");
+        std::fs::create_dir_all(&made).unwrap();
+        std::fs::write(made.join("shop-billing.md"), "---\nname: shop-billing\n---\nYou know the billing code.\n").unwrap();
+        a.run(Cmd::Agent(None), "").unwrap();
+        let rows = screen(&mut a, 100, 16).join("\n");
+        assert!(rows.contains("none yet. A specialist is a file of instructions") && rows.contains("/agent add shop-billing"), "{rows}");
+        // refused: a name that is taken or no name, a base that cannot carry instructions, skills off Claude, no file
+        for (cmd, why) in [(add("claude", None, None, false), "one of Ringo's own agents"), (add("a b", None, None, false), "cannot be an agent's name"),
+                           (add("billing", Some("shop-billing"), Some("agy"), false), "agy is not one"),
+                           (add("billing", Some("shop-billing"), Some("codex"), true), "skills are Claude Code's"),
+                           (add("billing", None, None, false), "no instructions file `billing`")] {
+            assert!(a.run(cmd, "").unwrap_err().contains(why), "{why}");
+        }
+        // made: on claude unless another is named, from the Claude Code agent of that name
+        let said = a.run(add("shop-billing", None, None, false), "").unwrap().unwrap();
+        assert!(said.starts_with("  shop-billing is an agent here now: claude with ") && said.contains("(26 characters, about 6 tokens more"), "{said}");
+        let own = Agent::from_name("shop-billing").unwrap();
+        assert_eq!((a.agents.last(), own.spec().adapter, own.spec().read, own.spec().skills), (Some(&own), ringo_cli::Adapter::Claude, true, false));
+        assert_eq!(parse("@shop-billing why is the invoice late?", &a.agents), Ok(Cmd::Agents(vec![(own, false)], "why is the invoice late?".into())));
+        let kept: serde_json::Value = serde_json::from_slice(&std::fs::read(a.s.state().join("agents.json")).unwrap()).unwrap();
+        assert_eq!((kept["agents"][3].as_str(), kept["custom"][0]["name"].as_str()), (Some("shop-billing"), Some("shop-billing")), "kept for the next start");
+        // it runs on its agent's plan: one read, one gauge
+        a.s.programs.insert(claude, std::env::current_exe().unwrap());
+        a.s.programs.insert(codex, std::env::current_exe().unwrap());
+        a.s.programs.insert(own, std::env::current_exe().unwrap());
+        assert_eq!(a.plan_agents(), [codex], "one program, one plan");
+        let listing_start = a.out.len();
+        a.run(Cmd::Agent(None), "").unwrap();
+        // Check this listing, not the earlier suggestion still in the scrollback. Temporary paths vary by OS
+        // and can wrap between the character count and its label, so compare the wrapped text as words.
+        for width in [60, 87, 120] {
+            let rows = a.out[listing_start..].iter().flat_map(|entry| entry.rows(width, &a.theme))
+                .map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+            let words = rows.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("shop-billing on claude · ") && words.contains("26 characters")
+                    && !words.contains("/agent add shop-billing"), "width {width}: {rows}");
+        }
+        // the same name again, and taken away: its file stays
+        assert!(a.run(add("shop-billing", None, None, false), "").unwrap_err().contains("you already have an agent called shop-billing"));
+        a.main = own;
+        assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("shop-billing".into()))), "").unwrap().unwrap().contains("its instructions file is untouched"));
+        assert!(!a.agents.contains(&own) && a.main == codex && made.join("shop-billing.md").is_file());
+        assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("claude".into()))), "").unwrap_err().contains("not an agent of your own"));
+    }
+
+    /// The list under the input for what has been typed, as (completes to, what it says).
+    fn listed_for(a: &mut App, typed: &str) -> Vec<(String, String)> {
+        a.input = typed.chars().collect();
+        a.cursor = a.input.len();
+        a.menu_entries().into_iter().map(|(to, _, what)| (to, what)).collect()
+    }
+
+    #[test]
+    fn a_model_is_picked_from_a_list_or_named_alone() {
+        let own = |pairs: &[(&str, &str)]| -> Vec<(String, String)> { pairs.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect() };
+        // one agent takes a model: its models at once, the one it runs on marked
+        let mut a = app(&["claude", "agy", "grok"]);
+        let claude = Agent::from_name("claude").unwrap();
+        assert_eq!(listed_for(&mut a, "/model "), own(&[("default", "← now · its own default"), ("fable", ""), ("opus", ""), ("sonnet", ""), ("haiku", "")]));
+        assert_eq!(listed_for(&mut a, "/model s"), own(&[("sonnet", "")]));
+        assert!(listed_for(&mut a, "/model").iter().any(|(to, _)| to == "/model"), "without the space, the commands still");
+        // Enter on a pick sends it: no second Enter, no agent to name
+        listed_for(&mut a, "/model ");
+        a.last_key = Instant::now() - Duration::from_secs(1);
+        a.key(KeyEvent::from(KeyCode::Down));
+        a.key(KeyEvent::from(KeyCode::Down));
+        a.last_key = Instant::now() - Duration::from_secs(1);
+        a.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!((a.s.models.get(&claude).map(String::as_str), a.input.is_empty()), (Some("opus"), true));
+        assert_eq!(listed_for(&mut a, "/model o"), own(&[("opus", "← now")]));
+        // named alone, by hand: the agent it belongs to; an agent's name alone shows who runs on what
+        assert!(a.run(parse("/model sonnet", &[claude]).unwrap(), "").unwrap().unwrap().starts_with("  claude runs on sonnet from its next turn"));
+        assert!(a.run(parse("/model claude", &[claude]).unwrap(), "").unwrap().unwrap().contains("to change one: /model and a space lists what to pick from"));
+        assert!(a.run(parse("/model gpt-6-luna", &[claude]).unwrap(), "").unwrap_err().contains("is a model for codex, which is not set up here"));
+        assert!(a.run(parse("/model default", &[claude]).unwrap(), "").unwrap().unwrap().starts_with("  claude runs on its own default again"));
+        assert_eq!(a.model_owner("some-new-model"), Ok(claude), "a name Ringo cannot place is for the agent you talk to");
+
+        // two agents take one: whose first, then which; a model's first letters find it under either
+        let mut a = app(&["codex", "claude", "grok"]);
+        let codex = Agent::from_name("codex").unwrap();
+        a.offered = vec![ringo_cli::Model { name: "gpt-big".into(), what: "the large one".into(), default: true },
+                         ringo_cli::Model { name: "gpt-small".into(), what: "the quick one".into(), default: false }];
+        assert_eq!(listed_for(&mut a, "/model "), own(&[("codex ", "runs on its own default · pick its model"), ("claude ", "runs on its own default · pick its model")]));
+        assert_eq!(listed_for(&mut a, "/model c"), own(&[("codex ", "runs on its own default · pick its model"), ("claude ", "runs on its own default · pick its model")]));
+        assert_eq!(listed_for(&mut a, "/model codex "), own(&[("default", "← now · its own default"), ("gpt-big", "its default · the large one"), ("gpt-small", "the quick one")]));
+        assert_eq!(listed_for(&mut a, "/model claude s"), own(&[("sonnet", "")]));
+        assert_eq!(listed_for(&mut a, "/model gpt-s"), own(&[("gpt-small", "codex · the quick one")]));
+        assert_eq!(listed_for(&mut a, "/model o"), own(&[("opus", "claude")]));
+        assert!(listed_for(&mut a, "/model grok ").is_empty() && listed_for(&mut a, "/model codex gpt-big x").is_empty());
+        a.main = codex;
+        assert_eq!((a.model_owner("opus"), a.model_owner("gpt-small"), a.model_owner("default")), (Ok(claude), Ok(codex), Ok(codex)),
+                   "a model goes to the agent it belongs to, whoever the owner talks to; default to the one they talk to");
+        a.main = Agent::from_name("grok").unwrap();
+        assert!(a.model_owner("some-new-model").unwrap_err().contains("whose model is some-new-model? /model AGENT some-new-model"));
+        // /model shows the list it has, without reading it again; one being read for the pick-list is shown when it is in
+        a.main = codex;
+        a.s.programs.insert(codex, std::env::current_exe().unwrap());
+        a.run(Cmd::Model(None), "").unwrap();
+        assert!(a.listing.is_none() && screen(&mut a, 120, 24).join("\n").contains("gpt-small  the quick one"), "said from what was read");
+        a.listing = Some((codex, std::thread::spawn(|| Ok(Vec::new())), false));
+        a.run(Cmd::Model(None), "").unwrap();
+        assert!(a.listing.as_ref().is_some_and(|(.., said)| *said), "the read under way is the one shown");
+        a.listing = None;
+        a.s.programs.remove(&codex);
+        a.main = Agent::from_name("grok").unwrap();
+        // the list is read for Codex once, unseen, when /model is being typed (here no codex is installed to ask)
+        listed_for(&mut a, "/mode");
+        a.want_models();
+        assert!(!a.asked_models);
+        listed_for(&mut a, "/model");
+        a.want_models();
+        assert!(a.asked_models);
+    }
+
+    #[test]
+    fn each_agent_runs_on_the_model_its_owner_chose() {
+        let mut a = app(&["claude", "agy"]);
+        let claude = Agent::from_name("claude").unwrap();
+        assert_eq!((parse("/model", &[claude]), parse("/model claude opus", &[claude]), parse("/model @claude default", &[claude])),
+                   (Ok(Cmd::Model(None)), Ok(Cmd::Model(Some(("claude".into(), "opus".into())))),
+                    Ok(Cmd::Model(Some(("claude".into(), "default".into()))))));
+        assert_eq!(parse("/model opus", &[claude]), Ok(Cmd::Model(Some((String::new(), "opus".into())))), "whose it is comes later");
+        assert!(parse("/model claude a b", &[claude]).is_err());
+        let set = |a: &mut App, agent: &str, model: &str| a.run(Cmd::Model(Some((agent.into(), model.into()))), "");
+        assert!(set(&mut a, "claude", "opus").unwrap().unwrap().starts_with("  claude runs on opus from its next turn (saved)"));
+        assert_eq!(a.s.models.get(&claude).map(String::as_str), Some("opus"));
+        assert_eq!(crate::theme::settings_all()["models"]["claude"], "opus", "remembered for the next start");
+        // an agent that takes none, one not set up, a name that is not one, and a model that is not one word
+        assert!(set(&mut a, "agy", "x").unwrap_err().contains("chooses its own model"));
+        assert!(set(&mut a, "codex", "x").unwrap_err().contains("not set up here"));
+        assert!(set(&mut a, "nobody", "x").unwrap_err().contains("no agent nobody: claude, agy"));
+        assert!(set(&mut a, "claude", "--bare").unwrap_err().contains("one word") && a.s.models[&claude] == "opus");
+        // /model shows who runs on what, and the settings line names the choice
+        assert!(a.run(Cmd::Model(None), "").unwrap().unwrap().contains("/ask, /review, /design and /research run on codex-chatgpt"));
+        let rows = screen(&mut a, 90, 16);
+        assert!(rows.iter().any(|r| r.trim() == "claude  opus  · your choice"), "{rows:#?}");
+        assert!(rows.iter().any(|r| r.trim() == "agy     its own  · it takes no model from Ringo"), "{rows:#?}");
+        assert!(a.listing.is_none() && a.settings().contains("models claude opus (/model)"), "no codex here to ask for its list");
+        // a turn that fails on a chosen model says where the choice came from
+        let job = std::env::temp_dir().join(format!("ringo-tui-fake-model-{}", std::process::id()));
+        std::fs::write(&job, "#!/bin/sh\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o755)).unwrap();
+            a.s.programs.insert(claude, job);
+            a.talk(claude, "hi".into(), "hi".into()).unwrap();
+            assert_eq!(a.s.peers, a.agents, "a turn may ask the agents set up here");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while a.s.running() > 0 && Instant::now() < deadline {
+                a.s.pump();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            a.feed();
+            let rows = screen(&mut a, 110, 30);
+            assert!(rows.iter().any(|r| r.contains("it ran on opus, your choice for claude: /model claude default goes back")), "{rows:#?}");
+        }
+        assert!(set(&mut a, "claude", "default").unwrap().unwrap().contains("claude runs on its own default again"));
+        assert!(a.s.models.is_empty() && crate::theme::settings_all()["models"].get("claude").is_none());
+        assert!(a.settings().contains("models each agent's own (/model)"));
+        a.s.shutdown();
+    }
+
+    #[test]
+    fn the_head_says_a_newer_ringo_is_there_until_it_is_applied() {
+        let mut a = app(&["claude"]);
+        a.pending = Some(Vec::new()); // the agents' own check has answered: none to update
+        assert!(!screen(&mut a, 100, 10)[0].contains("update"), "nothing to say yet");
+        // one this build cannot apply by itself: the head points to /update, which says how to get it
+        a.updated = Some("  Ringo 1a2b3c4 is out (2 new changes). This build does not update itself".into());
+        assert!(screen(&mut a, 100, 10)[0].contains("folder  ↑ update available · /update"));
+        assert!(a.run(Cmd::Update(None), "/update").unwrap().unwrap().starts_with("  Ringo 1a2b3c4 is out (2 new changes)"));
+        // built and waiting: /restart applies it, and the head says so while a turn's hint has the input's corner
+        a.staged = Some(PathBuf::from("ringo"));
+        let rows = screen(&mut a, 100, 10);
+        assert!(rows[0].contains("folder  ↑ update ready · /restart") && rows[0].ends_with("ask mode · 0 tokens"), "{rows:#?}");
+        assert!(!screen(&mut a, 40, 10)[0].contains("update"), "a narrow head keeps the folder and the mode");
+    }
+
+    #[test]
+    fn a_reply_being_written_keeps_back_what_would_change() {
+        let now = Duration::ZERO;
+        let show = |text: &str| steady(text, now, 0).0;
+        // the word being written waits for its end; a pause lets it through, and so does having shown already
+        assert_eq!(show("The quick bro"), "The quick ");
+        assert_eq!(steady("The quick bro", WORD_HOLD, 0), ("The quick bro".into(), 13, None));
+        assert_eq!(steady("The quick bro", now, 11).0, "The quick bro", "what has shown stays");
+        assert_eq!(show("\u{6f22}\u{5b57}"), "\u{6f22}\u{5b57}", "wide characters have no spaces to wait for");
+        let long = format!("see {}", "x".repeat(HELD_WORD + 1));
+        assert_eq!(show(&long), long, "a path or a URL shows as it grows");
+        // a link shows once it is whole; a box, or a bracket in code, is no link
+        assert_eq!((show("see [the "), show("see [the guide](GUIDE.md")), ("see ".into(), "see ".into()));
+        assert_eq!(show("see [the guide](GUIDE.md) for "), "see [the guide](GUIDE.md) for ");
+        assert_eq!((show("- [x] done "), show("use `a[i ")), ("- [x] done ".into(), "use `a[i` ".into()));
+        let open = format!("the range [0, {} ", "9".repeat(HELD_LINK));
+        assert_eq!(show(&open), open, "a bracket that closes nothing does not hold the line back for long");
+        // a table shows once a line that is not one of its rows comes; until then one line counts its rows
+        let table = "Sizes:\n\n| Name | Size |\n|---|---|\n| a | 1 |\n| b";
+        assert_eq!(steady(table, now, 0), ("Sizes:\n\n*a table is being written · 1 row so far…*".into(), 8, Some(TABLE_HOLD)));
+        assert_eq!(show("| Name"), "*a table is being written…*");
+        assert_eq!(show(&format!("{table} | 2 |\n")), "Sizes:\n\n*a table is being written · 2 rows so far…*");
+        assert_eq!(show(&format!("{table} | 2 |\n\nDone. ")), format!("{table} | 2 |\n\nDone. "));
+        assert_eq!(steady(table, TABLE_HOLD, 0).0, table, "a long pause shows it as far as it is");
+        assert!(steady(table, now, 9).0.starts_with("Sizes:\n\n| Name"), "and once it shows, it stays");
+        assert_eq!(show("```\n| a | b"), "```\n| a | ", "in a code block a bar is only a bar");
+    }
+
+    /// An agent's reply with what replies have: emphasis, code, a link, a list, a table and a code block.
+    const SAMPLE_REPLY: &str = "I found the cause in **`client.rs`**: the request is sent once and a timeout is never retried, \
+so one slow response fails the whole sync. See [the retry notes](docs/RETRY.md) for the policy the team agreed on.\n\n\
+What I changed:\n\n\
+- `send` now retries up to 3 times, backing off 100 ms and then doubling each time\n\
+- the new `retry_count` setting defaults to 3, and 0 turns retries off entirely\n\
+- a test covers the case where the second attempt succeeds\n\n\
+| File | Change | Lines |\n|---|---|---|\n\
+| src/client.rs | wrap the send in a retry loop with backoff | +14 −2 |\n\
+| src/config.rs | read `retry_count` from the settings file | +6 |\n\
+| tests/client_test.rs | a response that fails once and then succeeds | +31 |\n\n\
+The loop itself is short:\n\n\
+```rust\nfor attempt in 0..=retries {\n    match self.http.send(req.clone()) {\n        Ok(resp) => return Ok(resp),\n\
+        Err(e) if attempt == retries => return Err(e),\n        Err(_) => sleep(backoff(attempt)),\n    }\n}\n```\n\n\
+All 42 tests pass. Nothing else in the client changed, and `/undo` takes this back if you would rather not keep it.\n";
+
+    #[test]
+    fn rows_already_written_do_not_change_as_a_reply_grows() {
+        let theme = Theme::named("mono", crate::theme::Depth::Mono).unwrap();
+        for width in [48, 78, 118] {
+            let (mut text, mut floor, mut prev) = (String::new(), 0, Vec::<String>::new());
+            for piece in pieces(SAMPLE_REPLY) {
+                text.push_str(&piece);
+                let (shown, kept, _) = steady(&text, Duration::ZERO, floor);
+                floor = floor.max(kept);
+                let cur = plain(&markdown(&shown, width, &theme));
+                if let Some(last) = prev.len().checked_sub(1) {
+                    assert_eq!(cur.get(..last), Some(&prev[..last]), "{width} columns: a row above the one being written changed");
+                    assert!(prev[last].contains("a table is being written") || cur[last].starts_with(prev[last].as_str()),
+                            "{width} columns: the row being written took text back: {:?} became {:?}", prev[last], cur[last]);
+                }
+                prev = cur;
+            }
+            assert_eq!(plain(&markdown(&steady(&text, WORD_HOLD.max(TABLE_HOLD), floor).0, width, &theme)),
+                       plain(&markdown(SAMPLE_REPLY, width, &theme)), "and it ends as the whole reply reads");
+        }
+    }
+
+    #[test]
+    fn scrolled_up_the_rows_stay_put_whatever_is_written_meanwhile() {
+        let mut a = app(&["claude"]);
+        a.out.push(Out::Reply("first".into())); // an agent's reply, still being written
+        for i in 0..30 {
+            a.say(format!("line {i}"));
+        }
+        screen(&mut a, 60, 10);
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        let before = screen(&mut a, 60, 10);
+        assert_eq!(before[7], "line 25");
+        // that reply grows by four rows above what is on screen, and a line arrives below it
+        a.out[0] = Out::Reply("first\n\nsecond\n\nthird".into());
+        a.fitted.clear();
+        a.say("line 30");
+        let after = screen(&mut a, 60, 10);
+        assert_eq!(after[2..8], before[2..8], "what was being read has not moved");
+        assert!(after[9].contains("scrolled up · 5 rows below"), "and the count says a line arrived: {after:#?}");
+        // text selected there stays selected while the reply above grows again
+        let (from, to) = (a.place(a.top + 4), a.place(a.top + 5));
+        a.sel = Some(((from.0, from.1, 2), (to.0, to.1, 5)));
+        assert_eq!(a.selected(), "ne 24\nline 2");
+        a.out[0] = Out::Reply("first\n\nsecond\n\nthird\n\nfourth".into());
+        a.fitted.clear();
+        assert_eq!((screen(&mut a, 60, 10)[2..8].to_vec(), a.selected()), (before[2..8].to_vec(), "ne 24\nline 2".to_string()));
+        a.sel = None;
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(screen(&mut a, 60, 10)[7], "line 21", "and PgUp still moves from there");
+        a.key(KeyEvent::from(KeyCode::End));
+        assert_eq!(screen(&mut a, 60, 10)[7], "line 30", "End, with nothing typed, goes back to the end");
+        a.key(KeyEvent::from(KeyCode::Home));
+        a.key(KeyEvent::from(KeyCode::PageUp)); // past the start is the start
+        assert_eq!(screen(&mut a, 60, 10)[2].trim(), "first", "and Home to the start");
+        a.input = "x".chars().collect();
+        a.cursor = 1;
+        a.key(KeyEvent::from(KeyCode::Home));
+        assert_eq!((a.cursor, screen(&mut a, 60, 10)[2].trim().to_string()), (0, "first".to_string()), "typed, Home is the line's");
     }
 
     #[cfg(unix)]
@@ -4082,7 +5403,8 @@ mod tests {
         a.key(KeyEvent::from(KeyCode::Char('x')));
         assert_eq!(screen(&mut a, 30, 10)[7], "line 30", "typing goes back to the end");
         // a drag from "ne 29" through "line 3" (screen rows 6 and 7) selects just that text
-        a.sel = Some(((a.top + 4, 2), (a.top + 5, 5)));
+        let (from, to) = (a.place(a.top + 4), a.place(a.top + 5));
+        a.sel = Some(((from.0, from.1, 2), (to.0, to.1, 5)));
         assert_eq!(a.selected(), "ne 29\nline 3");
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
         terminal.draw(|f| a.draw(f)).unwrap();
@@ -4193,5 +5515,121 @@ mod tests {
         assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
         assert_eq!([base64(b"hi"), base64(b"hey"), base64(b"heya")], ["aGk=", "aGV5", "aGV5YQ=="]);
         assert_eq!(slice_cols("a漢字b", 1, 3), "漢", "a wide character counts where it starts");
+    }
+
+    /// Pieces of 4 to 24 characters, as an agent's text deltas come (the same pieces every run).
+    fn pieces(text: &str) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let (mut out, mut i, mut seed) = (Vec::new(), 0, 12345u32);
+        while i < chars.len() {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let n = 4 + (seed >> 16) as usize % 21;
+            out.push(chars[i..(i + n).min(chars.len())].iter().collect());
+            i += n;
+        }
+        out
+    }
+
+    /// Not a check: prints what the path a reply is written through costs and how still its rows stay.
+    /// cargo test --release measure_ -- --ignored --nocapture --test-threads 1
+    #[cfg(unix)]
+    #[test]
+    #[ignore]
+    fn measure_a_reply_being_written() {
+        use std::os::unix::fs::PermissionsExt;
+        const SHELL_DOC: &str = include_str!("../../docs/SHELL.md");
+        let fake = std::env::temp_dir().join(format!("ringo-tui-fake-measure-{}", std::process::id()));
+        std::fs::write(&fake, "#!/bin/sh\nsleep 120\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (claude, codex) = (Agent::from_name("claude").unwrap(), Agent::from_name("codex").unwrap());
+        let start = |fake: &Path| {
+            let mut a = app(&["claude", "codex"]);
+            a.s.programs.insert(claude, fake.to_path_buf());
+            a.s.programs.insert(codex, fake.to_path_buf());
+            a.talk(claude, "go".into(), "go".into()).unwrap();
+            a
+        };
+        let stats = |name: &str, mut us: Vec<u128>, extra: String| {
+            let n = us.len().max(1);
+            let late = us[n - n / 10 - 1..].iter().sum::<u128>() / (n / 10 + 1) as u128;
+            let total: u128 = us.iter().sum();
+            us.sort();
+            println!("{name:<44} frames {n:>5} · mean {:>6} µs · p95 {:>6} µs · max {:>6} µs · last tenth {late:>6} µs · \
+                      total {:>5} ms{extra}", total / n as u128, us[n * 95 / 100], us[n - 1], total / 1000);
+        };
+        let short: String = MANUAL.chars().take(3000).collect();
+        for (name, text, w, h) in [("a 3,000-character reply at 80x24", short.as_str(), 80, 24),
+                                   ("a 3,000-character reply at 120x40", short.as_str(), 120, 40),
+                                   ("the 14.8k guide as a reply at 120x40", MANUAL, 120, 40),
+                                   ("the 56k shell page as a reply at 120x40", SHELL_DOC, 120, 40)] {
+            let mut a = start(&fake);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            let (mut us, mut prev, mut above, mut back): (Vec<u128>, Vec<String>, usize, usize) = (Vec::new(), Vec::new(), 0, 0);
+            for piece in pieces(text) {
+                a.s.jobs[0].fresh = vec![Said::Partial(piece)];
+                let at = Instant::now();
+                a.feed();
+                terminal.draw(|f| a.draw(f)).unwrap();
+                us.push(at.elapsed().as_micros());
+                let cur = plain(&a.fitted[a.streams[&1].at]);
+                if let Some(last) = prev.len().checked_sub(1) {
+                    let show = std::env::var_os("RINGO_MEASURE_SHOW").is_some();
+                    if let Some(i) = (0..last).find(|&i| cur.get(i) != Some(&prev[i])) {
+                        above += 1; // a row above the one being written changed
+                        if show {
+                            println!("  above, {} rows up: {:?}\n      became {:?}", last - i, prev[i], cur.get(i));
+                        }
+                    } else if !prev[last].contains("a table is being written")
+                        && !cur.get(last).is_some_and(|row| row.starts_with(prev[last].as_str())) {
+                        back += 1; // the row being written took text back
+                        if show {
+                            println!("  back: {:?}\n      became {:?}", prev[last], cur.get(last));
+                        }
+                    }
+                }
+                prev = cur;
+            }
+            stats(name, us, format!(" · rows above rewritten in {above} frames, the last row took text back in {back}"));
+            a.s.shutdown();
+        }
+        // two agents side by side: claude's reply opened first and still grows, with codex's steps and reply under it
+        let mut a = start(&fake);
+        a.talk(codex, "docs".into(), "@codex docs".into()).unwrap();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        a.s.jobs[0].fresh = vec![Said::Partial("Starting. ".into())];
+        a.feed();
+        a.s.jobs[1].fresh = (0..300).map(|i| Said::Step(format!("Edit src/file{i}.rs · 2 lines\n- old\n+ new"))).collect();
+        a.s.jobs[1].fresh.push(Said::Partial(MANUAL.chars().take(6000).collect()));
+        a.feed();
+        let mut us = Vec::new();
+        for piece in pieces(&short) {
+            a.s.jobs[0].fresh = vec![Said::Partial(piece)];
+            let at = Instant::now();
+            a.feed();
+            terminal.draw(|f| a.draw(f)).unwrap();
+            us.push(at.elapsed().as_micros());
+        }
+        stats("the first of two agents writing, 120x40", us, String::new());
+        a.s.shutdown();
+        // a long conversation: what a turn's end costs (the text kept for --resume) and a frame with nothing new
+        let mut a = start(&fake);
+        for i in 0..300 {
+            a.echo(&format!("request {i}"));
+            a.out.extend((0..10).map(|k| Out::Step(format!("Read src/file{k}.rs · 40 lines"))));
+            a.reply(&short);
+        }
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        let at = Instant::now();
+        a.save();
+        println!("{:<44} {} µs for {} entries", "saving a 300-turn conversation", at.elapsed().as_micros(), a.out.len());
+        let us = (0..200).map(|_| {
+            let at = Instant::now();
+            terminal.draw(|f| a.draw(f)).unwrap();
+            at.elapsed().as_micros()
+        }).collect();
+        stats("a frame of it with nothing new", us, String::new());
+        a.s.shutdown();
+        let _ = std::fs::remove_file(&fake);
     }
 }

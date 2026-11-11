@@ -68,6 +68,90 @@ pub struct Spec {
     pub installer: Option<String>,
     /// Added by the owner (kept in agents.json), not shipped with Ringo.
     pub custom: bool,
+    /// What makes an agent of the owner's a specialist: a file of standing instructions that goes to its every turn
+    /// (see `instructions`). A Claude or Codex agent only: Ringo has no place to give them to another.
+    pub instructions: Option<String>,
+    /// Claude only: outside read mode its turns load the owner's Claude Code skills, plugins and connectors, which
+    /// every other turn goes without (see `launch_agent`).
+    pub skills: bool,
+}
+
+/// A path as its owner typed it: `~/` is their home folder.
+pub fn home_path(path: &str) -> PathBuf {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from).unwrap_or_default();
+    path.strip_prefix("~/").map_or_else(|| PathBuf::from(path), |rest| home.join(rest))
+}
+
+/// The most a specialist's instructions may hold: they are read on every call of its turns (about 100k tokens here).
+pub const INSTRUCTIONS_MAX: usize = 400_000;
+
+/// A specialist's file as it stands now: its standing instructions, and what its opening `---` block says of the
+/// model it runs on and the tools it uses, as an agent file made for Claude Code has them.
+#[derive(Debug, Default, PartialEq)]
+pub struct OwnFile {
+    pub text: Vec<u8>,
+    /// `model:` (not `inherit`): the model its turns run on, unless the owner chose one with /model.
+    pub model: Option<String>,
+    /// `tools:` the built-in tools it is offered, and no others (a connector's tools are not Ringo's to offer): none
+    /// when the line names none of those. No such line, or `default` in it: None, every tool as usual.
+    pub tools: Option<Vec<String>>,
+}
+
+/// A specialist's standing instructions (`Spec::instructions`), read anew for each turn, so an edit applies at the
+/// next one: the file's text without a leading `---` block (a Claude Code agent file opens with its name and
+/// description there). An agent that has none: None. A file that cannot be read, holds nothing or is too large is an
+/// error, never a turn without them: that turn would not be this agent's.
+pub fn instructions(spec: &Spec) -> Result<Option<Vec<u8>>, String> {
+    own_file(spec).map(|file| file.map(|f| f.text))
+}
+
+/// `instructions`, with what the file's opening block says of its model and tools.
+pub fn own_file(spec: &Spec) -> Result<Option<OwnFile>, String> {
+    let Some(path) = &spec.instructions else { return Ok(None) };
+    let file = home_path(path);
+    let bytes = fs::read(&file).map_err(|e| format!("{}'s instructions could not be read ({}: {e})", spec.name, file.display()))?;
+    let (mut body, mut head) = (&bytes[..], &bytes[..0]);
+    if let Some(rest) = bytes.strip_prefix(b"---\n").or_else(|| bytes.strip_prefix(b"---\r\n")) {
+        let mut at = 0;
+        for line in rest.split_inclusive(|b| *b == b'\n') {
+            if line.trim_ascii_end() == b"---" {
+                (head, body) = (&rest[..at], &rest[at + line.len()..]);
+                break;
+            }
+            at += line.len();
+        }
+    }
+    let body = body.trim_ascii();
+    match body.len() {
+        0 => return Err(format!("{}'s instructions file has no text in it ({})", spec.name, file.display())),
+        n if n > INSTRUCTIONS_MAX => return Err(format!("{}'s instructions are {n} bytes, and they are read on every call: \
+                                                         keep them under {INSTRUCTIONS_MAX} ({})", spec.name, file.display())),
+        _ => {}
+    }
+    // The block's `model:` and `tools:` lines, the two that change how a turn runs. A value is one line, or for the
+    // tools a list: `tools: Read, Grep`, `tools: [Read, Grep]`, or `- Read` lines under it.
+    let bare = |v: &str| v.trim().trim_matches(['"', '\'']).trim().to_string();
+    let (mut model, mut tools, mut listing) = (None, None::<Vec<String>>, false);
+    for line in String::from_utf8_lossy(head).lines() {
+        if let Some(item) = line.trim_start().strip_prefix('-').filter(|_| listing) {
+            tools.get_or_insert_default().push(bare(item));
+        } else if let Some(value) = line.strip_prefix("model:") {
+            listing = false;
+            model = Some(bare(value)).filter(|m| m != "inherit" && valid_model(m));
+        } else if let Some(value) = line.strip_prefix("tools:") {
+            listing = value.trim().is_empty();
+            tools = Some(value.trim().trim_matches(['[', ']']).split(',').map(bare).collect());
+        } else if !line.trim().is_empty() {
+            listing = false;
+        }
+    }
+    // `default` is Claude Code's word for its whole set: no restriction. Otherwise the names Ringo can pass on are
+    // kept, and a line that leaves none offers none: it was written to narrow, and must not widen by being unreadable.
+    let tools = tools.filter(|all| !all.iter().any(|t| t.eq_ignore_ascii_case("default"))).map(|mut all| {
+        all.retain(|t| !t.is_empty() && !t.starts_with("mcp__") && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        all
+    });
+    Ok(Some(OwnFile { text: body.to_vec(), model, tools }))
 }
 
 /// A name that can be a program on PATH and go into a command line: letters, digits, `-`, `_`, `.`.
@@ -101,12 +185,21 @@ impl Spec {
             return Err(format!("{name}: Ringo cannot verify a read-only mode for a plain agent, so \"read\" must be \
                                 false"));
         }
+        let instructions = text("instructions").filter(|p| !p.trim().is_empty());
+        if instructions.is_some() && !matches!(adapter, Adapter::Claude | Adapter::Codex) {
+            return Err(format!("{name}: \"instructions\" go to a claude or codex agent; Ringo has no place to give them \
+                                to another"));
+        }
+        let skills = v.get("skills").and_then(|b| b.as_bool()).unwrap_or(false);
+        if skills && adapter != Adapter::Claude {
+            return Err(format!("{name}: \"skills\" are Claude Code's, so its adapter must be claude"));
+        }
         let os = if cfg!(windows) { "windows" } else { "unix" };
         let installer = v.get("installer").and_then(|i| i.get(os)).and_then(|s| s.as_str()).map(str::to_string);
         Ok(Spec { program: text("program").unwrap_or_else(|| name.clone()),
                   company: text("company").unwrap_or_else(|| format!("{name} (added by you)")),
                   install: text("install").unwrap_or_default(), login: list("login")?, read, args: list("args")?,
-                  npm: text("npm"), self_update: text("self_update"), installer, adapter, name, custom })
+                  npm: text("npm"), self_update: text("self_update"), installer, adapter, name, custom, instructions, skills })
     }
 }
 
@@ -401,6 +494,13 @@ pub struct Job {
     cancel: Arc<AtomicBool>,
     /// The model the agent said it runs, when it says (for the usage record).
     pub model: Option<String>,
+    /// A turn in the agents' talk (the shell's /discuss): the others hear all of its reply, not its first lines.
+    pub talk: bool,
+    /// Whether this turn was given the means to ask another agent (`serve_asks`), and how many asks it has made.
+    pub can_ask: bool,
+    pub asked: usize,
+    /// A turn another agent asked for in the middle of its own: that turn's job, and the file its answer goes in.
+    pub asked_by: Option<(usize, PathBuf)>,
     /// Whether the job reported any token count: one that finishes without is recorded as unknown, not left out.
     counted: bool,
     /// How many of its model calls reported no count (a pipeline's): its counts are then of the others alone.
@@ -541,8 +641,18 @@ pub struct Session {
     pub mode: Mode,
     /// How hard they think (see `Tier`).
     pub tier: Tier,
+    /// The model each agent's turns run on, where the owner chose one (`/model`): a name the agent's own program
+    /// takes (Claude Code's `--model`, Codex's thread `model`). None for an agent: its own default.
+    pub models: HashMap<Agent, String>,
     /// Ringo's state folder, where `usage.jsonl` keeps what each finished job used.
     root: PathBuf,
+    /// The owner's home folder, where the agents they made for Claude Code are (`.claude/agents`).
+    pub home: PathBuf,
+    /// The agents set up in the shell that runs this session: the ones a turn here may ask a question in the middle
+    /// of its work (`serve_asks`). With none, no turn is given the means to.
+    pub peers: Vec<Agent>,
+    /// The program that serves a turn's asks: this one (`ringo ask-server`).
+    pub asker: PathBuf,
     /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
     pub claude_limits: Option<serde_json::Value>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
@@ -885,8 +995,8 @@ impl Session {
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, dir, jobs: Vec::new(), max_jobs: 3,
-                     backend: "codex-chatgpt".into(),
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(), max_jobs: 3,
+                     backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
                      returned: Vec::new(), start: 1,
@@ -1101,6 +1211,72 @@ impl Session {
         self.threads.contains_key(&agent)
     }
 
+    /// `agent`'s next turn starts its conversation again from Ringo's record of it (see `handoff`), not from the one
+    /// its program keeps: for what that one holds on to, as its model does (checked live, Claude Code 2.1.322 and
+    /// codex-cli 0.167.0: resumed with no model named, each ran the model it was last given). False when it had none.
+    pub fn start_over(&mut self, agent: Agent) -> bool {
+        let Some(old) = self.threads.remove(&agent) else { return false };
+        self.usage_so_far.remove(&(agent, old));
+        self.context.remove(&agent);
+        true
+    }
+
+    /// The agents `agent`'s turn may ask (`peers`): the others set up that work in this folder and are installed.
+    fn askable(&self, agent: Agent) -> Vec<Agent> {
+        self.peers.iter().copied().filter(|a| *a != agent && a.spec().read && self.installed(*a)).collect()
+    }
+
+    /// Starts what the running turns have asked of other agents since the last look (`serve_asks` wrote each ask
+    /// into its turn's folder). The agent asked takes a turn of its own, in read mode whatever the session's and
+    /// without the means to ask in its turn; its reply is the answer (`end_with`). An ask that cannot be served is
+    /// answered at once with the reason, which the asking agent reads and works around. True when one came.
+    fn take_asks(&mut self) -> bool {
+        let asking: Vec<usize> = self.jobs.iter().filter(|j| j.running() && j.can_ask).map(|j| j.id).collect();
+        let mut any = false;
+        for id in asking {
+            let n = self.jobs[id - 1].asked + 1;
+            let asks = self.jobs[id - 1].dir.join("asks");
+            let Ok(bytes) = fs::read(asks.join(format!("{n}.json"))) else { continue };
+            any = true;
+            self.jobs[id - 1].asked = n;
+            // the server writes each ask whole; one that does not read is answered, not waited on
+            let ask = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
+            let Kind::Agent { agent: asker, .. } = self.jobs[id - 1].kind else { continue };
+            let (name, question) = (ask["agent"].as_str().unwrap_or(""), ask["question"].as_str().unwrap_or(""));
+            let (answer, others) = (asks.join(format!("{n}.answer")), self.askable(asker));
+            let target = match Agent::from_name(name).filter(|a| others.contains(a)) {
+                _ if n > MAX_ASKS => Err(format!("this turn has asked {MAX_ASKS} times already: go on with what you have")),
+                None => Err(format!("there is no agent {name} to ask here: {}",
+                                    others.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "))),
+                Some(target) if self.busy_for(target).is_some() =>
+                    Err(format!("{name} is at work on something else: go on without it")),
+                Some(target) => Ok(target),
+            };
+            let started = target.and_then(|target| {
+                let prompt = format!("{0} is in the middle of a turn for me and asks you:\n\n{question}\n\nAnswer {0} directly \
+                                      and briefly. Look at the files if it helps; change nothing.", asker.name());
+                let (mode, peers) = (std::mem::replace(&mut self.mode, Mode::Read), std::mem::take(&mut self.peers));
+                let started = self.launch_agent(target, false, &prompt);
+                (self.mode, self.peers) = (mode, peers);
+                started.map_err(|e| format!("{name} could not be asked: {e}"))
+            });
+            match started {
+                Ok(asked) => {
+                    let job = &mut self.jobs[asked - 1];
+                    job.asked_by = Some((id, answer));
+                    // what it was told of the turns it missed is in its log (/show N); the conversation shows its answer
+                    job.fresh.retain(|said| !matches!(said, Said::Line(_)));
+                    self.jobs[id - 1].push_log(format!("asks {name}: {}", parse::short(question, 200)));
+                }
+                Err(why) => {
+                    self.jobs[id - 1].push_log(format!("asked {name}, and was told: {why}"));
+                    answer_ask(&answer, false, &why);
+                }
+            }
+        }
+        any
+    }
+
     /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
     pub fn forget(&mut self) {
         self.threads.clear();
@@ -1163,6 +1339,11 @@ impl Session {
         let own = read("config.toml").is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
         !own && ["AGENTS.override.md", "AGENTS.md"].into_iter().filter_map(|f| read(f).ok())
             .find(|text| !text.trim().is_empty()).is_some_and(|text| text.contains("ringo"))
+    }
+
+    /// Ringo's state folder for this session: agents.json and rules.md are there.
+    pub fn state(&self) -> &Path {
+        &self.root
     }
 
     /// The owner's own rules for every Claude turn: a file they write in Ringo's state folder. With none, a turn is as
@@ -1305,9 +1486,15 @@ impl Session {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
+            // agy is not told where the whole record is: it is outside its folder, and a read agy has no permission
+            // for ends its turn with no reply (live, 11/10: it read the project's files, opened record.md and stopped,
+            // 82.5k tokens in). The others are refused such a read and go on, or may make it.
+            let whole_at = match agent.spec().adapter {
+                Adapter::Agy => String::new(),
+                _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
+            };
             let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
-                                and can be wrong; the files here are the truth). The whole record, uncut, is in {}.\n\n{}\n\n",
-                               self.jobs[id - 1].dir.join("record.md").display(), record.trim_end());
+                                and can be wrong; the files here are the truth).{whole_at}\n\n{}\n\n", record.trim_end());
             let about = text.len() as u64 / 4; // the owner's message goes either way
             let ids: Vec<usize> = turns.iter().map(|j| j.id).collect();
             (!fresh || resume.is_none() || about * 2 <= fills).then_some((fresh, text, about, span, whole, ids))
@@ -1409,7 +1596,7 @@ impl Session {
         let mut kept = Vec::new();
         let mut used = 0;
         for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, i + 1 == turns.len(), false);
+            let part = render(j, i + 1 == turns.len() || j.talk || j.asked_by.is_some(), false);
             if used + part.len() > RECORD_CHARS && !kept.is_empty() {
                 kept.push(format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1));
                 break;
@@ -1454,7 +1641,7 @@ impl Session {
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
-                             codex_turn: None, connectors: false, reached: false, model: None, counted: false,
+                             codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None) });
         Ok(id)
     }
@@ -1481,9 +1668,19 @@ impl Session {
         }
         // A turn in the owner's folder edits it, unless in read mode; a write turn edits its own copy.
         let edits = write || self.mode != Mode::Read;
+        // a specialist of the owner's: what makes it one, or no turn at all
+        let (own, own_model, own_tools) = match own_file(spec)? {
+            Some(file) => (Some(file.text), file.model, file.tools),
+            None => (None, None, None),
+        };
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
         let _ = fs::write(dir.join("prompt.txt"), prompt);
+        if let Some(own) = &own && let Err(e) = fs::write(dir.join("agent.md"), own) {
+            let e = format!("{name}'s instructions could not be kept for its turn: {e}");
+            self.end(id, Status::Failed(e.clone()));
+            return Err(e);
+        }
         let cwd = if write {
             // The copy starts from the folder as it is now, uncommitted changes included, so its change applies
             // back onto it.
@@ -1562,6 +1759,21 @@ impl Session {
                 // for the API (codex-cli 0.165.0: a new turn in each mode, and a resumed one). The thread's settings
                 // go in thread/start or thread/resume; turn/start follows once the thread's id is known.
                 cmd.arg("app-server");
+                // The means to ask another agent here in the middle of the turn, as Claude's turn is given them
+                // (`serve_asks`): one MCP server in Codex's settings, for this run only. The values are TOML, and a
+                // JSON string or list of strings reads as the same TOML.
+                let others = if write || prompt.trim() == "/compact" { Vec::new() } else { self.askable(agent) };
+                if !others.is_empty() {
+                    let mut args = vec!["ask-server".to_string(), dir.to_string_lossy().into_owned()];
+                    args.extend(others.iter().map(|a| a.name().to_string()));
+                    cmd.args(["-c", &format!("mcp_servers.ringo.command={}", serde_json::json!(self.asker))]);
+                    cmd.args(["-c", &format!("mcp_servers.ringo.args={}", serde_json::json!(args))]);
+                    // Its one tool is approved ahead: a turn that may not ask for approvals (read and ask mode) was
+                    // otherwise refused it ("ask_agent required approval, but this session's policy disallows
+                    // approvals", codex-cli 0.167.0). The turn it starts looks and does not touch.
+                    cmd.args(["-c", "mcp_servers.ringo.default_tools_approval_mode=\"approve\""]);
+                    self.jobs[id - 1].can_ask = true;
+                }
                 let auto = edits && self.mode == Mode::Auto;
                 if edits {
                     // Auto: the sandbox has the network, for git, gh and package installs, and Codex's own reviewer
@@ -1596,9 +1808,19 @@ impl Session {
                 if auto {
                     thread["approvalsReviewer"] = "auto_review".into();
                 }
-                // Kept by the thread once it is given; given on resuming too, for a thread started without it
-                if self.codex_told_to_use_ringo() {
-                    thread["developerInstructions"] = CODEX_IN_RINGO.into();
+                // the owner's choice of model (/model); given on resuming too, so a conversation goes on with it
+                if let Some(model) = self.models.get(&agent) {
+                    thread["model"] = model.as_str().into();
+                }
+                // Kept by the thread once it is given; given on resuming too, for a thread started without it. A
+                // specialist's instructions go the same way, ahead of it: for its turns they stand in for any
+                // developer instructions in the owner's Codex settings, which the thread's replace.
+                let told = self.codex_told_to_use_ringo().then_some(CODEX_IN_RINGO);
+                match (&own, told) {
+                    (Some(own), told) => thread["developerInstructions"] =
+                        [&*String::from_utf8_lossy(own), told.unwrap_or("")].join("\n\n").trim_end().into(),
+                    (None, Some(told)) => thread["developerInstructions"] = told.into(),
+                    (None, None) => {}
                 }
                 let method = match &resume {
                     Some(id) => {
@@ -1624,12 +1846,27 @@ impl Session {
                 // The reply streams as it is written (--include-partial-messages); neither changes any tokens.
                 cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                           "--include-partial-messages", "--replay-user-messages"]);
-                if self.mode != Mode::Read && connectors {
+                // whom this turn may ask in the middle of its work (see below); a turn in its own copy hears no one
+                // Only when the owner's message names one of them: the tool takes the turn out of safe mode (below),
+                // and every other turn of Claude's stays as it was, to the argument.
+                let others = if write || prompt.trim() == "/compact" { Vec::new() } else { self.askable(agent) };
+                let others: Vec<Agent> = others.into_iter().filter(|_| names_agent(prompt, &self.askable(agent))).collect();
+                let can_ask = !others.is_empty();
+                // a turn that would have run in safe mode, and has the tool instead (see below)
+                let lean_asks = can_ask && !(self.mode != Mode::Read && (spec.skills || connectors));
+                if self.mode != Mode::Read && (spec.skills || connectors) {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
                     // Without CLAUDE.md the owner's instruction to use Ringo cannot start Ringo again either.
+                    // A specialist the owner set up with skills keeps those too: its instructions name them, and the
+                    // owner chose their cost for this agent's turns alone. Not in read mode, where no turn loads the
+                    // owner's customizations: a connector's tool their own settings allow could write, and read
+                    // mode's promise is that nothing can.
                     cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
-                    cmd.args(["--agent", "claude", "--disable-slash-commands"]);
+                    cmd.args(["--agent", "claude"]);
+                    if !spec.skills {
+                        cmd.arg("--disable-slash-commands");
+                    }
                 } else {
                     // --safe-mode drops the owner's CLAUDE.md, skills, plugins, hooks and MCP servers: one trivial
                     // turn measured 16.6k tokens instead of 50.2k, with the subscription login and built-in subagents
@@ -1640,7 +1877,19 @@ impl Session {
                     if prompt.trim() != "/compact" {
                         cmd.arg("--disable-slash-commands");
                     }
-                    cmd.arg("--safe-mode");
+                    match can_ask {
+                        false => cmd.arg("--safe-mode"),
+                        // Safe mode would drop the one tool this turn is given with the rest (checked live, Claude
+                        // Code 2.1.322: the tool was not there). So what it drops is turned off piece by piece: no
+                        // CLAUDE.md or memory, no commands or skills (above), no main agent of the owner's, no hooks
+                        // (in the settings below), and no MCP server but the one given below. The owner's settings
+                        // files still load, as they do in safe mode: their deny rules, model and effort are theirs
+                        // to keep. Skipping those files (--setting-sources "") was 361 tokens leaner and dropped the
+                        // owner's own deny rules, so it was not taken. What is left over safe mode: the owner's
+                        // plugins and agent files load (one trivial turn: 10,655 tokens against 10,069).
+                        true => cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+                            .args(["--agent", "claude", "--strict-mcp-config"]),
+                    };
                 }
                 // Ask: Claude's default permission checks, every prompt sent to Ringo (`--permission-prompt-tool
                 // stdio`, the Agent SDK's own channel; `--permission-prompts host` alone denies). Auto: Claude's
@@ -1673,12 +1922,39 @@ impl Session {
                     // CLAUDE.md, where such a rule would otherwise live. It also drops Claude Code's attribution reminder
                     // from every turn: 626 bytes less a request (measured against a local capture server).
                     // Codex 0.165.0 adds none (codex_git_commit is removed and off) and agy has no such line.
-                    let settings = serde_json::json!({"permissions": {"ask": self.always_ask},
-                                                      "attribution": {"commit": "", "pr": ""}});
-                    cmd.arg("--settings").arg(settings.to_string());
-                    if !self.allowed.is_empty() {
-                        cmd.arg("--allowedTools").args(&self.allowed);
+                    let mut settings = serde_json::json!({"permissions": {"ask": self.always_ask},
+                                                          "attribution": {"commit": "", "pr": ""}});
+                    if lean_asks {
+                        settings["disableAllHooks"] = true.into();
                     }
+                    cmd.arg("--settings").arg(settings.to_string());
+                } else if lean_asks {
+                    cmd.arg("--settings").arg(r#"{"disableAllHooks":true}"#);
+                }
+                // The means to ask another agent here in the middle of the turn (`serve_asks`): one tool, served by
+                // this program from the turn's own folder, allowed without asking in every mode, because the turn
+                // it starts looks and does not touch. Not for a turn in its own copy, which hears no one.
+                let mut allowed: Vec<String> = if self.mode != Mode::Read { self.allowed.iter().cloned().collect() } else { Vec::new() };
+                if can_ask {
+                    let mut args = vec!["ask-server".to_string(), dir.to_string_lossy().into_owned()];
+                    args.extend(others.iter().map(|a| a.name().to_string()));
+                    cmd.arg("--mcp-config")
+                        .arg(serde_json::json!({"mcpServers": {"ringo": {"command": self.asker, "args": args}}}).to_string());
+                    allowed.push("mcp__ringo__ask_agent".into());
+                    self.jobs[id - 1].can_ask = true;
+                }
+                if !allowed.is_empty() {
+                    cmd.arg("--allowedTools").args(&allowed);
+                }
+                // the owner's choice of model (/model): an alias or a full name, as Claude Code's --model takes it.
+                // With none, a specialist runs on the model its file names, as it does in Claude Code.
+                if let Some(model) = self.models.get(&agent).or(own_model.as_ref()) {
+                    cmd.args(["--model", model]);
+                }
+                // A specialist's file may list the tools it uses: Claude Code then offers it those of its own and no
+                // others. It can only narrow: what this mode denies above stays denied.
+                if let Some(tools) = &own_tools {
+                    cmd.arg("--tools").arg(tools.join(",")); // an empty list is Claude Code's "" for no tools
                 }
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", effort]);
@@ -1706,19 +1982,30 @@ impl Session {
                         None
                     }
                 };
-                let append = match (rules, doc) {
-                    (Some(rules), Some(doc)) => {
+                let append = match (rules, &own, doc) {
+                    (None, None, doc) => doc,
+                    (Some(_), None, None) => Some(self.rules_path()),
+                    (None, Some(_), None) => Some(dir.join("agent.md")),
+                    // the owner's rules, then what makes this agent a specialist, then the project's own file
+                    (rules, own, doc) => {
                         let both = dir.join("instructions.md");
-                        match fs::read(&doc).and_then(|text| fs::write(&both, [rules.trim_ascii_end(), b"\n\n", &text].concat())) {
+                        let joined = doc.as_ref().map(fs::read).transpose().map(|text| {
+                            [rules.as_deref().map(<[u8]>::trim_ascii_end), own.as_deref(), text.as_deref()]
+                                .into_iter().flatten().collect::<Vec<_>>().join(&b"\n\n"[..])
+                        });
+                        match joined.and_then(|bytes| fs::write(&both, bytes)) {
                             Ok(()) => Some(both),
+                            // a specialist's turn still carries what makes it one
+                            Err(e) if own.is_some() => {
+                                self.jobs[id - 1].push_log(format!("your rules.md and the project's instructions are left out of this turn: {e}"));
+                                Some(dir.join("agent.md"))
+                            }
                             Err(e) => {
                                 self.jobs[id - 1].push_log(format!("your rules.md is left out of this turn: {e}"));
-                                Some(doc)
+                                doc
                             }
                         }
                     }
-                    (Some(_), None) => Some(self.rules_path()),
-                    (None, doc) => doc,
                 };
                 if let Some(file) = append {
                     cmd.arg("--append-system-prompt-file").arg(file);
@@ -2078,6 +2365,22 @@ impl Session {
 
     /// `end` with the job's reply already read.
     fn end_with(&mut self, id: usize, status: Status, reply: String) {
+        // A turn another agent asked for: what it said is that agent's answer. A turn that ends takes the turns it
+        // asked for with it: no one is waiting for them.
+        if let Some((_, answer)) = self.jobs[id - 1].asked_by.clone() {
+            let who = match self.jobs[id - 1].kind { Kind::Agent { agent, .. } => agent.name(), _ => "it" };
+            match &status {
+                Status::Done if !reply.trim().is_empty() => answer_ask(&answer, true, reply.trim()),
+                Status::Done => answer_ask(&answer, false, &format!("{who} gave no answer")),
+                Status::Failed(why) => answer_ask(&answer, false, &format!("{who} could not answer: {why}")),
+                _ => answer_ask(&answer, false, &format!("{who} was stopped before it answered")),
+            }
+        }
+        let left: Vec<usize> = self.jobs.iter().filter(|j| j.running() && j.asked_by.as_ref().is_some_and(|(by, _)| *by == id))
+            .map(|j| j.id).collect();
+        for asked in left {
+            let _ = self.kill(asked);
+        }
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
         job.activity = match &status {
@@ -2187,7 +2490,7 @@ impl Session {
 
     /// Folds pending events into the jobs; true when anything changed.
     pub fn pump(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.take_asks();
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -2641,6 +2944,21 @@ pub fn add_custom_agent(root: &Path, entry: serde_json::Value) -> Result<Agent, 
     Agent::register(spec)
 }
 
+/// Takes the owner's entry `name` out of `root`/agents.json, and out of the agents set up there. This process keeps
+/// knowing the name until it ends (`Agent::register`). False when there was no such entry.
+pub fn remove_custom_agent(root: &Path, name: &str) -> Result<bool, String> {
+    with_agents_lock(root, || {
+        let mut file = read_agents_file(root);
+        let named = |v: &serde_json::Value| v.as_str().or(v["name"].as_str()) == Some(name);
+        let Some(custom) = file["custom"].as_array_mut().filter(|c| c.iter().any(named)) else { return Ok(false) };
+        custom.retain(|v| !named(v));
+        if let Some(agents) = file["agents"].as_array_mut() {
+            agents.retain(|v| !named(v));
+        }
+        write_agents_file(root, &file).map(|_| true)
+    })
+}
+
 /// The agents set up with `ringo setup` (state_root()/agents.json), the owner's own entries registered first;
 /// None before the first setup.
 pub fn configured_agents() -> Option<Vec<Agent>> {
@@ -2653,11 +2971,15 @@ pub fn configured_agents() -> Option<Vec<Agent>> {
 
 /// Saves which agents are set up; the owner's own entries are kept as they are.
 pub fn save_agents(agents: &[Agent]) -> Result<(), String> {
-    let root = state_root();
-    with_agents_lock(&root, || {
-        let mut file = read_agents_file(&root);
+    save_agents_in(&state_root(), agents)
+}
+
+/// `save_agents` for the state folder `root`.
+pub fn save_agents_in(root: &Path, agents: &[Agent]) -> Result<(), String> {
+    with_agents_lock(root, || {
+        let mut file = read_agents_file(root);
         file["agents"] = agents.iter().map(|a| a.name()).collect::<Vec<_>>().into();
-        write_agents_file(&root, &file)
+        write_agents_file(root, &file)
     })
 }
 
@@ -2805,6 +3127,144 @@ pub fn plan(agent: Agent, program: &Path) -> Result<Plan, String> {
         }
         Adapter::Agy | Adapter::Plain => Err("reports no plan usage".into()),
     }
+}
+
+/// Whether the owner's message names one of `agents`, as a word of its own in any case ("ask codex", "Codex:").
+fn names_agent(prompt: &str, agents: &[Agent]) -> bool {
+    let prompt = prompt.to_lowercase();
+    let mut words = prompt.split(|c: char| !(c.is_alphanumeric() || "-_.".contains(c))).map(|w| w.trim_matches('.'));
+    words.any(|w| agents.iter().any(|a| a.name() == w))
+}
+
+/// Asks one turn may make of other agents: with its own turn, an owner's message costs at most `1 + MAX_ASKS` turns
+/// this way (a turn that was asked for cannot ask in its turn).
+pub const MAX_ASKS: usize = 3;
+
+/// How long a turn waits for the agent it asked, at most.
+const ASK_WAIT: Duration = Duration::from_secs(900);
+
+/// `ringo ask-server DIR PEER...`: the MCP server (stdio, one JSON-RPC message a line) a turn is given so its agent
+/// can ask another agent here a question in the middle of its work. A call writes the ask into the turn's own folder
+/// (`DIR/asks/N.json`) and waits for the answer beside it (`N.answer`): the shell that runs the turn starts the
+/// other agent's and writes what it said (`Session::take_asks`). So the server reaches nothing by itself, and a
+/// turn asks only whom its shell lets it.
+pub fn serve_asks(dir: &Path, peers: &[String], input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+    use serde_json::json;
+    let mut asked = 0;
+    for line in input.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line?) else { continue };
+        let Some(id) = msg.get("id").cloned() else { continue }; // a notification: nothing to answer
+        let result = match msg["method"].as_str().unwrap_or("") {
+            "initialize" => Ok(json!({"protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
+                                      "capabilities": {"tools": {}},
+                                      "serverInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}})),
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({"tools": [{
+                "name": "ask_agent",
+                "description": format!("Ask another AI agent that works in this folder a question while you work, and get \
+                                        its answer: {}. It reads the files itself and changes nothing. Each ask is a whole \
+                                        turn of that agent's, so ask when a second view would change what you do.",
+                                       peers.join(", ")),
+                "inputSchema": {"type": "object", "required": ["agent", "question"],
+                                "properties": {"agent": {"type": "string", "enum": peers}, "question": {"type": "string"}}}}]})),
+            "tools/call" => {
+                let args = &msg["params"]["arguments"];
+                let said = match (msg["params"]["name"].as_str(), args["agent"].as_str(), args["question"].as_str()) {
+                    (Some("ask_agent"), Some(agent), Some(question)) if !question.trim().is_empty() =>
+                        ask(&dir.join("asks"), &mut asked, agent, question),
+                    _ => Err("ask_agent takes an agent and a question".to_string()),
+                };
+                let failed = said.is_err();
+                Ok(json!({"content": [{"type": "text", "text": said.unwrap_or_else(|e| e)}], "isError": failed}))
+            }
+            other => Err(json!({"code": -32601, "message": format!("no method {other}")})),
+        };
+        let reply = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+        };
+        writeln!(output, "{reply}")?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
+/// One ask, from the server's side: written whole, then waited on. It is counted (`asked`) once it is written: the
+/// session looks for the asks in order, so one that never reached the folder must not take a number.
+fn ask(asks: &Path, asked: &mut usize, agent: &str, question: &str) -> Result<String, String> {
+    private_dir(asks)?;
+    let n = *asked + 1;
+    let (file, part) = (asks.join(format!("{n}.json")), asks.join(format!("{n}.part")));
+    fs::write(&part, serde_json::json!({"agent": agent, "question": question}).to_string())
+        .and_then(|_| fs::rename(&part, &file)).map_err(|e| format!("the ask could not be written: {e}"))?;
+    *asked = n;
+    let (answer, until) = (asks.join(format!("{n}.answer")), Instant::now() + ASK_WAIT);
+    loop {
+        if let Some(v) = fs::read(&answer).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            return if v["ok"] == true { Ok(text) } else { Err(text) };
+        }
+        if Instant::now() > until {
+            return Err(format!("{agent} did not answer in time: go on without it"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// An ask's answer, written whole and renamed into place, so the server never reads half of one.
+fn answer_ask(file: &Path, ok: bool, text: &str) {
+    let part = file.with_extension("answer.part");
+    let _ = fs::write(&part, serde_json::json!({"ok": ok, "text": text}).to_string()).and_then(|_| fs::rename(&part, file));
+}
+
+/// A model an agent's plan offers: the name its program takes, what its maker says of it, and whether it is the one
+/// the agent runs when none is chosen.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Model {
+    pub name: String,
+    pub what: String,
+    pub default: bool,
+}
+
+/// Whether an agent's turns can be given a model (`Session::models`): Claude Code and Codex take one; agy and a
+/// plain agent choose their own.
+pub fn takes_model(agent: Agent) -> bool {
+    matches!(agent.spec().adapter, Adapter::Claude | Adapter::Codex)
+}
+
+/// A model's name as it can go to an agent's program: one word of letters, digits and `. _ - : / [ ]`.
+pub fn valid_model(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 80 && name.chars().all(|c| c.is_ascii_alphanumeric() || "._-:/[]".contains(c))
+        && !name.starts_with('-')
+}
+
+/// The models an agent's plan offers, asked of the agent with no model call. Codex's app-server lists them
+/// (`model/list`, about 0.3 s); Claude Code has no such list, so its models are named by alias or full name.
+pub fn models(agent: Agent, program: &Path) -> Result<Vec<Model>, String> {
+    if agent.spec().adapter != Adapter::Codex {
+        return Err("has no list of its models to read".into());
+    }
+    let mut cmd = Command::new(program);
+    cmd.args(["app-server", "-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\"",
+              "-c", "analytics.enabled=false"]);
+    let hello = serde_json::json!({"id": 1, "method": "initialize",
+                                   "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
+    let ask = serde_json::json!({"id": 2, "method": "model/list", "params": {}});
+    let v = ask_once(cmd, &[hello, serde_json::json!({"method": "initialized"}), ask], |v| v["id"] == 2,
+                     Duration::from_secs(15))?;
+    if let Some(e) = v.get("error") {
+        return Err(parse::short(e["message"].as_str().unwrap_or("an error"), 120));
+    }
+    Ok(codex_models(&v["result"]))
+}
+
+/// Codex's `model/list` answer (codex-cli 0.167.0): the models it shows, the default first as it sends them.
+pub fn codex_models(r: &serde_json::Value) -> Vec<Model> {
+    r["data"].as_array().into_iter().flatten().filter(|m| m["hidden"] != true)
+        .filter_map(|m| Some(Model { name: m["model"].as_str().or(m["id"].as_str())?.to_string(),
+                                     what: m["description"].as_str().unwrap_or("").to_string(),
+                                     default: m["isDefault"] == true }))
+        .collect()
 }
 
 fn claude_window(kind: &str) -> String {

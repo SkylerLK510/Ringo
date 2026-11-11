@@ -27,11 +27,13 @@ Prompts and plans come from RINGO_HOME (default: the checkout ringo was built fr
 ";
 
 fn main() -> ExitCode {
-    if std::env::var_os("RINGO_CHILD").is_some() {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    // Ringo does not start inside a turn it launched. The one thing such a turn runs of Ringo is its own ask server,
+    // which starts nothing: it writes the ask into the turn's folder and waits for the shell to answer (`serve_asks`).
+    if std::env::var_os("RINGO_CHILD").is_some() && args.first().and_then(|a| a.to_str()) != Some("ask-server") {
         eprintln!("ringo: refusing to start inside an agent that ringo launched (RINGO_CHILD is set)");
         return ExitCode::from(2);
     }
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     match args.first().and_then(|a| a.to_str()) {
         None if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => tui::run(tui::Start::New),
         Some("--resume" | "-r") if args.len() == 1 && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
@@ -61,6 +63,18 @@ fn main() -> ExitCode {
         Some("wait") => {
             let rest: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
             ExitCode::from(ringo_cli::rt::wait::main(&rest) as u8)
+        }
+        // `ringo ask-server DIR PEER...`: serves one turn's asks of other agents; an agent's program runs it, not a person
+        Some("ask-server") => {
+            let rest: Vec<String> = args[1..].iter().map(|a| a.to_string_lossy().into_owned()).collect();
+            let Some((dir, peers)) = rest.split_first() else {
+                eprintln!("usage: ringo ask-server DIR PEER...");
+                return ExitCode::from(2);
+            };
+            match ringo_cli::serve_asks(std::path::Path::new(dir), peers, std::io::stdin().lock(), std::io::stdout().lock()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(_) => ExitCode::FAILURE,
+            }
         }
         Some("review" | "design" | "work") => pipeline(args),
         _ => harness(args),

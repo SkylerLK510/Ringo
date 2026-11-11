@@ -267,22 +267,23 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 
 /// Ringo's own update, in the background: the newest `main` from where this binary came, built in a folder of its
 /// own (`install/COMMIT` in Ringo's state, its prompts and pipelines with it). Only a binary built from a clean
-/// checkout of a commit on `main` updates: one with changes of its own, from a branch ahead of main, or run with
-/// RINGO_HOME is the owner's to update. The line to show and the built binary, which `install` puts where this one
+/// checkout of a commit on `main` updates: one with changes of its own, from a branch, or run with RINGO_HOME is the
+/// owner's to update, and is told that a newer one is out and how to get it. The line to show and the built binary
+/// (none for a build that is the owner's to update, or one that did not build), which `install` puts where this one
 /// is when the shell ends or restarts (an open shell keeps its own version until then); None: nothing to say.
 pub fn update_ringo(exe: &Path) -> Option<(String, PathBuf)> {
     let (home, install) = (ringo_cli::ringo_home(), ringo_cli::state_root().join("install"));
     if home.starts_with(&install) {
         let _ = fs::write(home.join(".used"), ""); // this version is open: pruning leaves it (see prune)
     }
-    if std::env::var_os("RINGO_NO_UPDATE_CHECK").is_some() || std::env::var_os("RINGO_HOME").is_some()
-        || exe.as_os_str().is_empty() {
+    if std::env::var_os("RINGO_NO_UPDATE_CHECK").is_some() || exe.as_os_str().is_empty() {
         return None;
     }
     if cfg!(windows) {
         let _ = fs::remove_file(exe.with_extension("old")); // the one the last install moved aside
     }
-    update_from(ringo_cli::COMMIT, &home, &install, OsStr::new("cargo"))
+    let yours = std::env::var_os("RINGO_HOME").map(|_| "RINGO_HOME is set");
+    update_from(ringo_cli::COMMIT, &home, &install, OsStr::new("cargo"), yours)
 }
 
 /// The binary a shell's pipelines run: its version's own copy when the updater built it (never replaced), so they
@@ -292,11 +293,20 @@ pub fn own_binary(exe: &Path) -> PathBuf {
     if ringo_cli::ringo_home().starts_with(ringo_cli::state_root().join("install")) && own.is_file() { own } else { exe.to_path_buf() }
 }
 
-fn update_from(commit: &str, home: &Path, install: &Path, cargo: &OsStr) -> Option<(String, PathBuf)> {
-    if commit.is_empty() || git(home, &["rev-parse", "HEAD"])? != commit
-        || !git(home, &["status", "--porcelain", "--untracked-files=no"])?.is_empty() {
-        return None;
-    }
+/// `yours`: why this build is the owner's to update whatever its commit (RINGO_HOME is set).
+/// A build Ringo does not update is still told when main has changes it lacks. Before, it was told nothing: a shell
+/// installed from a checkout with changes of its own stayed a week behind main without a word.
+fn update_from(commit: &str, home: &Path, install: &Path, cargo: &OsStr, yours: Option<&str>) -> Option<(String, PathBuf)> {
+    let head = git(home, &["rev-parse", "HEAD"])?;
+    let changed = !git(home, &["status", "--porcelain", "--untracked-files=no"])?.is_empty();
+    let yours = yours.or(match () {
+        _ if commit.is_empty() => Some("it was built with changes of its own"),
+        _ if head != commit => Some("its checkout has moved on since it was built"),
+        _ if changed => Some("its checkout has changes of its own"),
+        _ => None,
+    });
+    // what main is compared with: the commit this binary is, or where its checkout is when it has none
+    let commit = if commit.is_empty() { head.as_str() } else { commit };
     fs::create_dir_all(install).ok()?;
     let (repo, log) = (install.join("repo.git"), install.join("update.log"));
     if !repo.join("HEAD").is_file() {
@@ -315,11 +325,26 @@ fn update_from(commit: &str, home: &Path, install: &Path, cargo: &OsStr) -> Opti
         return None; // offline: say nothing, ask again next time
     }
     let new = git(&repo, &["rev-parse", "main"])?;
-    if new == commit || git(&repo, &["merge-base", "--is-ancestor", commit, &new]).is_none() {
-        return None; // up to date, or this build is not on main
+    if new == commit {
+        return None; // up to date
     }
-    let changes = git(&repo, &["rev-list", "--count", &format!("{commit}..{new}")]).unwrap_or_default();
     let short = &new[..new.len().min(7)];
+    let on_main = git(&repo, &["merge-base", "--is-ancestor", commit, &new]).is_some();
+    // a branch that already holds main's newest lacks nothing (asked of the checkout, which has the branch)
+    if !on_main && git(home, &["merge-base", "--is-ancestor", &new, commit]).is_some() {
+        return None;
+    }
+    // how many of main's changes it lacks; not known for a commit main's history does not have
+    let changes = git(&repo, &["rev-list", "--count", &format!("{commit}..{new}")]).unwrap_or_default();
+    if let Some(why) = yours.or((!on_main).then_some("it is from a commit that is not on main")) {
+        let lacks = match changes.as_str() {
+            "" | "0" => String::new(),
+            "1" => " (1 new change)".into(),
+            n => format!(" ({n} new changes)"),
+        };
+        return Some((format!("  Ringo {short} is out{lacks}. This build does not update itself ({why}): git pull in {}, then \
+                              cargo install --path cli there", home.display()), PathBuf::new()));
+    }
     let dir = install.join(&new);
     let bin = dir.join(if cfg!(windows) { "ringo.exe" } else { "ringo" });
     if !bin.is_file() {
@@ -556,7 +581,7 @@ mod tests {
         fs::write(&cargo, format!("#!/bin/sh\necho x >> '{}/builds'\nmkdir -p \"$CARGO_TARGET_DIR/release\"\n\
             printf 'new %s %s' \"$RINGO_COMMIT\" \"$RINGO_BUILD_HOME\" > \"$CARGO_TARGET_DIR/release/ringo\"\n", dir.display())).unwrap();
         fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).unwrap();
-        let update = |commit: &str| update_from(commit, &home, &install, cargo.as_os_str());
+        let update = |commit: &str| update_from(commit, &home, &install, cargo.as_os_str(), None);
         let builds = || fs::read_to_string(dir.join("builds")).map(|t| t.lines().count()).unwrap_or(0);
 
         let said = format!("  Ringo updated to {} (1 new change) · /restart to apply", &b[..7]);
@@ -579,11 +604,28 @@ mod tests {
         fs::remove_dir(install.join("build.lock")).unwrap();
         assert!(update(&a).is_some_and(|(l, _)| l.contains(&c[..7]) && l.contains("2 new changes")));
 
+        // A build that is the owner's to update is not built, and is told what is out and how to get it
+        let (built, out) = (builds(), format!("  Ringo {} is out", &c[..7]));
+        let how = format!("git pull in {}, then cargo install --path cli there", home.display());
+        let told = |commit: &str, yours: Option<&str>| {
+            let (line, bin) = update_from(commit, &home, &install, cargo.as_os_str(), yours).expect("told");
+            assert!(bin.as_os_str().is_empty() && line.ends_with(&how), "{line}");
+            line
+        };
         fs::write(home.join("a.txt"), "mine").unwrap();
-        assert_eq!(update(&a), None, "a checkout with changes of its own is the owner's to update");
+        assert_eq!(told(&a, None), format!("{out} (2 new changes). This build does not update itself (its checkout has changes of its own): {how}"));
+        assert!(told(&a, Some("RINGO_HOME is set")).contains("(RINGO_HOME is set)"));
         let d = commit(&home, "mine");
-        assert_eq!(update(&d), None, "a build ahead of main is the owner's too");
-        assert_eq!(update(&a), None, "and one whose checkout moved on since it was built");
+        assert_eq!(told(&d, None), format!("{out}. This build does not update itself (it is from a commit that is not on main): {how}"));
+        assert!(told(&a, None).contains("(2 new changes). This build does not update itself (its checkout has moved on since it was built)"));
+        assert!(told("", None).contains("(it was built with changes of its own)"), "a build with no commit is compared from its checkout");
+        assert_eq!(builds(), built, "none of them is built");
+        // a branch that already holds main's newest lacks nothing, and neither does a build at main's newest
+        run(&home, &["fetch", "-q", "origin"]);
+        run(&home, &["reset", "-q", "--hard", "origin/main"]);
+        assert_eq!(update(""), None, "at main's newest, with no commit of its own");
+        let e = commit(&home, "ahead");
+        assert_eq!((update(&e), update("")), (None, None), "ahead of main with all of main in it");
         let _ = fs::remove_dir_all(&dir);
     }
 

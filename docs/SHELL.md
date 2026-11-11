@@ -82,6 +82,73 @@ Fields: `name` (letters, digits, `-`, `_`, `.`), `program` (default: the name; a
 path), which then works in copies as that agent does, and in your folder too with `"read": true`. The agents Ringo ships are the same kind of entry,
 in `cli/src/agents.json`; how each protocol is spoken stays in code.
 
+### Agents of your own
+
+Claude Code and Codex let a person or a team write a specialist: a file of standing instructions (what it knows,
+how it works, what it must not do) that makes the model that agent. Until this change such a specialist could not
+work in Ringo: a Claude turn runs in safe mode, which drops custom agents with the rest of the owner's
+customizations, and nothing gave Codex one either. Now it is an agent like any other:
+
+```
+/agent add billing ~/notes/billing.md          Claude, with that file as its standing instructions
+/agent add billing ~/notes/billing.md codex    the same specialist on the Codex plan
+/agent add shop-billing                        an agent made for Claude Code, by its name
+/agent add billing ~/notes/billing.md skills   on Claude, with your Claude Code skills, plugins and connectors
+/agent                                         your own agents, and the Claude Code agent files found
+/agent remove billing                          the entry goes; the file is yours and stays
+```
+
+`/agent add` writes an entry in your `agents.json` (`"instructions": PATH`, the base agent's `adapter` and `program`,
+`"read": true`, and `"skills": true` when asked) and sets the agent up at once. A name alone, or a word that is not
+a file, is looked up as `NAME.md` in `.claude/agents` of this folder and then of your home folder, where Claude
+Code keeps agent files; `/agent` lists the ones found that are not agents here yet.
+
+How the instructions reach the model, each turn:
+
+- The file is read when the turn starts, so an edit is in the next turn. A leading `---` block (a Claude Code agent
+  file opens with its name and description there) is left out. A file that is missing, empty or over 400,000 bytes
+  stops the turn before it starts: a turn without them would not be that agent's.
+- **Claude:** appended to the system prompt (`--append-system-prompt-file`), after your `rules.md` and before the
+  project's `CLAUDE.md` or `AGENTS.md`. The turn stays in safe mode, as lean as any other.
+- **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
+  turns they stand in for any `developer_instructions` in your Codex settings.
+- **The file's `model` and `tools` lines (Claude only):** an agent file made for Claude Code can name both in its
+  opening block. The model is the one the specialist runs on unless you chose one with `/model` (`inherit` means
+  the agent's own). The tools listed are the only built-in tools it is offered (`--tools`); `tools: Read, Grep`, a
+  `[Read, Grep]` list and `- Read` lines all read the same. It can only narrow: what the mode denies stays denied,
+  and a connector's tools are not Ringo's to offer. A line that names none Ringo can pass on (`tools: []`, or only
+  a connector's) offers none, since it was written to narrow; `default` in it means Claude Code's whole set. On Codex both lines are left out, because they name Claude
+  Code's models and tools, and `/agent add` says so.
+- **`skills` (Claude only):** outside read mode the turn runs without safe mode and keeps Claude Code's commands,
+  so your skills, plugins, hooks and connectors load. Your own `CLAUDE.md` and memory still do not (so an
+  instruction there to use Ringo cannot start Ringo inside Ringo). In read mode the turn is as lean as any other
+  and loads none of it: a connector's tool that your own settings allow could write, and read mode's promise is
+  that nothing can. So a specialist in a talk (`/discuss`, always read mode) goes without its skills.
+
+A specialist is a separate agent: its own conversation, its own row in the side panel and in `/usage`, its own
+`/model`. In the conversation the agents share it hears what the others did and they hear it (see
+[One conversation](#one-conversation-and-a-fresh-start-past-64k)). It runs on the plan of the agent it is made from,
+so the plan's gauge shows once, under that agent's name.
+
+Checked live with a team's 49.6k-character agent file, one trivial read-mode turn each
+(`cargo run --example own -- REPO BASE FILE [skills]`; Claude Code 2.1.322, codex-cli 0.167.0; one run each, so an
+instance and not a rate):
+
+| Turn | Tokens | Time | What came back |
+|------|--------|------|----------------|
+| the specialist on Claude | 30,002 | 4.5 s | answered as the specialist, naming what its file says it knows |
+| the specialist on Codex | 25,596 | 3.9 s | the same |
+| on Claude, asked to name skills it can invoke | 29,857 | 3.4 s | "NONE": no Skill tool in a safe-mode turn |
+| on Claude with `skills`, same question, ask mode | 42,784 | 3.0 s | named three of the owner's skills |
+| a 23-byte file with `model: sonnet` and `tools: Read, Grep`, asked to list its tools | 4,691 | 1.7 s | ran `claude-sonnet-5-5`; listed Grep and Read, nothing else |
+| the same with `tools: []` | 2,322 | 2.0 s | "NONE" |
+
+The same turn with a ten-byte instructions file was 10,069 tokens on Claude and 13,375 on Codex, so this file costs
+about 20k tokens a call on Claude and 12k on Codex, and `skills` about 13k more with 99 skills installed. That is
+the cost of the feature, paid only by the specialist's own turns: a turn of `claude` or `codex` is unchanged.
+
+Not done: agy and plain agents take no instructions, and a removed name stays taken until Ringo restarts.
+
 ### Who takes which turn
 
 Claude owns writing and reading code: a plain line goes to Claude when it is set up, else to Codex, else to any
@@ -92,6 +159,140 @@ agent, and the input box always names it (` claude ❯ `). Waiting lines show wh
 It is one conversation: an agent is told what the others did since its last turn (see
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)). Codex owns the abstract work: Ringo's pipelines (`/research`,
 `/design`, `/review`) and `/ask` run on it.
+
+### The agents' talk
+
+Working with several agents used to mean asking one, reading its answer, then typing `@codex what do you think?`
+and carrying each view to the next agent by hand. `/discuss TOPIC` has them talk it over among themselves while you
+read:
+
+```
+ you  /discuss Is this folder's layout fine as it is, or would you move anything?
+  claude and codex talk it over, one at a time, looking but not touching · at most 2 turns each · a line of
+  yours joins in · Esc stops them
+
+ claude  #1 · claude-fable-5-2
+  The layout is fine as it is and I would not move any file: ...
+
+ codex  #2 · gpt-6.1-sol
+  I agree with keeping the layout ... I'd keep the timeout default in Client::new() for now, because ...
+
+ claude  #3 · claude-fable-5-2
+  AGREED
+
+── the talk is over: no one has more to add · 3 turns · 0:32 · 90.0k tokens · /discuss goes on with it
+```
+
+How it works:
+
+- **Who:** every agent set up that works in this folder, or the ones named (`/discuss @claude @codex TOPIC`). An
+  agent of your own takes part like any other; one that works only in its own copy hears no one and is refused. It
+  needs the conversation the agents share, so `/separate` refuses it.
+- **Order:** one speaks at a time. The agent you talk to opens a topic. With no topic (`/discuss` alone) they talk
+  over the last turn, so the others answer the agent that took it.
+- **What each hears:** Ringo's record of the turns it was away for, as for any turn in the shared conversation
+  (see [One conversation](#one-conversation-and-a-fresh-start-past-64k)), so nothing is sent twice and no call
+  summarises anything. A talk's replies are heard whole (up to 6,000 characters), not by their first paragraph.
+  The topic is said once, to the first speaker; the others read it in the record.
+- **Read mode:** a talk's turns look and do not touch, whatever the session's mode. Acting on the outcome is your
+  next line.
+- **You:** a plain line typed while they talk joins in: the next speaker is sent it (`I add: ...`), and each agent
+  may answer once more. Esc stops the running turn and the talk. `@agent ...` still goes to that agent alone.
+- **The end:** a reply that is the one word AGREED adds nothing, and when every agent but the last to say
+  something has agreed, the talk is over. Otherwise it ends when each has spoken twice: with `n` agents a talk is
+  at most `2n` turns, and each line of yours adds at most `n`. It also ends when a turn fails or the next agent
+  is at work on something else. Its turns have no `done` rows of their own: the last row counts them all.
+
+Checked live through the real shell in a pty, Claude Code 2.1.322 and codex-cli 0.167.0 on a small Rust project,
+one run each:
+
+| Wording of the first turn | Turns | Time | Tokens | What happened |
+|---------------------------|-------|------|--------|---------------|
+| "Talk this over with codex, among yourselves" | 2 | 1:46 | 155.4k | Claude looked for a way to run Codex itself, reported that it could not reach it, and gave no view of its own; Codex replied AGREED |
+| "I want you and codex to talk this over ... Your reply is shown to them and theirs come back to you here" | 3 | 0:32 | 90.0k | Claude gave its view; Codex read the files, agreed on one point and differed on another with its reason; Claude replied AGREED |
+| the same, Claude and agy (agy 1.5.5), agy told where the whole record is | 2 | 0:41 | 117.0k | agy read the project's files, then opened the record, which is outside its folder: its turn ended with no reply, 82.5k tokens in |
+| the same, agy not told where it is | 4 | 1:40 | 165.2k | agy agreed and added a point; Claude differed on it with its reason; agy replied AGREED |
+
+The first wording was dropped: an agent told to talk to another, and not told that its words are carried, goes
+looking for the other. The second is what ships. A talk is about 30k tokens a turn here, most of it each agent
+reading the files for itself: it is the cost of asking each agent, without the typing in between.
+
+While they talk, `/separate` and taking a talker away (`/agent remove`) are refused, and `/clear` ends the talk with
+the turn then running: the conversation they talked in is gone.
+
+agy takes part as the others do, since the third run above. Every agent that goes on in the shared conversation is
+told where the whole record of the turns it missed is kept. That file is in Ringo's state folder, and a read agy has
+no permission for ends its turn (the others are refused such a read and go on). So agy is no longer told where it
+is: it gets the record itself, as before, and nothing to open. This holds for any turn of agy's after another
+agent's, not only in a talk.
+
+Not done: a talk under way ends with the shell: it is not kept across `/restart`.
+
+### An agent asks another
+
+An agent can ask another a question in the middle of its own turn and go on with the answer, whichever
+subscription each is on:
+
+```
+ you  @claude Would you move the 3000 ms timeout in src/client.rs into src/config.rs? Ask codex what it
+      thinks before you answer, then give me both views in two sentences.
+
+ claude  #1 · claude-fable-5-2
+  ✓ read 2 files, searched 1 time
+  asks codex: In this repo, src/client.rs hardcodes `timeout_ms: 3000` in `Client::new()`, while ...
+
+ codex  #2 · gpt-6-astra
+  Claude, I'd move the 3000 ms default into src/config.rs as a named constant ... The main caveat is that
+  timeout_ms is currently only stored: send() never reads it ...
+── ✓ done · 0:11 · 41.8k tokens
+
+ claude  #1 · claude-fable-5-2
+  Codex would move it into src/config.rs as a named constant ... I agree on moving it, though I'd make it a
+  timeout_ms() function mirroring retries() ...
+── ✓ done · 0:21 · 36.0k tokens
+```
+
+How it works:
+
+- **One tool.** The turn's agent is given `ask_agent(agent, question)`, served by `ringo ask-server`, an MCP
+  server on stdio that its program starts. A call writes the ask into the turn's own folder and waits. The shell
+  that runs the turn sees it, starts the other agent's turn and writes that turn's reply back. The server reaches
+  nothing by itself, so a turn asks only whom its shell lets it: the agents set up here that work in the folder.
+- **The turn it asks for** is the other agent's own, in this folder: read mode whatever the session's, told who
+  asks and what, its reply heard whole by the others afterwards. It is not given the tool, so asks do not chain.
+- **Bounds.** One turn asks at most 3 times, so an owner's message costs at most its own turn and three more this
+  way (pinned in a test). An ask that cannot be served (no such agent, the agent at work on something else, the
+  limit) is answered at once with the reason, which the asking agent reads and works around. A turn that ends
+  takes the turn it asked for with it. In a talk no turn has the tool: the agents hear each other already.
+- **Codex** has the tool whenever another agent is set up: 13,394 tokens a trivial turn against 13,375 without it.
+  The server goes in its settings for the run, with its tool approved ahead; without that Codex refused the call in
+  the modes that allow no approvals.
+- **Claude** has it when your message names another agent here ("ask codex", "what would agy say"), and not
+  otherwise, because the tool costs Claude its safe mode: safe mode drops MCP servers with everything else. A turn
+  that has the tool turns off what safe mode drops piece by piece (no `CLAUDE.md` or memory, no commands or skills,
+  no hooks, no MCP server but Ringo's, Claude Code's own main agent) and still reads your settings files, as safe
+  mode does, so your own deny rules, model and effort hold. What is left over safe mode is that your plugins and
+  agent files load: 10,655 tokens a trivial turn against 10,069. Not reading the settings files was leaner (10,294)
+  and would have dropped your deny rules, so it was not taken. Every other turn of Claude's is as it was, to the
+  argument.
+- **agy** can be asked and cannot ask: Ringo denies its MCP tools.
+- Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
+  through, and it starts nothing.
+
+Checked live, one run each (Claude Code 2.1.322, codex-cli 0.167.0; `cargo run --example ask`, and the last through
+the shell in a pty):
+
+| Who asks whom | The asking turn | The turn it asked for |
+|---------------|-----------------|-----------------------|
+| Claude asks a specialist of the owner's (on Claude, `sonnet`, Read and Grep only) | 9.7 s, 32,926 tokens | 4.0 s, 10,409 |
+| Codex asks the same specialist | 15.2 s, 40,577 | 4.1 s, 10,134 |
+| in the shell, Claude asks Codex about a change, as above | 0:21, 36.0k | 0:11, 41.8k |
+
+Three things failed on the way and are why the code is as it is: under safe mode the tool was not there; Ringo's own
+guard refused the server; and Codex refused the call for want of approval.
+
+Not done: Claude is not given the tool unless your message names an agent; an agent that was asked cannot ask in
+its turn; agy cannot ask.
 
 ### A message while it works
 
@@ -159,11 +360,14 @@ times"), until another step or the reply comes; Codex's commands that only read 
 step too long for the row loses its end to `…`, and `/show N` has every step whole, each read and search too. Then
 one line when a job ends with its time, tokens and Ringo model calls, and the files it changed. A reply appears as it
 is written (Claude's and agy's text deltas, Codex's `item/agentMessage/delta`), and the whole reply replaces the
-pieces when it is complete. Replies render their
+pieces when it is complete. What has been written does not change under the reader ([details](#a-reply-as-it-is-written)). Replies render their
 markdown: headings, emphasis and code styled, lists and quotes wrapped under their own text, and tables as aligned
 columns (a long last column wraps under itself), or, when even that does not fit, as one block per row with each cell
 under its column's name. Everything is fitted again when the window's width changes. The mouse wheel and PgUp/PgDn
-scroll it, and it stays where you scrolled while new lines arrive below; typing goes back to the end. A drag over
+scroll it, and it stays where you scrolled whatever is written meanwhile, below it or above it: the place is kept as
+a row of an entry, not as a count from the end, so the reply of an agent that started first can grow above what you
+are reading of the second without moving it. The input's hint counts the rows below (`scrolled up · 14 rows below`),
+so nothing arrives unseen. Typing goes back to the end; with nothing typed, End does too, and Home goes to the start. A drag over
 the conversation selects its text alone (never the input or the status line) and copies it when you let go, with
 the system's own clipboard tool (`pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip`) or, where there is none, such as a
 server over ssh, by asking the terminal (OSC 52). `/copy` copies the last answer. Below the conversation are the
@@ -186,6 +390,9 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, and nothing of one is told to another. `/together` (the default): one conversation again. Either way the agents work in the folder at the same time, one turn each. Text after either is sent as a line of its own once it has switched (`/separate @codex write the README`); any other command that takes nothing refuses text after it rather than drop it. The head says `separate` while it is on |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
+| `/discuss TOPIC`, `/discuss`, `/discuss @A @B TOPIC` | the agents talk it over among themselves, one at a time, while you read (see [The agents' talk](#the-agents-talk)); alone, the last turn |
+| `/agent`, `/agent add NAME FILE [codex] [skills]`, `/agent remove NAME` | your own agents (see [Agents of your own](#agents-of-your-own)): a file of standing instructions makes Claude or Codex a specialist under its own name, talked to as `@NAME` |
+| `/model`, `/model NAME`, `/model AGENT NAME` | which model each agent's turns run on (see [Models](#models)): alone, who runs on what and the models your Codex plan offers; with a space after it, a list to pick from; with a name, that model for the agent it belongs to, from its next turn and remembered (`/model AGENT default`: its own again) |
 | `/usage` | this session's tokens by agent, the last 24 hours and 7 days from `usage.jsonl`, and each plan's limits as Claude and Codex report them (no model call) |
 | `/review #N` | Ringo reviews job N's change (a copy's, or a turn's here from its before and after), with its task as the change description |
 | `/review BASE [HEAD]` | Ringo reviews `BASE...HEAD` of the repository |
@@ -236,6 +443,35 @@ count reached 93% of the turn's own total, which replaces it at the end (a messa
 written). Codex reports its tokens only when a turn ends. When two unapplied copies edit the same file, the running
 job's row and the line it ends with say so (`⚠ same files as #2 client.rs`) before you apply either. That check costs
 no tokens: it compares the agents' own edit events as they arrive.
+
+### A reply as it is written
+
+A reply's pieces arrive a few characters at a time, and markdown is not known until its marks close. Shown as they
+come, rows already on screen change: a word that outgrows its row moves to the next, a link loses its brackets when
+it closes, and a table's columns shift with every wider cell (and it starts as a row of bars). So three things wait
+until they are whole (`steady`), and nothing that has shown is taken back:
+
+- the word being written, until its end comes or 150 ms pass without a piece (a path or URL past 32 characters, and
+  Chinese, Japanese or Korean text, which has no spaces, show as they grow);
+- a link whose text has a space in it, until it closes;
+- a table, until a line that is not one of its rows comes or 1.5 s pass: meanwhile one line says
+  `a table is being written · 3 rows so far…`.
+
+A step, the turn's end or the pause shows everything kept back, so the last word before a tool call never waits.
+
+Measured by writing a document in pieces of 4 to 24 characters and comparing each frame's rows with the one before
+(release build, 120 columns; `measure_a_reply_being_written` prints it):
+
+| Written in pieces | Frames | Rows above the last rewritten | The last row took text back |
+|---|---|---|---|
+| the 14.8k user guide, before | 1,060 | 85 | 18 |
+| the same, now | 1,060 | 0 | 1 |
+| this 56k page, before | 4,007 | 157 | 105 |
+| the same, now | 4,007 | 3 | 10 |
+
+What is left: a code span or a link that goes on over a line end, which the last line alone does not show. A frame
+costs what it did: 0.2 ms on average for the guide and about 1 ms at the end of the 56k page, each frame parsing the whole
+reply again, so the parse was left as it is. Saving a 300-turn conversation at a turn's end took 16 ms.
 
 ## Modes and permissions
 
@@ -354,6 +590,8 @@ newest `main` in the background: one `git fetch` into Ringo's own copy of the hi
 priority into a folder of its own (`install/COMMIT`, with its prompts and pipelines). All versions share one build
 folder, and only one builds at a time, so only Ringo itself compiles again. The shell then says
 `Ringo updated to 1a2b3c4 (2 new changes) · /restart to apply`, and the hint by the input box says `update ready`.
+That line scrolls away and the hint gives way to others while a turn runs, so the head of the screen also says
+`↑ update ready · /restart` until you do.
 
 The update is put where the running `ringo` is when the shell ends or restarts. Until then the open shell, and the
 pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
@@ -371,6 +609,13 @@ Ringo leaves some builds for you to update yourself:
 - one whose checkout has moved on since it was built;
 - one from a commit that is not on `main`;
 - one run with `RINGO_HOME` set.
+
+These are told as well, when `main` has changes they lack: `Ringo 1a2b3c4 is out (2 new changes). This build does not
+update itself (it was built with changes of its own): git pull in ~/Ringo, then cargo install --path cli there`. The
+head then says `↑ update available · /update`, and `/update` says the line again. A build with no commit is compared
+from where its checkout is, and a branch that already holds main's newest hears nothing. Until 2026-11-10 these
+builds were told nothing: on one machine the shell had been installed by hand from a checkout with changes of its
+own, and the newest version its updater had built was a week behind `main`.
 
 `RINGO_NO_UPDATE_CHECK=1` turns the check off. Updating needs git and cargo (a `cargo install` needed them already).
 No model call is made, and the release gate still decides what the pipelines run (next section).
@@ -460,7 +705,8 @@ that number as the turn's own. It now counts only what each turn adds. Claude re
 33,056 was the two turns added together.
 
 So the shell starts Claude in safe mode (your CLAUDE.md, skills, plugins, hooks and MCP servers are left out; sign-in,
-built-in tools and subagents work as usual), unless the task names a connector (see Modes and permissions), and
+built-in tools and subagents work as usual), unless the task names a connector (see Modes and permissions) or
+another agent here (see [An agent asks another](#an-agent-asks-another)), and
 appends the repository's own `CLAUDE.md` or `AGENTS.md`. Your own rules for every Claude turn can go in `rules.md`
 in Ringo's state folder (`~/.local/share/ringo/rules.md` on macOS and Linux): when that file has text, it is appended
 ahead of the repository's file. Every line in it is read on every call, so keep it short; with no file nothing is
@@ -566,6 +812,66 @@ review (`{#R}`); no review follows that turn. Where `/undo` is off there is no b
 `/tier ultra` says so. The revision is Ringo's line, so the conversation does not show it as yours. Claude Code's own
 `ultracode` setting is not used: it runs Claude Code's dynamic workflows, which
 `--safe-mode` turns off and which Ringo does not measure.
+
+## Models
+
+Each person's plan includes different models, so which model does what is theirs to set. A turn runs on its agent's
+own default until `/model AGENT NAME` names another:
+
+- **Claude:** `--model NAME`, an alias (`fable`, `opus`, `sonnet`, `haiku`) or a model's full name. Claude Code has
+  no list of a plan's models to read.
+- **Codex:** `model` in the thread's `thread/start` and `thread/resume`, so a conversation under way goes on with the
+  new one. `/model` asks its app-server what the plan offers (`model/list`, no thread and no model call; 0.3 s for 8
+  models, codex-cli 0.167.0) and prints each name with what OpenAI says of it and which is the default.
+- **agy** and agents you add with the plain adapter choose their own: `/model` refuses a name for them and says so.
+
+Three ways to set one, the first needing nothing remembered:
+
+- **Pick it.** `/model` and a space opens a list under the input: with more than one agent that takes a model, whose
+  it is, then that agent's models (`default`, Claude Code's four aliases, or what the Codex plan offers, with
+  OpenAI's own line on each and `← now` on the one in use). Up and Down move, and Enter on a model sets it: no
+  second Enter. With one such agent the list is its models at once. Codex's models are read once a session, the
+  first time `/model` is typed (the same `model/list` read as above); `/model` alone then shows what was read.
+- **Name it.** `/model opus` sets it for the agent the name belongs to: Claude Code's aliases and `claude-...` for a
+  Claude agent, a name the Codex plan lists or `gpt-...` for a Codex one, the agent you are talking to before any
+  other of its kind. `/model default`, or a name Ringo cannot place, is for the agent you are talking to. A few
+  letters are enough in the list: `/model so` shows `sonnet`.
+- **Say whose.** `/model AGENT NAME`, for a specialist of your own on the same plan, or when Ringo asks whose.
+
+The choice is one word that goes to the agent's own program as an argument (letters, digits and `. _ - : / [ ]`); it
+is kept in `shell-settings.json` (`"models": {"claude": "opus"}`) and applies from the agent's next turn, a running
+turn keeping its own. A conversation under way moves to a newly named model as it is. Going back
+(`/model AGENT default`) names none, and a conversation resumed with no model named keeps the one it was last
+given, so the agent's next turn starts its conversation again from Ringo's record of it (see
+[One conversation](#one-conversation-and-a-fresh-start-past-64k)). Ringo does not check a name against the plan: the agent does, when the turn starts. A turn
+that fails on a chosen model ends with `it ran on NAME, your choice for claude: /model claude default goes back to
+its own`. Each turn's first line names the model its agent reports (` claude  #3 · claude-opus-5-5`), chosen or
+not, so which model did a piece of work is on screen and in `usage.jsonl`.
+
+The pipelines' model is the backend's: `/backend claude@opus` or `/backend codex-chatgpt@MODEL/EFFORT` sets it for
+`/ask`, `/review`, `/design`, `/research` and ultra's review. So turns and reviews can run on different models.
+
+Checked live, one trivial read-mode turn each (`cargo run --example model -- REPO AGENT MODEL`; Claude Code 2.1.322,
+codex-cli 0.167.0, one run each, so the times are an instance and not a rate):
+
+| Asked for | Ended | Time | Tokens | Model the agent reported |
+|-----------|-------|------|--------|--------------------------|
+| claude `sonnet` | done | 4.4 s | 8,541 | `claude-sonnet-5-5` |
+| codex `gpt-6-luna` | done | 2.9 s | 12,643 | `gpt-6-luna` |
+| claude `no-such-model-xyz` | failed in 1.1 s | | 0 | none: "There's an issue with the selected model (no-such-model-xyz). It may not exist or you may not have access to it." |
+
+A name the plan does not have costs no tokens: the agent refuses it before any model call.
+
+The same conversation, one more trivial turn after the first (`... MODEL then=OTHER` and `... MODEL then-default`):
+
+| First turn on | Then | The second turn ran |
+|---------------|------|---------------------|
+| codex `gpt-6-luna` | changed to `gpt-5.6-luna` | `gpt-5.6-luna` |
+| claude `sonnet` | changed to `haiku` | `claude-haiku-5-5` |
+| codex `gpt-6-luna` | no model named | `gpt-6-luna` still |
+| claude `sonnet` | no model named | `claude-sonnet-5-5` still |
+
+The last two rows are why going back to the default starts the conversation again.
 
 ## Usage
 
@@ -676,3 +982,25 @@ pipelines.
 Route suggestions (`/route on`: word rules that put the matching command in the input for a line that read like a
 task; acceptable 35 times in 38 on 100 held-out lines, covering about half of the tasks) were removed when a plain
 line became an agent turn in the folder: there was nothing left for them to suggest.
+
+Lookups by a lighter agent (2026-11-10) were built, checked live and removed. A plain line that only asked where
+something is in the code (word rules, no model call) went to agy as a turn that only read, in every mode, and was
+asked to name each place as `path:line`; `/look TEXT` asked for one outright. One run each of "where is the retry
+count configured" in a four-file repository, through that same read-only turn (agy 1.5.3 to 1.5.5: it updated itself
+meanwhile; Claude Code 2.1.322, codex-cli 0.167.0):
+
+| Agent | Time | Tokens | Answer |
+|---|---|---|---|
+| agy | 53.4 s | 32,687 | none: it started a subagent and ended its turn with "waiting for results" |
+| agy, told to use its own read tools and no subagent | 70.1 s | 183,863 | right, 2 places |
+| Claude | 10.7 s | 34,481 | right, 4 places |
+| Codex | 14.6 s | 41,519 | right, 4 places |
+
+agy began with `find` and `ls` as commands, which Ringo refuses it because it cannot ask. Told to read for itself, it
+opened files by guessed paths (9 of its 14 reads failed) over 15 calls, and none read from a cache: 8,559 to 13,448
+input tokens each. So a lookup sent to agy was slower and larger than one left with the agent you talk to. The word
+rule also took none of the 113 plain lines in one owner's shell history, and none of them was a lookup: they were
+tasks, answers and follow-ups. One run each on a toy repository is enough not to adopt it and is not a measure of
+agy. An agy turn in your folder that has to search meets the same refusals. To try again: a lighter agent that reads
+from a cache between calls and can search without a command, or a lighter model of Claude's or Codex's own, measured
+the same way.
