@@ -193,6 +193,11 @@ Instead of asking each agent in turn and carrying the answers between them yours
   tokens.
 - An agent of your own (`/agent`) takes part like any other.
 
+For one question and not a whole talk, name the agent to consult in your message:
+`@claude would you move the timeout into config.rs? ask codex first`. Claude asks Codex in the middle of its turn,
+Codex's answer shows under its own name, and Claude goes on with it. The turn it asks for looks and does not
+touch, and one turn asks at most three times.
+
 ## Give each agent its own task
 
 Type `/separate`, then give each agent its task: `@claude fix the login bug`, then `@codex write the README`

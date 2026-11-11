@@ -1942,6 +1942,8 @@ impl App {
     /// heard whole by the others. What it was told is in its log (/show N), not in the conversation.
     fn talk_turn(&mut self, agent: Agent, prompt: &str) -> Result<usize, String> {
         let prompt = self.s.expand(prompt)?;
+        // in a talk the agents already hear each other: no turn of it asks another on the side
+        self.s.peers.clear();
         let mode = std::mem::replace(&mut self.s.mode, Mode::Read);
         let started = self.s.launch_agent(agent, false, &prompt);
         self.s.mode = mode;
@@ -2611,6 +2613,8 @@ impl App {
             return Err(format!("{} has no conversation here to compact", agent.name()));
         }
         let expanded = self.s.expand(task)?;
+        // whom this turn may ask in the middle of its work: the agents set up here
+        self.s.peers = self.agents.clone();
         let id = self.s.launch_agent(agent, false, &expanded)?;
         // Ultra: the plans are read while the turn runs (about a second, no model call), so its review can go to
         // a plan with room, and when none has any the owner hears it now, not after the turn.
@@ -4542,7 +4546,7 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         assert!(a.run(Cmd::Agent(Some(OwnAgent::Remove("talk-reviewer".into()))), "").unwrap_err().contains("is in the talk under way"));
         until_talked(&mut a, |_| {});
         assert_eq!(a.s.jobs.len(), 2 * TALK_ROUNDS, "two agents, TALK_ROUNDS turns each, and not one more");
-        assert!(a.s.jobs.iter().all(|j| j.talk && j.status == Status::Done));
+        assert!(a.s.jobs.iter().all(|j| j.talk && !j.can_ask && j.status == Status::Done), "in a talk no turn asks on the side");
         let kinds: Vec<Agent> = a.s.jobs.iter().filter_map(|j| match j.kind { Kind::Agent { agent, .. } => Some(agent), _ => None }).collect();
         assert_eq!(kinds, [claude, reviewer, claude, reviewer], "in turn, the one the owner talks to first");
         // the topic once; each hears what the other said, whole, and is asked to answer it
@@ -4757,6 +4761,7 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
             std::fs::set_permissions(&job, std::fs::Permissions::from_mode(0o755)).unwrap();
             a.s.programs.insert(claude, job);
             a.talk(claude, "hi".into(), "hi".into()).unwrap();
+            assert_eq!(a.s.peers, a.agents, "a turn may ask the agents set up here");
             let deadline = Instant::now() + Duration::from_secs(10);
             while a.s.running() > 0 && Instant::now() < deadline {
                 a.s.pump();

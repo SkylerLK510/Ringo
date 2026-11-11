@@ -224,8 +224,73 @@ no permission for ends its turn (the others are refused such a read and go on). 
 is: it gets the record itself, as before, and nothing to open. This holds for any turn of agy's after another
 agent's, not only in a talk.
 
-Not done: an agent cannot ask another on its own in the middle of a turn. A talk under way ends with the shell: it is
-not kept across `/restart`.
+Not done: a talk under way ends with the shell: it is not kept across `/restart`.
+
+### An agent asks another
+
+An agent can ask another a question in the middle of its own turn and go on with the answer, whichever
+subscription each is on:
+
+```
+ you  @claude Would you move the 3000 ms timeout in src/client.rs into src/config.rs? Ask codex what it
+      thinks before you answer, then give me both views in two sentences.
+
+ claude  #1 · claude-fable-5-2
+  ✓ read 2 files, searched 1 time
+  asks codex: In this repo, src/client.rs hardcodes `timeout_ms: 3000` in `Client::new()`, while ...
+
+ codex  #2 · gpt-6-astra
+  Claude, I'd move the 3000 ms default into src/config.rs as a named constant ... The main caveat is that
+  timeout_ms is currently only stored: send() never reads it ...
+── ✓ done · 0:11 · 41.8k tokens
+
+ claude  #1 · claude-fable-5-2
+  Codex would move it into src/config.rs as a named constant ... I agree on moving it, though I'd make it a
+  timeout_ms() function mirroring retries() ...
+── ✓ done · 0:21 · 36.0k tokens
+```
+
+How it works:
+
+- **One tool.** The turn's agent is given `ask_agent(agent, question)`, served by `ringo ask-server`, an MCP
+  server on stdio that its program starts. A call writes the ask into the turn's own folder and waits. The shell
+  that runs the turn sees it, starts the other agent's turn and writes that turn's reply back. The server reaches
+  nothing by itself, so a turn asks only whom its shell lets it: the agents set up here that work in the folder.
+- **The turn it asks for** is the other agent's own, in this folder: read mode whatever the session's, told who
+  asks and what, its reply heard whole by the others afterwards. It is not given the tool, so asks do not chain.
+- **Bounds.** One turn asks at most 3 times, so an owner's message costs at most its own turn and three more this
+  way (pinned in a test). An ask that cannot be served (no such agent, the agent at work on something else, the
+  limit) is answered at once with the reason, which the asking agent reads and works around. A turn that ends
+  takes the turn it asked for with it. In a talk no turn has the tool: the agents hear each other already.
+- **Codex** has the tool whenever another agent is set up: 13,394 tokens a trivial turn against 13,375 without it.
+  The server goes in its settings for the run, with its tool approved ahead; without that Codex refused the call in
+  the modes that allow no approvals.
+- **Claude** has it when your message names another agent here ("ask codex", "what would agy say"), and not
+  otherwise, because the tool costs Claude its safe mode: safe mode drops MCP servers with everything else. A turn
+  that has the tool turns off what safe mode drops piece by piece (no `CLAUDE.md` or memory, no commands or skills,
+  no hooks, no MCP server but Ringo's, Claude Code's own main agent) and still reads your settings files, as safe
+  mode does, so your own deny rules, model and effort hold. What is left over safe mode is that your plugins and
+  agent files load: 10,655 tokens a trivial turn against 10,069. Not reading the settings files was leaner (10,294)
+  and would have dropped your deny rules, so it was not taken. Every other turn of Claude's is as it was, to the
+  argument.
+- **agy** can be asked and cannot ask: Ringo denies its MCP tools.
+- Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
+  through, and it starts nothing.
+
+Checked live, one run each (Claude Code 2.1.322, codex-cli 0.167.0; `cargo run --example ask`, and the last through
+the shell in a pty):
+
+| Who asks whom | The asking turn | The turn it asked for |
+|---------------|-----------------|-----------------------|
+| Claude asks a specialist of the owner's (on Claude, `sonnet`, Read and Grep only) | 9.7 s, 32,926 tokens | 4.0 s, 10,409 |
+| Codex asks the same specialist | 15.2 s, 40,577 | 4.1 s, 10,134 |
+| in the shell, Claude asks Codex about a change, as above | 0:21, 36.0k | 0:11, 41.8k |
+
+Three things failed on the way and are why the code is as it is: under safe mode the tool was not there; Ringo's own
+guard refused the server; and Codex refused the call for want of approval.
+
+Not done: Claude is not given the tool unless your message names an agent; an agent that was asked cannot ask in
+its turn; agy cannot ask.
 
 ### A message while it works
 
@@ -638,7 +703,8 @@ that number as the turn's own. It now counts only what each turn adds. Claude re
 33,056 was the two turns added together.
 
 So the shell starts Claude in safe mode (your CLAUDE.md, skills, plugins, hooks and MCP servers are left out; sign-in,
-built-in tools and subagents work as usual), unless the task names a connector (see Modes and permissions), and
+built-in tools and subagents work as usual), unless the task names a connector (see Modes and permissions) or
+another agent here (see [An agent asks another](#an-agent-asks-another)), and
 appends the repository's own `CLAUDE.md` or `AGENTS.md`. Your own rules for every Claude turn can go in `rules.md`
 in Ringo's state folder (`~/.local/share/ringo/rules.md` on macOS and Linux): when that file has text, it is appended
 ahead of the repository's file. Every line in it is read on every call, so keep it short; with no file nothing is

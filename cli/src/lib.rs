@@ -490,6 +490,11 @@ pub struct Job {
     pub model: Option<String>,
     /// A turn in the agents' talk (the shell's /discuss): the others hear all of its reply, not its first lines.
     pub talk: bool,
+    /// Whether this turn was given the means to ask another agent (`serve_asks`), and how many asks it has made.
+    pub can_ask: bool,
+    pub asked: usize,
+    /// A turn another agent asked for in the middle of its own: that turn's job, and the file its answer goes in.
+    pub asked_by: Option<(usize, PathBuf)>,
     /// Whether the job reported any token count: one that finishes without is recorded as unknown, not left out.
     counted: bool,
     /// How many of its model calls reported no count (a pipeline's): its counts are then of the others alone.
@@ -637,6 +642,11 @@ pub struct Session {
     root: PathBuf,
     /// The owner's home folder, where the agents they made for Claude Code are (`.claude/agents`).
     pub home: PathBuf,
+    /// The agents set up in the shell that runs this session: the ones a turn here may ask a question in the middle
+    /// of its work (`serve_asks`). With none, no turn is given the means to.
+    pub peers: Vec<Agent>,
+    /// The program that serves a turn's asks: this one (`ringo ask-server`).
+    pub asker: PathBuf,
     /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
     pub claude_limits: Option<serde_json::Value>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
@@ -979,7 +989,7 @@ impl Session {
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), dir, jobs: Vec::new(), max_jobs: 3,
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
@@ -1203,6 +1213,61 @@ impl Session {
         self.usage_so_far.remove(&(agent, old));
         self.context.remove(&agent);
         true
+    }
+
+    /// The agents `agent`'s turn may ask (`peers`): the others set up that work in this folder and are installed.
+    fn askable(&self, agent: Agent) -> Vec<Agent> {
+        self.peers.iter().copied().filter(|a| *a != agent && a.spec().read && self.installed(*a)).collect()
+    }
+
+    /// Starts what the running turns have asked of other agents since the last look (`serve_asks` wrote each ask
+    /// into its turn's folder). The agent asked takes a turn of its own, in read mode whatever the session's and
+    /// without the means to ask in its turn; its reply is the answer (`end_with`). An ask that cannot be served is
+    /// answered at once with the reason, which the asking agent reads and works around. True when one came.
+    fn take_asks(&mut self) -> bool {
+        let asking: Vec<usize> = self.jobs.iter().filter(|j| j.running() && j.can_ask).map(|j| j.id).collect();
+        let mut any = false;
+        for id in asking {
+            let n = self.jobs[id - 1].asked + 1;
+            let asks = self.jobs[id - 1].dir.join("asks");
+            let Some(ask) = fs::read(asks.join(format!("{n}.json"))).ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { continue };
+            any = true;
+            self.jobs[id - 1].asked = n;
+            let Kind::Agent { agent: asker, .. } = self.jobs[id - 1].kind else { continue };
+            let (name, question) = (ask["agent"].as_str().unwrap_or(""), ask["question"].as_str().unwrap_or(""));
+            let (answer, others) = (asks.join(format!("{n}.answer")), self.askable(asker));
+            let target = match Agent::from_name(name).filter(|a| others.contains(a)) {
+                _ if n > MAX_ASKS => Err(format!("this turn has asked {MAX_ASKS} times already: go on with what you have")),
+                None => Err(format!("there is no agent {name} to ask here: {}",
+                                    others.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "))),
+                Some(target) if self.busy_for(target).is_some() =>
+                    Err(format!("{name} is at work on something else: go on without it")),
+                Some(target) => Ok(target),
+            };
+            let started = target.and_then(|target| {
+                let prompt = format!("{0} is in the middle of a turn for me and asks you:\n\n{question}\n\nAnswer {0} directly \
+                                      and briefly. Look at the files if it helps; change nothing.", asker.name());
+                let (mode, peers) = (std::mem::replace(&mut self.mode, Mode::Read), std::mem::take(&mut self.peers));
+                let started = self.launch_agent(target, false, &prompt);
+                (self.mode, self.peers) = (mode, peers);
+                started.map_err(|e| format!("{name} could not be asked: {e}"))
+            });
+            match started {
+                Ok(asked) => {
+                    let job = &mut self.jobs[asked - 1];
+                    job.asked_by = Some((id, answer));
+                    // what it was told of the turns it missed is in its log (/show N); the conversation shows its answer
+                    job.fresh.retain(|said| !matches!(said, Said::Line(_)));
+                    self.jobs[id - 1].push_log(format!("asks {name}: {}", parse::short(question, 200)));
+                }
+                Err(why) => {
+                    self.jobs[id - 1].push_log(format!("asked {name}, and was told: {why}"));
+                    answer_ask(&answer, false, &why);
+                }
+            }
+        }
+        any
     }
 
     /// A new conversation: the next turn of each agent starts fresh instead of resuming (`/clear`).
@@ -1524,7 +1589,7 @@ impl Session {
         let mut kept = Vec::new();
         let mut used = 0;
         for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, i + 1 == turns.len() || j.talk, false);
+            let part = render(j, i + 1 == turns.len() || j.talk || j.asked_by.is_some(), false);
             if used + part.len() > RECORD_CHARS && !kept.is_empty() {
                 kept.push(format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1));
                 break;
@@ -1569,7 +1634,7 @@ impl Session {
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
-                             codex_turn: None, connectors: false, reached: false, model: None, talk: false, counted: false,
+                             codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None) });
         Ok(id)
     }
@@ -1687,6 +1752,21 @@ impl Session {
                 // for the API (codex-cli 0.165.0: a new turn in each mode, and a resumed one). The thread's settings
                 // go in thread/start or thread/resume; turn/start follows once the thread's id is known.
                 cmd.arg("app-server");
+                // The means to ask another agent here in the middle of the turn, as Claude's turn is given them
+                // (`serve_asks`): one MCP server in Codex's settings, for this run only. The values are TOML, and a
+                // JSON string or list of strings reads as the same TOML.
+                let others = if write || prompt.trim() == "/compact" { Vec::new() } else { self.askable(agent) };
+                if !others.is_empty() {
+                    let mut args = vec!["ask-server".to_string(), dir.to_string_lossy().into_owned()];
+                    args.extend(others.iter().map(|a| a.name().to_string()));
+                    cmd.args(["-c", &format!("mcp_servers.ringo.command={}", serde_json::json!(self.asker))]);
+                    cmd.args(["-c", &format!("mcp_servers.ringo.args={}", serde_json::json!(args))]);
+                    // Its one tool is approved ahead: a turn that may not ask for approvals (read and ask mode) was
+                    // otherwise refused it ("ask_agent required approval, but this session's policy disallows
+                    // approvals", codex-cli 0.167.0). The turn it starts looks and does not touch.
+                    cmd.args(["-c", "mcp_servers.ringo.default_tools_approval_mode=\"approve\""]);
+                    self.jobs[id - 1].can_ask = true;
+                }
                 let auto = edits && self.mode == Mode::Auto;
                 if edits {
                     // Auto: the sandbox has the network, for git, gh and package installs, and Codex's own reviewer
@@ -1759,6 +1839,14 @@ impl Session {
                 // The reply streams as it is written (--include-partial-messages); neither changes any tokens.
                 cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
                           "--include-partial-messages", "--replay-user-messages"]);
+                // whom this turn may ask in the middle of its work (see below); a turn in its own copy hears no one
+                // Only when the owner's message names one of them: the tool takes the turn out of safe mode (below),
+                // and every other turn of Claude's stays as it was, to the argument.
+                let others = if write || prompt.trim() == "/compact" { Vec::new() } else { self.askable(agent) };
+                let others: Vec<Agent> = others.into_iter().filter(|_| names_agent(prompt, &self.askable(agent))).collect();
+                let can_ask = !others.is_empty();
+                // a turn that would have run in safe mode, and has the tool instead (see below)
+                let lean_asks = can_ask && !(self.mode != Mode::Read && (spec.skills || connectors));
                 if self.mode != Mode::Read && (spec.skills || connectors) {
                     // The owner's connectors (MCP servers, plugins) load, but not their CLAUDE.md, memory, skills or
                     // main agent: 27.5k tokens a trivial turn instead of 57.8k with all of it (Claude Code 2.1.316).
@@ -1782,7 +1870,19 @@ impl Session {
                     if prompt.trim() != "/compact" {
                         cmd.arg("--disable-slash-commands");
                     }
-                    cmd.arg("--safe-mode");
+                    match can_ask {
+                        false => cmd.arg("--safe-mode"),
+                        // Safe mode would drop the one tool this turn is given with the rest (checked live, Claude
+                        // Code 2.1.322: the tool was not there). So what it drops is turned off piece by piece: no
+                        // CLAUDE.md or memory, no commands or skills (above), no main agent of the owner's, no hooks
+                        // (in the settings below), and no MCP server but the one given below. The owner's settings
+                        // files still load, as they do in safe mode: their deny rules, model and effort are theirs
+                        // to keep. Skipping those files (--setting-sources "") was 361 tokens leaner and dropped the
+                        // owner's own deny rules, so it was not taken. What is left over safe mode: the owner's
+                        // plugins and agent files load (one trivial turn: 10,655 tokens against 10,069).
+                        true => cmd.env("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1").env("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1")
+                            .args(["--agent", "claude", "--strict-mcp-config"]),
+                    };
                 }
                 // Ask: Claude's default permission checks, every prompt sent to Ringo (`--permission-prompt-tool
                 // stdio`, the Agent SDK's own channel; `--permission-prompts host` alone denies). Auto: Claude's
@@ -1815,12 +1915,29 @@ impl Session {
                     // CLAUDE.md, where such a rule would otherwise live. It also drops Claude Code's attribution reminder
                     // from every turn: 626 bytes less a request (measured against a local capture server).
                     // Codex 0.165.0 adds none (codex_git_commit is removed and off) and agy has no such line.
-                    let settings = serde_json::json!({"permissions": {"ask": self.always_ask},
-                                                      "attribution": {"commit": "", "pr": ""}});
-                    cmd.arg("--settings").arg(settings.to_string());
-                    if !self.allowed.is_empty() {
-                        cmd.arg("--allowedTools").args(&self.allowed);
+                    let mut settings = serde_json::json!({"permissions": {"ask": self.always_ask},
+                                                          "attribution": {"commit": "", "pr": ""}});
+                    if lean_asks {
+                        settings["disableAllHooks"] = true.into();
                     }
+                    cmd.arg("--settings").arg(settings.to_string());
+                } else if lean_asks {
+                    cmd.arg("--settings").arg(r#"{"disableAllHooks":true}"#);
+                }
+                // The means to ask another agent here in the middle of the turn (`serve_asks`): one tool, served by
+                // this program from the turn's own folder, allowed without asking in every mode, because the turn
+                // it starts looks and does not touch. Not for a turn in its own copy, which hears no one.
+                let mut allowed: Vec<String> = if self.mode != Mode::Read { self.allowed.iter().cloned().collect() } else { Vec::new() };
+                if can_ask {
+                    let mut args = vec!["ask-server".to_string(), dir.to_string_lossy().into_owned()];
+                    args.extend(others.iter().map(|a| a.name().to_string()));
+                    cmd.arg("--mcp-config")
+                        .arg(serde_json::json!({"mcpServers": {"ringo": {"command": self.asker, "args": args}}}).to_string());
+                    allowed.push("mcp__ringo__ask_agent".into());
+                    self.jobs[id - 1].can_ask = true;
+                }
+                if !allowed.is_empty() {
+                    cmd.arg("--allowedTools").args(&allowed);
                 }
                 // the owner's choice of model (/model): an alias or a full name, as Claude Code's --model takes it.
                 // With none, a specialist runs on the model its file names, as it does in Claude Code.
@@ -2241,6 +2358,22 @@ impl Session {
 
     /// `end` with the job's reply already read.
     fn end_with(&mut self, id: usize, status: Status, reply: String) {
+        // A turn another agent asked for: what it said is that agent's answer. A turn that ends takes the turns it
+        // asked for with it: no one is waiting for them.
+        if let Some((_, answer)) = self.jobs[id - 1].asked_by.clone() {
+            let who = match self.jobs[id - 1].kind { Kind::Agent { agent, .. } => agent.name(), _ => "it" };
+            match &status {
+                Status::Done if !reply.trim().is_empty() => answer_ask(&answer, true, reply.trim()),
+                Status::Done => answer_ask(&answer, false, &format!("{who} gave no answer")),
+                Status::Failed(why) => answer_ask(&answer, false, &format!("{who} could not answer: {why}")),
+                _ => answer_ask(&answer, false, &format!("{who} was stopped before it answered")),
+            }
+        }
+        let left: Vec<usize> = self.jobs.iter().filter(|j| j.running() && j.asked_by.as_ref().is_some_and(|(by, _)| *by == id))
+            .map(|j| j.id).collect();
+        for asked in left {
+            let _ = self.kill(asked);
+        }
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
         job.activity = match &status {
@@ -2350,7 +2483,7 @@ impl Session {
 
     /// Folds pending events into the jobs; true when anything changed.
     pub fn pump(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.take_asks();
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -2987,6 +3120,93 @@ pub fn plan(agent: Agent, program: &Path) -> Result<Plan, String> {
         }
         Adapter::Agy | Adapter::Plain => Err("reports no plan usage".into()),
     }
+}
+
+/// Whether the owner's message names one of `agents`, as a word of its own in any case ("ask codex", "Codex:").
+fn names_agent(prompt: &str, agents: &[Agent]) -> bool {
+    let prompt = prompt.to_lowercase();
+    let mut words = prompt.split(|c: char| !(c.is_alphanumeric() || "-_.".contains(c))).map(|w| w.trim_matches('.'));
+    words.any(|w| agents.iter().any(|a| a.name() == w))
+}
+
+/// Asks one turn may make of other agents: with its own turn, an owner's message costs at most `1 + MAX_ASKS` turns
+/// this way (a turn that was asked for cannot ask in its turn).
+pub const MAX_ASKS: usize = 3;
+
+/// How long a turn waits for the agent it asked, at most.
+const ASK_WAIT: Duration = Duration::from_secs(900);
+
+/// `ringo ask-server DIR PEER...`: the MCP server (stdio, one JSON-RPC message a line) a turn is given so its agent
+/// can ask another agent here a question in the middle of its work. A call writes the ask into the turn's own folder
+/// (`DIR/asks/N.json`) and waits for the answer beside it (`N.answer`): the shell that runs the turn starts the
+/// other agent's and writes what it said (`Session::take_asks`). So the server reaches nothing by itself, and a
+/// turn asks only whom its shell lets it.
+pub fn serve_asks(dir: &Path, peers: &[String], input: impl BufRead, mut output: impl Write) -> std::io::Result<()> {
+    use serde_json::json;
+    let mut asked = 0;
+    for line in input.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(&line?) else { continue };
+        let Some(id) = msg.get("id").cloned() else { continue }; // a notification: nothing to answer
+        let result = match msg["method"].as_str().unwrap_or("") {
+            "initialize" => Ok(json!({"protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2024-11-05"),
+                                      "capabilities": {"tools": {}},
+                                      "serverInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}})),
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({"tools": [{
+                "name": "ask_agent",
+                "description": format!("Ask another AI agent that works in this folder a question while you work, and get \
+                                        its answer: {}. It reads the files itself and changes nothing. Each ask is a whole \
+                                        turn of that agent's, so ask when a second view would change what you do.",
+                                       peers.join(", ")),
+                "inputSchema": {"type": "object", "required": ["agent", "question"],
+                                "properties": {"agent": {"type": "string", "enum": peers}, "question": {"type": "string"}}}}]})),
+            "tools/call" => {
+                let args = &msg["params"]["arguments"];
+                let said = match (msg["params"]["name"].as_str(), args["agent"].as_str(), args["question"].as_str()) {
+                    (Some("ask_agent"), Some(agent), Some(question)) if !question.trim().is_empty() => {
+                        asked += 1;
+                        ask(&dir.join("asks"), asked, agent, question)
+                    }
+                    _ => Err("ask_agent takes an agent and a question".to_string()),
+                };
+                let failed = said.is_err();
+                Ok(json!({"content": [{"type": "text", "text": said.unwrap_or_else(|e| e)}], "isError": failed}))
+            }
+            other => Err(json!({"code": -32601, "message": format!("no method {other}")})),
+        };
+        let reply = match result {
+            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+            Err(error) => json!({"jsonrpc": "2.0", "id": id, "error": error}),
+        };
+        writeln!(output, "{reply}")?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
+/// One ask, from the server's side: written whole, then waited on.
+fn ask(asks: &Path, n: usize, agent: &str, question: &str) -> Result<String, String> {
+    private_dir(asks)?;
+    let (file, part) = (asks.join(format!("{n}.json")), asks.join(format!("{n}.part")));
+    fs::write(&part, serde_json::json!({"agent": agent, "question": question}).to_string())
+        .and_then(|_| fs::rename(&part, &file)).map_err(|e| format!("the ask could not be written: {e}"))?;
+    let (answer, until) = (asks.join(format!("{n}.answer")), Instant::now() + ASK_WAIT);
+    loop {
+        if let Some(v) = fs::read(&answer).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {
+            let text = v["text"].as_str().unwrap_or("").to_string();
+            return if v["ok"] == true { Ok(text) } else { Err(text) };
+        }
+        if Instant::now() > until {
+            return Err(format!("{agent} did not answer in time: go on without it"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// An ask's answer, written whole and renamed into place, so the server never reads half of one.
+fn answer_ask(file: &Path, ok: bool, text: &str) {
+    let part = file.with_extension("answer.part");
+    let _ = fs::write(&part, serde_json::json!({"ok": ok, "text": text}).to_string()).and_then(|_| fs::rename(&part, file));
 }
 
 /// A model an agent's plan offers: the name its program takes, what its maker says of it, and whether it is the one

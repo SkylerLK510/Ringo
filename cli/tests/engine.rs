@@ -1965,3 +1965,106 @@ fn agy_is_not_sent_to_a_file_it_cannot_open() {
     let heard = turn_text(&codex);
     assert!(heard.contains("agy: fine by me") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
 }
+
+/// A stand-in Claude Code that asks other agents as the real one does: it finds the ask server in its `--mcp-config`
+/// and calls it, once for each `agent|question` line in its `.asks` file, with the environment Ringo gave it. Its
+/// reply is what it heard.
+const CLAUDE_ASKS_AGENTS: &str = r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+env > "$0.env"
+cfg=""; while [ $# -gt 0 ]; do [ "$1" = --mcp-config ] && cfg="$2"; shift; done
+head -n 1 > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"s-asks","apiKeySource":"none"}'
+said=""
+if [ -n "$cfg" ] && [ -f "$0.asks" ]; then
+  ringo=$(printf '%s' "$cfg" | sed 's/.*"command":"\([^"]*\)".*/\1/')
+  dir=$(printf '%s' "$cfg" | sed 's/.*"ask-server","\([^"]*\)".*/\1/')
+  n=0
+  while IFS='|' read -r who what; do
+    n=$((n+1))
+    printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"ask_agent","arguments":{"agent":"%s","question":"%s"}}}\n' "$n" "$who" "$what"
+  done < "$0.asks" | "$ringo" ask-server "$dir" codex > "$0.answers"
+  said=$(sed 's/.*"text":"\([^"]*\)".*/\1/' "$0.answers" | tr '\n' '/')
+fi
+printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"heard: $said\"}"
+"#;
+
+/// An agent asks another a question in the middle of its own turn: its program is given one tool, served by
+/// `ringo ask-server` from the turn's own folder, and the shell that runs the turn starts the other agent's. That
+/// turn looks and does not touch whatever the mode, is told who asks, cannot ask in its turn, and its reply is the
+/// answer. One turn asks at most MAX_ASKS times, and an ask that cannot be served is answered with the reason.
+#[test]
+fn an_agent_asks_another_in_the_middle_of_its_turn() {
+    let r = repo("asks");
+    let codex = fake(&root(), "codex-asked", &codex_script("", &codex_done("all done", (1, 0, 1))));
+    let claude = fake(&root(), "claude-asks-agents", CLAUDE_ASKS_AGENTS);
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("claude"), claude.clone());
+    s.asker = env!("CARGO_BIN_EXE_ringo").into();
+    let asks = format!("{}.asks", claude.display());
+    fs::write(&asks, "codex|is a.txt fine?\n").unwrap();
+    let turn = |s: &mut Session, write: bool| -> (usize, Vec<String>) {
+        let id = s.launch_agent(agent("claude"), write, "Check a.txt, and ask Codex what it thinks.").unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        (id, fs::read_to_string(format!("{}.argv", claude.display())).unwrap().lines().map(String::from).collect())
+    };
+    // no other agent set up to ask: the turn is as it always was
+    let (id, argv) = turn(&mut s, false);
+    assert!(argv.iter().any(|a| a == "--safe-mode") && !argv.iter().any(|a| a == "--mcp-config"), "{argv:?}");
+    assert!(!s.job(id).unwrap().can_ask && s.job(id).unwrap().reply() == "heard: ");
+    // with one that the message does not name: still as it always was, to the argument
+    s.peers = vec![agent("claude"), agent("codex")];
+    let plain = s.launch_agent(agent("claude"), false, "the task, with no one named (codexes is another word)").unwrap();
+    assert_eq!(wait(&mut s, plain), Status::Done);
+    let unnamed = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+    assert!(unnamed.lines().any(|a| a == "--safe-mode") && !unnamed.contains("--mcp-config") && !s.job(plain).unwrap().can_ask, "{unnamed}");
+    // named: the tool, and what safe mode would drop is dropped piece by piece (safe mode drops the tool too), with
+    // the owner's settings files still read, as safe mode reads them
+    let (id, argv) = turn(&mut s, false);
+    let has = |flag: &str| argv.iter().any(|a| a == flag);
+    assert!(!has("--safe-mode") && has("--mcp-config") && has("--strict-mcp-config") && !has("--setting-sources")
+            && has("--disable-slash-commands") && has("mcp__ringo__ask_agent"), "{argv:?}");
+    assert!(argv.iter().any(|a| a.contains("\"disableAllHooks\":true")) && argv.windows(2).any(|w| w == ["--agent", "claude"]), "{argv:?}");
+    let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
+    assert!(env.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1") && env.contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1")
+            && env.contains("RINGO_CHILD=1"), "the server runs inside a turn Ringo launched: {env}");
+    assert_eq!(s.job(id).unwrap().reply(), "heard: all done/", "what codex said came back into the turn");
+    assert!(s.job(id).unwrap().log.iter().any(|l| l == "asks codex: is a.txt fine?"), "{:?}", s.job(id).unwrap().log);
+    // the turn it asked for: codex's own, read-only though the session edits, told who asks, with no means to ask on
+    let asked = s.jobs.last().unwrap();
+    assert_eq!((asked.id, &asked.kind, &asked.status, asked.can_ask), (id + 1, &ringo_cli::Kind::Agent { agent: agent("codex"), write: false }, &Status::Done, false));
+    assert_eq!(asked.asked_by.as_ref().map(|(by, _)| *by), Some(id));
+    assert_eq!((threads(&codex).last().unwrap()["params"]["sandbox"].as_str(), s.mode), (Some("read-only"), Mode::Ask));
+    let heard = turn_text(&codex);
+    assert!(heard.contains("claude is in the middle of a turn for me and asks you:\n\nis a.txt fine?\n\nAnswer claude directly"), "{heard}");
+    // at most MAX_ASKS of them a turn: the next is told so, and no turn starts for it
+    let before = s.jobs.len();
+    fs::write(&asks, "codex|one\ncodex|two\ncodex|three\ncodex|four\n").unwrap();
+    let (id, _) = turn(&mut s, false);
+    assert_eq!(s.jobs.len() - before, 1 + ringo_cli::MAX_ASKS, "its own turn and MAX_ASKS more, never another");
+    assert_eq!(s.job(id).unwrap().reply(), "heard: all done/all done/all done/this turn has asked 3 times already: go on with what you have/");
+    // an agent that is not here to ask: the reason comes back, and the turn goes on
+    let before = s.jobs.len();
+    fs::write(&asks, "nobody|x\nclaude|y\n").unwrap();
+    let (id, _) = turn(&mut s, false);
+    assert_eq!(s.job(id).unwrap().reply(), "heard: there is no agent nobody to ask here: codex/there is no agent claude to ask here: codex/");
+    assert_eq!(s.jobs.len() - before, 1);
+    // Codex is given the same server, in its settings for the run
+    let id = s.launch_agent(agent("codex"), false, "the task").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let argv = fs::read_to_string(format!("{}.argv", codex.display())).unwrap();
+    let dir = s.job(id).unwrap().dir.display().to_string();
+    assert!(argv.contains(&format!("mcp_servers.ringo.command=\"{}\"", env!("CARGO_BIN_EXE_ringo")))
+            && argv.contains(&format!("mcp_servers.ringo.args=[\"ask-server\",\"{dir}\",\"claude\"]"))
+            && argv.contains("mcp_servers.ringo.default_tools_approval_mode=\"approve\"") && s.job(id).unwrap().can_ask, "{argv}");
+    // a turn in its own copy hears no one, and is given no one to ask
+    let (id, argv) = turn(&mut s, true);
+    assert!(!argv.iter().any(|a| a == "--mcp-config") && !s.job(id).unwrap().can_ask, "{argv:?}");
+    // Ringo still does not start inside a turn it launched: only its ask server does
+    let run = |arg: &str| Command::new(env!("CARGO_BIN_EXE_ringo")).arg(arg).env("RINGO_CHILD", "1").stdin(std::process::Stdio::null())
+        .output().unwrap().status.code();
+    assert_eq!((run("--version"), run("ask-server")), (Some(2), Some(2)), "refused; and the server wants its folder");
+    let served = Command::new(env!("CARGO_BIN_EXE_ringo")).args(["ask-server", "/nonexistent", "codex"]).env("RINGO_CHILD", "1")
+        .stdin(std::process::Stdio::null()).output().unwrap();
+    assert_eq!(served.status.code(), Some(0), "with nothing asked it ends when its input does");
+}
