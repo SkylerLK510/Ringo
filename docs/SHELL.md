@@ -830,7 +830,7 @@ Three ways to set one, the first needing nothing remembered:
 - **Pick it.** `/model` and a space opens a list under the input: with more than one agent that takes a model, whose
   it is, then that agent's models (`default`, Claude Code's four aliases, or what the Codex plan offers, with
   OpenAI's own line on each and `← now` on the one in use). Up and Down move, and Enter on a model sets it: no
-  second Enter. With one such agent the list is its models at once. Codex's models are read once a session, the
+  second Enter. With one such agent the list is its models at once. `/model claude` and Enter opens that agent's list. Codex's models are read once a session, the
   first time `/model` is typed (the same `model/list` read as above); `/model` alone then shows what was read.
 - **Name it.** `/model opus` sets it for the agent the name belongs to: Claude Code's aliases and `claude-...` for a
   Claude agent, a name the Codex plan lists or `gpt-...` for a Codex one, the agent you are talking to before any

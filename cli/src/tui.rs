@@ -2537,7 +2537,9 @@ impl App {
             });
         }
         let mut entries: Vec<(String, String, String)> = Vec::new();
-        if takers.len() > 1 {
+        // whose: always when more than one agent takes a model; for the one that does once its name is being typed,
+        // so /model claude and Enter opens claude's list either way
+        if takers.len() > 1 || !first.is_empty() {
             entries.extend(takers.iter().filter(|a| a.name().starts_with(first)).map(|a| {
                 (format!("{} ", a.name()), a.name().to_string(),
                  format!("runs on {} · pick its model", self.s.models.get(a).map_or("its own default", String::as_str)))
@@ -4709,6 +4711,12 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         assert_eq!(listed_for(&mut a, "/model "), own(&[("default", "← now · its own default"), ("fable", ""), ("opus", ""), ("sonnet", ""), ("haiku", "")]));
         assert_eq!(listed_for(&mut a, "/model s"), own(&[("sonnet", "")]));
         assert!(listed_for(&mut a, "/model").iter().any(|(to, _)| to == "/model"), "without the space, the commands still");
+        // its name typed opens its list, though no other agent takes a model
+        assert_eq!(listed_for(&mut a, "/model claude"), own(&[("claude ", "runs on its own default · pick its model")]));
+        a.last_key = Instant::now() - Duration::from_secs(1);
+        a.key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(a.input.iter().collect::<String>(), "/model claude ", "Enter opens its list, nothing is sent");
+        assert_eq!(listed_for(&mut a, "/model claude "), own(&[("default", "← now · its own default"), ("fable", ""), ("opus", ""), ("sonnet", ""), ("haiku", "")]));
         // Enter on a pick sends it: no second Enter, no agent to name
         listed_for(&mut a, "/model ");
         a.last_key = Instant::now() - Duration::from_secs(1);
