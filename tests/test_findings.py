@@ -235,5 +235,19 @@ class AdapterTest(unittest.TestCase):
             self.assertFalse(Path(d, 'findings.json').exists())
 
 
+class NamedFileTest(unittest.TestCase):
+    def test_a_stated_location_may_name_a_capitalised_file_without_an_extension(self):
+        heads = ['Wrong command (`README:12`)', 'Bad licence (`LICENSE:1`)', 'Owners (`CODEOWNERS:4-6`)',
+                 'Port (`localhost:8080`)', 'Two (`README:3`, `src/a.py:9`)', 'Prose only, Note:2 says so']
+        review = '\n'.join(f'### {n}. {h}\n- Problem: p.\n' for n, h in enumerate(heads, 1))
+        self.assertEqual([(f['finding'], f['file'], f['start_line'], f['end_line']) for f in findings.parse(review)],
+                         [(1, 'README', 12, 12), (2, 'LICENSE', 1, 1), (3, 'CODEOWNERS', 4, 6), (5, 'README', 3, 3),
+                          (5, 'src/a.py', 9, 9)])
+        located = '### 1. Title\n- Location: README:12\n- Problem: Note:2 says so, see HTTP:404.\n'
+        self.assertEqual([(f['file'], f['start_line']) for f in findings.parse(located)], [('README', 12)])
+        prose = '### 1. Title\n- Problem: Note:2 says so, see HTTP:404.\n'
+        self.assertEqual(findings.parse(prose), [])  # a name with a number in prose is not a file
+
+
 if __name__ == '__main__':
     unittest.main()

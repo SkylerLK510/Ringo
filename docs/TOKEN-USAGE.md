@@ -10,8 +10,10 @@ provider calls, tokenizer dependency or normal-path processing.
 | `cache_read` | Cached input tokens |
 | `cache_write` | Cache-write input tokens |
 | `output` | Output tokens |
+| `reasoning_output` | Of `output`, the tokens spent on reasoning (Codex reports them; absent when no call did) |
 
-The reported total is `input + cache_read + cache_write + output`. These are
+The reported total is `input + cache_read + cache_write + output`;
+`reasoning_output` is already inside `output` and is never added to it. These are
 Ringo's normalized fields: native Codex usage includes cached tokens within raw
 input, so Ringo subtracts that subset from `input` and records it in `cache_read`.
 Do not add raw input to normalized cached input and count the cache twice.
@@ -21,7 +23,11 @@ and failed calls. Report call count and elapsed time alongside tokens. If
 `untokened_calls` is nonzero, label the total **partial** and state how many
 attempts lack usage. Do not estimate missing usage from text length or treat it
 as zero consumption. Tokens from different model tokenizers are model-specific;
-record the backend/model when comparing efficiency.
+record the backend/model when comparing efficiency. Each call's trace record
+names the `backend` and the `model` and `effort` Ringo asked for; `null` means the
+CLI's default, which is not recorded, so pin both (`codex-chatgpt@MODEL/EFFORT`)
+for runs that will be compared. `elapsed_s` covers the whole task, the findings
+export included, and a failed run reports it too.
 
 ## Codex call overhead
 

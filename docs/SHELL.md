@@ -182,7 +182,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `TEXT` (no `/` or `@`) | a turn of the agent you are talking to, in this folder, continuing its conversation: it reads, changes files there, and asks before anything else (in `ask` mode). Each agent takes one turn at a time in the folder, and the agents work side by side: a line for an agent whose turn runs goes into that turn (Claude, Codex) or waits under the input for it (Esc stops the latest turn and gives its agent's waiting lines back to the input) |
 | `/undo` | the files the latest turn here changed go back as they were before it; each `/undo` goes one turn further back. A file you edited since makes it refuse and touch nothing |
 | `/ask TEXT` | a quick answer: one tool-free call with your last few `/ask` questions and answers as context; it cannot see your files. Measured: about 1,300 tokens for a design question that cost about 19,700 as a Claude Code turn. When the call reads the line as a task (files to change, read or review, or live sources) it answers with one `ROUTE:` line instead, and the shell gives it to the agent you are talking to, or to `/research`; a review is put in the input line for you to say what to review |
-| `/clear` | a new conversation: each agent's next turn starts fresh |
+| `/clear` | a new conversation: each agent's next turn starts fresh, and a plain question carries no earlier answers |
 | `/separate`, `/together` | `/separate`: each agent keeps a conversation of its own, and nothing of one is told to another. `/together` (the default): one conversation again. Either way the agents work in the folder at the same time, one turn each. Text after either is sent as a line of its own once it has switched (`/separate @codex write the README`); any other command that takes nothing refuses text after it rather than drop it. The head says `separate` while it is on |
 | `/mode ask\|auto\|read`, `/auto`, Shift-Tab | how far every agent may act without asking (see [Modes and permissions](#modes-and-permissions)); `/auto` turns auto on (typed with auto on, it says so: a toggle would turn it off unseen), Shift-Tab cycles ask, auto, read. Remembered for next time |
 | `/tier quick\|standard\|deep\|ultra` | how hard agents think (see [Tiers](#tiers)); for this session only |
@@ -590,7 +590,9 @@ read when the shell opens and again after a turn when the last read is ten minut
 - **This session:** the jobs in memory, by agent.
 - **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder. Each finished job that used tokens
   appends one line: when, which agent (or `ringo` for a pipeline), and its input, cache-read, cache-write and output
-  counts.
+  counts; and what they are counts of: the tier, the model when the agent names it, a pipeline's command, and the
+  job's folder (a pipeline's trace there names each call's model and effort). A job that finished without reporting
+  any count appends a line with `"unknown": true` and no counts: unknown is not zero, and the sums leave it out.
 - **Plans:** asked of each set-up agent in the background, about a second each:
   - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given
     a message, so no model call (its answer says cost 0). Claude marks it experimental. When it fails, or succeeds

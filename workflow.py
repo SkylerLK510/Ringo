@@ -135,8 +135,9 @@ def materialize(current, declared, reply):
 
 MARK = '@@@ '
 REPAIR = ' Send every file you change as one complete FILE block this time; use no REPLACE blocks.'
+REPAIR_JSON = ' Send the "files" form this time, with every editable file complete; use no "edits".'
 ROLES = ('writer', 'revision', 'escalate', 'tests', 'review')
-EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+EFFORTS = harness.EFFORTS
 DOC_SUFFIXES = ('.md', '.txt', '.rst', '.adoc')
 
 
@@ -145,23 +146,7 @@ def artifact_kind(spec):
     return 'doc' if all(PurePosixPath(n).suffix.lower() in DOC_SUFFIXES for n in spec['files']) else 'code'
 
 
-def role_backend(backend, opts):
-    """backend with a role's model and reasoning effort applied. Codex takes both as CLI options before its
-    trailing '-'; a claude-style backend takes a model only."""
-    if not opts:
-        return backend
-    argv = list(backend['argv'])
-    if backend['style'] == 'codex':
-        extra = (['--model', opts['model']] if opts.get('model') else []) \
-            + (['-c', f'model_reasoning_effort="{opts["effort"]}"'] if opts.get('effort') else [])
-        argv = argv[:-1] + extra + argv[-1:] if argv and argv[-1] == '-' else argv + extra
-    elif backend['style'] == 'claude':
-        if opts.get('effort'):
-            raise ValueError('a claude-style backend takes a role model, not an effort')
-        argv = harness.with_model(argv, opts['model']) if opts.get('model') else argv
-    else:
-        raise ValueError(f"role options need a codex or claude backend, not {backend['name']}")
-    return {**backend, 'argv': argv}
+role_backend = harness.with_options  # a role's model and reasoning effort, applied to its backend
 
 
 NUMBER = re.compile(r'(?:(?<![\w.])[-\u2212])?(?<![A-Za-z_])\d[\d,]*(?:\.\d+)?')
@@ -228,6 +213,13 @@ def render_feedback(feedback):
     for key, title in (('review', 'Review of your last candidate'), ('previous_review', 'Earlier review')):
         if feedback.get(key):
             out.append(f'{title}:\n{feedback[key]}')
+    # The Council's decision and scores, as the JSON protocol's writer gets them: without them a rejected
+    # candidate's writer was told "None."
+    if feedback.get('decision'):
+        out.append('Council assessment of your last candidate:\n' + json.dumps(
+            {'decision': feedback['decision'], 'scored': feedback.get('scored')}, ensure_ascii=False))
+    if feedback.get('previous_council'):
+        out.append('Earlier council assessment:\n' + json.dumps(feedback['previous_council'], ensure_ascii=False))
     return '\n\n'.join(out) or 'None.'
 
 
@@ -595,8 +587,8 @@ def run(spec_path, out, call_fn=harness.call):
             if soft <= 0:
                 raise harness.BudgetExceeded('workflow wall-clock limit reached')
             accounting.reserve()
-            record = {'step': label, 'attempt': attempt, 'system_sha256': harness.sha(system),
-                      'message_sha256': harness.sha(message)}
+            record = {'step': label, 'attempt': attempt, 'backend': spec_b['name'], **harness.chosen(spec_b['argv']),
+                      'system_sha256': harness.sha(system), 'message_sha256': harness.sha(message)}
             watch = None
             if harness.accepts_watch(call_fn):
                 watch = harness.Watch(accounting, label, attempt, spec_b, soft, limit, kind,
@@ -807,7 +799,8 @@ def run(spec_path, out, call_fn=harness.call):
                 # not the round (and the review or check feedback it was answering).
                 entry['repair'] = errors[0]['protocol_error']
                 repaired = call(f'writer-{n}.repair', spec['writer'], writer_prompt,
-                                writer_message({**feedback, 'protocol_error': errors[0]['protocol_error'] + REPAIR}),
+                                writer_message({**feedback, 'protocol_error': errors[0]['protocol_error']
+                                                + (REPAIR if text_protocol else REPAIR_JSON)}),
                                 role=role)
                 try:
                     parsed.append((k + 1, *parse(repaired)))

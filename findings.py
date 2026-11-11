@@ -21,7 +21,11 @@ SEG = r'[\w.@+\-\[\]]'
 # well-known bare file name. Not inside a longer token, and not followed by more path characters.
 FILE = (rf'(?<![\w./\\@+\-\[\]])(/?(?:{SEG}+[/\\])*{SEG}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z])|/?(?:{SEG}+[/\\])+{SEG}+'
         rf'|Dockerfile|Makefile|Gemfile|Rakefile|Procfile)(?![\w@+\-\[\]/]|\.\w)')
-LOC = re.compile(FILE + r'`?(?:(?::L?|#L|:\s*lines?\s+)~?(\d+)(?:\s*[-–]\s*L?~?(\d+))?)?')
+LINES = r'`?(?:(?::L?|#L|:\s*lines?\s+)~?(\d+)(?:\s*[-–]\s*L?~?(\d+))?)?'
+LOC = re.compile(FILE + LINES)
+# Where a finding states its location (the `- Location:` line, the heading's trailing parentheses), a capitalised bare
+# name with a line number is a file too: README:12, LICENSE:1, CODEOWNERS:4. Not in prose, where Note:2 is no file.
+NAMED = re.compile(FILE[:-len(r')(?![\w@+\-\[\]/]|\.\w)')] + r'|[A-Z][\w+\-]*(?=`?(?::L?|#L)~?\d))(?![\w@+\-\[\]/]|\.\w)' + LINES)
 FIELD = r'^\s*[-*]\s*\**{}\**\s*:\s*\**\s*(.*?)\s*\**\s*$'
 FIELD_START = re.compile(r'^(\s*)[-*]\s*\**[A-Z][\w -]{0,30}\**\s*:')
 TRAILING = re.compile(r'\(([^()]*(?:\([^()]*\)[^()]*)*)\)[\s*.]*$')
@@ -35,11 +39,12 @@ def clean(path):
     return path.lstrip('/')
 
 
-def locations(text, need_line=False):
+def locations(text, need_line=False, named=False):
     """[(file, start, end)] anchors in text, first one per file; a file without a line gets line 1. need_line keeps
-    only anchors with a line number or a directory, which prose mentions such as `d.db` rarely have."""
+    only anchors with a line number or a directory, which prose mentions such as `d.db` rarely have. named: text is
+    a stated location, so NAMED's bare names count."""
     out, seen = [], set()
-    for m in LOC.finditer(text):
+    for m in (NAMED if named else LOC).finditer(text):
         path = clean(m.group(1))
         if not path or path in seen or (need_line and not m.group(2) and '/' not in path):
             continue
@@ -53,7 +58,7 @@ def heading_anchors(title):
     """Anchors in a heading: those in its trailing parentheses, else backticked spans in it that have a line or a
     directory (a bare `name.ext` in a title is as often code, such as `d.db`, as a file)."""
     m = TRAILING.search(title)
-    found = locations(m.group(1)) if m else []
+    found = locations(m.group(1), named=True) if m else []
     return found or locations(' '.join(re.findall(r'`([^`\n]+)`', title)), need_line=True)
 
 
@@ -93,7 +98,7 @@ def parse(review_text):
         title = pipelines.HEAD.match(head).group(2).strip(' *')
         lines = rest.splitlines()
         loc = field(rest, 'Location')
-        anchors = (locations(loc) if loc else []) or heading_anchors(title) \
+        anchors = (locations(loc, named=True) if loc else []) or heading_anchors(title) \
             or (locations(rest, need_line=True) or locations(rest))[:1]
         detail = problem(lines) or ' '.join(rest.split())
         message = (title.rstrip(' .') + ('. ' + detail if detail else ''))[:MESSAGE]

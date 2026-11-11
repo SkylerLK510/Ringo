@@ -124,7 +124,17 @@ def backend(spec):
     prompt and tool modes are removed, see backends._lean_codex) and 'tools', the tool item types its turns may
     contain: the `codex` preset keeps its shell, `codex-search` (research's gather call: the codex-chatgpt
     restrictions with live web search) may search the web, a `codex:` command may search the web only when its own
-    argv passes --search, and every other tool item fails the turn."""
+    argv passes --search, and every other tool item fails the turn. A preset takes a model, a reasoning effort or
+    both after '@' (codex-chatgpt@MODEL, @MODEL/EFFORT or @/EFFORT; claude@MODEL): the preset's own restrictions
+    with those options set, under a name that says which model was asked."""
+    name, opts = preset(spec)
+    if opts is not None:
+        if not opts:
+            raise ValueError(f'backend {spec!r} names no model or effort after @')
+        if opts.get('effort') and (name == 'claude' or opts['effort'] not in EFFORTS):
+            raise ValueError(f"backend {spec!r}: the claude preset takes a model only" if name == 'claude' else
+                             f"backend {spec!r}: the effort is one of {', '.join(EFFORTS)}")
+        return {**with_options(backend(name), opts), 'name': spec}
     extra = {}
     if spec == 'claude':  # the preset uses the subscription login: API keys and endpoint overrides are removed
         argv, style = split_command(backends.JUDGE_PRESETS['claude']), 'claude'
@@ -167,6 +177,57 @@ def with_model(argv, model):
     return out if replaced else [*out, '--model', model]
 
 
+EFFORTS = ('low', 'medium', 'high', 'xhigh', 'max')
+OPTION_PRESETS = ('claude', 'codex', 'codex-chatgpt', 'codex-search')
+
+
+def with_options(backend, opts):
+    """backend with a role's model and reasoning effort applied. Codex takes both as CLI options before its
+    trailing '-'; a claude-style backend takes a model only."""
+    if not opts:
+        return backend
+    argv = list(backend['argv'])
+    if backend['style'] == 'codex':
+        extra = (['--model', opts['model']] if opts.get('model') else []) \
+            + (['-c', f'model_reasoning_effort="{opts["effort"]}"'] if opts.get('effort') else [])
+        argv = argv[:-1] + extra + argv[-1:] if argv and argv[-1] == '-' else argv + extra
+    elif backend['style'] == 'claude':
+        if opts.get('effort'):
+            raise ValueError('a claude-style backend takes a role model, not an effort')
+        argv = with_model(argv, opts['model']) if opts.get('model') else argv
+    else:
+        raise ValueError(f"role options need a codex or claude backend, not {backend['name']}")
+    return {**backend, 'argv': argv}
+
+
+def preset(spec):
+    """(preset, options) of a backend spec. 'PRESET@MODEL', 'PRESET@MODEL/EFFORT' and 'PRESET@/EFFORT' name a
+    preset with a model, a reasoning effort or both: options holds the ones given. Any other spec is returned
+    whole, with None."""
+    name, at, chosen = spec.partition('@')
+    if not at or name not in OPTION_PRESETS:
+        return spec, None
+    model, _, effort = chosen.partition('/')
+    return name, {k: v for k, v in (('model', model), ('effort', effort)) if v}
+
+
+EFFORT_ARG = re.compile(r'model_reasoning_effort="?([^"]*)"?')
+
+
+def chosen(argv):
+    """{'model', 'effort'} a command line asks for: its last --model value and its last Codex reasoning-effort
+    override. None means the command leaves it to the backend's own default, which Ringo does not see."""
+    model = effort = None
+    for k, arg in enumerate(argv):
+        if arg == '--model' and k + 1 < len(argv):
+            model = argv[k + 1]
+        elif arg.startswith('--model='):
+            model = arg[8:]
+        elif k and argv[k - 1] == '-c' and (m := EFFORT_ARG.fullmatch(arg)):
+            effort = m.group(1)
+    return {'model': model, 'effort': effort}
+
+
 TOOL_ITEMS = {'command_execution', 'mcp_tool_call', 'web_search', 'file_change'}
 # Codex's own built-in MCP server offers resource listings that no flag disables; with a private CODEX_HOME they
 # list nothing, so a call that returned an empty list told the model nothing and does not break a tool-free turn.
@@ -198,7 +259,8 @@ def codex_reply(output, name='codex-chatgpt', tools=()):
     Warnings (item type 'error'), reasoning, todo lists and started/updated events are tolerated and recorded:
     usage['items'] counts completed item types, usage['warnings'] keeps the warning texts. Without a turn.completed
     event, or one whose usage reports no token counts, the tokens are unknown, not zero, so the usage carries no token
-    fields and the call counts as untokened."""
+    fields and the call counts as untokened. usage['reasoning_output'] is there when Codex reports it: the part of
+    `output` spent on reasoning, already counted in it."""
     usage = dict.fromkeys(TOKEN_KEYS, 0)
     usage['cost_usd'] = None
     messages, completed, measured, reasons, items, warnings = [], 0, 0, [], {}, []
@@ -228,6 +290,8 @@ def codex_reply(output, name='codex-chatgpt', tools=()):
             usage['cache_read'] += cached
             usage['cache_write'] += tokens('cache_write_input_tokens')
             usage['output'] += tokens('output_tokens')
+            if type(reported.get('reasoning_output_tokens')) is int and reported['reasoning_output_tokens'] >= 0:
+                usage['reasoning_output'] = usage.get('reasoning_output', 0) + reported['reasoning_output_tokens']
         item = event.get('item')
         if kind == 'item.completed' and isinstance(item, dict):
             item_type = str(item.get('type'))
@@ -436,7 +500,7 @@ def probe(run, backend, label, call_fn=None, stop=None):
     fn = call_fn or call
     step = f'{label}.probe'
     run.reserve()
-    rec = {'step': step, 'attempt': 1, 'backend': backend['name'], 'started': time.time()}
+    rec = {'step': step, 'attempt': 1, 'backend': backend['name'], **chosen(backend['argv']), 'started': time.time()}
     run.record({**rec, 'status': 'started'})  # so an interrupted probe is visible, and its cost unknown
     t0 = time.monotonic()
     try:
@@ -495,6 +559,7 @@ class Run:
         self.calls, self.cost, self.unpriced, self.untokened = 0, 0.0, 0, 0
         self.admission_refusals, self.incidents = 0, 0
         self.tokens = dict.fromkeys(TOKEN_KEYS, 0)
+        self.reasoning = None  # output tokens spent on reasoning, summed over the calls that report it (Codex)
         self.finished = {}  # kind -> [{'seconds', 'tokens'}] of successful calls, for soft-limit comparisons
         self.incident_dir = None
         self.lock = threading.Lock()
@@ -541,6 +606,8 @@ class Run:
             usage = rec.get('usage')
             for k in self.tokens:
                 self.tokens[k] += (usage or {}).get(k) or 0
+            if type((usage or {}).get('reasoning_output')) is int:
+                self.reasoning = (self.reasoning or 0) + usage['reasoning_output']
             if rec.get('status') in PAID_STATUSES:
                 if not isinstance(usage, dict) or not all(k in usage for k in TOKEN_KEYS):
                     self.untokened += 1
@@ -603,7 +670,8 @@ class Run:
     def summary(self):
         return {'calls': self.calls, 'cost_usd': round(self.cost, 6), 'unpriced_calls': self.unpriced,
                 'untokened_calls': self.untokened, 'admission_refusals': self.admission_refusals,
-                'incidents': self.incidents, **self.tokens}
+                'incidents': self.incidents, **self.tokens,
+                **({} if self.reasoning is None else {'reasoning_output': self.reasoning})}
 
 
 def outside_repo(path, what):
@@ -622,6 +690,7 @@ def tool_access(name):
     """What tools a preset's child may use: preset declarations, not an attestation of arbitrary commands or CLI
     installations. 'none' is about tools, not instructions: a CLI can still load instructions on its own, which is
     why Codex children also get a private CODEX_HOME and HOME (backends.run_isolated)."""
+    name = preset(name)[0]  # a model or an effort chosen after '@' changes neither
     if name in ('claude', 'codex-chatgpt') or name.startswith('ollama:'):
         return 'none'
     return {'codex': 'disk', 'codex-search': 'web'}.get(name, 'unknown')
@@ -714,7 +783,9 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                 raise type(exc)(f'{exc}; retry not started after attempt {attempt - 1} failed: '
                                 f'{type(last).__name__}: {last}') from last
             backend = spec_for(p)
+            asked = chosen(backend['argv'])
             rec = {'step': label, 'attempt': attempt, 'pass': p['id'], 'backend': backend['name'],
+                   'model': p.get('model') or asked['model'], 'effort': asked['effort'],
                    'system_sha256': sha(system),
                    'message_sha256': sha(message), 'started': time.time()}
             soft, limit = timeout_s, limit_for(timeout_s)
@@ -825,15 +896,19 @@ def findings_pr(args):
 
 def write_findings(args, text, run):
     """Write the review's findings as ReviewBench contract JSON to --findings-json (and the trace); anchors are
-    checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary."""
+    checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary;
+    findings_unshaped says the review has no numbered finding and no "No defects found" line, so the empty file
+    means the reply could not be read, not that the review found nothing."""
     import findings  # deferred: only --findings-json uses it
     found = findings.parse(text)
+    unshaped = not pipelines.findings('f', text)[1] and not pipelines.NO_DEFECTS.search(pipelines.unfenced(text)[1])
     kept, dropped = findings.anchor(found, args.repo, args.head, args.base) if getattr(args, 'repo', None) else (found, [])
     data = json.dumps(findings.reviewbench(kept, args.findings_pr, args.agent), indent=1) + '\n'
     Path(args.findings_json).write_text(data, encoding='utf-8')
     if run.trace:
         (run.trace / 'findings.json').write_text(data, encoding='utf-8')
-    return {'findings_written': len(kept), 'findings_dropped': len(dropped), 'findings_anchored': bool(args.repo)}
+    return {'findings_written': len(kept), 'findings_dropped': len(dropped), 'findings_anchored': bool(args.repo),
+            'findings_unshaped': unshaped}
 
 
 def task(args, kind):
@@ -878,21 +953,27 @@ def task(args, kind):
             with contextlib.suppress(OSError):
                 run.state('failed', error=f'cannot start: {exc}'[:500])
         return 2
+    def elapsed():  # the whole task so far, its own work around the calls included
+        return (time.perf_counter_ns() - started) / 1_000_000_000
     try:
         text, stats = run_plan(plan, material, b, run, timeout_s=args.timeout, checker_spec=c)
     except (backends.JudgeError, ValueError, OSError, subprocess.TimeoutExpired, BudgetExceeded, pipelines.NeedVerdicts) as exc:
         print(f'harness: {kind} failed: {exc}', file=sys.stderr)
-        print(f'harness: {json.dumps({**run.summary(), **names})}', file=sys.stderr)
+        print(f'harness: {json.dumps({**run.summary(), **names, "elapsed_s": elapsed()})}', file=sys.stderr)
         run.state('failed', error=f'{type(exc).__name__}: {exc}'[:500])
         return 2
     except BaseException:
         run.state('interrupted')
         raise
     summary = {**run.summary(), **stats, **names}
-    summary['elapsed_s'] = (time.perf_counter_ns() - started) / 1_000_000_000
+    summary['elapsed_s'] = elapsed()  # replaced below once the findings are written; kept if writing them fails
     try:
         if getattr(args, 'findings_json', None):
             summary.update(write_findings(args, text, run))
+            if summary['findings_unshaped']:
+                print('harness: the review has no numbered finding and no "No defects found" line, so the findings '
+                      'file is empty', file=sys.stderr)
+            summary['elapsed_s'] = elapsed()
         if run.trace:
             (run.trace / 'result.md').write_text(text + '\n', encoding='utf-8')
             (run.trace / 'summary.json').write_text(json.dumps(summary, indent=1), encoding='utf-8')
@@ -902,6 +983,7 @@ def task(args, kind):
             print(text)
     except (OSError, ValueError) as exc:
         print(text)
+        summary['elapsed_s'] = elapsed()  # the export that failed took its time too
         print(f'harness: {kind} cannot write the result: {exc}', file=sys.stderr)
         print(f'harness: {json.dumps(summary)}', file=sys.stderr)
         run.state('failed', error=f'cannot write the result: {exc}'[:500])
@@ -939,8 +1021,9 @@ def main(argv=None, *, prog='harness.py'):
         else:
             p.add_argument('--input', required=True, help='the material: the brief, as one text file')
         p.add_argument('--backend', default='claude',
-                       help='claude, codex, codex-chatgpt, ollama:MODEL, claude:<command>, codex:<command> '
-                            '(prints Codex exec --json events), or any stdin command')
+                       help='claude, codex, codex-chatgpt (a preset takes @MODEL, @MODEL/EFFORT or @/EFFORT), '
+                            'ollama:MODEL, claude:<command>, codex:<command> (prints Codex exec --json events), '
+                            'or any stdin command')
         p.add_argument('--checker-backend',
                        help="a second backend (same forms as --backend) for the plan's verdicts pass and its repair, "
                             'so another model or provider checks the findings; the plan needs a verdicts pass')

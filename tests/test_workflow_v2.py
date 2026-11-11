@@ -3,6 +3,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -395,6 +396,59 @@ class SpecTestLoopTest(unittest.TestCase):
                 workflow.load_spec(path)
         with self.assertRaisesRegex(ValueError, 'at most one script'):
             workflow.parse_text_reply('@@@ SCRIPT\nprint(1)\n@@@ SCRIPT\nprint(2)\n')
+
+    def test_json_protocol_repair_asks_for_json_not_for_file_blocks(self):
+        bad = json.dumps({'edits': [{'path': 'value.py', 'old': 'not there', 'new': 'x'}], 'rationale': 'r'})
+        good = json.dumps({'files': {'value.py': 'def f(x):\n    return 2*x\n'}, 'rationale': 'r'})
+        path = self.root / 'task.json'
+        spec = {k: v for k, v in self.spec.items() if k not in ('protocol', 'spec_tests')}
+        path.write_text(json.dumps({**spec, 'protocol_repair': True}))
+        seen, writer = [], iter([bad, good])
+
+        def call(backend, system, message, timeout_s):
+            seen.append((system, message))
+            return (next(writer) if system.startswith('Implement the task') else REVIEW_OK), {}
+        report = workflow.run(path, self.root / 'run', call_fn=call)
+        self.assertEqual((report['status'], len(report['rounds'])), ('ready_for_review', 1))
+        self.assertEqual(report['usage']['calls'], 3)  # writer, repair, review
+        asked = json.loads(seen[1][1])['feedback']['protocol_error']
+        self.assertTrue(asked.endswith(workflow.REPAIR_JSON), asked)
+        self.assertNotIn('FILE block', asked)  # the text protocol's form, which the JSON parser refuses
+
+    def test_each_call_record_names_its_backend_model_and_effort(self):
+        good = '@@@ FILE value.py\ndef f(x):\n    return 2*x\n'
+        fake = {'name': 'codex-chatgpt', 'argv': ['codex', 'exec', '-'], 'style': 'codex'}
+        with mock.patch.object(harness, 'backend', return_value=fake):
+            report, _ = self.run_with([good], roles={'writer': {'model': 'gpt-x', 'effort': 'low'}})
+        self.assertEqual(report['status'], 'ready_for_review')
+        records = [json.loads(line) for line in (self.root / 'run/trace.jsonl').read_text().splitlines()]
+        named = {r['step']: (r['backend'], r['model'], r['effort']) for r in records}
+        self.assertEqual(named['writer-1'], ('codex-chatgpt', 'gpt-x', 'low'))
+        self.assertEqual(named['spec-tests'], ('codex-chatgpt', None, None))  # no role options: the backend's default
+
+    def test_spec_runner_counts_a_skipped_test_as_neither_passed_nor_run(self):
+        import subprocess
+        module = self.root / 'skip_tests.py'
+        module.write_text('import unittest\n\nclass T(unittest.TestCase):\n    def test_runs(self):\n        pass\n\n'
+                          '    @unittest.skip("no network")\n    def test_skipped(self):\n        self.fail("never runs")\n\n'
+                          '    @unittest.expectedFailure\n    def test_surprise(self):\n        pass\n\n'
+                          '    @unittest.expectedFailure\n    def test_known(self):\n        self.fail("known")\n\n'
+                          'class Away(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n'
+                          '        raise unittest.SkipTest("no database")\n\n    def test_a(self):\n        pass\n\n'
+                          '    def test_b(self):\n        pass\n')
+        out = self.root / 'out.json'
+        ran = subprocess.run([sys.executable, '-I', '-B', str(Path(workflow.__file__).parent / 'spec_runner.py'),
+                              str(self.root), str(module), '--json', str(out)], capture_output=True, text=True, timeout=60)
+        result = json.loads(out.read_text())
+        self.assertEqual((result['passed'], result['total'], result['skipped']), (2, 3, 3))
+        # a fixture that skips ran none of its tests: skipped too, not failed as "not run"
+        self.assertEqual([result['tests'][f'Away.test_{t}'] for t in 'ab'], [{'ok': True, 'error': '', 'skipped': 'no database'}] * 2)
+        self.assertEqual(result['tests']['T.test_skipped'], {'ok': True, 'error': '', 'skipped': 'no network'})
+        self.assertFalse(result['tests']['T.test_surprise']['ok'])
+        self.assertIn('unexpected success', result['tests']['T.test_surprise']['error'])
+        self.assertTrue(result['tests']['T.test_known']['ok'])
+        self.assertIn('2/3 spec tests pass, 3 skipped', ran.stdout)
+        self.assertEqual(ran.returncode, 1)
 
 
 if __name__ == '__main__':

@@ -419,11 +419,10 @@ fn turns_outside_git_undo_from_ringos_own_store() {
     assert_eq!(fs::read_dir(state.join("undo")).unwrap().count(), 1);
 }
 
-#[test]
-fn a_plain_question_is_one_tool_free_call_that_remembers_the_last_answers() {
-    // A stand-in ringo.py: records its argv and the material it was given, then answers through its trace and --out.
-    let r = repo("ask");
-    let home = root().join("fake-ask-home");
+/// A stand-in ringo.py in a home folder of its own: it records its argv and the material it was given (seen-N.json),
+/// then answers "answer N" through its trace and --out.
+fn ask_home(name: &str) -> PathBuf {
+    let home = root().join(name);
     fs::create_dir_all(&home).unwrap();
     fs::write(home.join("ringo.py"), "import json, sys, pathlib\n\
         a = sys.argv[1:]\n\
@@ -435,6 +434,35 @@ fn a_plain_question_is_one_tool_free_call_that_remembers_the_last_answers() {
         (t / 'trace.jsonl').write_text(json.dumps({'step': 'answer', 'backend': 'b', 'status': 'started'}) + '\\n' +\n\
             json.dumps({'step': 'answer', 'status': 'ok', 'usage': {'input': 900, 'cache_write': 0, 'cache_read': 0, 'output': 40}}) + '\\n')\n\
         pathlib.Path(val('--out')).write_text(f'answer {n}\\n')\n").unwrap();
+    home
+}
+
+#[test]
+fn a_plain_question_after_clear_carries_no_earlier_answers() {
+    let r = repo("ask-clear");
+    let home = ask_home("fake-ask-clear-home");
+    let mut s = Session::new(&r).unwrap();
+    s.ringo_home = home.clone();
+    let first = s.ask("what is a dotfiles repository?").unwrap();
+    assert_eq!(wait(&mut s, first), Status::Done);
+    s.forget(); // /clear
+    let second = s.ask("something else entirely").unwrap();
+    assert_eq!(wait(&mut s, second), Status::Done);
+    let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join("seen-2.json")).unwrap()).unwrap();
+    let material = seen["material"].as_str().unwrap();
+    assert!(!material.contains("dotfiles") && !material.contains("answer 1"), "the question before /clear went along: {material}");
+    assert!(material.ends_with("Question: something else entirely\n"), "{material}");
+    // and the conversation since /clear still carries its own
+    let third = s.ask("and then?").unwrap();
+    assert_eq!(wait(&mut s, third), Status::Done);
+    let seen: serde_json::Value = serde_json::from_str(&fs::read_to_string(home.join("seen-3.json")).unwrap()).unwrap();
+    assert!(seen["material"].as_str().unwrap().contains("Question: something else entirely\n\nAnswer:\nanswer 2"));
+}
+
+#[test]
+fn a_plain_question_is_one_tool_free_call_that_remembers_the_last_answers() {
+    let r = repo("ask");
+    let home = ask_home("fake-ask-home");
     let mut s = Session::new(&r).unwrap();
     s.ringo_home = home.clone();
     let first = s.ask("what is a dotfiles repository?").unwrap();
@@ -1585,4 +1613,180 @@ fn a_turn_that_cannot_start_after_a_restart_is_still_told_the_turns_before_it() 
     said(&mut next, "claude", "and now");
     let (told, resumed) = claude_heard(&claude);
     assert!(resumed && told.contains("#2 · the owner to codex: take it from here"), "{told}");
+}
+
+#[test]
+fn what_a_restart_carries_for_an_agent_stays_bounded() {
+    let r = repo("carry-cap");
+    let (codex, claude) = (fake(&root(), "codex-carry-cap", &codex_ok()), fake(&root(), "claude-carry-cap", CLAUDE_TALKS));
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex);
+    s.codex_home = root().join("codex-home-golden");
+    // Claude has a conversation and was away for several restarts: what it is owed came to 150,000 characters
+    let old: String = (0..2_500).map(|n| format!("#{n} · the owner to codex: {}\n", "x".repeat(40))).collect();
+    assert!(old.len() > 150_000);
+    s.resume(&[("claude".into(), "s-1".into())], &[("claude".into(), old)], &[]);
+    let latest = said(&mut s, "codex", "take it from here");
+    let carried = s.carry().into_iter().find(|(name, _)| name == "claude").unwrap().1;
+    assert!(carried.len() <= 60_100, "the sum had no limit: {} characters", carried.len());
+    assert!(carried.starts_with("(the earliest turns before the restart are cut)\n"), "{}", &carried[..80]);
+    assert!(carried.contains("#2499 · the owner to codex") && !carried.contains("#0 · the owner to codex"), "the newest stay");
+    assert!(carried.contains(&format!("#{latest} · the owner to codex: take it from here")), "and the turn since");
+}
+
+#[test]
+fn a_turn_that_dies_while_starting_leaves_its_handoff_for_the_next() {
+    let r = repo("dies-starting");
+    let (codex, claude) = (fake(&root(), "codex-dies-starting", &codex_ok()), fake(&root(), "claude-dies-starting", CLAUDE_TALKS));
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    s.codex_home = root().join("codex-home-golden");
+    said(&mut s, "claude", "fix it");
+    let theirs = said(&mut s, "codex", "take it from here");
+    // Claude's program starts and dies before it reads a word: the turn was told nothing, though it did start
+    let dies = fake(&root(), "claude-dies", "#!/bin/sh\nhead -n 1 >/dev/null\necho 'cannot reach the login service' >&2\nexit 1\n");
+    s.programs.insert(agent("claude"), dies);
+    let failed = s.launch_agent(agent("claude"), false, "and now").unwrap();
+    assert!(matches!(wait(&mut s, failed), Status::Failed(_)));
+    assert!(s.job(failed).unwrap().log.iter().any(|l| l.contains("failed before it read its message")), "{:?}", s.job(failed).unwrap().log);
+    s.programs.insert(agent("claude"), claude.clone());
+    said(&mut s, "claude", "and now");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(resumed && told.contains(&format!("#{theirs} · the owner to codex: take it from here")), "{told}");
+    // told once: a turn that did read its message keeps what it was told
+    said(&mut s, "claude", "again");
+    assert_eq!(claude_heard(&claude), ("again".into(), true));
+}
+
+#[test]
+fn a_compacted_conversation_goes_on_instead_of_starting_fresh() {
+    let r = repo("compacted");
+    // grows past the handoff size on GROW; /compact answers with the boundary Claude Code sends and no words
+    let claude = fake(&root(), "claude-compacted", r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+head -n 1 > "$0.stdin"
+echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'
+case "$(cat "$0.stdin")" in
+  *'/compact"}}') echo '{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":70005}}'
+    echo '{"type":"result","subtype":"success","is_error":false,"result":""}'; exit 0 ;;
+  *'GROW"}}') big=70000 ;; *) big=10 ;; esac
+echo '{"type":"assistant","message":{"id":"m1","content":[],"usage":{"input_tokens":'$big',"output_tokens":5}},"parent_tool_use_id":null}'
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+"#);
+    let mut s = session(&r, agent("claude"), &claude);
+    said(&mut s, "claude", "GROW");
+    said(&mut s, "claude", "/compact");
+    said(&mut s, "claude", "and now");
+    // before, the size from before the compaction stood, so this turn started fresh and the compaction was thrown away
+    assert_eq!(claude_heard(&claude), ("and now".into(), true), "the compacted conversation goes on");
+    // a conversation still past the size after a turn starts fresh, as ever
+    said(&mut s, "claude", "GROW");
+    said(&mut s, "claude", "next");
+    let (told, resumed) = claude_heard(&claude);
+    assert!(!resumed && told.starts_with("Ringo's record of this conversation so far"), "{told}");
+}
+
+fn usage_rows(state: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(state.join("usage.jsonl")).unwrap_or_default().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+#[test]
+fn the_usage_record_says_what_its_counts_are_of_and_keeps_a_turn_that_reported_none() {
+    let r = repo("usage-rows");
+    let state = root().join("usage-rows-state");
+    let _ = fs::remove_dir_all(&state);
+    let counted = fake(&root(), "claude-usage-rows", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-u\",\"apiKeySource\":\"none\",\"model\":\"claude-test-1\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"model_usage_since_last_result\":{\"claude-test-1\":{\"inputTokens\":5,\"outputTokens\":6}}}'\n");
+    // a turn that ends well and reports no count anywhere
+    let silent = fake(&root(), "claude-usage-silent", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-u\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n");
+    let mut s = Session::with_state(&r, &state).unwrap();
+    s.programs.insert(agent("claude"), counted);
+    s.tier = ringo_cli::Tier::Deep;
+    let first = said(&mut s, "claude", "work");
+    s.tier = ringo_cli::Tier::Standard;
+    s.programs.insert(agent("claude"), silent);
+    let second = said(&mut s, "claude", "more");
+    let rows = usage_rows(&state);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!((rows[0]["agent"].as_str(), rows[0]["tier"].as_str(), rows[0]["model"].as_str()),
+               (Some("claude"), Some("deep"), Some("claude-test-1")));
+    assert_eq!((rows[0]["input"].as_u64(), rows[0]["output"].as_u64()), (Some(5), Some(6)));
+    assert_eq!(rows[0]["job"].as_str(), s.job(first).unwrap().dir.to_str());
+    assert!(rows[0].get("unknown").is_none());
+    // unknown is not zero: the row is there, says so, and holds no counts
+    assert_eq!((rows[1]["unknown"].as_bool(), rows[1]["tier"].as_str()), (Some(true), Some("standard")));
+    assert!(rows[1].get("input").is_none() && rows[1].get("model").is_none(), "{}", rows[1]);
+    assert_eq!(rows[1]["job"].as_str(), s.job(second).unwrap().dir.to_str());
+    assert_eq!(s.used_since(86_400).0.get("claude").map(|t| t.total()), Some(11), "/usage sums what was counted");
+}
+
+#[test]
+fn an_older_claude_that_reports_a_running_total_is_counted_once() {
+    let r = repo("claude-running-total");
+    let state = root().join("claude-running-total-state");
+    let _ = fs::remove_dir_all(&state);
+    // Claude Code before 2.1.316: modelUsage alone, the whole session's so far (100, then 150 after a second turn)
+    let claude = fake(&root(), "claude-running-total", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+        n=$(cat \"$0.n\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"$0.n\"\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-o\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"modelUsage\":{\"m\":{\"inputTokens\":'$((50 + 50 * n))',\"outputTokens\":0}}}'\n");
+    let mut s = Session::with_state(&r, &state).unwrap();
+    s.programs.insert(agent("claude"), claude);
+    let (first, second) = (said(&mut s, "claude", "one"), said(&mut s, "claude", "two"));
+    assert_eq!((s.job(first).unwrap().tokens.total(), s.job(second).unwrap().tokens.total()), (100, 50), "the first turn's 100 counted again");
+    assert_eq!(s.used_since(86_400).0.get("claude").map(|t| t.total()), Some(150));
+}
+
+#[test]
+fn a_pipeline_call_without_counts_is_marked_in_the_usage_record() {
+    let r = repo("uncounted");
+    let state = root().join("uncounted-state");
+    let _ = fs::remove_dir_all(&state);
+    // a stand-in ringo.py: two finished calls, the second (first run) or both (later runs) without token counts
+    let home = root().join("fake-uncounted-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("ringo.py"), "import json, sys, pathlib\n\
+        a = sys.argv[1:]\n\
+        val = lambda k: a[a.index(k) + 1]\n\
+        here = pathlib.Path(sys.argv[0]).parent\n\
+        n = len(list(here.glob('ran-*'))) + 1\n\
+        (here / f'ran-{n}').write_text('')\n\
+        first = {'input': 900, 'cache_write': 0, 'cache_read': 0, 'output': 40} if n == 1 else {'cost_usd': None}\n\
+        t = pathlib.Path(val('--trace')); t.mkdir(parents=True, exist_ok=True)\n\
+        (t / 'trace.jsonl').write_text(json.dumps({'step': 'a', 'status': 'ok', 'usage': first}) + '\\n' +\n\
+            json.dumps({'step': 'b', 'status': 'ok', 'usage': None}) + '\\n')\n\
+        pathlib.Path(val('--out')).write_text('answer\\n')\n").unwrap();
+    let mut s = Session::with_state(&r, &state).unwrap();
+    s.ringo_home = home;
+    for question in ["one?", "two?"] {
+        let id = s.ask(question).unwrap();
+        assert_eq!(wait(&mut s, id), Status::Done);
+    }
+    let rows = usage_rows(&state);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // counts of the call that reported them, and a mark that another call's are missing
+    assert_eq!((rows[0]["input"].as_u64(), rows[0]["output"].as_u64(), rows[0]["uncounted_calls"].as_u64()), (Some(900), Some(40), Some(1)));
+    assert_eq!((rows[0]["agent"].as_str(), rows[0]["command"].as_str()), (Some("ringo"), Some("ask")));
+    assert!(rows[0].get("unknown").is_none());
+    // no call reported any: unknown, with how many
+    assert_eq!((rows[1]["unknown"].as_bool(), rows[1]["uncounted_calls"].as_u64()), (Some(true), Some(2)));
+    assert!(rows[1].get("input").is_none(), "{}", rows[1]);
+    assert_eq!(s.jobs[0].tokens.total(), 940);
+}
+
+#[test]
+fn an_older_claude_write_job_counts_a_repeated_running_total_once() {
+    let r = repo("claude-write-total");
+    // one run that ends in two results (a line taken in while it worked), each with the session's total so far
+    let claude = fake(&root(), "claude-write-total", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-w\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"one\",\"modelUsage\":{\"m\":{\"inputTokens\":100,\"outputTokens\":0}}}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"modelUsage\":{\"m\":{\"inputTokens\":150,\"outputTokens\":0}}}'\n");
+    let mut s = session(&r, agent("claude"), &claude);
+    let id = s.launch_agent(agent("claude"), true, "write it").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert_eq!(s.job(id).unwrap().tokens.total(), 150, "100 then 150 is 150 in all, not 250");
 }

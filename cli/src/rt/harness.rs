@@ -417,6 +417,57 @@ pub fn shlex_split(s: &str, escape: Option<char>) -> Result<Vec<String>> {
     }
 }
 
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+pub const OPTION_PRESETS: [&str; 4] = ["claude", "codex", "codex-chatgpt", "codex-search"];
+
+/// `with_options(backend, opts)`: backend with a role's model and reasoning effort applied (Python's
+/// workflow.role_backend is this function).
+pub use super::workflow::role_backend as with_options;
+
+/// `preset(spec)`: (preset, options) of a backend spec. 'PRESET@MODEL', 'PRESET@MODEL/EFFORT' and
+/// 'PRESET@/EFFORT' name a preset with a model, a reasoning effort or both: options holds the ones given. Any
+/// other spec is returned whole, with None.
+pub fn preset(spec: &str) -> (&str, Option<Map<String, Value>>) {
+    let Some((name, chosen)) = spec.split_once('@').filter(|(name, _)| OPTION_PRESETS.contains(name)) else {
+        return (spec, None);
+    };
+    let (model, effort) = chosen.split_once('/').unwrap_or((chosen, ""));
+    let opts = [("model", model), ("effort", effort)].into_iter().filter(|(_, v)| !v.is_empty());
+    (name, Some(opts.map(|(k, v)| (k.to_string(), Value::String(v.into()))).collect()))
+}
+
+/// `chosen(argv)`: the (model, effort) a command line asks for: its last --model value and its last Codex
+/// reasoning-effort override. None means the command leaves it to the backend's own default, which Ringo does
+/// not see.
+pub fn chosen(argv: &[String]) -> (Option<String>, Option<String>) {
+    let (mut model, mut effort) = (None, None);
+    for (k, arg) in argv.iter().enumerate() {
+        if arg == "--model" && k + 1 < argv.len() {
+            model = Some(argv[k + 1].clone());
+        } else if let Some(m) = arg.strip_prefix("--model=") {
+            model = Some(m.to_string());
+        } else if k > 0 && argv[k - 1] == "-c"
+            && let Some(rest) = arg.strip_prefix("model_reasoning_effort=")
+        {
+            // the pattern model_reasoning_effort="?([^"]*)"?, matched whole
+            let rest = rest.strip_prefix('"').unwrap_or(rest);
+            let rest = rest.strip_suffix('"').unwrap_or(rest);
+            if !rest.contains('"') {
+                effort = Some(rest.to_string());
+            }
+        }
+    }
+    (model, effort)
+}
+
+/// The "model" and "effort" entries of a trace record: `model` when the pass names one, else what the command asks.
+pub fn asked(rec: &mut Map<String, Value>, argv: &[String], model: Option<&Value>) {
+    let (m, e) = chosen(argv);
+    let text = |v: Option<String>| v.map_or(Value::Null, Value::String);
+    rec.insert("model".into(), model.filter(|v| py::truthy(v)).cloned().unwrap_or_else(|| text(m)));
+    rec.insert("effort".into(), text(e));
+}
+
 /// argv with its --model value replaced by model (or --model model appended).
 pub fn with_model(argv: &[String], model: &str) -> Vec<String> {
     let (mut out, mut replaced, mut k) = (Vec::new(), false, 0);
@@ -485,10 +536,12 @@ fn unhashable(v: &Value) -> Option<&'static str> {
 /// counts. Warnings (item type 'error'), reasoning, todo lists and started/updated events are tolerated and
 /// recorded: usage['items'] counts completed item types, usage['warnings'] keeps the warning texts. Without a
 /// turn.completed event, or one whose usage reports no token counts, the tokens are unknown, not zero, so the
-/// usage carries no token fields and the call counts as untokened. Python's default arguments are
+/// usage carries no token fields and the call counts as untokened. usage['reasoning_output'] is there when Codex
+/// reports it: the part of `output` spent on reasoning, already counted in it. Python's default arguments are
 /// name='codex-chatgpt' and tools=().
 pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String, Map<String, Value>)> {
     let mut tok = [0i128; 4]; // TOKEN_KEYS order
+    let mut reasoning: Option<i128> = None; // the part of `output` spent on reasoning, when Codex reports it
     let (mut messages, mut completed, mut measured) = (Vec::<String>::new(), 0usize, 0usize);
     let mut reasons: Vec<String> = Vec::new();
     let mut items: Vec<(String, u64)> = Vec::new();
@@ -524,6 +577,9 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
                 (3, tokens("output_tokens")),
             ] {
                 tok[k] = tok[k].checked_add(add).ok_or_else(py::too_big)?;
+            }
+            if let Some(n) = nonneg_int(reported.get("reasoning_output_tokens")) {
+                reasoning = Some(reasoning.unwrap_or(0).checked_add(n).ok_or_else(py::too_big)?);
             }
         }
         if kind.is_some_and(|k| k == "item.completed")
@@ -572,6 +628,9 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
         }
     }
     usage.insert("cost_usd".into(), Value::Null);
+    if let Some(n) = reasoning {
+        usage.insert("reasoning_output".into(), Num::Int(n).to_value());
+    }
     usage.insert("items".into(), Value::Object(items.iter().map(|(k, n)| (k.clone(), Value::from(*n))).collect()));
     usage.insert("warnings".into(), Value::Array(warnings));
     if !reasons.is_empty() {
@@ -630,6 +689,7 @@ pub fn total_tokens(usage: Option<&Value>) -> Result<Option<Num>> {
 /// installations. 'none' is about tools, not instructions: a CLI can still load instructions on its own, which is
 /// why Codex children also get a private CODEX_HOME and HOME (backends.run_isolated).
 pub fn tool_access(name: &str) -> &'static str {
+    let name = preset(name).0; // a model or an effort chosen after '@' changes neither
     if name == "claude" || name == "codex-chatgpt" || name.starts_with("ollama:") {
         "none"
     } else if name == "codex" {
@@ -765,6 +825,8 @@ struct Totals {
     admission_refusals: i64,
     incidents: i64,
     tokens: [Num; 4],
+    /// Output tokens spent on reasoning, summed over the calls that report it (Codex).
+    reasoning: Option<Num>,
     finished: HashMap<String, Vec<Finished>>,
     incident_dir: Option<PathBuf>,
     last: Value,
@@ -820,6 +882,7 @@ impl Run {
                 admission_refusals: 0,
                 incidents: 0,
                 tokens: [Num::Int(0); 4],
+                reasoning: None,
                 finished: HashMap::new(),
                 incident_dir: None,
                 last: Value::Null,
@@ -879,6 +942,9 @@ impl Run {
         for (i, k) in TOKEN_KEYS.iter().enumerate() {
             let x = fields.and_then(|m| m.get(*k)).filter(|v| py::truthy(v)).unwrap_or(&zero);
             t.tokens[i] = py_add(t.tokens[i], x, "+=")?;
+        }
+        if let Some(x) = fields.and_then(|m| m.get("reasoning_output")).filter(|v| py::int_of(v).is_some()) {
+            t.reasoning = Some(py_add(t.reasoning.unwrap_or(Num::Int(0)), x, "+=")?);
         }
         if matches!(rec.get("status"), Some(Value::String(s)) if PAID_STATUSES.contains(&s.as_str())) {
             if !matches!(usage, Some(Value::Object(m)) if TOKEN_KEYS.iter().all(|k| m.contains_key(*k))) {
@@ -988,6 +1054,9 @@ fn summary_of(t: &Totals) -> Map<String, Value> {
     m.insert("incidents".into(), Value::from(t.incidents));
     for (k, n) in TOKEN_KEYS.iter().zip(t.tokens) {
         m.insert((*k).into(), n.to_value());
+    }
+    if let Some(n) = t.reasoning {
+        m.insert("reasoning_output".into(), n.to_value());
     }
     m
 }
@@ -1247,8 +1316,24 @@ impl backends::Watch for Leash {
 /// --json` events, private CODEX_HOME and HOME) or 'plain'. A codex backend also declares `subscription_auth`,
 /// `lean` (the codex-chatgpt and codex-search presets) and `tools`, the tool item types its turns may contain: the
 /// `codex` preset keeps its shell, `codex-search` may search the web, a `codex:` command may search the web only
-/// when its own argv passes --search.
+/// when its own argv passes --search. A preset takes a model, a reasoning effort or both after '@'
+/// (codex-chatgpt@MODEL, @MODEL/EFFORT or @/EFFORT; claude@MODEL): the preset's own restrictions with those options
+/// set, under a name that says which model was asked.
 pub fn backend(spec: &str) -> Result<Backend> {
+    if let (name, Some(opts)) = preset(spec) {
+        if opts.is_empty() {
+            return Err(Error::value(format!("backend {} names no model or effort after @", py::repr(spec))));
+        }
+        if let Some(Value::String(effort)) = opts.get("effort")
+            && (name == "claude" || !EFFORTS.contains(&effort.as_str()))
+        {
+            return Err(Error::value(match name {
+                "claude" => format!("backend {}: the claude preset takes a model only", py::repr(spec)),
+                _ => format!("backend {}: the effort is one of {}", py::repr(spec), EFFORTS.join(", ")),
+            }));
+        }
+        return Ok(Backend { name: spec.into(), ..with_options(&backend(name)?, Some(&Value::Object(opts)))? });
+    }
     let preset = |name: &str| split_command(backends::judge_preset(name).expect("a preset"));
     let (mut subscription_auth, mut lean, mut tools) = (None, None, None);
     let (argv, style) = if spec == "claude" {
@@ -1457,6 +1542,7 @@ pub fn probe(run: &Arc<Run>, backend: &Backend, label: &str, call_fn: Option<&Ca
     rec.insert("step".into(), Value::String(format!("{label}.probe")));
     rec.insert("attempt".into(), Value::from(1));
     rec.insert("backend".into(), Value::String(backend.name.clone()));
+    asked(&mut rec, &backend.argv, None);
     rec.insert("started".into(), pyjson::float_value(now()));
     run.record(&with(&rec, &[("status", "started".into())]), None, None)?; // so an interrupted probe is visible
     let t0 = Instant::now();
@@ -1586,6 +1672,7 @@ impl Plan<'_> {
             rec.insert("attempt".into(), Value::from(attempt));
             rec.insert("pass".into(), p.get("id").cloned().unwrap_or(Value::Null));
             rec.insert("backend".into(), Value::String(backend.name.clone()));
+            asked(&mut rec, &backend.argv, p.get("model"));
             rec.insert("system_sha256".into(), Value::String(sha(&self.system)));
             rec.insert("message_sha256".into(), Value::String(sha(message)));
             rec.insert("started".into(), pyjson::float_value(now()));
@@ -1909,9 +1996,13 @@ pub fn findings_pr(args: &Args) -> Result<Map<String, Value>> {
 }
 
 /// Write the review's findings as ReviewBench contract JSON to --findings-json (and the trace); anchors are
-/// checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary.
+/// checked against the repository at head with --repo, left unchecked otherwise. Returns counts for the summary;
+/// findings_unshaped says the review has no numbered finding and no "No defects found" line, so the empty file
+/// means the reply could not be read, not that the review found nothing.
 pub fn write_findings(args: &Args, text: &str, run: &Run) -> Result<Map<String, Value>> {
     let found = super::findings::parse(text)?;
+    let unshaped = pipelines::findings("f", text).1.is_empty()
+        && !pipelines::NO_DEFECTS.is_match(&pipelines::unfenced(text).1);
     let (kept, dropped) = match given(&args.repo) {
         Some(repo) => super::findings::anchor(&found, Path::new(repo), args.head.as_deref().unwrap_or(""), args.base.as_deref())?,
         None => (found, vec![]),
@@ -1925,6 +2016,7 @@ pub fn write_findings(args: &Args, text: &str, run: &Run) -> Result<Map<String, 
     out.insert("findings_written".into(), Value::from(kept.len()));
     out.insert("findings_dropped".into(), Value::from(dropped.len()));
     out.insert("findings_anchored".into(), Value::Bool(given(&args.repo).is_some()));
+    out.insert("findings_unshaped".into(), Value::Bool(unshaped));
     Ok(out)
 }
 
@@ -2037,6 +2129,8 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
         }
         m
     };
+    // the whole task so far, its own work around the calls included
+    let elapsed = || pyjson::float_value(started.elapsed().as_nanos() as f64 / 1e9);
     backends::install_interrupt();
     let ran = run_plan(&plan, &material, &b, &run, &CallFn::real(), args.timeout, None, c.as_ref(), None);
     let ran = match ran {
@@ -2047,7 +2141,9 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
         Ok(parts) => parts,
         Err(exc) if reported(&exc) => {
             print_stderr(&format!("harness: {kind} failed: {}", exc.msg));
-            print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary_of(&[&names])))));
+            let mut summary = summary_of(&[&names]);
+            summary.insert("elapsed_s".into(), elapsed());
+            print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
             let _ = run.state("failed", &[("error", Value::String(py::head(&described(&exc), 500).into()))]);
             return 2;
         }
@@ -2058,10 +2154,14 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
     };
     let stats = stats.as_object().cloned().unwrap_or_default();
     let mut summary = summary_of(&[&stats, &names]);
-    summary.insert("elapsed_s".into(), pyjson::float_value(started.elapsed().as_nanos() as f64 / 1e9));
+    summary.insert("elapsed_s".into(), elapsed()); // replaced below once the findings are written; kept if writing them fails
     let written = (|| -> Result<()> {
         if given(&args.findings_json).is_some() {
             summary.extend(write_findings(args, &text, &run)?);
+            if summary.get("findings_unshaped") == Some(&Value::Bool(true)) {
+                print_stderr("harness: the review has no numbered finding and no \"No defects found\" line, so the findings file is empty");
+            }
+            summary.insert("elapsed_s".into(), elapsed());
         }
         if let Some(trace) = &run.trace {
             py::write_file(&py::join(trace, "result.md"), format!("{text}\n").as_bytes())?;
@@ -2078,6 +2178,7 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
             return uncaught(&exc, Some(&run));
         }
         print_stdout(&text);
+        summary.insert("elapsed_s".into(), elapsed()); // the export that failed took its time too
         print_stderr(&format!("harness: {kind} cannot write the result: {}", exc.msg));
         print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
         let _ = run.state("failed", &[("error", Value::String(py::head(&format!("cannot write the result: {}", exc.msg), 500).into()))]);
@@ -2166,7 +2267,7 @@ fn options(command: &str) -> Vec<Opt> {
         out.push(Opt { required: true, ..opt(&["--input"], "input", Kind::Str, s("the material: the brief, as one text file")) });
     }
     out.extend([
-        opt(&["--backend"], "backend", Kind::Str, s("claude, codex, codex-chatgpt, ollama:MODEL, claude:<command>, codex:<command> (prints Codex exec --json events), or any stdin command")),
+        opt(&["--backend"], "backend", Kind::Str, s("claude, codex, codex-chatgpt (a preset takes @MODEL, @MODEL/EFFORT or @/EFFORT), ollama:MODEL, claude:<command>, codex:<command> (prints Codex exec --json events), or any stdin command")),
         opt(&["--checker-backend"], "checker_backend", Kind::Str, s("a second backend (same forms as --backend) for the plan's verdicts pass and its repair, so another model or provider checks the findings; the plan needs a verdicts pass")),
         opt(&["--pipeline"], "pipeline", Kind::Str, s("a plan JSON file (default: the built-in one-call plan)")),
         opt(&["--out"], "out", Kind::Str, s("write the result here instead of stdout")),
