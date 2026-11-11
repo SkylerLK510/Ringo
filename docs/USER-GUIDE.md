@@ -115,6 +115,7 @@ Each agent runs on its own default model until you choose another, from those yo
 |---|---|
 | `/model` | who runs on what now, and the models your Codex plan offers |
 | `/model` and a space | a list to pick from: Up and Down move, Enter sets it |
+| `/model claude` | that agent's models to pick from (Enter opens the list) |
 | `/model opus` | that model, for the agent it belongs to: `fable`, `opus`, `sonnet`, `haiku` or a model's full name for Claude, any name `/model` lists for Codex |
 | `/model billing opus` | says whose: for an agent of your own, or when Ringo asks |
 | `/model claude default` | back to the agent's own default; its conversation starts again from Ringo's record of it |
