@@ -4674,9 +4674,17 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         a.s.programs.insert(codex, std::env::current_exe().unwrap());
         a.s.programs.insert(own, std::env::current_exe().unwrap());
         assert_eq!(a.plan_agents(), [codex], "one program, one plan");
+        let listing_start = a.out.len();
         a.run(Cmd::Agent(None), "").unwrap();
-        let rows = screen(&mut a, 120, 16).join("\n");
-        assert!(rows.contains("shop-billing  on claude · ") && rows.contains("26 characters") && !rows.contains("/agent add shop-billing"), "{rows}");
+        // Check this listing, not the earlier suggestion still in the scrollback. Temporary paths vary by OS
+        // and can wrap between the character count and its label, so compare the wrapped text as words.
+        for width in [60, 87, 120] {
+            let rows = a.out[listing_start..].iter().flat_map(|entry| entry.rows(width, &a.theme))
+                .map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+            let words = rows.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(words.contains("shop-billing on claude · ") && words.contains("26 characters")
+                    && !words.contains("/agent add shop-billing"), "width {width}: {rows}");
+        }
         // the same name again, and taken away: its file stays
         assert!(a.run(add("shop-billing", None, None, false), "").unwrap_err().contains("you already have an agent called shop-billing"));
         a.main = own;
