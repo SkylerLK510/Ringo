@@ -171,3 +171,26 @@ or plugins when it lists the bundled ones; the description above is the correcte
 2. 10 November, at the same point. So that sessions are not started only to be ended by the limit, the run also
    waits before a session until the Claude 5-hour window has room for the largest rise that arm's earlier sessions
    showed (at most 60 points). This changes when a session runs, not what is measured.
+
+## Closing record
+
+Stopped by the owner on 11 November 2026, before any session had finished. No hidden check was run. There is no
+result, and nothing here says which surface is better or cheaper.
+
+What ran: three attempts at the first session (cc-ringo on the first task). The Claude plan's 5-hour limit ended
+each of them, one at once. Together they spent 1,197,119 weighted Claude tokens and three Codex review calls
+(16,529 uncached input tokens). The longest ran 787 seconds and 24 model calls at a median context of 92,784
+tokens (largest 124,684), wrote 61,963 output tokens, and spent 761,436 weighted tokens without finishing its first
+task. The plan's 5-hour window read 10% before it and 95% after it; the owner's other sessions were using the plan
+in the same minutes, so that rise is not this session's alone. No stock session and no terminal session ran on a
+task.
+
+What this leaves:
+
+- The design cannot be run on this plan as registered. One cc-ringo session on a small task can take most of a
+  5-hour window, and 18 sessions were planned. A rerun needs a smaller unit, or a share of each window fixed
+  before it starts.
+- The first task was started three times by cc-ringo and never scored. The other five tasks were not started.
+  The tasks and their hidden checks stay private and unopened.
+- The two set-aside numbers above are one arm on one task, unfinished, with no other arm beside them. They are
+  not a comparison.
