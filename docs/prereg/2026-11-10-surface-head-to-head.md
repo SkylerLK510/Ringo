@@ -160,4 +160,11 @@ or plugins when it lists the bundled ones; the description above is the correcte
 
 ## Deviations
 
-None so far.
+1. 10 November, during the first session, before any session had finished and before any hidden check was run. The
+   Claude plan's 5-hour limit ended the first session (cc-ringo on the first task) seven minutes in, and its one
+   rerun started while the limit still applied and ended at once. By the rule under "How sessions run" the second
+   attempt would stand. It does not, because a session that the plan's limit ended says nothing about the arm. From
+   this point a session ended by a usage limit (the provider's status 429) is set aside, and the task is run again
+   from a fresh copy when the window has room. It is kept on record, counts toward the budget and does not use up
+   the one rerun. The two sessions set aside so far spent 435,683 weighted Claude tokens and one Codex call. The run
+   now also stops if a session did not start on the fixed model and mode.
