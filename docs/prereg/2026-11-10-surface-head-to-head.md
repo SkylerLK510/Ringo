@@ -168,3 +168,6 @@ or plugins when it lists the bundled ones; the description above is the correcte
    from a fresh copy when the window has room. It is kept on record, counts toward the budget and does not use up
    the one rerun. The two sessions set aside so far spent 435,683 weighted Claude tokens and one Codex call. The run
    now also stops if a session did not start on the fixed model and mode.
+2. 10 November, at the same point. So that sessions are not started only to be ended by the limit, the run also
+   waits before a session until the Claude 5-hour window has room for the largest rise that arm's earlier sessions
+   showed (at most 60 points). This changes when a session runs, not what is measured.
