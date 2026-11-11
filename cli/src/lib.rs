@@ -92,8 +92,9 @@ pub struct OwnFile {
     pub text: Vec<u8>,
     /// `model:` (not `inherit`): the model its turns run on, unless the owner chose one with /model.
     pub model: Option<String>,
-    /// `tools:` the built-in tools it is offered, and no others (a connector's tools are not Ringo's to offer).
-    pub tools: Vec<String>,
+    /// `tools:` the built-in tools it is offered, and no others (a connector's tools are not Ringo's to offer): none
+    /// when the line names none of those. No such line, or `default` in it: None, every tool as usual.
+    pub tools: Option<Vec<String>>,
 }
 
 /// A specialist's standing instructions (`Spec::instructions`), read anew for each turn, so an edit applies at the
@@ -130,21 +131,26 @@ pub fn own_file(spec: &Spec) -> Result<Option<OwnFile>, String> {
     // The block's `model:` and `tools:` lines, the two that change how a turn runs. A value is one line, or for the
     // tools a list: `tools: Read, Grep`, `tools: [Read, Grep]`, or `- Read` lines under it.
     let bare = |v: &str| v.trim().trim_matches(['"', '\'']).trim().to_string();
-    let (mut model, mut tools, mut listing) = (None, Vec::new(), false);
+    let (mut model, mut tools, mut listing) = (None, None::<Vec<String>>, false);
     for line in String::from_utf8_lossy(head).lines() {
         if let Some(item) = line.trim_start().strip_prefix('-').filter(|_| listing) {
-            tools.push(bare(item));
+            tools.get_or_insert_default().push(bare(item));
         } else if let Some(value) = line.strip_prefix("model:") {
             listing = false;
             model = Some(bare(value)).filter(|m| m != "inherit" && valid_model(m));
         } else if let Some(value) = line.strip_prefix("tools:") {
             listing = value.trim().is_empty();
-            tools = value.trim().trim_matches(['[', ']']).split(',').map(bare).collect();
+            tools = Some(value.trim().trim_matches(['[', ']']).split(',').map(bare).collect());
         } else if !line.trim().is_empty() {
             listing = false;
         }
     }
-    tools.retain(|t| !t.is_empty() && !t.starts_with("mcp__") && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+    // `default` is Claude Code's word for its whole set: no restriction. Otherwise the names Ringo can pass on are
+    // kept, and a line that leaves none offers none: it was written to narrow, and must not widen by being unreadable.
+    let tools = tools.filter(|all| !all.iter().any(|t| t.eq_ignore_ascii_case("default"))).map(|mut all| {
+        all.retain(|t| !t.is_empty() && !t.starts_with("mcp__") && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'));
+        all
+    });
     Ok(Some(OwnFile { text: body.to_vec(), model, tools }))
 }
 
@@ -1230,10 +1236,11 @@ impl Session {
         for id in asking {
             let n = self.jobs[id - 1].asked + 1;
             let asks = self.jobs[id - 1].dir.join("asks");
-            let Some(ask) = fs::read(asks.join(format!("{n}.json"))).ok()
-                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) else { continue };
+            let Ok(bytes) = fs::read(asks.join(format!("{n}.json"))) else { continue };
             any = true;
             self.jobs[id - 1].asked = n;
+            // the server writes each ask whole; one that does not read is answered, not waited on
+            let ask = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default();
             let Kind::Agent { agent: asker, .. } = self.jobs[id - 1].kind else { continue };
             let (name, question) = (ask["agent"].as_str().unwrap_or(""), ask["question"].as_str().unwrap_or(""));
             let (answer, others) = (asks.join(format!("{n}.answer")), self.askable(asker));
@@ -1664,7 +1671,7 @@ impl Session {
         // a specialist of the owner's: what makes it one, or no turn at all
         let (own, own_model, own_tools) = match own_file(spec)? {
             Some(file) => (Some(file.text), file.model, file.tools),
-            None => (None, None, Vec::new()),
+            None => (None, None, None),
         };
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
@@ -1946,8 +1953,8 @@ impl Session {
                 }
                 // A specialist's file may list the tools it uses: Claude Code then offers it those of its own and no
                 // others. It can only narrow: what this mode denies above stays denied.
-                if !own_tools.is_empty() {
-                    cmd.arg("--tools").arg(own_tools.join(","));
+                if let Some(tools) = &own_tools {
+                    cmd.arg("--tools").arg(tools.join(",")); // an empty list is Claude Code's "" for no tools
                 }
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", effort]);
@@ -3163,10 +3170,8 @@ pub fn serve_asks(dir: &Path, peers: &[String], input: impl BufRead, mut output:
             "tools/call" => {
                 let args = &msg["params"]["arguments"];
                 let said = match (msg["params"]["name"].as_str(), args["agent"].as_str(), args["question"].as_str()) {
-                    (Some("ask_agent"), Some(agent), Some(question)) if !question.trim().is_empty() => {
-                        asked += 1;
-                        ask(&dir.join("asks"), asked, agent, question)
-                    }
+                    (Some("ask_agent"), Some(agent), Some(question)) if !question.trim().is_empty() =>
+                        ask(&dir.join("asks"), &mut asked, agent, question),
                     _ => Err("ask_agent takes an agent and a question".to_string()),
                 };
                 let failed = said.is_err();
@@ -3184,12 +3189,15 @@ pub fn serve_asks(dir: &Path, peers: &[String], input: impl BufRead, mut output:
     Ok(())
 }
 
-/// One ask, from the server's side: written whole, then waited on.
-fn ask(asks: &Path, n: usize, agent: &str, question: &str) -> Result<String, String> {
+/// One ask, from the server's side: written whole, then waited on. It is counted (`asked`) once it is written: the
+/// session looks for the asks in order, so one that never reached the folder must not take a number.
+fn ask(asks: &Path, asked: &mut usize, agent: &str, question: &str) -> Result<String, String> {
     private_dir(asks)?;
+    let n = *asked + 1;
     let (file, part) = (asks.join(format!("{n}.json")), asks.join(format!("{n}.part")));
     fs::write(&part, serde_json::json!({"agent": agent, "question": question}).to_string())
         .and_then(|_| fs::rename(&part, &file)).map_err(|e| format!("the ask could not be written: {e}"))?;
+    *asked = n;
     let (answer, until) = (asks.join(format!("{n}.answer")), Instant::now() + ASK_WAIT);
     loop {
         if let Some(v) = fs::read(&answer).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()) {

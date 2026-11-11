@@ -1943,10 +1943,9 @@ impl App {
     fn talk_turn(&mut self, agent: Agent, prompt: &str) -> Result<usize, String> {
         let prompt = self.s.expand(prompt)?;
         // in a talk the agents already hear each other: no turn of it asks another on the side
-        self.s.peers.clear();
-        let mode = std::mem::replace(&mut self.s.mode, Mode::Read);
+        let (mode, peers) = (std::mem::replace(&mut self.s.mode, Mode::Read), std::mem::take(&mut self.s.peers));
         let started = self.s.launch_agent(agent, false, &prompt);
-        self.s.mode = mode;
+        (self.s.mode, self.s.peers) = (mode, peers); // a turn already running keeps whom it may ask
         let id = started?;
         let job = &mut self.s.jobs[id - 1];
         job.talk = true;
@@ -2349,11 +2348,15 @@ impl App {
         let file = ringo_cli::own_file(&ringo_cli::Spec::from_json(&entry, true)?)?.unwrap_or_default();
         let size = file.text.len();
         // what the file's opening lines say of its model and tools is Claude Code's, and goes to Claude alone
-        let lines = match (&file.model, file.tools.len(), adapter) {
-            (None, 0, _) => String::new(),
+        let offered = file.tools.as_ref().map(|tools| match tools.len() {
+            0 => "it is offered none of Claude Code's tools".to_string(),
+            1 => "it is offered 1 tool and no others".to_string(),
+            n => format!("it is offered {n} tools and no others"),
+        });
+        let lines = match (&file.model, offered, adapter) {
+            (None, None, _) => String::new(),
             (_, _, "codex") => ". Its file's model and tools lines are Claude Code's, and codex goes without them".into(),
-            (model, tools, _) => format!(". From its file: {}", [model.as_ref().map(|m| format!("it runs on {m} until /model names another")),
-                (tools > 0).then(|| format!("it is offered {tools} tool{} and no others", if tools == 1 { "" } else { "s" }))]
+            (model, offered, _) => format!(". From its file: {}", [model.as_ref().map(|m| format!("it runs on {m} until /model names another")), offered]
                 .into_iter().flatten().collect::<Vec<_>>().join(", and ")),
         };
         let agent = ringo_cli::add_custom_agent(self.s.state(), entry)?;
@@ -2571,14 +2574,19 @@ impl App {
     /// /model's list of an agent's models, once it has answered.
     fn models_done(&mut self) -> bool {
         let Some((agent, read, said)) = self.listing.take_if(|(_, read, _)| read.is_finished()) else { return false };
-        let (style, t) = (self.agent_style(agent), self.theme);
         let read = read.join().unwrap_or_else(|_| Err("the read stopped".into()));
         if let Ok(models) = &read && !models.is_empty() {
             self.offered = models.clone();
         }
-        if !said {
-            return true; // read for the list under the input, which shows it
+        if said {
+            self.say_models(agent, read); // else it was read for the list under the input, which shows it
         }
+        true
+    }
+
+    /// The models an agent's plan offers, into the conversation (/model).
+    fn say_models(&mut self, agent: Agent, read: Result<Vec<ringo_cli::Model>, String>) {
+        let (style, t) = (self.agent_style(agent), self.theme);
         match read {
             Ok(models) if !models.is_empty() => {
                 self.out.push(agent_head(agent.name(), style, &format!(" · the models your plan offers (/model {} NAME)", agent.name()), &t));
@@ -2592,7 +2600,6 @@ impl App {
             Err(e) => self.out.push(agent_head(agent.name(), style, &format!(" · its models could not be read: {e}"), &t)),
         }
         self.last = 0;
-        true
     }
 
     /// Ultra's plan read, once it has answered: which backend the turn's review will run on. When no plan has room,
@@ -2837,10 +2844,16 @@ impl App {
                 self.last = 0;
                 // Codex lists what the plan offers (no model call, a fraction of a second); Claude Code has no list
                 let lists = self.agents.iter().copied()
-                    .find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a)).filter(|_| self.listing.is_none());
-                if let Some(agent) = lists {
-                    let program = self.s.program(agent);
-                    self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program)), true));
+                    .find(|a| a.spec().adapter == ringo_cli::Adapter::Codex && self.s.installed(*a));
+                match (&mut self.listing, lists) {
+                    (Some((.., said)), _) => *said = true, // being read for the list under the input: shown when it is in
+                    (None, Some(agent)) if !self.offered.is_empty() => self.say_models(agent, Ok(self.offered.clone())),
+                    (None, Some(agent)) => {
+                        let program = self.s.program(agent);
+                        self.asked_models = true;
+                        self.listing = Some((agent, std::thread::spawn(move || ringo_cli::models(agent, &program)), true));
+                    }
+                    (None, None) => {}
                 }
                 Some(format!("  to change one: /model and a space lists what to pick from, or name it (/model opus)\n  \
                               /ask, /review, /design and /research run on {} · /backend SPEC changes it, and SPEC@MODEL names a \
@@ -4535,8 +4548,10 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         a.s.programs.insert(claude, one.clone());
         a.s.programs.insert(reviewer, two.clone());
         a.s.mode = Mode::Auto;
+        a.s.peers = a.agents.clone();
         a.send("/discuss should we split the parser?");
         assert_eq!(a.s.mode, Mode::Auto, "the session's mode is its own");
+        assert_eq!(a.s.peers, a.agents, "and a turn already running keeps whom it may ask");
         let rows = screen(&mut a, 180, 30).join("\n");
         assert!(rows.contains("claude and talk-reviewer talk it over, one at a time, looking but not touching · at most 2 turns each"), "{rows}");
         assert!(rows.contains("the agents are talking · a line of yours joins in · Esc stops them"), "{rows}");
@@ -4719,6 +4734,17 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
                    "a model goes to the agent it belongs to, whoever the owner talks to; default to the one they talk to");
         a.main = Agent::from_name("grok").unwrap();
         assert!(a.model_owner("some-new-model").unwrap_err().contains("whose model is some-new-model? /model AGENT some-new-model"));
+        // /model shows the list it has, without reading it again; one being read for the pick-list is shown when it is in
+        a.main = codex;
+        a.s.programs.insert(codex, std::env::current_exe().unwrap());
+        a.run(Cmd::Model(None), "").unwrap();
+        assert!(a.listing.is_none() && screen(&mut a, 120, 24).join("\n").contains("gpt-small  the quick one"), "said from what was read");
+        a.listing = Some((codex, std::thread::spawn(|| Ok(Vec::new())), false));
+        a.run(Cmd::Model(None), "").unwrap();
+        assert!(a.listing.as_ref().is_some_and(|(.., said)| *said), "the read under way is the one shown");
+        a.listing = None;
+        a.s.programs.remove(&codex);
+        a.main = Agent::from_name("grok").unwrap();
         // the list is read for Codex once, unseen, when /model is being typed (here no codex is installed to ask)
         listed_for(&mut a, "/mode");
         a.want_models();

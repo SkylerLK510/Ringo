@@ -116,7 +116,8 @@ How the instructions reach the model, each turn:
   opening block. The model is the one the specialist runs on unless you chose one with `/model` (`inherit` means
   the agent's own). The tools listed are the only built-in tools it is offered (`--tools`); `tools: Read, Grep`, a
   `[Read, Grep]` list and `- Read` lines all read the same. It can only narrow: what the mode denies stays denied,
-  and a connector's tools are not Ringo's to offer. On Codex both lines are left out, because they name Claude
+  and a connector's tools are not Ringo's to offer. A line that names none Ringo can pass on (`tools: []`, or only
+  a connector's) offers none, since it was written to narrow; `default` in it means Claude Code's whole set. On Codex both lines are left out, because they name Claude
   Code's models and tools, and `/agent add` says so.
 - **`skills` (Claude only):** outside read mode the turn runs without safe mode and keeps Claude Code's commands,
   so your skills, plugins, hooks and connectors load. Your own `CLAUDE.md` and memory still do not (so an
@@ -140,6 +141,7 @@ instance and not a rate):
 | on Claude, asked to name skills it can invoke | 29,857 | 3.4 s | "NONE": no Skill tool in a safe-mode turn |
 | on Claude with `skills`, same question, ask mode | 42,784 | 3.0 s | named three of the owner's skills |
 | a 23-byte file with `model: sonnet` and `tools: Read, Grep`, asked to list its tools | 4,691 | 1.7 s | ran `claude-sonnet-5-5`; listed Grep and Read, nothing else |
+| the same with `tools: []` | 2,322 | 2.0 s | "NONE" |
 
 The same turn with a ten-byte instructions file was 10,069 tokens on Claude and 13,375 on Codex, so this file costs
 about 20k tokens a call on Claude and 12k on Codex, and `skills` about 13k more with 99 skills installed. That is
@@ -828,8 +830,8 @@ Three ways to set one, the first needing nothing remembered:
 - **Pick it.** `/model` and a space opens a list under the input: with more than one agent that takes a model, whose
   it is, then that agent's models (`default`, Claude Code's four aliases, or what the Codex plan offers, with
   OpenAI's own line on each and `← now` on the one in use). Up and Down move, and Enter on a model sets it: no
-  second Enter. With one such agent the list is its models at once. Codex's models are read once, unseen, the
-  first time `/model` is typed (the same `model/list` read as above).
+  second Enter. With one such agent the list is its models at once. Codex's models are read once a session, the
+  first time `/model` is typed (the same `model/list` read as above); `/model` alone then shows what was read.
 - **Name it.** `/model opus` sets it for the agent the name belongs to: Claude Code's aliases and `claude-...` for a
   Claude agent, a name the Codex plan lists or `gpt-...` for a Codex one, the agent you are talking to before any
   other of its kind. `/model default`, or a name Ringo cannot place, is for the agent you are talking to. A few

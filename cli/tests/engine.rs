@@ -1928,6 +1928,13 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
     assert!(threads(&codex).last().unwrap()["params"].get("model").is_none());
     assert!(told(&mut s).starts_with("You know the ledger.\n\nRingo launched"), "the block is not part of its text");
     assert!(threads(&codex).last().unwrap()["params"].get("model").is_none(), "a Claude Code model is not Codex's");
+    // a tools line that names nothing Ringo can pass on offers nothing: written to narrow, it must not widen
+    for none in ["tools: []", "tools:", "tools: mcp__x__y, --bare"] {
+        fs::write(&file, format!("---\n{none}\n---\nYou know the ledger.\n")).unwrap();
+        assert_eq!(after(&args(&mut s), "--tools"), Some(String::new()), "{none}");
+    }
+    fs::write(&file, "---\ntools: Read, default\n---\nYou know the ledger.\n").unwrap();
+    assert_eq!(after(&args(&mut s), "--tools"), None, "Claude Code's word for its whole set: no restriction");
     fs::write(&file, "You know the billing code, and the ledger.\n").unwrap();
     assert_eq!((after(&args(&mut s), "--model"), after(&args(&mut s), "--tools")), (None, None), "no block, nothing added");
     // no instructions, no turn: a turn without them would not be this agent's
