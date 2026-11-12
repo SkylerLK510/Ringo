@@ -1238,6 +1238,9 @@ fn one_row(text: &str, width: usize) -> String {
 
 /// Text in at most `room` columns: a longer one is cut, and ends in "…".
 fn cut(text: &str, room: usize) -> String {
+    if room == 0 {
+        return String::new();
+    }
     if cols(text) <= room {
         return text.to_string();
     }
@@ -1423,6 +1426,9 @@ struct App {
     cursor: usize,
     history: Vec<String>,
     hist: usize,
+    /// The unfinished line and cursor while browsing history, and the last line cleared with Esc or Ctrl-C.
+    draft: Option<(Vec<char>, usize)>,
+    cleared: Option<(Vec<char>, usize)>,
     /// The conversation, and each entry fitted to `fitted_w` (fitted lazily; all again when the width changes).
     out: Vec<Out>,
     fitted: Vec<Vec<Line<'static>>>,
@@ -1449,6 +1455,8 @@ struct App {
     queue: VecDeque<(Agent, String, String)>,
     /// The menu's chosen row (see `menu`), and the chosen answer to a permission request.
     pick: usize,
+    menu_off: bool,
+    menu_page: usize,
     choice: usize,
     /// Per job (at its id - 1): whether the line it ended with is printed.
     ended: Vec<bool>,
@@ -1574,10 +1582,10 @@ fn mascot(state: &str) -> Vec<Vec<&'static str>> {
 
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
-        App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, out: Vec::new(), fitted: Vec::new(),
+        App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, draft: None, cleared: None, out: Vec::new(), fitted: Vec::new(),
               fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
-              main: first_choice(&agents), queue: VecDeque::new(), pick: 0, choice: 0, ended: Vec::new(),
+              main: first_choice(&agents), queue: VecDeque::new(), pick: 0, menu_off: false, menu_page: 6, choice: 0, ended: Vec::new(),
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
@@ -2763,6 +2771,9 @@ impl App {
         let line: String = self.input.iter().collect();
         self.input.clear();
         self.cursor = 0;
+        self.draft = None;
+        self.cleared = None;
+        self.menu_off = false;
         self.scroll = 0;
         if line.trim().is_empty() {
             return;
@@ -3122,6 +3133,9 @@ impl App {
     }
 
     fn menu_entries(&self) -> Vec<(String, String, String)> {
+        if self.menu_off {
+            return Vec::new();
+        }
         let before: String = self.input[..self.cursor].iter().collect();
         if let Some(args) = before.strip_prefix("/model ").filter(|_| self.cursor == self.input.len()) {
             return self.model_menu(args);
@@ -3145,9 +3159,11 @@ impl App {
         self.input.splice(start..self.cursor, chars);
         self.cursor = start + n;
         self.pick = 0;
+        self.menu_off = false;
     }
 
     fn insert(&mut self, text: &str) {
+        self.menu_off = false;
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len();
         self.input.splice(self.cursor..self.cursor, chars);
@@ -3175,8 +3191,22 @@ impl App {
     }
 
     fn recall(&mut self) {
-        self.input = self.history.get(self.hist).map(|h| h.chars().collect()).unwrap_or_default();
-        self.cursor = self.input.len();
+        self.menu_off = false;
+        if self.hist == self.history.len() {
+            (self.input, self.cursor) = self.draft.take().unwrap_or_default();
+        } else if let Some(line) = self.history.get(self.hist) {
+            self.input = line.chars().collect();
+            self.cursor = self.input.len();
+        }
+    }
+
+    fn clear_input(&mut self) {
+        self.cleared = Some((std::mem::take(&mut self.input), self.cursor));
+        self.cursor = 0;
+        self.hist = self.history.len();
+        self.draft = None;
+        self.menu_off = false;
+        self.note("cleared · Up restores your line");
     }
 
     /// The answers a permission request offers, in order: once, for the session (unless an always-ask rule covers
@@ -3231,6 +3261,9 @@ impl App {
     }
 
     fn key(&mut self, k: KeyEvent) {
+        if k.kind != KeyEventKind::Press {
+            return;
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
         let shift = k.modifiers.contains(KeyModifiers::SHIFT);
@@ -3247,6 +3280,15 @@ impl App {
         if self.answer_key(&k) {
             return;
         }
+        // AltGr is reported as Ctrl+Alt by some Windows terminals. Its printable characters are text, including
+        // @ and backslash on international layouts, before any Ctrl/Alt editing shortcuts get a chance to eat them.
+        if ctrl && alt && let KeyCode::Char(c) = k.code {
+            self.insert(c.encode_utf8(&mut [0; 4]));
+            return;
+        }
+        if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
+            self.menu_off = false;
+        }
         // The menu under the input (a / command or an @agent being typed) has Up, Down and Tab, and Enter while the
         // word is not yet a whole entry that takes nothing more (a paste's Enter is left alone).
         let entries = self.menu_entries();
@@ -3260,7 +3302,14 @@ impl App {
             match k.code {
                 KeyCode::Up if choosing => return self.pick = (pick + entries.len() - 1) % entries.len(),
                 KeyCode::Down if choosing => return self.pick = (pick + 1) % entries.len(),
-                KeyCode::Tab => return self.complete(&entries[pick].0),
+                KeyCode::PageUp if choosing => return self.pick = pick.saturating_sub(self.menu_page),
+                KeyCode::PageDown if choosing => return self.pick = (pick + self.menu_page).min(entries.len() - 1),
+                KeyCode::Esc => {
+                    self.menu_off = true;
+                    self.pick = 0;
+                    return;
+                }
+                KeyCode::Tab if !shift => return self.complete(&entries[pick].0),
                 KeyCode::Enter if !(ctrl || alt || shift || pasted || whole) => {
                     let to = entries[pick].0.clone();
                     self.complete(&to);
@@ -3284,8 +3333,7 @@ impl App {
             }
             KeyCode::Char('c' | 'd') if ctrl => {
                 if !self.input.is_empty() {
-                    self.input.clear();
-                    self.cursor = 0;
+                    self.clear_input();
                 } else if let Some(id) = self.holding() {
                     self.stop(id);
                 } else if self.quit_armed {
@@ -3293,7 +3341,7 @@ impl App {
                 } else {
                     self.quit_armed = true;
                     let n = self.s.running();
-                    self.say(match n {
+                    self.note(match n {
                         0 => "  Ctrl-C again quits".to_string(),
                         n => format!("  Ctrl-C again stops {} and quits", if n == 1 { "the job running".into() } else { format!("the {n} jobs running") }),
                     });
@@ -3347,7 +3395,14 @@ impl App {
             KeyCode::Right => self.cursor = (self.cursor + 1).min(self.input.len()),
             KeyCode::Up => match vertical(&self.input, self.cursor, true) {
                 Some(at) => self.cursor = at,
+                None if self.hist == self.history.len() && self.input.is_empty() && self.cleared.is_some() => {
+                    (self.input, self.cursor) = self.cleared.take().expect("a cleared line");
+                    self.note("restored your line");
+                }
                 None if self.hist > 0 => {
+                    if self.hist == self.history.len() {
+                        self.draft = Some((self.input.clone(), self.cursor));
+                    }
                     self.hist -= 1;
                     self.recall();
                 }
@@ -3366,8 +3421,7 @@ impl App {
                 self.say(text);
             }
             KeyCode::Esc if !self.input.is_empty() => {
-                self.input.clear();
-                self.cursor = 0;
+                self.clear_input();
             }
             KeyCode::Esc => match self.holding() {
                 Some(id) => self.stop(id),
@@ -3575,24 +3629,31 @@ impl App {
         let ask = self.prompt_lines(w.saturating_sub(2));
         let ask_h = ask.as_ref().map_or(0, |(_, lines)| (lines.len() as u16 + 1).clamp(2, (height / 2).max(2)));
         let typing = ask.is_none() || !self.input.is_empty();
-        let mark: Vec<Span<'static>> = match self.target() {
+        let mut mark: Vec<Span<'static>> = match self.target() {
             Some((name, style)) => vec![Span::styled(format!(" {name}"), style), Span::styled(" ❯ ", t.focus)],
             None => vec![Span::styled(" ❯ ", t.focus)],
         };
+        if mark.iter().map(|s| cols(&s.content)).sum::<usize>() + 2 > w {
+            mark = vec![Span::styled(if w >= 3 { " ❯ " } else { "❯" }, t.focus)];
+        }
         let mark_w = mark.iter().map(|s| cols(&s.content)).sum::<usize>();
         let (rows, at) = input_rows(&self.input, self.cursor, w.saturating_sub(mark_w));
         let shown = rows.len().min((height / 4).clamp(1, 10) as usize);
         let top = (at.0 + 1).saturating_sub(shown);
         let entries = if typing { self.menu_entries() } else { Vec::new() };
-        let room = (height / 4).clamp(1, 6) as usize;
+        let room = ((height / 4).clamp(1, 6) as usize).min((height as usize)
+            .saturating_sub(4 + shown + ask_h as usize + jobs.len() + queue.len()));
         let pick = self.pick.min(entries.len().saturating_sub(1));
         let first = (pick + 1).saturating_sub(room);
-        let label = entries.iter().map(|(_, l, _)| cols(l)).max().unwrap_or(0);
+        let label = entries.iter().map(|(_, l, _)| cols(l)).max().unwrap_or(0).min(w.saturating_sub(4) / 2);
         let menu = entries.iter().enumerate().skip(first).take(room)
             .map(|(i, (_, l, what))| {
                 let (mark, style) = if i == pick { ("› ", t.focus) } else { ("  ", t.dim) };
-                Line::from(vec![Span::styled(format!(" {mark}{l}{} ", " ".repeat(label - cols(l))), style),
-                                Span::styled(what.clone(), t.dim)])
+                let label_text = cut(l, label);
+                let head = cut(&format!(" {mark}{label_text}{} ", " ".repeat(label.saturating_sub(cols(&label_text)))), w);
+                let detail = one_row(what, w.saturating_sub(cols(&head)));
+                Line::from(vec![Span::styled(head, style),
+                                Span::styled(detail, if i == pick { t.title } else { t.dim })])
             })
             .collect();
         Live { panel, jobs, queue, ask, ask_h, typing, rows, at, top, shown, menu, mark, mark_w }
@@ -3734,6 +3795,7 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
         let live = self.live(area.width, area.height);
+        self.menu_page = live.menu.len().max(1);
         let t = self.theme;
         let w = area.width as usize;
         let [head, rule, middle, below, base, asked, input, menu] = Layout::vertical([Constraint::Length(1),
@@ -3807,17 +3869,42 @@ impl App {
             f.render_widget(Paragraph::new(shown).block(frame), asked);
         }
         if live.typing {
+            let entries = self.menu_entries();
             let hint = match &self.toast {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
+                _ if !entries.is_empty() => {
+                    let position = format!("{}/{}", self.pick.min(entries.len() - 1) + 1, entries.len());
+                    let hints = [format!("↑↓ {position} · Tab fills · Enter picks · Esc closes"),
+                                 format!("↑↓ {position} · Tab fills · Esc closes"), format!("↑↓ {position} · Esc closes")];
+                    hints.into_iter().find(|h| cols(h) + live.mark_w < w).unwrap_or(position)
+                }
                 // the count grows as lines are written below: nothing arrives unseen
-                _ if self.scroll > 0 => format!("scrolled up · {} rows below · End goes back", self.scroll),
+                _ if self.scroll > 0 => format!("scrolled up · {} rows below · {}", self.scroll,
+                                               if self.input.is_empty() { "End goes back" } else { "PgDn scrolls" }),
+                _ if self.holding().is_some() && !self.input.is_empty() => "Esc clears the line · Esc again stops".into(),
+                _ if live.top > 0 => format!("↑ {} draft rows above · Ctrl-J newline", live.top),
                 _ if self.talking.is_some() => "the agents are talking · a line of yours joins in · Esc stops them".into(),
                 _ if self.s.busy().is_some() => "Esc stops the turn".into(),
                 _ if self.staged.is_some() => "update ready · /restart".into(),
                 _ if self.release.is_some() => "pipelines ready · /update approve".into(),
-                _ => "⇧⇥ mode · ? keys".into(),
+                _ => {
+                    let room = w.saturating_sub(live.mark_w + if self.input.is_empty() {
+                        cols("Tell Ringo what you want to do") + 3
+                    } else { cols(&live.rows[0]) + 3 });
+                    ["Shift-Tab mode · Ctrl-J newline · ? keys", "Shift-Tab mode · ? keys"].into_iter()
+                        .find(|h| cols(h) <= room).unwrap_or("? keys").into()
+                }
             };
-            let marked = |rest: Span<'static>| Line::from([live.mark.clone(), vec![rest]].concat());
+            let marked = |rest: Span<'static>| {
+                let mut mark = live.mark.clone();
+                if live.top > 0 && live.mark_w >= 3 {
+                    let count = format!(" ↑{} ", live.top);
+                    let count = if cols(&count) + 2 <= live.mark_w { count } else { "↑".into() };
+                    mark = vec![Span::styled(format!("{}{count}", " ".repeat(live.mark_w - cols(&count) - 2)), t.dim),
+                                Span::styled("❯ ", t.focus)];
+                }
+                Line::from([mark, vec![rest]].concat())
+            };
             let mut rows: Vec<Line> = if self.input.is_empty() {
                 // what a line does now, by `talk`'s rules: starts a turn, goes into the agent's turn at work, or waits
                 let main = self.main;
@@ -3831,7 +3918,7 @@ impl App {
                 vec![marked(Span::styled(ask, t.dim))]
             } else {
                 live.rows.iter().enumerate().skip(live.top).take(live.shown).map(|(i, r)| match i {
-                    0 => marked(Span::raw(r.clone())),
+                    _ if i == live.top => marked(Span::raw(r.clone())),
                     _ => Line::from(vec![Span::raw(" ".repeat(live.mark_w)), Span::raw(r.clone())]),
                 }).collect()
             };
@@ -3847,8 +3934,9 @@ impl App {
                 }
             }
             f.render_widget(Paragraph::new(rows), input);
-            if live.ask.is_none() || !self.input.is_empty() {
-                f.set_cursor_position((input.x + live.mark_w as u16 + live.at.1 as u16, input.y + (live.at.0 - live.top) as u16));
+            if (live.ask.is_none() || !self.input.is_empty()) && input.width > 0 && input.height > 0 {
+                f.set_cursor_position((input.x + (live.mark_w + live.at.1).min(input.width as usize - 1) as u16,
+                                       input.y + (live.at.0 - live.top).min(input.height as usize - 1) as u16));
             }
         }
     }
@@ -4458,7 +4546,7 @@ mod tests {
         let at = rows[middle].find('▲').unwrap();
         assert!((at as i32 - (80 - 8) / 2).abs() <= 1, "centred: {rows:#?}");
         assert!(a.intro().contains("/undo takes back its last change"), "outside git too, in Ringo's own store");
-        assert!(rows[23].starts_with(" claude ❯ Tell Ringo what you want to do") && rows[23].ends_with("⇧⇥ mode · ? keys"),
+        assert!(rows[23].starts_with(" claude ❯ Tell Ringo what you want to do") && rows[23].ends_with("Shift-Tab mode · ? keys"),
                 "{rows:#?}");
         a.echo("hello");
         assert!(!screen(&mut a, 80, 24).iter().any(|r| r.contains("/usrman how it works")), "it goes once you speak");
@@ -5637,6 +5725,136 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert_eq!(to("fix it @cl"), ["@claude ", "@claude! "]);
         assert!(to("a /re").is_empty(), "a command only as the line's first word");
         assert!(to("ping @someone").is_empty() && to("plain words").is_empty());
+    }
+
+    #[test]
+    fn history_and_clear_keep_the_unfinished_line_and_cursor() {
+        let mut a = app(&["claude"]);
+        a.history = vec!["an earlier message".into()];
+        a.hist = a.history.len();
+        a.insert("unfinished 漢字\nsecond line");
+        a.cursor = 4;
+        a.key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(a.input.iter().collect::<String>(), "an earlier message");
+        a.key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(a.input.iter().collect::<String>(), "unfinished 漢字\nsecond line");
+        assert_eq!(a.cursor, 4, "return to the exact editing position");
+        for key in [KeyEvent::from(KeyCode::Esc), KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)] {
+            a.key(key);
+            assert!(a.input.is_empty());
+            a.key(KeyEvent::from(KeyCode::Up));
+            assert_eq!(a.input.iter().collect::<String>(), "unfinished 漢字\nsecond line");
+            assert_eq!(a.cursor, 4);
+        }
+        a.clear_input();
+        a.insert("/help");
+        a.submit();
+        assert!(a.cleared.is_none() && a.draft.is_none(), "a sent line finishes draft recovery");
+    }
+
+    #[test]
+    fn escape_closes_the_picker_before_clearing_and_edits_reopen_it() {
+        let mut a = app(&["claude"]);
+        a.insert("/re");
+        a.key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(a.input.iter().collect::<String>(), "/re");
+        assert!(a.menu_entries().is_empty());
+        a.key(KeyEvent::from(KeyCode::Char('s')));
+        assert!(!a.menu_entries().is_empty());
+        a.key(KeyEvent::from(KeyCode::Esc));
+        a.key(KeyEvent::from(KeyCode::Esc));
+        assert!(a.input.is_empty());
+        a.key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(a.input.iter().collect::<String>(), "/res");
+    }
+
+    #[test]
+    fn windows_altgr_and_shift_tab_work_while_the_picker_is_open() {
+        let mut a = app(&["claude"]);
+        for c in ['@', '\\', '{', '[', 'c', 'd'] {
+            a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        }
+        assert_eq!(a.input.iter().collect::<String>(), "@\\{[cd");
+        let mut release = KeyEvent::from(KeyCode::Char('x'));
+        release.kind = KeyEventKind::Release;
+        let before = a.last_key;
+        a.key(release);
+        assert_eq!(a.last_key, before);
+        assert!(!a.input.contains(&'x'));
+        a.input.clear();
+        a.cursor = 0;
+        a.insert("/");
+        let mode = a.s.mode;
+        a.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT));
+        assert_eq!(a.s.mode, mode.next());
+        assert_eq!(a.input, vec!['/'], "Shift-Tab must not accept a completion");
+    }
+
+    #[test]
+    fn the_picker_pages_and_fits_small_terminals() {
+        let mut a = app(&["claude"]);
+        a.insert("/");
+        let n = a.menu_entries().len();
+        let rows = screen(&mut a, 80, 24);
+        assert!(rows.iter().any(|r| r.contains(&format!("1/{n}"))));
+        a.key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(a.pick, 6);
+        assert_eq!(a.scroll, 0, "paging a picker leaves the conversation alone");
+        let rows = screen(&mut a, 80, 24);
+        assert!(rows.iter().any(|r| r.contains(&format!("7/{n}"))));
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(a.pick, 0);
+        for (w, h) in [(120, 36), (80, 24), (60, 12), (40, 8), (20, 5), (8, 5), (1, 1)] {
+            for input in ["/", "a long draft with 漢字 and more text\nsecond line"] {
+                a.input = input.chars().collect();
+                a.cursor = a.input.len();
+                let live = a.live(w, h);
+                assert!(live.menu.iter().all(|r| r.width() <= w as usize), "menu exceeds {w} columns");
+                let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                terminal.draw(|f| a.draw(f)).unwrap();
+                let at = terminal.get_cursor_position().unwrap();
+                assert!(at.x < w && at.y < h, "cursor outside {w}x{h}: {at:?}");
+                if h >= 5 {
+                    assert!(screen(&mut a, w, h).iter().any(|r| r.contains('❯')), "input lost at {w}x{h}");
+                }
+            }
+        }
+    }
+
+    /// Export actual styled cell buffers for visual inspection without launching agents or the interactive shell.
+    /// RINGO_TUI_PREVIEW_DIR=/private/tmp/ringo-preview cargo test --bin ringo export_usability_previews -- --ignored
+    #[test]
+    #[ignore]
+    fn export_usability_previews() {
+        let dir = PathBuf::from(std::env::var_os("RINGO_TUI_PREVIEW_DIR").expect("set a private preview directory"));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, w, h, input, pick, theme) in [
+            ("welcome", 80, 24, "", 0, "siamese"),
+            ("commands", 80, 24, "/", 8, "siamese"),
+            ("wide", 120, 36, "/model ", 0, "siamese"),
+            ("narrow", 40, 8, "/", 8, "siamese"),
+            ("small-draft", 20, 5, "a long draft with 漢字\nsecond line", 0, "mono"),
+            ("light", 80, 24, "/", 8, "siamese-light"),
+        ] {
+            let mut a = app(&["codex", "claude"]);
+            a.theme = Theme::named(theme, crate::theme::Depth::TrueColor).unwrap();
+            a.welcome();
+            if !input.is_empty() {
+                a.echo("Help me refine this CLI before moving to Windows and WSL.");
+                a.reply("**Ready.** Your draft stays intact while you browse history.\n\n- Ctrl-J adds a line.\n- Esc closes the picker first.");
+                a.insert(input);
+                a.pick = pick;
+            }
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            terminal.draw(|f| a.draw(f)).unwrap();
+            let cells: Vec<_> = terminal.backend().buffer().content.iter().map(|c| serde_json::json!({
+                "text": c.symbol(), "fg": format!("{:?}", c.fg), "bg": format!("{:?}", c.bg),
+                "bold": c.modifier.contains(Modifier::BOLD), "reverse": c.modifier.contains(Modifier::REVERSED),
+                "dim": c.modifier.contains(Modifier::DIM)
+            })).collect();
+            let value = serde_json::json!({"width":w,"height":h,"theme":theme,"cells":cells});
+            std::fs::write(dir.join(format!("{name}.json")), serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        }
     }
 
     #[test]

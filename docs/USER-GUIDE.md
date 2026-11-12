@@ -272,19 +272,20 @@ Every turn and pipeline is a numbered job.
 |---|---|
 | Enter | send |
 | Shift-Enter, Ctrl-J | new line (so does `\` then Enter) |
-| Esc | clear the input; with it empty, stop the turn |
-| Up, Down | move between lines, then through earlier messages |
-| `/` or `@` | a menu of commands or agents: Up and Down choose, Tab or Enter completes |
+| Esc | close the completion menu first; otherwise clear the input (Up restores it); with it empty, stop the turn |
+| Up, Down | move between lines, then through earlier messages; Down past the newest restores your unfinished line and cursor |
+| `/` or `@` | a menu of commands or agents: Up and Down choose, PgUp/PgDn page, Tab or Enter completes; the input shows your position in the list |
 | PgUp, PgDn | scroll the conversation (the mouse wheel does too); what you are reading then stays where it is while agents write, and the box counts the rows below |
 | Home, End | with nothing typed, the conversation's start and end |
 | drag | select text in the conversation and copy it |
 | Ctrl-A, Ctrl-E | the start or end of the line; Ctrl-U and Ctrl-K cut to either |
 | Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W cuts the word before |
 | Shift-Tab | change the mode |
-| Ctrl-C | stop the turn; with nothing running, twice to quit |
+| Ctrl-C | clear a typed line (Up restores it); with the input empty, stop the turn; with nothing running, twice to quit |
 
 A paste keeps its lines and is not sent until you press Enter. Shift-Enter works where the terminal can report it
-(iTerm2, kitty, WezTerm, Ghostty); in macOS Terminal use Ctrl-J. When you quit, the conversation is saved as a text
+(iTerm2, kitty, WezTerm, Ghostty); Ctrl-J works in terminals that cannot distinguish Shift-Enter, including Windows/WSL terminals.
+AltGr characters such as `@`, `\` and `{` work on international Windows keyboard layouts. When you quit, the conversation is saved as a text
 file and Ringo prints where.
 
 To go on with a conversation later, after you quit, a crash or a closed terminal, run `ringo --resume` (or `ringo -r`)
