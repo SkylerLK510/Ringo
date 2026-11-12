@@ -31,7 +31,8 @@ new path. On macOS and Windows `Ringo` also works, because their file systems ig
 `alias Ringo=ringo` to your shell profile.
 
 Windows: the shell builds and the pipelines run through the Python runtime. `/kill` is exercised on Windows in CI,
-and agents start in a process group of their own, so Ctrl-C in the shell stops the shell alone. The integration
+and agents start in a process group of their own, so Ctrl-C in the shell stops the shell alone. `/kill` immediately
+force-stops the tree off the UI thread; Windows has no graceful stop period. The integration
 suites' agent fakes and the native runtime stay macOS-and-Linux so far. Use WSL 2 if you hit a problem.
 
 ## First run

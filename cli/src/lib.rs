@@ -919,8 +919,9 @@ fn agent_env(cmd: &mut Command) {
     cmd.env("RINGO_CHILD", "1");
 }
 
-/// Stops a job's whole process group: TERM, then KILL after a grace period. A Ringo pipeline gets INT first: its
-/// model calls run in sessions of their own, out of the group's reach, and Python's interrupt handling ends them.
+/// Stops a job's whole process group: on Unix, TERM then KILL after a grace period. A Ringo pipeline gets INT first:
+/// its model calls run in sessions of their own, out of the group's reach, and Python's interrupt handling ends them.
+/// Windows force-stops the tree in one pass; a graceful pass can lose descendants when their parent exits.
 fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     #[cfg(unix)]
     {
@@ -941,24 +942,19 @@ fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     }
     #[cfg(not(unix))]
     {
-        let _ = pipeline;
-        // Windows has no signal to send, so `taskkill`'s graceful pass stands in for the first signal: it asks
-        // windows-bearing processes to close, which console agents usually refuse, and the forced pass is the stop
-        // that lands — the same TERM, then KILL, shape. Both pass run on the escalation thread, like Unix's KILL,
-        // so `/kill` never waits on a process tree that takes its time to die; the forced pass stays anchored to
-        // the stop's own deadline, counting the graceful pass's time against the grace.
-        let started = Instant::now();
+        let _ = (grace, pipeline);
+        // Without job objects, taskkill can only find the tree while its parent still exists. Do not first ask
+        // the parent to exit or wait out a grace period: either can orphan descendants before the forced pass.
+        // Run the single forced pass off the UI thread, so a slow taskkill cannot block the shell.
         thread::spawn(move || {
-            let graceful = Command::new("taskkill").args(["/T", "/PID", &pid.to_string()]).output();
-            if graceful.is_err() {
-                // could not even start taskkill; the forced pass is the only chance left
-                let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
-                return;
+            let mut kill = Command::new("taskkill");
+            kill.args(["/T", "/F", "/PID", &pid.to_string()]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                kill.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: the helper must not flash a console
             }
-            if let Some(left) = grace.checked_sub(started.elapsed()) {
-                thread::sleep(left);
-            }
-            let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+            let _ = kill.stdout(Stdio::null()).stderr(Stdio::null()).status();
         });
     }
 }
@@ -3402,25 +3398,65 @@ mod tests {
         assert!(!wsl_from(None, false, None)); // plain Linux: no variable, no microsoft in /proc/version
     }
 
-    /// The Windows half of `stop_group`: nothing else would end the child, so a stop that lands proves the
-    /// graceful pass and the forced pass after the grace both ran. Runs on the Windows CI runner only.
+    /// A long grace must not delay the forced stop, and descendants must end as well as the parent.
+    /// Keep handles to both processes so the result does not depend on PID reuse or tasklist's output.
     #[cfg(windows)]
     #[test]
-    fn a_windows_stop_ends_the_process_after_the_grace() {
+    fn a_windows_stop_ends_the_tree_without_waiting_for_a_grace() {
+        use std::ffi::c_void;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
         use std::os::windows::process::CommandExt;
-        let mut child = Command::new("cmd").args(["/c", "ping", "-n", "30", "127.0.0.1"])
-            .creation_flags(0x0200).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn the sleeper");
-        stop_group(child.id(), Duration::from_millis(200), false);
-        let mut ended = false;
-        for _ in 0..100 {
-            if child.try_wait().is_ok_and(|s| s.is_some()) {
-                ended = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
         }
-        let _ = child.wait();
-        assert!(ended, "taskkill's graceful pass, then the forced one, must end the child within 10 s");
+
+        // Redirect the descendant's output so only its PID reaches our readiness pipe. Both processes would
+        // otherwise live for a minute, far longer than the stop deadline. Test agents and pipelines alike.
+        let script = r#"
+            $ErrorActionPreference = 'Stop'
+            $s = New-Object System.Diagnostics.ProcessStartInfo
+            $s.FileName = "$env:SystemRoot\System32\ping.exe"
+            $s.Arguments = '-n 60 127.0.0.1'
+            $s.UseShellExecute = $false
+            $s.CreateNoWindow = $true
+            $s.RedirectStandardOutput = $true
+            $s.RedirectStandardError = $true
+            $child = [System.Diagnostics.Process]::Start($s)
+            [Console]::WriteLine($child.Id)
+            Start-Sleep -Seconds 60
+        "#;
+        for pipeline in [false, true] {
+            let mut parent = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(0x0800_0200).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+                .spawn().expect("spawn the parent");
+            let mut line = String::new();
+            BufReader::new(parent.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            let pid: u32 = line.trim().parse().expect("parent reports its live descendant's PID");
+            // SAFETY: requests only a synchronization handle to the known live descendant, with no inheritance.
+            let raw = unsafe { OpenProcess(0x0010_0000, 0, pid) }; // SYNCHRONIZE
+            assert!(!raw.is_null(), "open descendant: {}", std::io::Error::last_os_error());
+            // SAFETY: OpenProcess returned a new, valid, exclusively owned handle.
+            let descendant = unsafe { OwnedHandle::from_raw_handle(raw) };
+            let started = Instant::now();
+            stop_group(parent.id(), Duration::from_secs(60), pipeline);
+            let returned = started.elapsed();
+            // SAFETY: both handles remain owned and valid for these bounded waits. WAIT_OBJECT_0 is zero.
+            let (parent_ended, descendant_ended) = unsafe {
+                (WaitForSingleObject(parent.as_raw_handle(), 10_000) == 0,
+                 WaitForSingleObject(descendant.as_raw_handle(), 10_000) == 0)
+            };
+            // Clean up even if the regression returns: taskkill the parent tree, then the descendant by PID.
+            for remaining in [parent.id(), pid] {
+                let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &remaining.to_string()])
+                    .creation_flags(0x0800_0000).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
+            let _ = parent.wait();
+            assert!(returned < Duration::from_secs(1), "stop_group blocked the caller for {returned:?}");
+            assert!(parent_ended && descendant_ended, "both parent and descendant must stop before the 60 s grace");
+        }
     }
 
     #[test]

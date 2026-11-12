@@ -84,7 +84,8 @@ have so far been run only on macOS.
 - `/copy` keeps Unicode text intact: text with a non-ASCII letter goes to PowerShell's `Set-Clipboard`, which takes
   it, rather than `clip`, which reads the console codepage and garbles it.
 - Agents the shell starts run in a process group of their own, so Ctrl-C in the shell stops the shell alone, and
-  `/kill` asks first (`taskkill` without the force), then forces after the grace.
+  `/kill` force-stops the process tree (`taskkill /T /F`) off the UI thread. Windows does not wait for a grace
+  period: a parent that exits during that wait can leave descendants beyond `taskkill`'s reach.
 
 To run Ringo as on Linux instead, use WSL 2 (the Windows Subsystem for Linux):
 
