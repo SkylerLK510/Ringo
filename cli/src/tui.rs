@@ -3201,7 +3201,11 @@ impl App {
     }
 
     fn clear_input(&mut self) {
-        self.cleared = Some((std::mem::take(&mut self.input), self.cursor));
+        let visible = (std::mem::take(&mut self.input), self.cursor);
+        // A recalled message is already safe in history. Recover the unsent draft it temporarily replaced.
+        self.cleared = Some(if self.hist < self.history.len() {
+            self.draft.take().filter(|(text, _)| !text.is_empty()).unwrap_or(visible)
+        } else { visible });
         self.cursor = 0;
         self.hist = self.history.len();
         self.draft = None;
@@ -3302,8 +3306,8 @@ impl App {
             match k.code {
                 KeyCode::Up if choosing => return self.pick = (pick + entries.len() - 1) % entries.len(),
                 KeyCode::Down if choosing => return self.pick = (pick + 1) % entries.len(),
-                KeyCode::PageUp if choosing => return self.pick = pick.saturating_sub(self.menu_page),
-                KeyCode::PageDown if choosing => return self.pick = (pick + self.menu_page).min(entries.len() - 1),
+                KeyCode::PageUp if choosing && self.scroll == 0 => return self.pick = pick.saturating_sub(self.menu_page),
+                KeyCode::PageDown if choosing && self.scroll == 0 => return self.pick = (pick + self.menu_page).min(entries.len() - 1),
                 KeyCode::Esc => {
                     self.menu_off = true;
                     self.pick = 0;
@@ -3341,7 +3345,7 @@ impl App {
                 } else {
                     self.quit_armed = true;
                     let n = self.s.running();
-                    self.note(match n {
+                    self.say(match n {
                         0 => "  Ctrl-C again quits".to_string(),
                         n => format!("  Ctrl-C again stops {} and quits", if n == 1 { "the job running".into() } else { format!("the {n} jobs running") }),
                     });
@@ -3872,15 +3876,18 @@ impl App {
             let entries = self.menu_entries();
             let hint = match &self.toast {
                 Some((text, at)) if at.elapsed() < TOAST => text.clone(),
+                // Scrolled away from live output, paging keeps moving through the conversation even with a picker.
+                _ if self.scroll > 0 => format!("scrolled up · {} rows below · {}", self.scroll,
+                                               if self.input.is_empty() { "End goes back" } else { "PgDn scrolls" }),
                 _ if !entries.is_empty() => {
                     let position = format!("{}/{}", self.pick.min(entries.len() - 1) + 1, entries.len());
-                    let hints = [format!("↑↓ {position} · Tab fills · Enter picks · Esc closes"),
+                    let word: String = self.input[..self.cursor].iter().rev().take_while(|c| !matches!(c, ' ' | '\n'))
+                        .collect::<Vec<_>>().into_iter().rev().collect();
+                    let enter = if entries.iter().any(|(to, ..)| *to == word) { "runs" } else { "picks" };
+                    let hints = [format!("↑↓ {position} · Tab fills · Enter {enter} · Esc closes"),
                                  format!("↑↓ {position} · Tab fills · Esc closes"), format!("↑↓ {position} · Esc closes")];
                     hints.into_iter().find(|h| cols(h) + live.mark_w < w).unwrap_or(position)
                 }
-                // the count grows as lines are written below: nothing arrives unseen
-                _ if self.scroll > 0 => format!("scrolled up · {} rows below · {}", self.scroll,
-                                               if self.input.is_empty() { "End goes back" } else { "PgDn scrolls" }),
                 _ if self.holding().is_some() && !self.input.is_empty() => "Esc clears the line · Esc again stops".into(),
                 _ if live.top > 0 => format!("↑ {} draft rows above · Ctrl-J newline", live.top),
                 _ if self.talking.is_some() => "the agents are talking · a line of yours joins in · Esc stops them".into(),
@@ -5746,6 +5753,13 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
             assert_eq!(a.input.iter().collect::<String>(), "unfinished 漢字\nsecond line");
             assert_eq!(a.cursor, 4);
         }
+        a.key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(a.input.iter().collect::<String>(), "an earlier message");
+        a.key(KeyEvent::from(KeyCode::Esc));
+        a.key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(a.input.iter().collect::<String>(), "unfinished 漢字\nsecond line",
+                   "clearing a recalled entry recovers the original unsent draft");
+        assert_eq!(a.cursor, 4);
         a.clear_input();
         a.insert("/help");
         a.submit();
@@ -5804,6 +5818,19 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(rows.iter().any(|r| r.contains(&format!("7/{n}"))));
         a.key(KeyEvent::from(KeyCode::PageUp));
         assert_eq!(a.pick, 0);
+        for i in 0..40 {
+            a.say(format!("line {i}"));
+        }
+        a.scroll = 5;
+        let rows = screen(&mut a, 80, 24);
+        assert!(rows.iter().any(|r| r.contains("rows below") && r.contains("PgDn scrolls")));
+        let before = a.scroll;
+        a.key(KeyEvent::from(KeyCode::PageUp));
+        assert!(a.scroll > before, "when scrolled up, page keys move through the conversation");
+        a.scroll = 0;
+        a.input = "/clear".chars().collect();
+        a.cursor = a.input.len();
+        assert!(screen(&mut a, 80, 24).iter().any(|r| r.contains("Enter runs")));
         for (w, h) in [(120, 36), (80, 24), (60, 12), (40, 8), (20, 5), (8, 5), (1, 1)] {
             for input in ["/", "a long draft with 漢字 and more text\nsecond line"] {
                 a.input = input.chars().collect();

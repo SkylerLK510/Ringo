@@ -274,7 +274,7 @@ Every turn and pipeline is a numbered job.
 | Shift-Enter, Ctrl-J | new line (so does `\` then Enter) |
 | Esc | close the completion menu first; otherwise clear the input (Up restores it); with it empty, stop the turn |
 | Up, Down | move between lines, then through earlier messages; Down past the newest restores your unfinished line and cursor |
-| `/` or `@` | a menu of commands or agents: Up and Down choose, PgUp/PgDn page, Tab or Enter completes; the input shows your position in the list |
+| `/` or `@` | a menu of commands or agents: Up and Down choose, PgUp/PgDn page, Tab or Enter completes; the input shows your position in the list. When scrolled up, page keys keep scrolling the conversation |
 | PgUp, PgDn | scroll the conversation (the mouse wheel does too); what you are reading then stays where it is while agents write, and the box counts the rows below |
 | Home, End | with nothing typed, the conversation's start and end |
 | drag | select text in the conversation and copy it |
