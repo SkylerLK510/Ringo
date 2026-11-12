@@ -1354,10 +1354,22 @@ fn set_clipboard_unicode(text: &str) -> bool {
         return false;
     }
     let took = Command::new("powershell").args(["-NoProfile", "-Command",
-        "Get-Content -Raw -Encoding UTF8 -LiteralPath $args[0] | Set-Clipboard"]).arg(&file).output()
+        "Get-Content -Raw -Encoding UTF8 -LiteralPath $env:RINGO_CLIPBOARD_FILE | Set-Clipboard"])
+        .env("RINGO_CLIPBOARD_FILE", &file).output()
         .is_ok_and(|out| out.status.success());
     let _ = std::fs::remove_file(&file);
     took
+}
+
+#[cfg(windows)]
+#[test]
+fn a_unicode_answer_reaches_the_windows_clipboard_and_back() {
+    use std::process::Command;
+    assert!(set_clipboard_unicode("grüße ☺"));
+    // the read-back sets its own output encoding: a console pipe's default codepage would garble what it prints
+    let back = Command::new("powershell").args(["-NoProfile", "-Command",
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Clipboard"]).output().expect("read the clipboard");
+    assert_eq!(String::from_utf8_lossy(&back.stdout).trim_end(), "grüße ☺");
 }
 
 /// The Keys section of the guide, for `?`.

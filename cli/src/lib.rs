@@ -943,17 +943,21 @@ fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     {
         let _ = pipeline;
         // Windows has no signal to send, so `taskkill`'s graceful pass stands in for the first signal: it asks
-        // windows-bearing processes to close, which console agents usually refuse, and the forced pass after the
-        // grace is the stop that lands — the same TERM, then KILL, shape. The forced pass runs on the escalation
-        // thread, like Unix's KILL, so `/kill` never waits on a process tree that takes its time to die.
-        let graceful = Command::new("taskkill").args(["/T", "/PID", &pid.to_string()]).output();
+        // windows-bearing processes to close, which console agents usually refuse, and the forced pass is the stop
+        // that lands — the same TERM, then KILL, shape. Both pass run on the escalation thread, like Unix's KILL,
+        // so `/kill` never waits on a process tree that takes its time to die; the forced pass stays anchored to
+        // the stop's own deadline, counting the graceful pass's time against the grace.
+        let started = Instant::now();
         thread::spawn(move || {
+            let graceful = Command::new("taskkill").args(["/T", "/PID", &pid.to_string()]).output();
             if graceful.is_err() {
                 // could not even start taskkill; the forced pass is the only chance left
                 let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
                 return;
             }
-            thread::sleep(grace);
+            if let Some(left) = grace.checked_sub(started.elapsed()) {
+                thread::sleep(left);
+            }
             let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
         });
     }
