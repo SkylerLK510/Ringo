@@ -81,12 +81,18 @@ have so far been run only on macOS.
   example `node.exe` with the CLI's JavaScript entry point.
 - Private folders are locked to your Windows account. [Portability](docs/EXPERIMENTS.md#9-portability) explains
   what that covers and what it doesn't.
+- `/copy` keeps Unicode text intact: text with a non-ASCII letter goes to PowerShell's `Set-Clipboard`, which takes
+  it, rather than `clip`, which reads the console codepage and garbles it.
+- Agents the shell starts run in a process group of their own, so Ctrl-C in the shell stops the shell alone, and
+  `/kill` force-stops the process tree (`taskkill /T /F`) off the UI thread. Windows does not wait for a grace
+  period: a parent that exits during that wait can leave descendants beyond `taskkill`'s reach.
 
 To run Ringo as on Linux instead, use WSL 2 (the Windows Subsystem for Linux):
 
 1. Open PowerShell as Administrator, run `wsl --install`, then restart Windows. This installs WSL 2 with Ubuntu.
 2. Open **Ubuntu** from the Start menu and follow the Linux steps above inside it.
-3. Install the model CLIs inside Ubuntu too, using the Linux commands below, so Ringo can find them.
+3. Install the model CLIs inside Ubuntu too, using the Linux commands below, so Ringo can find them. Under WSL 2,
+   `/copy` also tries Windows' own `clip.exe` (WSL puts it on your PATH) where the Linux tools are missing.
 
 ### Without git
 

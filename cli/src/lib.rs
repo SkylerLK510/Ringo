@@ -743,6 +743,19 @@ pub fn python() -> OsString {
     std::env::var_os("RINGO_PYTHON").unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into())
 }
 
+/// Whether the shell runs under WSL (the Windows Subsystem for Linux): Windows' own tools like `clip.exe` are then
+/// reachable on PATH, and the shell uses them where Linux's own clipboard tools are missing.
+pub fn is_wsl() -> bool {
+    wsl_from(std::env::var_os("WSL_DISTRO_NAME").as_deref(), std::env::var_os("WSLENV").is_some(),
+            std::fs::read_to_string("/proc/version").ok().as_deref())
+}
+
+/// The testable core of `is_wsl`: WSL sets `WSL_DISTRO_NAME` for every process; its `/proc/version` carries
+/// `microsoft` in some casing; `WSLENV` alone is only a hint, but nothing else sets it with that name.
+fn wsl_from(distro: Option<&std::ffi::OsStr>, wslenv: bool, proc_version: Option<&str>) -> bool {
+    distro.is_some() || wslenv || proc_version.is_some_and(|v| v.to_ascii_lowercase().contains("microsoft"))
+}
+
 /// Whether a program is on PATH (or is an existing path).
 pub fn installed(program: &Path) -> bool {
     if program.components().count() > 1 {
@@ -906,8 +919,9 @@ fn agent_env(cmd: &mut Command) {
     cmd.env("RINGO_CHILD", "1");
 }
 
-/// Stops a job's whole process group: TERM, then KILL after a grace period. A Ringo pipeline gets INT first: its
-/// model calls run in sessions of their own, out of the group's reach, and Python's interrupt handling ends them.
+/// Stops a job's whole process group: on Unix, TERM then KILL after a grace period. A Ringo pipeline gets INT first:
+/// its model calls run in sessions of their own, out of the group's reach, and Python's interrupt handling ends them.
+/// Windows force-stops the tree in one pass; a graceful pass can lose descendants when their parent exits.
 fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     #[cfg(unix)]
     {
@@ -929,7 +943,19 @@ fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     #[cfg(not(unix))]
     {
         let _ = (grace, pipeline);
-        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+        // Without job objects, taskkill can only find the tree while its parent still exists. Do not first ask
+        // the parent to exit or wait out a grace period: either can orphan descendants before the forced pass.
+        // Run the single forced pass off the UI thread, so a slow taskkill cannot block the shell.
+        thread::spawn(move || {
+            let mut kill = Command::new("taskkill");
+            kill.args(["/T", "/F", "/PID", &pid.to_string()]);
+            #[cfg(windows)]
+            {
+                use std::os::windows::process::CommandExt;
+                kill.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: the helper must not flash a console
+            }
+            let _ = kill.stdout(Stdio::null()).stderr(Stdio::null()).status();
+        });
     }
 }
 
@@ -2243,6 +2269,16 @@ impl Session {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0); // its own group: /kill stops every descendant, and Ctrl-C in the shell does not
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NEW_PROCESS_GROUP (0x0200) is the Windows stand-in for `process_group(0)`: Ctrl-C in the shell
+            // does not reach the agent, and /kill's taskkill /T still takes the whole tree. CREATE_NO_WINDOW
+            // (0x0800_0000) keeps a console child from flashing a window over the shell. Both are safe here because
+            // every spawn in this path pipes stdin, stdout and stderr — the interactive sign-in flow spawns on its
+            // own, with the owner's console inherited.
+            cmd.creation_flags(0x0800_0200);
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -3350,6 +3386,78 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_shows_in_the_distro_variable_and_proc_version() {
+        use std::ffi::OsStr;
+        assert!(wsl_from(Some(OsStr::new("Ubuntu-22.04")), false, None));
+        assert!(wsl_from(None, true, None));
+        assert!(wsl_from(None, false, Some("Linux version 5.15.167.4-microsoft-standard-WSL2")));
+        assert!(wsl_from(None, false, Some("Linux version 4.4.0-19041-Microsoft")));
+        assert!(!wsl_from(None, false, Some("Linux version 6.6.0 (gcc)")));
+        assert!(!wsl_from(None, false, None)); // plain Linux: no variable, no microsoft in /proc/version
+    }
+
+    /// A long grace must not delay the forced stop, and descendants must end as well as the parent.
+    /// Keep handles to both processes so the result does not depend on PID reuse or tasklist's output.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_stop_ends_the_tree_without_waiting_for_a_grace() {
+        use std::ffi::c_void;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::os::windows::process::CommandExt;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn OpenProcess(access: u32, inherit: i32, pid: u32) -> *mut c_void;
+            fn WaitForSingleObject(handle: *mut c_void, millis: u32) -> u32;
+        }
+
+        // Redirect the descendant's output so only its PID reaches our readiness pipe. Both processes would
+        // otherwise live for a minute, far longer than the stop deadline. Test agents and pipelines alike.
+        let script = r#"
+            $ErrorActionPreference = 'Stop'
+            $s = New-Object System.Diagnostics.ProcessStartInfo
+            $s.FileName = "$env:SystemRoot\System32\ping.exe"
+            $s.Arguments = '-n 60 127.0.0.1'
+            $s.UseShellExecute = $false
+            $s.CreateNoWindow = $true
+            $s.RedirectStandardOutput = $true
+            $s.RedirectStandardError = $true
+            $child = [System.Diagnostics.Process]::Start($s)
+            [Console]::WriteLine($child.Id)
+            Start-Sleep -Seconds 60
+        "#;
+        for pipeline in [false, true] {
+            let mut parent = Command::new("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script])
+                .creation_flags(0x0800_0200).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null())
+                .spawn().expect("spawn the parent");
+            let mut line = String::new();
+            BufReader::new(parent.stdout.take().unwrap()).read_line(&mut line).unwrap();
+            let pid: u32 = line.trim().parse().expect("parent reports its live descendant's PID");
+            // SAFETY: requests only a synchronization handle to the known live descendant, with no inheritance.
+            let raw = unsafe { OpenProcess(0x0010_0000, 0, pid) }; // SYNCHRONIZE
+            assert!(!raw.is_null(), "open descendant: {}", std::io::Error::last_os_error());
+            // SAFETY: OpenProcess returned a new, valid, exclusively owned handle.
+            let descendant = unsafe { OwnedHandle::from_raw_handle(raw) };
+            let started = Instant::now();
+            stop_group(parent.id(), Duration::from_secs(60), pipeline);
+            let returned = started.elapsed();
+            // SAFETY: both handles remain owned and valid for these bounded waits. WAIT_OBJECT_0 is zero.
+            let (parent_ended, descendant_ended) = unsafe {
+                (WaitForSingleObject(parent.as_raw_handle(), 10_000) == 0,
+                 WaitForSingleObject(descendant.as_raw_handle(), 10_000) == 0)
+            };
+            // Clean up even if the regression returns: taskkill the parent tree, then the descendant by PID.
+            for remaining in [parent.id(), pid] {
+                let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &remaining.to_string()])
+                    .creation_flags(0x0800_0000).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
+            let _ = parent.wait();
+            assert!(returned < Duration::from_secs(1), "stop_group blocked the caller for {returned:?}");
+            assert!(parent_ended && descendant_ended, "both parent and descendant must stop before the 60 s grace");
+        }
+    }
 
     #[test]
     fn a_carried_record_keeps_its_newest_whole_lines() {

@@ -286,7 +286,8 @@ pub fn near_miss(text: &str, old: &str) -> String {
     }
     let at = text.find(&old[..bounds[lo]]).expect("the prefix occurs");
     let line = text[..at].matches('\n').count() + 1;
-    let shown = py::head(text.split('\n').nth(line - 1).unwrap_or(""), 200);
+    // a file written on Windows ends its lines with CRLF; the carriage return is not content to quote back
+    let shown = py::head(text.split('\n').nth(line - 1).unwrap_or("").trim_end_matches('\r'), 200);
     format!("its first {lo} of {n} characters match at line {line}: {}", py::repr(shown))
 }
 
@@ -3486,4 +3487,15 @@ pub fn main(argv: &[String], implementation: &Value) -> i32 {
     let (tty, columns) = (false, None);
     let env = |k: &str| std::env::var(k).ok();
     main_with(argv, Console { out: &mut out, err: &mut err, stdout_tty: tty, terminal_columns: columns, env: &env }, None, implementation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_near_miss_quotes_a_windows_line_without_its_carriage_return() {
+        let shown = near_miss("first\r\nsecond\r\n", "secondly");
+        assert!(shown.contains("'second'") && !shown.contains('\r'), "{shown}");
+    }
 }

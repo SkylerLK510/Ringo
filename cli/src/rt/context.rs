@@ -557,13 +557,15 @@ pub fn python_symbols_many(requests: &[(&str, &BTreeSet<u64>)]) -> Result<Vec<Sy
         let input = serde_json::Value::Array(
             requests.iter().map(|(source, lines)| serde_json::json!([source, lines.iter().collect::<Vec<_>>()])).collect(),
         );
-        let mut child = Command::new("python3")
+        let program = crate::python();
+        let name = program.to_string_lossy().into_owned();
+        let mut child = Command::new(&program)
             .args(["-P", "-c", SCRIPT])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit()) // ast.parse's SyntaxWarnings reach stderr, as in the Python runtime
             .spawn()
-            .map_err(|e| Error::io(&e, Some("python3")))?;
+            .map_err(|e| Error::io(&e, Some(name.as_str())))?;
         let mut stdin = child.stdin.take().expect("piped");
         let written = stdin.write_all(input.to_string().as_bytes());
         drop(stdin);
@@ -577,7 +579,7 @@ pub fn python_symbols_many(requests: &[(&str, &BTreeSet<u64>)]) -> Result<Vec<Sy
             _ => None,
         };
         let Some(parsed) = parsed else {
-            return Err(Error::os(format!("python3 could not run python_symbols ({status})")));
+            return Err(Error::os(format!("{name} could not run python_symbols ({status})")));
         };
         let set = |v: &serde_json::Value| -> BTreeSet<String> {
             v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_string)).collect()
