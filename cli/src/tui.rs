@@ -36,6 +36,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "the guide (also /usrman)"),
     ("/undo", "take back the last change an agent made here"),
     ("/copy", "copy the last answer"),
+    ("/attach PATH", "attach an image; /attach clipboard or Ctrl-V pastes a screenshot on macOS"),
     ("/clear", "start a new conversation"),
     ("/compact", "shrink a long conversation so later turns cost less"),
     ("/separate", "a conversation of its own for each agent, so none is told what the others do"),
@@ -240,6 +241,7 @@ pub enum Cmd {
     Ask(String),
     Undo,
     Copy,
+    Attach(String),
     Clear,
     Compact,
     /// `/separate` (true): each agent a conversation of its own, at the same time; `/together` (false): one again.
@@ -359,6 +361,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "setup" => Ok(Cmd::Setup),
             "undo" => Ok(Cmd::Undo),
             "copy" => Ok(Cmd::Copy),
+            "attach" => Ok(Cmd::Attach(tail.into())),
             "clear" | "new" => Ok(Cmd::Clear),
             "compact" => Ok(Cmd::Compact),
             "separate" => Ok(Cmd::Separate(true)),
@@ -1327,7 +1330,7 @@ fn copy(text: &str) -> bool {
 /// The Keys section of the guide, for `?`.
 fn keys() -> String {
     let section = MANUAL.split_once("## Keys").map_or("", |(_, rest)| rest.split("\n## ").next().unwrap_or(rest));
-    format!("## Keys{section}")
+    format!("## Keys{section}\n\nImages: /attach PATH, or Ctrl-V / /attach clipboard on macOS. Add your message and press Enter. PNG, JPEG, GIF and WebP; up to 8 images, 20 MiB each. Send to @claude or @codex.")
 }
 
 /// The agent a plain line goes to before the owner picks one with @: claude for code, else codex, else any that
@@ -2757,6 +2760,15 @@ impl App {
             Cmd::Talk(text) if self.talking.is_some() => Some(self.join_talk(text)),
             Cmd::Talk(text) => return self.talk(self.main, text, line.to_string()),
             Cmd::Discuss(agents, topic) => return self.discuss(agents, topic),
+            Cmd::Attach(source) => {
+                let marker = if source.is_empty() || source == "clipboard" {
+                    ringo_cli::images::clipboard(&self.s.dir)?
+                } else {
+                    ringo_cli::images::attach(&ringo_cli::images::path(&source, &self.s.repo), &self.s.dir)?
+                };
+                self.insert(&format!("{marker} "));
+                Some("  image attached; add a message and press Enter to send. Delete its [image:…] marker to remove it".into())
+            }
             Cmd::Help => {
                 let intro = self.intro();
                 self.say(intro);
@@ -3100,6 +3112,20 @@ impl App {
 
     /// A paste goes into the input as it is, its lines kept; nothing is sent until Enter.
     fn paste(&mut self, text: &str) {
+        if self.input.iter().collect::<String>().trim_start().starts_with("/attach ") {
+            self.insert(&clean(text));
+            return;
+        }
+        let path = ringo_cli::images::path(text, &self.s.repo);
+        if path.is_file() && path.extension().is_some_and(|e| {
+            ["png", "jpg", "jpeg", "gif", "webp"].iter().any(|ext| e.eq_ignore_ascii_case(ext))
+        }) {
+            match ringo_cli::images::attach(&path, &self.s.dir) {
+                Ok(marker) => self.insert(&format!("{marker} ")),
+                Err(e) => self.say(format!("  {e}")),
+            }
+            return;
+        }
         self.insert(&clean(text));
     }
 
@@ -3205,6 +3231,12 @@ impl App {
         self.pick = 0;
         let page = (self.view.height as usize).saturating_sub(2).max(1);
         match k.code {
+            KeyCode::Char('v') if ctrl => {
+                match ringo_cli::images::clipboard(&self.s.dir) {
+                    Ok(marker) => self.insert(&format!("{marker} ")),
+                    Err(e) => self.say(format!("  {e}")),
+                }
+            }
             KeyCode::Char('c' | 'd') if ctrl => {
                 if !self.input.is_empty() {
                     self.input.clear();
@@ -4282,6 +4314,27 @@ mod tests {
         assert_eq!(vertical(&input, 2, false), Some(5));
         assert_eq!(vertical(&input, 5, false), Some(7));
         assert_eq!(vertical(&input, 9, false), None); // the last line: history
+    }
+
+    #[test]
+    fn image_paths_attach_to_the_draft_and_ordinary_pastes_stay_text() {
+        let mut a = app(&["codex", "claude"]);
+        let source = a.s.repo.join("Screenshot with spaces.png");
+        std::fs::write(&source, b"\x89PNG\r\n\x1a\nfixture").unwrap();
+        a.paste(&format!("'{}' ", source.display()));
+        let draft: String = a.input.iter().collect();
+        assert!(draft.starts_with("[image:"));
+        assert!(a.s.jobs.is_empty(), "attaching does not send a message");
+        std::fs::remove_file(&source).unwrap();
+        assert!(ringo_cli::images::content(ringo_cli::Adapter::Codex, &draft, &draft).is_ok());
+        a.paste("explain this\nsecond line");
+        assert!(a.input.iter().collect::<String>().ends_with("explain this\nsecond line"));
+        a.input = "/attach ".chars().collect();
+        a.cursor = a.input.len();
+        a.paste("'/tmp/a screenshot.png'");
+        assert_eq!(a.input.iter().collect::<String>(), "/attach '/tmp/a screenshot.png'");
+        assert_eq!(parse("/attach '/tmp/my shot.png'", &a.agents), Ok(Cmd::Attach("'/tmp/my shot.png'".into())));
+        assert_eq!(parse("/attach clipboard", &a.agents), Ok(Cmd::Attach("clipboard".into())));
     }
 
     #[test]

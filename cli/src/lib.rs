@@ -5,6 +5,7 @@
 pub mod parse;
 pub mod rt;
 
+pub mod images;
 use parse::{Note, Parser, Permission, Style, Tokens};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -1059,12 +1060,13 @@ impl Session {
         if names_connector(text) && !job.connectors {
             return false;
         }
+        let Ok(content) = images::content(agent.spec().adapter, text, text) else { return false };
         let line = match agent.spec().adapter {
-            Adapter::Claude => serde_json::json!({"type": "user", "message": {"role": "user", "content": text}}),
+            Adapter::Claude => serde_json::json!({"type": "user", "message": {"role": "user", "content": content}}),
             Adapter::Codex => match &job.codex_turn {
                 Some((thread, turn)) => serde_json::json!({"id": parse::STEER_ID + job.steered.len() as u64,
                     "method": "turn/steer", "params": {"threadId": thread, "expectedTurnId": turn,
-                                                       "input": [{"type": "text", "text": text}]}}),
+                                                       "input": content}}),
                 None => return false,
             },
             _ => return false,
@@ -1654,6 +1656,8 @@ impl Session {
                                 (or run git init here). @{} without ! works in any folder", agent.name(), agent.name()));
         }
         let (name, spec) = (agent.name(), agent.spec());
+        // Validate before creating a job or taking a snapshot. A failed attachment starts no model call.
+        let mut content = images::content(spec.adapter, prompt, prompt)?;
         if !self.installed(agent) {
             return Err(format!("{name} is not installed (no `{}` on PATH)", self.program(agent).display()));
         }
@@ -1749,6 +1753,12 @@ impl Session {
             });
         }
         let sandbox = if edits { "workspace-write" } else { "read-only" };
+        // Keep the validated image blocks, with the handoff added to the text alone.
+        if let Some(blocks) = content.as_array_mut() {
+            blocks[0]["text"] = sent.clone().into();
+        } else {
+            content = sent.clone().into();
+        }
         // `sent` is what the agent gets; the owner's message (`prompt`) stays the job's title, prompt.txt and what
         // decides the turn's settings
         let (mut input, mut turn) = (Some(sent.clone()), None);
@@ -1835,7 +1845,7 @@ impl Session {
                 input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
                                      serde_json::json!({"id": 2, "method": method, "params": thread})));
                 turn = Some(serde_json::json!({"id": 3, "method": "turn/start",
-                                               "params": {"input": [{"type": "text", "text": sent}]}}));
+                                               "params": {"input": content}}));
                 Style::Codex
             }
             Adapter::Claude => {
@@ -2010,7 +2020,7 @@ impl Session {
                 if let Some(file) = append {
                     cmd.arg("--append-system-prompt-file").arg(file);
                 }
-                input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": sent}})));
+                input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": content}})));
                 Style::Claude
             }
             Adapter::Agy => {
@@ -2167,6 +2177,9 @@ impl Session {
     /// an agent turn costs 17,000 before it starts. A line that is a task (files to change, review or read, or live
     /// sources) is answered with one `ROUTE: <route>` line, which `pump` hands to the shell to start.
     pub fn ask(&mut self, question: &str) -> Result<usize, String> {
+        if images::has_images(question) {
+            return Err("send images to @claude or @codex on a plain line".into());
+        }
         const KEEP: usize = 4; // earlier exchanges carried as context
         const ROOM: usize = 12_000; // characters of them at most, the newest kept first
         let mut earlier: Vec<String> = Vec::new();
