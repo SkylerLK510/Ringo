@@ -1171,6 +1171,66 @@ fn a_line_sent_while_claude_works_goes_into_its_turn() {
     assert_eq!(s.job(id).unwrap().title_full, "fix it QUIT");
 }
 
+#[test]
+fn screenshots_reach_agents_as_images_on_initial_and_running_turns() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOmsAAAAASUVORK5CYII=";
+    let r = repo("screenshots");
+    let source = r.join("screenshot.png");
+    fs::write(&source, STANDARD.decode(PNG).unwrap()).unwrap();
+    let codex = fake(&root(), "codex-screenshots", &codex_ok());
+    let claude = fake(&root(), "claude-screenshots", CLAUDE_TALKS);
+    let mut s = session(&r, agent("codex"), &codex);
+    s.programs.insert(agent("claude"), claude.clone());
+    let marker = ringo_cli::images::attach(&source, &s.dir).unwrap();
+    fs::remove_file(source).unwrap();
+    let prompt = format!("Review this error: {marker}");
+    let id = s.launch_agent(agent("codex"), false, &prompt).unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let turn: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.turn", codex.display())).unwrap()).unwrap();
+    assert_eq!(turn["params"]["input"][1]["type"], "localImage");
+    assert!(Path::new(turn["params"]["input"][1]["path"].as_str().unwrap()).starts_with(&s.dir));
+    let id = s.launch_agent(agent("claude"), false, &prompt).unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let first: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.stdin", claude.display())).unwrap()).unwrap();
+    assert!(first["message"]["content"][0]["text"].as_str().unwrap().contains("Review this error:"), "the handoff keeps the question");
+    assert_eq!(first["message"]["content"][1]["source"]["data"], PNG);
+
+    let claude = fake(&root(), "claude-screenshot-steer", CLAUDE_STEERED);
+    s.programs.insert(agent("claude"), claude.clone());
+    let id = s.launch_agent(agent("claude"), false, "fix it").unwrap();
+    assert!(s.steer(id, &prompt));
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let steered: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.steer", claude.display())).unwrap()).unwrap();
+    assert_eq!(steered["message"]["content"][1]["source"]["data"], PNG);
+
+    let codex_steer = fake(&root(), "codex-screenshot-steer", &codex_script(
+        "echo '{\"id\":3,\"result\":{\"turn\":{\"id\":\"u1\"}}}'\nread -r steer\nprintf '%s\\n' \"$steer\" > \"$0.steer\"\necho '{\"id\":100,\"result\":{\"turnId\":\"u1\"}}'",
+        &codex_done("reviewed screenshot", (10, 0, 2))));
+    s.programs.insert(agent("codex"), codex_steer.clone());
+    let id = s.launch_agent(agent("codex"), false, "inspect the dashboard").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !s.steerable(id) {
+        assert!(Instant::now() < deadline);
+        s.pump();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(s.steer(id, &prompt));
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let steered: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.steer", codex_steer.display())).unwrap()).unwrap();
+    assert_eq!(steered["method"], "turn/steer");
+    assert_eq!(steered["params"]["input"][1]["type"], "localImage");
+
+    // A fresh shell can still read the private copy named in the conversation record.
+    let mut restarted = session(&r, agent("codex"), &codex);
+    let id = restarted.launch_agent(agent("codex"), false, &prompt).unwrap();
+    assert_eq!(wait(&mut restarted, id), Status::Done);
+    let jobs = restarted.jobs.len();
+    assert!(restarted.launch_agent(agent("codex"), false, "[image:/missing.png]").is_err());
+    assert_eq!(restarted.jobs.len(), jobs, "an unreadable attachment starts no job");
+    assert!(restarted.ask(&prompt).unwrap_err().contains("@claude"));
+}
+
 /// What the fake claude was last sent, and whether it resumed a conversation.
 fn claude_heard(claude: &Path) -> (String, bool) {
     let line: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.stdin", claude.display())).unwrap()).unwrap();

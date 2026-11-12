@@ -48,6 +48,25 @@ add a dark mode switch to the settings page
 - To give every Claude turn your own rules (how you push, what never to do), write them in `rules.md` in Ringo's
   state folder (`~/.local/share/ringo/rules.md`). Keep it short: every line is read on every call.
 
+## Send an image
+
+Send screenshots to `@claude` or `@codex`:
+
+1. Type `/attach PATH` with an image file. Quotes and paths with spaces work. You can also drag one image file into
+   the input if your terminal supports bracketed paste.
+2. Look for an `[image:…]` marker in your draft.
+3. Add your question and press Enter.
+
+On macOS, you can copy a screenshot and press Ctrl-V, or use `/attach clipboard`. Typing `/attach` with no path also
+uses the clipboard.
+
+Attaching alone starts no agent call. Delete the complete marker to remove an image. You can attach a screenshot
+while an agent is working too.
+
+Supported formats: PNG, JPEG, GIF and WebP. Each message can have up to eight images, up to 20 MiB each. Ringo keeps
+a private copy outside your project, so moving or deleting the original does not break a queued message or a retry.
+Other agents and `/ask` do not accept images yet.
+
 ## Take back a change
 
 When a turn changes files, its last line says which ones, for example `changed app.py (/undo takes it back)`.
