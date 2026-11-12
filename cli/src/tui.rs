@@ -19,7 +19,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame, Terminal};
-use ringo_cli::{Agent, Decision, Kind, Mode, Said, Session, Status, Tier};
+use ringo_cli::{Agent, Decision, is_wsl, Kind, Mode, Said, Session, Status, Tier};
 use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -962,6 +962,8 @@ impl Md {
             }
             T::CodeBlock => {
                 let code = self.code.take().unwrap_or_default();
+                // text written on Windows ends its lines with CRLF; the carriage returns are not content
+                let code = code.replace("\r\n", "\n").replace('\r', "\n");
                 for line in code.strip_suffix('\n').unwrap_or(&code).split('\n') {
                     self.emit_under(vec![Span::styled(format!("  {line}"), self.t.ringo)], 2);
                 }
@@ -1303,18 +1305,17 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 /// Puts text on the clipboard with the system's own tool; where there is none (a server over ssh), the terminal is
-/// asked to (OSC 52, which many allow). True when a tool took it. ceiling: Windows' clip garbles non-ASCII text.
+/// asked to (OSC 52, which many allow). True when a tool took it.
 fn copy(text: &str) -> bool {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    let tools: &[&[&str]] = if cfg!(target_os = "macos") {
-        &[&["pbcopy"]]
-    } else if cfg!(windows) {
-        &[&["clip"]]
-    } else {
-        &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]]
-    };
-    for tool in tools {
+    #[cfg(windows)]
+    {
+        if !text.is_ascii() && set_clipboard_unicode(text) {
+            return true;
+        }
+    }
+    for tool in clipboard_tools(is_wsl(), text.is_ascii()) {
         let Ok(mut child) = Command::new(tool[0]).args(&tool[1..]).stdin(Stdio::piped()).stdout(Stdio::null())
             .stderr(Stdio::null()).spawn() else { continue };
         let wrote = child.stdin.take().is_some_and(|mut pipe| pipe.write_all(text.as_bytes()).is_ok());
@@ -1325,6 +1326,38 @@ fn copy(text: &str) -> bool {
     let _ = write!(stdout(), "\x1b]52;c;{}\x07", base64(text.as_bytes()));
     let _ = stdout().flush();
     false
+}
+
+/// The clipboard tools `copy` tries, in order, for this target OS. Under WSL the Linux list gains Windows' own
+/// `clip.exe`, which WSL puts on PATH; clip itself reads the console codepage, so text with any non-ASCII byte
+/// never goes to it — an empty list on Windows then, where `copy` has already tried PowerShell's Set-Clipboard
+/// (which takes Unicode) and only the terminal's OSC 52 answer is left.
+fn clipboard_tools(wsl: bool, ascii_only: bool) -> &'static [&'static [&'static str]] {
+    if cfg!(target_os = "macos") {
+        &[&["pbcopy"]]
+    } else if cfg!(windows) {
+        if ascii_only { &[&["clip"]] } else { &[] }
+    } else if wsl && ascii_only {
+        &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"], &["clip.exe"]]
+    } else {
+        &[&["wl-copy"], &["xclip", "-selection", "clipboard"], &["xsel", "--clipboard", "--input"]]
+    }
+}
+
+/// Windows only: puts Unicode text on the clipboard by way of a UTF-8 file, because PowerShell reads a file's
+/// encoding as it says (`-Encoding UTF8`) where stdin's decoding depends on the console codepage that garbles clip.
+#[cfg(windows)]
+fn set_clipboard_unicode(text: &str) -> bool {
+    use std::process::Command;
+    let file = std::env::temp_dir().join(format!("ringo-clipboard-{}", std::process::id()));
+    if std::fs::write(&file, text.as_bytes()).is_err() {
+        return false;
+    }
+    let took = Command::new("powershell").args(["-NoProfile", "-Command",
+        "Get-Content -Raw -Encoding UTF8 -LiteralPath $args[0] | Set-Clipboard"]).arg(&file).output()
+        .is_ok_and(|out| out.status.success());
+    let _ = std::fs::remove_file(&file);
+    took
 }
 
 /// The Keys section of the guide, for `?`.
@@ -4211,6 +4244,32 @@ fn restart(exe: &Path, kept: &Path) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_takes_only_ascii_and_wsl_adds_windows_clip() {
+        let has = |list: &[&[&str]], name: &str| list.iter().any(|t| t[0] == name);
+        if cfg!(target_os = "macos") {
+            assert_eq!(clipboard_tools(true, false)[0][0], "pbcopy");
+        } else if cfg!(windows) {
+            assert!(has(clipboard_tools(false, true), "clip"));
+            assert!(!has(clipboard_tools(false, false), "clip"), "clip garbles non-ASCII text, so it gets none");
+        } else {
+            assert!(has(clipboard_tools(true, true), "clip.exe"), "WSL reaches Windows' clip through its PATH");
+            assert!(!has(clipboard_tools(true, false), "clip.exe"), "clip.exe garbles non-ASCII text, so it gets none");
+            assert!(!has(clipboard_tools(false, true), "clip.exe"), "outside WSL, Windows' tools are not on PATH");
+        }
+    }
+
+    #[test]
+    fn a_code_block_writes_windows_line_endings_as_lines() {
+        let theme = Theme::named("mono", crate::theme::Depth::Mono).unwrap();
+        let rows = |text: &str| markdown(text, 80, &theme).iter().filter(|l| l.width() > 0)
+            .map(|l| l.to_string()).collect::<Vec<_>>();
+        let rows = rows("```\r\nfirst\r\nsecond\n```");
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].contains('\r') && rows[0].contains("first"));
+        assert!(rows[1].contains("second"), "the CRLF pairs split, not glue, the lines");
+    }
 
     #[cfg(unix)]
     #[test]

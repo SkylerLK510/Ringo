@@ -743,6 +743,19 @@ pub fn python() -> OsString {
     std::env::var_os("RINGO_PYTHON").unwrap_or_else(|| if cfg!(windows) { "python" } else { "python3" }.into())
 }
 
+/// Whether the shell runs under WSL (the Windows Subsystem for Linux): Windows' own tools like `clip.exe` are then
+/// reachable on PATH, and the shell uses them where Linux's own clipboard tools are missing.
+pub fn is_wsl() -> bool {
+    wsl_from(std::env::var_os("WSL_DISTRO_NAME").as_deref(), std::env::var_os("WSLENV").is_some(),
+            std::fs::read_to_string("/proc/version").ok().as_deref())
+}
+
+/// The testable core of `is_wsl`: WSL sets `WSL_DISTRO_NAME` for every process; its `/proc/version` carries
+/// `microsoft` in some casing; `WSLENV` alone is only a hint, but nothing else sets it with that name.
+fn wsl_from(distro: Option<&std::ffi::OsStr>, wslenv: bool, proc_version: Option<&str>) -> bool {
+    distro.is_some() || wslenv || proc_version.is_some_and(|v| v.to_ascii_lowercase().contains("microsoft"))
+}
+
 /// Whether a program is on PATH (or is an existing path).
 pub fn installed(program: &Path) -> bool {
     if program.components().count() > 1 {
@@ -928,8 +941,21 @@ fn stop_group(pid: u32, grace: Duration, pipeline: bool) {
     }
     #[cfg(not(unix))]
     {
-        let _ = (grace, pipeline);
-        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+        let _ = pipeline;
+        // Windows has no signal to send, so `taskkill`'s graceful pass stands in for the first signal: it asks
+        // windows-bearing processes to close, which console agents usually refuse, and the forced pass after the
+        // grace is the stop that lands — the same TERM, then KILL, shape. The forced pass runs on the escalation
+        // thread, like Unix's KILL, so `/kill` never waits on a process tree that takes its time to die.
+        let graceful = Command::new("taskkill").args(["/T", "/PID", &pid.to_string()]).output();
+        thread::spawn(move || {
+            if graceful.is_err() {
+                // could not even start taskkill; the forced pass is the only chance left
+                let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+                return;
+            }
+            thread::sleep(grace);
+            let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output();
+        });
     }
 }
 
@@ -2243,6 +2269,16 @@ impl Session {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0); // its own group: /kill stops every descendant, and Ctrl-C in the shell does not
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NEW_PROCESS_GROUP (0x0200) is the Windows stand-in for `process_group(0)`: Ctrl-C in the shell
+            // does not reach the agent, and /kill's taskkill /T still takes the whole tree. CREATE_NO_WINDOW
+            // (0x0800_0000) keeps a console child from flashing a window over the shell. Both are safe here because
+            // every spawn in this path pipes stdin, stdout and stderr — the interactive sign-in flow spawns on its
+            // own, with the owner's console inherited.
+            cmd.creation_flags(0x0800_0200);
+        }
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) => {
@@ -3350,6 +3386,38 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wsl_shows_in_the_distro_variable_and_proc_version() {
+        use std::ffi::OsStr;
+        assert!(wsl_from(Some(OsStr::new("Ubuntu-22.04")), false, None));
+        assert!(wsl_from(None, true, None));
+        assert!(wsl_from(None, false, Some("Linux version 5.15.167.4-microsoft-standard-WSL2")));
+        assert!(wsl_from(None, false, Some("Linux version 4.4.0-19041-Microsoft")));
+        assert!(!wsl_from(None, false, Some("Linux version 6.6.0 (gcc)")));
+        assert!(!wsl_from(None, false, None)); // plain Linux: no variable, no microsoft in /proc/version
+    }
+
+    /// The Windows half of `stop_group`: nothing else would end the child, so a stop that lands proves the
+    /// graceful pass and the forced pass after the grace both ran. Runs on the Windows CI runner only.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_stop_ends_the_process_after_the_grace() {
+        use std::os::windows::process::CommandExt;
+        let mut child = Command::new("cmd").args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .creation_flags(0x0200).stdout(Stdio::null()).stderr(Stdio::null()).spawn().expect("spawn the sleeper");
+        stop_group(child.id(), Duration::from_millis(200), false);
+        let mut ended = false;
+        for _ in 0..100 {
+            if child.try_wait().is_ok_and(|s| s.is_some()) {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.wait();
+        assert!(ended, "taskkill's graceful pass, then the forced one, must end the child within 10 s");
+    }
 
     #[test]
     fn a_carried_record_keeps_its_newest_whole_lines() {

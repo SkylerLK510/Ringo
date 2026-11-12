@@ -30,8 +30,9 @@ ringo
 new path. On macOS and Windows `Ringo` also works, because their file systems ignore case; on Linux add
 `alias Ringo=ringo` to your shell profile.
 
-Windows: the shell builds and the pipelines run, but job cancellation and the agent fakes in the tests are only
-exercised on macOS and Linux so far. Use WSL 2 if you hit a problem.
+Windows: the shell builds and the pipelines run through the Python runtime. `/kill` is exercised on Windows in CI,
+and agents start in a process group of their own, so Ctrl-C in the shell stops the shell alone. The integration
+suites' agent fakes and the native runtime stay macOS-and-Linux so far. Use WSL 2 if you hit a problem.
 
 ## First run
 
