@@ -67,6 +67,7 @@ fn repo(name: &str) -> PathBuf {
 
 fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
     let path = dir.join(name);
+    let script = if script.starts_with("#!") { script.to_string() } else { format!("#!/bin/sh\n{script}") };
     fs::write(&path, script).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
