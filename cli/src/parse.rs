@@ -539,6 +539,9 @@ impl Parser {
     fn codex_tokens(&mut self) -> Note {
         self.counted = true;
         let usage = &self.usage;
+        if !["inputTokens", "outputTokens"].iter().all(|k| usage.get(k).and_then(Value::as_u64).is_some()) {
+            return Note::Uncounted;
+        }
         let cached = u(usage, "cachedInputTokens").min(u(usage, "inputTokens"));
         Note::Tokens(Tokens { input: u(usage, "inputTokens") - cached, cache_read: cached,
                               cache_write: u(usage, "cacheWriteInputTokens"), output: u(usage, "outputTokens") })
@@ -846,8 +849,12 @@ impl Parser {
                 // Thinking is part of output_tokens (input + output = total_tokens); cache reads are taken to be part
                 // of input_tokens, as Gemini counts them.
                 let cached = u(usage, "cache_read_tokens").min(u(usage, "input_tokens"));
-                notes.push(Note::Tokens(Tokens { input: u(usage, "input_tokens") - cached, cache_read: cached,
-                                                 cache_write: 0, output: u(usage, "output_tokens") }));
+                if ["input_tokens", "output_tokens"].iter().all(|k| usage.get(k).and_then(Value::as_u64).is_some()) {
+                    notes.push(Note::Tokens(Tokens { input: u(usage, "input_tokens") - cached, cache_read: cached,
+                                                     cache_write: 0, output: u(usage, "output_tokens") }));
+                } else {
+                    notes.push(Note::Uncounted);
+                }
                 self.reply = s(r, "response").to_string();
                 let denied: Vec<&str> = r.get("denied_actions").and_then(Value::as_array).into_iter().flatten()
                     .map(|d| s(d, "action")).collect();
@@ -925,6 +932,9 @@ fn claude_tokens(e: &Value) -> Option<Note> {
         return Some(Note::TokensSoFar(sum(total)));
     }
     let usage = e.get("usage").filter(|u| u.is_object())?;
+    if !["input_tokens", "output_tokens"].iter().all(|k| usage.get(k).and_then(Value::as_u64).is_some()) {
+        return None;
+    }
     Some(Note::Tokens(Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
                                cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") }))
 }
@@ -932,6 +942,7 @@ fn claude_tokens(e: &Value) -> Option<Note> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn run(style: Style, lines: &[&str]) -> (Parser, Vec<Note>) {
         let mut p = Parser::new(style);
@@ -1333,6 +1344,31 @@ mod tests {
         assert!(notes.iter().any(|n| matches!(n, Note::Step(l) if l.contains("run_command refused"))));
         assert!(notes.contains(&Note::Reply("Fixed calc.py.".into())), "the reply is in the conversation");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
+    }
+
+    #[test]
+    fn codex_and_agy_missing_counts_are_unknown_but_explicit_zero_is_known() {
+        for usage in [json!(null), json!({}), json!({"inputTokens": 1}), json!({"outputTokens": "2"})] {
+            let event = json!({"method": "thread/tokenUsage/updated", "params": {"tokenUsage": {"total": usage}}});
+            let completed = r#"{"method":"turn/completed","params":{"turn":{"status":"completed"}}}"#;
+            let (_, notes) = run(Style::Codex, &[&event.to_string(), completed]);
+            assert!(notes.contains(&Note::Uncounted), "{notes:?}");
+            assert!(!notes.iter().any(|n| matches!(n, Note::Tokens(_))));
+        }
+        for usage in [json!(null), json!({}), json!({"input_tokens": 1}), json!({"output_tokens": "2"})] {
+            let event = json!({"event": "result", "result": {"status": "SUCCESS", "response": "ok", "usage": usage}});
+            let (_, notes) = run(Style::Agy, &[&event.to_string()]);
+            assert!(notes.contains(&Note::Uncounted), "{notes:?}");
+            assert!(!notes.iter().any(|n| matches!(n, Note::Tokens(_))));
+        }
+        let event = r#"{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":0,"outputTokens":0}}}}"#;
+        let completed = r#"{"method":"turn/completed","params":{"turn":{"status":"completed"}}}"#;
+        assert!(run(Style::Codex, &[event, completed]).1.contains(&Note::Tokens(Tokens::default())));
+        let event = r#"{"event":"result","result":{"status":"SUCCESS","response":"ok","usage":{"input_tokens":0,"output_tokens":0}}}"#;
+        assert!(run(Style::Agy, &[event]).1.contains(&Note::Tokens(Tokens::default())));
+        for usage in [json!(null), json!({}), json!({"input_tokens": 1})] {
+            assert!(claude_tokens(&json!({"usage": usage})).is_none());
+        }
     }
 
     #[test]

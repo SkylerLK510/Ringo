@@ -22,6 +22,21 @@ name = "ringo_cli"
 name = "ringo"
 path = "src/main.rs"
 
+# The offline measurement runner (docs/TURN-RUNNER.md). Off by default, so `cargo install` and the
+# updater's release build make only `ringo`; CI builds and tests it with --all-features.
+[features]
+turnrun = []
+
+[[bin]]
+name = "turnrun"
+path = "src/bin/turnrun.rs"
+required-features = ["turnrun"]
+
+[[test]]
+name = "gate_turnrun"
+path = "tests/gate_turnrun.rs"
+required-features = ["turnrun"]
+
 [profile.release]
 lto = true
 codegen-units = 1
