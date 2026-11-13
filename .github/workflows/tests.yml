@@ -19,15 +19,15 @@ jobs:
           python-version: '3.11'
       - name: Resolve the offline test image to an immutable local ID
         run: |
-          docker pull python:3.11-slim
+          docker pull python:3.11
           python - <<'PY'
           import os, subprocess
-          image = subprocess.check_output(['docker', 'image', 'inspect', 'python:3.11-slim', '--format', '{{.Id}}'], text=True).strip()
+          image = subprocess.check_output(['docker', 'image', 'inspect', 'python:3.11', '--format', '{{.Id}}'], text=True).strip()
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write('RINGO_TEST_IMAGE=' + image + '\n')
           print(image)
           PY
-      - run: python -m unittest tests.test_turnrun_isolation -v
+      - run: python -m unittest tests.test_turnrun_isolation tests.test_turnrun_certify tests.test_turnrun_broker -v
 
   unittest:
     runs-on: ${{ matrix.os }}

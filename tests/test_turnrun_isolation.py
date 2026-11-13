@@ -57,6 +57,11 @@ class ArchiveTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 isolation.DockerSandbox(image)
 
+    def test_workspace_quota_is_a_bounded_controller_setting(self):
+        for quota in (True, 0, 1024, 1024*1024*1024+1, '64m'):
+            with self.assertRaisesRegex(ValueError, 'quota'):
+                isolation.DockerSandbox('sha256:'+'a'*64, workspace_bytes=quota)
+
     def test_owner_liveness_query_is_non_destructive(self):
         self.assertTrue(isolation.process_alive(os.getpid()))
 
@@ -68,6 +73,25 @@ class DockerTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.image = os.environ['RINGO_TEST_IMAGE']
+
+    def test_aggregate_workspace_quota_and_stopped_export(self):
+        with isolation.DockerSandbox(self.image, workspace_bytes=8*1024*1024) as worker:
+            # Multiple individually small files must still hit a filesystem-wide cap.
+            result = worker.execute("python3 - <<'PY'\n"
+                "import errno, pathlib\n"
+                "try:\n"
+                " for n in range(32): pathlib.Path(str(n)).write_bytes(b'x'*(1024*1024))\n"
+                "except OSError as e:\n"
+                " assert e.errno == errno.ENOSPC, e\n"
+                "else: raise AssertionError('workspace quota was not enforced')\n"
+                "for p in pathlib.Path('.').iterdir(): p.unlink()\n"
+                "pathlib.Path('kept.txt').write_text('survives worker shutdown')\nPY")
+            self.assertEqual(result['exit'], 0, result)
+            keeper, volume = worker.keeper, worker.volume
+            submitted = worker.submission(self.root / 'quota-submitted')
+            self.assertEqual((submitted / 'kept.txt').read_text(), 'survives worker shutdown')
+        for command in (['inspect', keeper], ['volume', 'inspect', volume]):
+            self.assertNotEqual(subprocess.run(['docker', *command], capture_output=True).returncode, 0)
 
     def test_worker_cannot_read_host_checks_credentials_neighbors_or_access_network(self):
         canaries = []
@@ -139,26 +163,32 @@ class DockerTest(unittest.TestCase):
                 f'with DockerSandbox({self.image!r}, lifetime=30) as w:\n'
                 ' print(w.id, flush=True)\n time.sleep(30)\n')
         proc = subprocess.Popen([sys.executable, '-c', code], stdout=subprocess.PIPE, text=True)
-        identity = None
+        identity = keeper = volume = None
         try:
             identity = proc.stdout.readline().strip()
             self.assertEqual(len(identity), 64)
+            inspection = json.loads(subprocess.check_output(['docker', 'inspect', identity]))[0]
+            keeper = inspection['Name'].lstrip('/')+'-keeper'
+            volume = next(m['Name'] for m in inspection['Mounts'] if m['Destination'] == '/work')
             proc.kill()
             proc.wait(timeout=5)
             deadline = time.monotonic()+10
             while time.monotonic() < deadline:
-                if subprocess.run(['docker', 'inspect', identity], capture_output=True).returncode:
+                if all(subprocess.run(['docker', *args], capture_output=True).returncode for args in (
+                        ['inspect', identity], ['inspect', keeper], ['volume', 'inspect', volume])):
                     break
                 time.sleep(0.25)
             else:
-                self.fail('worker survived controller termination')
+                self.fail('worker, keeper or workspace survived controller termination')
         finally:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
             proc.stdout.close()
             if identity:
-                subprocess.run(['docker', 'rm', '-f', identity], capture_output=True)
+                subprocess.run(['docker', 'rm', '-f', identity, keeper or identity], capture_output=True)
+            if volume:
+                subprocess.run(['docker', 'volume', 'rm', '-f', volume], capture_output=True)
 
 
 if __name__ == '__main__':

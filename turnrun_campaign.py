@@ -19,6 +19,8 @@ from turnrun import CampaignLock, ledger_append, ledger_entries, outside_repo, s
 POLICY_DEFAULTS = {'instruction': '', 'handoff_instruction': '', 'handoff_at': 64000}
 PHASES = ('controls', 'search', 'manual', 'confirmation')
 BLOCKERS = ['native subscription broker is not certified',
+            'fresh sealed scenarios and split sensitivity are not verified',
+            'numeric live inference budget is not recorded',
             'live controls have not run', 'live campaigns cannot launch inside a Ringo child']
 
 
@@ -94,6 +96,7 @@ def validate_plan(value):
 def code_identity():
     root = Path(__file__).resolve().parent
     return {name: sha256_file(root / name) for name in ('turnrun_campaign.py', 'turnrun_isolation.py',
+            'turnrun_broker.py', 'turnrun_certify.py',
             'turnrun.py', 'cli/src/turn_policy.rs', 'cli/src/bin/scenariorun.rs',
             'cli/src/bin/turnrun.rs', 'cli/src/lib.rs', 'cli/src/parse.rs')}
 

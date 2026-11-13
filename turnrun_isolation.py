@@ -172,11 +172,14 @@ with tempfile.TemporaryFile() as out:
 
 class DockerSandbox:
     """One controller-owned worker. No tool parameter can select a host path or container."""
-    def __init__(self, image, *, check=None, lifetime=900, docker=None):
+    def __init__(self, image, *, check=None, lifetime=900, workspace_bytes=512*1024*1024, docker=None):
         if not isinstance(image, str) or not IMAGE.fullmatch(image):
             raise ValueError('use an immutable image ID or repository digest')
         if type(lifetime) is not int or not 1 <= lifetime <= 3600:
             raise ValueError('container lifetime must be from 1 through 3600 seconds')
+        if type(workspace_bytes) is not int or not 1024*1024 <= workspace_bytes <= 1024*1024*1024:
+            raise ValueError('workspace quota must be from 1 MiB through 1 GiB')
+        self.workspace_bytes = workspace_bytes
         self.image, self.check, self.lifetime = image, Path(check).resolve(strict=True) if check else None, lifetime
         if self.check and not self.check.is_file():
             raise ValueError('protected check must be an ordinary file')
@@ -186,7 +189,7 @@ class DockerSandbox:
         self.docker = docker or shutil.which('docker')
         if not self.docker:
             raise ValueError('Docker is unavailable')
-        self.id, self.watchdog, self.stopped, self.volume = None, None, False, None
+        self.id, self.watchdog, self.stopped, self.volume, self.keeper = None, None, False, None, None
 
     def _call(self, args, **kwargs):
         code, out = bounded([self.docker, *args], **kwargs)
@@ -195,37 +198,53 @@ class DockerSandbox:
         return out
 
     def __enter__(self):
+        self.lease_deadline = time.monotonic()+self.lifetime
         name = 'ringo-rrsi-' + uuid.uuid4().hex
         self.volume = name + '-work'
-        self._call(['volume', 'create', '--label', 'ringo.rrsi.disposable=true', self.volume], limit=8192)
-        try:
-            self._call(['run', '--rm', '--network', 'none', '--read-only', '--cap-drop', 'ALL',
-                '--security-opt', 'no-new-privileges:true', '--mount', f'type=volume,source={self.volume},target=/work,volume-nocopy',
-                self.image, 'python3', '-I', '-c', 'import os; os.chmod("/work", 0o777)'], limit=8192)
-        except BaseException:
-            self.close()
-            raise
-        args = ['create', '--name', name, '--label', 'ringo.rrsi.disposable=true', '--init',
+        # A daemon-side tmpfs volume imposes byte and inode limits without trusting task code.
+        # A separate idle container keeps it mounted after *all* worker processes are stopped.
+        # Ordinary volumes and per-file ulimits do not bound aggregate workspace storage.
+        options = {'type': 'tmpfs', 'device': 'tmpfs',
+                   'o': f'size={self.workspace_bytes},nr_inodes=32768,uid=65532,gid=65532,mode=0700,nosuid,nodev'}
+        args = ['--label', 'ringo.rrsi.disposable=true', '--init', '--log-driver', 'none',
                 '--read-only', '--network', 'none', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true',
-                '--pids-limit', '128', '--memory', '2g', '--cpus', '2', '--user', '65532:65532',
+                '--pids-limit', '128', '--memory', '2g', '--memory-swap', '2g', '--cpus', '2',
+                '--shm-size', '16m', '--user', '65532:65532',
                 '--mount', f'type=volume,source={self.volume},target=/work,volume-nocopy',
-                '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=256m,mode=1777',
+                '--tmpfs', '/tmp:rw,exec,nosuid,nodev,size=256m,nr_inodes=32768,mode=1777',
                 '--workdir', '/work', '--env', 'HOME=/tmp/home', '--env', 'RINGO_CHILD=1']
-        if self.check:
-            args += ['--mount', f'type=bind,source={self.check},target=/protected/check.py,readonly']
-        args += [self.image, 'python3', '-I', '-c', f'import time; time.sleep({self.lifetime})']
+        idle = [self.image, 'python3', '-I', '-c', f'import time; time.sleep({self.lifetime})']
+        keeper = name + '-keeper'
         try:
-            self.id = self._call(args, limit=8192).decode().strip()
+            self._call(['volume', 'create', '--driver', 'local', '--label', 'ringo.rrsi.disposable=true',
+                *[part for key, value in options.items() for part in ('--opt', f'{key}={value}')],
+                self.volume], limit=8192)
+            volume = json.loads(self._call(['volume', 'inspect', self.volume], limit=8192))[0]
+            if volume['Driver'] != 'local' or volume['Options'] != options:
+                raise ValueError('Docker did not establish the workspace quota')
+            self.watchdog = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_watch',
+                self.docker, name, str(os.getpid()), str(self.lifetime), self.volume, keeper],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=os.name != 'nt')
+            self._call(['create', '--name', keeper, *args, *idle], limit=8192)
+            self.keeper = keeper
+            self._call(['start', self.keeper], limit=8192)
+            worker_args = ['create', '--name', name, *args]
+            if self.check:
+                worker_args += ['--mount', f'type=bind,source={self.check},target=/protected/check.py,readonly']
+            self.id = self._call([*worker_args, *idle], limit=8192).decode().strip()
             if not re.fullmatch('[0-9a-f]{64}', self.id):
                 raise ValueError('Docker returned an invalid container identity')
-            self.watchdog = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '_watch',
-                self.docker, self.id, str(os.getpid()), str(self.lifetime), self.volume], stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=os.name != 'nt')
             self._call(['start', self.id], limit=8192)
             inspection = json.loads(self._call(['inspect', self.id], limit=1024*1024))[0]
             host = inspection['HostConfig']
             if host['NetworkMode'] != 'none' or host['Privileged'] or not host['ReadonlyRootfs']:
                 raise ValueError('Docker did not establish the requested isolation')
+            actual_quota = json.loads(self._call(['exec', self.id, 'python3', '-I', '-c',
+                'import json,os; s=os.statvfs("/work"); print(json.dumps([s.f_blocks*s.f_frsize,s.f_files]))'],
+                limit=8192))
+            if not 0 < actual_quota[0] <= self.workspace_bytes or not 0 < actual_quota[1] <= 32768:
+                raise ValueError('workspace quota is not enforced by the mounted filesystem')
             check_sources = {str(self.check)} if self.check else set()
             if self.check and sys.platform == 'darwin':
                 check_sources.update(prefix+str(self.check) for prefix in ('/host_mnt', '/run/desktop/mnt/host'))
@@ -278,17 +297,23 @@ class DockerSandbox:
         return self.execute('python3 /protected/check.py /work', seconds)
 
     def close(self):
-        try:
-            if self.id:
-                self._call(['rm', '--force', self.id], timeout=30, limit=8192)
-        finally:
-            self.id = None
-            if self.volume:
-                self._call(['volume', 'rm', '--force', self.volume], timeout=30, limit=8192)
-                self.volume = None
-            if self.watchdog:
-                self.watchdog.terminate()
-                self.watchdog.wait(timeout=10)
+        errors = []
+        for attr, command in [('id', ['rm', '--force']), ('keeper', ['rm', '--force']),
+                              ('volume', ['volume', 'rm', '--force'])]:
+            identity = getattr(self, attr)
+            if identity:
+                try:
+                    self._call([*command, identity], timeout=30, limit=8192)
+                    setattr(self, attr, None)
+                except Exception as exc:
+                    errors.append(exc)
+        # If synchronous cleanup failed, keep the independent lease cleanup alive.
+        if not errors and self.watchdog:
+            self.watchdog.terminate()
+            self.watchdog.wait(timeout=10)
+            self.watchdog = None
+        if errors:
+            raise errors[0]
 
     def __exit__(self, *exc):
         self.close()
@@ -321,22 +346,22 @@ def process_alive(pid):
         return False
 
 
-def watch(docker, container, owner, lifetime, volume):
+def watch(docker, container, owner, lifetime, volume, keeper):
     """Independent cleanup survives the controller being killed. Hard lease bounds PID reuse."""
     deadline = time.monotonic() + lifetime
     while time.monotonic() < deadline:
         if not process_alive(owner):
             break
         time.sleep(0.25)
-    subprocess.run([docker, 'rm', '--force', container], stdout=subprocess.DEVNULL,
+    subprocess.run([docker, 'rm', '--force', container, keeper], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=30)
     subprocess.run([docker, 'volume', 'rm', '--force', volume], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=30)
 
 
 def main():
-    if len(sys.argv) == 7 and sys.argv[1] == '_watch':
-        watch(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6])
+    if len(sys.argv) == 8 and sys.argv[1] == '_watch':
+        watch(sys.argv[2], sys.argv[3], int(sys.argv[4]), int(sys.argv[5]), sys.argv[6], sys.argv[7])
         return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--image', required=True)
