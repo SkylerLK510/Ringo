@@ -503,9 +503,9 @@ pub struct Job {
     /// A turn another agent asked for in the middle of its own: that turn's job, and the file its answer goes in.
     pub asked_by: Option<(usize, PathBuf)>,
     /// Whether the job reported any token count: one that finishes without is recorded as unknown, not left out.
-    counted: bool,
+    pub counted: bool,
     /// How many of its model calls reported no count (a pipeline's): its counts are then of the others alone.
-    uncounted: u32,
+    pub uncounted: u32,
     /// The running total its agent last reported inside this job, where a turn's own count is not reported and the
     /// job has a conversation of its own (`Note::TokensSoFar` in a write job).
     so_far: Tokens,
