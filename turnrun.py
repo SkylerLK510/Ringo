@@ -45,6 +45,7 @@ import os
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tarfile
@@ -578,6 +579,16 @@ def run_task(args):
 
 # --- verification and split ----------------------------------------------------------------------
 
+def remove_fixture(folder):
+    """Remove our snapshot, including Git's read-only object files on Windows."""
+    def make_writable_and_retry(fn, path, exc):
+        if not isinstance(exc[1], PermissionError):
+            raise exc[1]
+        os.chmod(path, os.stat(path).st_mode | stat.S_IWUSR)
+        fn(path)
+    shutil.rmtree(folder, onerror=make_writable_and_retry)
+
+
 def verify_inventory(args):
     """Each check against pristine snapshots, with no model inference: it must exit 1 at the parent
     and 0 at the last fix. A check that reports it cannot tell here (exit 3) is listed as such."""
@@ -594,13 +605,13 @@ def verify_inventory(args):
         for side in ('base', 'fix'):
             folder = work / f'{t["id"]}-{side}'
             if folder.exists():
-                shutil.rmtree(folder)
+                remove_fixture(folder)
             fixture = build_fixture(source, side_commit(t, side), folder)
             started = time.monotonic()
             code, evidence = run_check(tasks / t['check'], fixture['dir'], work / f'{t["id"]}-{side}.check.txt')
             entry[side] = {'exit': code, 'evidence': evidence, 'seconds': round(time.monotonic() - started, 1)}
             if not args.keep:
-                shutil.rmtree(folder)
+                remove_fixture(folder)
         if 3 in (entry['base']['exit'], entry['fix']['exit']):
             entry['verdict'] = 'unavailable here'
         else:

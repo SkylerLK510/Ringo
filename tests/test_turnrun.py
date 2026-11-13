@@ -191,8 +191,8 @@ class DriverTest(unittest.TestCase):
 
     def test_verify_inventory_needs_fail_at_base_and_pass_at_fix(self):
         work = self.root / 'work'
-        code, out, _ = self.cli('verify-inventory', '--work', str(work), '--report', str(self.root / 'r.json'))
-        self.assertEqual(code, 0, out)
+        code, out, err = self.cli('verify-inventory', '--work', str(work), '--report', str(self.root / 'r.json'))
+        self.assertEqual(code, 0, out + err)
         report = json.loads((self.root / 'r.json').read_text())
         self.assertEqual(report[0]['verdict'], 'discriminates')
         self.assertEqual((report[0]['base']['exit'], report[0]['fix']['exit']), (1, 0))
