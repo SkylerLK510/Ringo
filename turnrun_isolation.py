@@ -22,6 +22,8 @@ import uuid
 MAX_BYTES = 64 * 1024 * 1024
 MAX_FILES = 20000
 IMAGE = re.compile(r'(?:sha256:[0-9a-f]{64}|[^\s]+@sha256:[0-9a-f]{64})')
+WINDOWS_DEVICES = {'con', 'prn', 'aux', 'nul', 'conin$', 'conout$',
+                   *(f'{prefix}{n}' for prefix in ('com', 'lpt') for n in '123456789¹²³')}
 
 
 def bounded(command, *, data=None, timeout=60, limit=MAX_BYTES):
@@ -109,6 +111,9 @@ def extract_submission(data, output):
             path = PurePosixPath(entry.name)
             if path.is_absolute() or '..' in path.parts or '\\' in entry.name or ':' in entry.name:
                 raise ValueError('unsafe submission path')
+            if any(p.endswith(('.', ' ')) or p.split('.')[0].casefold() in WINDOWS_DEVICES
+                   or any(ord(c) < 32 or c in '<>"|?*' for c in p) for p in path.parts):
+                raise ValueError('unsafe submission path alias or device')
             if not path.parts:
                 continue
             if any(p.casefold() == '.git' for p in path.parts):
@@ -123,8 +128,8 @@ def extract_submission(data, output):
             content = tar.extractfile(entry).read() if entry.isfile() else None
             entries.append((path, content, bool(entry.mode & 0o111)))
     # A file may not be an ancestor of another entry, regardless of archive order.
-    files = {p for p, content, _ in entries if content is not None}
-    if any(parent in files for p, _, _ in entries for parent in p.parents):
+    files = {p.as_posix().casefold() for p, content, _ in entries if content is not None}
+    if any(parent.as_posix().casefold() in files for p, _, _ in entries for parent in p.parents):
         raise ValueError('submission file is used as a directory')
     output.mkdir(parents=True)
     try:

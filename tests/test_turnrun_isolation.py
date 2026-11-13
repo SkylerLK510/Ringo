@@ -18,7 +18,9 @@ import turnrun_isolation as isolation
 class ArchiveTest(unittest.TestCase):
     def test_rejects_links_traversal_special_files_duplicates_and_oversize(self):
         with tempfile.TemporaryDirectory() as temp:
-            for index, attack in enumerate(('../escape', '/absolute', 'C:/escape', 'back\\slash', 'symlink', 'hardlink', 'device', 'duplicate')):
+            for index, attack in enumerate(('../escape', '/absolute', 'C:/escape', 'back\\slash',
+                    'NUL', 'con.txt', 'COM¹.log', 'file.', 'file ', 'wild*card',
+                    'symlink', 'hardlink', 'device', 'duplicate')):
                 with self.subTest(attack=attack):
                     buf = io.BytesIO()
                     with tarfile.open(fileobj=buf, mode='w') as tar:
