@@ -166,6 +166,18 @@ fn a_finished_turn_without_counts_keeps_its_total_unknown() {
 }
 
 #[test]
+fn an_explicit_policy_reaches_the_real_turn_and_is_hashed() {
+    let r = repo("policy");
+    let codex = fake(&root(), "codex-policy", CODEX_OK);
+    let selected = root().join("policy.json");
+    fs::write(&selected, r#"{"instruction":"Verify the result."}"#).unwrap();
+    let (code, rec) = turnrun(&r, &codex, &["--policy", selected.to_str().unwrap()]);
+    assert_eq!(code, 0, "{rec}");
+    assert_eq!(codex_turn(&codex), "Verify the result.\n\ndo the thing");
+    assert_eq!(rec["policy_sha256"].as_str().map(str::len), Some(64));
+}
+
+#[test]
 fn refuses_a_dirty_fixture_the_recursion_and_bad_usage() {
     let r = repo("dirty");
     let codex = fake(&root(), "codex-dirty", CODEX_OK);

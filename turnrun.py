@@ -493,7 +493,11 @@ def run_task(args):
                 'program_sha256': sha256_file(program), 'inventory_sha256': inventory_digest(tasks, items),
                 'driver': driver_identity(), 'python': sys.version.split()[0],
                 'source_head': git(source, 'rev-parse', 'HEAD'),
-                'total_budget_tokens': args.total_budget_tokens}
+                'total_budget_tokens': args.total_budget_tokens, 'policy_sha256': None}
+        if args.policy:
+            from turnrun_campaign import policy
+            policy(json.loads(Path(args.policy).read_text(encoding='utf-8')))
+            pins['policy_sha256'] = sha256_file(args.policy)
         pinned = next((e for e in entries if e['kind'] == 'campaign'), None)
         if pinned is None:
             ledger_append(ledger, {'kind': 'campaign', 'pins': pins})
@@ -548,6 +552,8 @@ def run_task(args):
                '--state', str(run_dir / 'state'), '--home', str(run_dir / 'home'), '--source-id', key,
                '--record', str(record_path), '--budget-tokens', str(args.budget_tokens),
                '--budget-seconds', str(args.budget_seconds)]
+        if args.policy:
+            cmd += ['--policy', str(Path(args.policy).resolve())]
         code, stopped = run_runner(cmd, args.budget_seconds + RUNNER_GRACE, run_dir / 'runner.log')
         if record_path.is_file():
             record = json.loads(record_path.read_text(encoding='utf-8'))
@@ -708,6 +714,7 @@ def main(argv=None):
     p.add_argument('--retry-interrupted', action='store_true', help='abandon an unfinished attempt and run again, once')
     p.add_argument('--no-check', action='store_true')
     p.add_argument('--binary', help=f'the runner (default {DEFAULT_BINARY})')
+    p.add_argument('--policy', help='explicit restricted experimental policy JSON; pinned for this campaign')
     p.set_defaults(fn=run_task)
 
     p = sub.add_parser('split', help='dev/validation by date and cluster')
