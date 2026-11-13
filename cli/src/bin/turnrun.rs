@@ -69,13 +69,14 @@ struct Set {
     source_id: Option<String>,
     budget_tokens: Option<u64>,
     budget_seconds: Option<u64>,
+    policy: Option<PathBuf>,
 }
 
 fn parse(args: Vec<String>) -> Result<Set, String> {
     let mut set = Set {
         project: String::new(), agent: String::new(), message: String::new(), program: None, state: None,
         home: None, record: None, mode: None, tier: None, write: false, resume: None, handoff_at: None,
-        source_id: None, budget_tokens: None, budget_seconds: None,
+        source_id: None, budget_tokens: None, budget_seconds: None, policy: None,
     };
     let mut have_message = false;
     let mut it = args.into_iter();
@@ -106,6 +107,7 @@ fn parse(args: Vec<String>) -> Result<Set, String> {
             "--source-id" => set.source_id = Some(value("--source-id")?),
             "--budget-tokens" => set.budget_tokens = Some(value("--budget-tokens")?.parse::<u64>().map_err(|_| "--budget-tokens needs a number")?),
             "--budget-seconds" => set.budget_seconds = Some(value("--budget-seconds")?.parse::<u64>().map_err(|_| "--budget-seconds needs a number")?),
+            "--policy" => set.policy = Some(PathBuf::from(value("--policy")?)),
             other => return Err(format!("unknown flag {other}")),
         }
     }
@@ -240,6 +242,14 @@ fn run_set(set: Set) -> Run {
         .map_err(|e| (json!({"outcome": "refused", "reason": format!("no session: {e}")}), set.record.clone()))?;
     session.mode = mode;
     session.tier = tier;
+    if let Some(path) = &set.policy {
+        let policy = fs::read(path).map_err(|e| (json!({"outcome":"refused", "reason":e.to_string()}), set.record.clone()))?;
+        let value: Value = serde_json::from_slice(&policy)
+            .map_err(|e| (json!({"outcome":"refused", "reason":e.to_string()}), set.record.clone()))?;
+        let policy = ringo_cli::turn_policy::TurnPolicy::from_json(&value)
+            .map_err(|e| (json!({"outcome":"refused", "reason":e}), set.record.clone()))?;
+        session.set_turn_policy(policy);
+    }
     if let Some(n) = set.handoff_at {
         session.handoff_at = n; // Phase 3 probes the handoff threshold through this flag
     }
@@ -281,6 +291,7 @@ fn run_set(set: Set) -> Run {
         "mode": mode.name(), "tier": tier.name(), "write": set.write,
         "budget": {"tokens": set.budget_tokens, "seconds": set.budget_seconds},
         "resume": set.resume.as_ref().map(|p| json!({"path": p.display().to_string(), "sha256": sha256_file(p)})),
+        "policy_sha256": set.policy.as_ref().and_then(|p| sha256_file(p)),
     });
     let mut outcome = "running";
     let mut stopped_by = Value::Null;

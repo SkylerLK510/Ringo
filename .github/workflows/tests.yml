@@ -9,6 +9,26 @@ permissions:
   contents: read
 
 jobs:
+  containment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Resolve the offline test image to an immutable local ID
+        run: |
+          docker pull python:3.11-slim
+          python - <<'PY'
+          import os, subprocess
+          image = subprocess.check_output(['docker', 'image', 'inspect', 'python:3.11-slim', '--format', '{{.Id}}'], text=True).strip()
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('RINGO_TEST_IMAGE=' + image + '\n')
+          print(image)
+          PY
+      - run: python -m unittest tests.test_turnrun_isolation -v
+
   unittest:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
