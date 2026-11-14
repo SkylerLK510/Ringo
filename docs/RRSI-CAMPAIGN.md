@@ -13,6 +13,7 @@ authorizing an experiment. An inconclusive control is a stop, not permission to 
 |---|---|
 | `turnrun_isolation.py` | Disposable Docker worker; separate network-disabled checker; safe submission export; parent-death and lifetime cleanup. |
 | `turnrun_broker.py` | Authenticated, leased MCP transport exposing one fixed worker tool; no provider launcher or native authentication. |
+| `turnrun_native.py`, `turnrun_native_bridge.py` | Separate network-disabled native provider container, fixed TLS/MCP stdio relay, offline native protocol replay and one bounded standalone subscription proof. Campaign and Session integration remain gated. |
 | `turnrun_certify.py` | Check discrimination against pristine historical snapshots inside the exact pinned grading image, with private hashed evidence. |
 | `scenariorun` (`turnrun` feature) | Scripted turns, clear, restart, seeded handoffs, threshold boundaries and Claude compact through the actual `Session`. Offline providers only. |
 | `cli/src/turn_policy.rs` | Explicit restricted policy loading. Empty policy preserves the normal runtime. |
@@ -168,6 +169,12 @@ For an actual private protocol, `prepare --plan FILE --campaign DIR` records it 
 `live-preflight` exits unsuccessfully and lists blockers; there is no enable-live flag.
 
 ## Remaining live prerequisites
+
+The native process adapter and its zero-inference checks are now implemented; see
+[NATIVE-RRSI-BROKER.md](NATIVE-RRSI-BROKER.md). Its offline native replay does not
+certify subscription authentication, provider connectivity, fresh scenarios or a
+live campaign. `turnrun_campaign.py budget --plan FILE` sizes the complete finite
+schedule without authorizing inference. `live-preflight` remains fail-closed.
 
 `WorkerEndpoint` implements the controller side of the fixed worker transport using
 [MCP Streamable HTTP](https://modelcontextprotocol.io/specification/2025-03-26/basic/transports).
