@@ -675,8 +675,9 @@ fn claude_turns_compact_at_200k_and_carry_the_owners_rules() {
 }
 
 /// agy (verified with 1.5.8): the prompt on stdin as one stream-json message, stream-json out, session-only
-/// permission rules — an edits turn allows file edits, sandboxed commands and the owner's MCP servers (deny wins
-/// over allow), a read turn denies every tool. A read turn's workspace gains the job's folder (--add-dir), so the
+/// permission rules — an edits turn allows file edits and sandboxed commands (the owner's MCP servers only in auto
+/// mode: agy cannot ask, so ask mode holds connector actions back), and deny wins over allow; a read turn denies
+/// every tool. A read turn's workspace gains the job's folder (--add-dir), so the
 /// pointer to the whole record is one it can follow. Resume by conversation id, where agy reports the
 /// conversation's usage so far and only the turn's own is counted. The prompt is never an argument, so a leading
 /// `-` or a quote cannot change the command line.
@@ -702,10 +703,14 @@ fn agy_turns_and_their_permissions() {
     };
     let head = ["--input-format", "stream-json", "--output-format", "stream-json", "--settings"];
     let read = r#"{"permissions":{"deny":["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
-    let edits = r#"{"permissions":{"allow":["write_file(*)","command(*)","mcp(*)"],"deny":["unsandboxed(*)","execute_url(*)"]}}"#;
-    assert_eq!(turn(&mut s, false), [&head[..], &[edits]].concat(), "ask mode edits here");
+    let edits = r#"{"permissions":{"allow":["write_file(*)","command(*)"],"deny":["unsandboxed(*)","execute_url(*)","mcp(*)"]}}"#;
+    let auto = r#"{"permissions":{"allow":["write_file(*)","command(*)","mcp(*)"],"deny":["unsandboxed(*)","execute_url(*)"]}}"#;
+    assert_eq!(turn(&mut s, false), [&head[..], &[edits]].concat(), "ask mode edits here, without the owner's MCP servers: agy cannot ask");
     assert_eq!(turn(&mut s, false), [&head[..], &[edits, "--conversation", "c-1"]].concat());
     assert_eq!(turn(&mut s, true), [&head[..], &[edits]].concat());
+    s.mode = Mode::Auto;
+    assert_eq!(turn(&mut s, false), [&head[..], &[auto, "--conversation", "c-1"]].concat(),
+               "auto mode adds the owner's MCP servers");
     s.mode = Mode::Read;
     assert_eq!(turn(&mut s, false),
                [&head[..], &[read, "--add-dir", "JOB-DIR", "--conversation", "c-1"]].concat(),

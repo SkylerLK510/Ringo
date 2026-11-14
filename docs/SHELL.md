@@ -224,10 +224,11 @@ the turn then running: the conversation they talked in is gone.
 
 agy takes part as the others do, since the third run above. Every agent that goes on in the shared conversation is
 told where the whole record of the turns it missed is kept. That file is in Ringo's state folder. An edits turn of
-agy's gains no folder — its file-edit permission would reach Ringo's own state folder with it — so it is not pointed
-there and gets the record itself, as before. A read turn is pointed there, and its `--add-dir` (measured with agy
-1.5.8, 2026-11-14) makes the job's folder part of its workspace, so the pointer is one it can follow. This holds for
-any turn of agy's after another agent's, not only in a talk.
+agy's gains no folder and is not pointed there — it gets the record itself, as before (its allow rules are not
+path-scoped, so the folder would add nothing to watch for). A read turn is pointed there, and its `--add-dir`
+(measured with agy 1.5.8, 2026-11-14) makes the job's folder part of its workspace, so the pointer is one it can
+follow; the grant stays with the conversation, so an edits turn that resumes after a read turn can still read that
+folder (measured). This holds for any turn of agy's after another agent's, not only in a talk.
 
 Not done: a talk under way ends with the shell: it is not kept across `/restart`.
 
@@ -278,8 +279,8 @@ How it works:
   agent files load: 10,655 tokens a trivial turn against 10,069. Not reading the settings files was leaner (10,294)
   and would have dropped your deny rules, so it was not taken. Every other turn of Claude's is as it was, to the
   argument.
-- **agy** can be asked and cannot ask: Ringo gives it no ask tool (its `mcp(*)` permission, an edits turn's, opens
-  the owner's own MCP servers only).
+- **agy** can be asked and cannot ask: Ringo gives it no ask tool (its `mcp(*)` permission, auto mode's edits turns
+  only, opens the owner's own MCP servers).
 - Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
   through, and it starts nothing.
 
@@ -930,10 +931,12 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   with `workspace-write` (edits and commands inside the folder, no network; in auto mode the network and Codex's own
   reviewer for its approval requests), Claude with `acceptEdits` in ask mode and auto mode in auto mode (edits in the
   folder allowed; any other command waits for you, or for its review), agy with session-only permission rules: an
-  edits turn allows `write_file(*)`, `command(*)` and `mcp(*)` and denies `unsandboxed(*)` and `execute_url(*)`
-  (measured with agy 1.5.8: headless cannot prompt, a tool without an allow rule is auto-denied, and deny wins over
-  allow); commands, MCP tools and browser fetches run sandboxed, and a denied tool returns an error agy sees and
-  works around. Grok and agents you add have no sandbox Ringo
+  edits turn allows `write_file(*)` and `command(*)`, and in auto mode `mcp(*)` too (ask mode holds the owner's MCP
+  servers back, since agy cannot ask); every mode denies `unsandboxed(*)` and `execute_url(*)` (measured with agy
+  1.5.8: headless cannot prompt, a tool without an allow rule is auto-denied, and deny wins over allow). Only the
+  bare `write_file(*)` wildcard matches — every path-scoped variant was denied even inside the working folder — and
+  `command(*)` writes outside the folder too, so agy's sandbox is a network one; the real floor is these deny rules
+  plus the undo trees below. A denied tool returns an error agy sees and works around. Grok and agents you add have no sandbox Ringo
   has verified, so they only work in a copy, and a line for one goes there.
 - **Undo:** in a git project, Ringo takes the folder's files (every file git does not ignore, untracked ones too) as
   a git tree before a turn that may edit and again when it ends, with a private copy of the index: your index, stash
