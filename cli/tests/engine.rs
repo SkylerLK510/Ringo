@@ -674,10 +674,12 @@ fn claude_turns_compact_at_200k_and_carry_the_owners_rules() {
     assert_eq!(fs::read(claude.with_extension("appended")).unwrap(), b"R\xe9gle.\n\nProjet \xe9t\xe9.\n");
 }
 
-/// agy (verified with 1.4.12): the prompt on stdin as one stream-json message, stream-json out, session-only deny
-/// rules (read turns cannot write files; no turn runs commands, MCP tools or browser actions), resume by
-/// conversation id, where agy reports the conversation's usage so far and only the turn's own is counted. The prompt
-/// is never an argument, so a leading `-` or a quote cannot change the command line.
+/// agy (verified with 1.5.8): the prompt on stdin as one stream-json message, stream-json out, session-only
+/// permission rules — an edits turn allows file edits, sandboxed commands and the owner's MCP servers (deny wins
+/// over allow), a read turn denies every tool. A read turn's workspace gains the job's folder (--add-dir), so the
+/// pointer to the whole record is one it can follow. Resume by conversation id, where agy reports the
+/// conversation's usage so far and only the turn's own is counted. The prompt is never an argument, so a leading
+/// `-` or a quote cannot change the command line.
 #[test]
 fn agy_turns_and_their_permissions() {
     let r = repo("agy");
@@ -690,20 +692,24 @@ fn agy_turns_and_their_permissions() {
     let mut s = session(&r, agent("agy"), &agy);
     let turn = |s: &mut Session, write: bool| -> Vec<String> {
         let id = s.launch_agent(agent("agy"), write, r#"-x the "task""#).unwrap();
+        let dir = s.job(id).unwrap().dir.display().to_string();
         assert_eq!(wait(s, id), Status::Done);
         assert_eq!(s.job(id).unwrap().tokens.total(), 9);
         assert_eq!(fs::read_to_string(format!("{}.stdin", agy.display())).unwrap(),
                    "{\"event\":\"user\",\"message\":{\"content\":\"-x the \\\"task\\\"\"}}\n");
-        fs::read_to_string(format!("{}.argv", agy.display())).unwrap().lines().map(str::to_string).collect()
+        fs::read_to_string(format!("{}.argv", agy.display())).unwrap().lines().map(str::to_string).collect::<Vec<_>>()
+            .into_iter().map(|a| a.replace(&dir, "JOB-DIR")).collect()
     };
-    let read = r#"{"permissions":{"deny":["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
     let head = ["--input-format", "stream-json", "--output-format", "stream-json", "--settings"];
-    let write = r#"{"permissions":{"deny":["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
-    assert_eq!(turn(&mut s, false), [&head[..], &[write, "--mode", "accept-edits"]].concat(), "ask mode edits here");
-    assert_eq!(turn(&mut s, false), [&head[..], &[write, "--mode", "accept-edits", "--conversation", "c-1"]].concat());
-    assert_eq!(turn(&mut s, true), [&head[..], &[write, "--mode", "accept-edits"]].concat());
+    let read = r#"{"permissions":{"deny":["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]}}"#;
+    let edits = r#"{"permissions":{"allow":["write_file(*)","command(*)","mcp(*)"],"deny":["unsandboxed(*)","execute_url(*)"]}}"#;
+    assert_eq!(turn(&mut s, false), [&head[..], &[edits]].concat(), "ask mode edits here");
+    assert_eq!(turn(&mut s, false), [&head[..], &[edits, "--conversation", "c-1"]].concat());
+    assert_eq!(turn(&mut s, true), [&head[..], &[edits]].concat());
     s.mode = Mode::Read;
-    assert_eq!(turn(&mut s, false), [&head[..], &[read, "--conversation", "c-1"]].concat(), "read mode cannot write files");
+    assert_eq!(turn(&mut s, false),
+               [&head[..], &[read, "--add-dir", "JOB-DIR", "--conversation", "c-1"]].concat(),
+               "read mode denies every tool, and its workspace gains the job's folder");
     s.mode = Mode::Ask;
     // A failed resumed turn reports no usage; the running total it leaves is still the last one reported.
     fs::write(format!("{}.fail", agy.display()), "").unwrap();
@@ -2012,15 +2018,18 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
     assert_eq!(names, ["own-skilled", "own-codex"]);
 }
 
-/// agy hears what the others did as any agent does, but is not pointed at the whole record: that file is outside its
-/// folder, and a read it has no permission for ends its turn with no reply. Codex, which can open it, still is.
+/// agy hears what the others did as any agent does. An edits turn (ask mode here) is not pointed at the whole
+/// record: giving it the job's folder would put its write_file(*) rule in reach of Ringo's own state folder. A
+/// read turn is pointed there, and its --add-dir makes that folder one it can open (measured with agy 1.5.8).
+/// Codex, which can always open it, is pointed there in both.
 #[test]
-fn agy_is_not_sent_to_a_file_it_cannot_open() {
+fn agy_is_sent_to_the_whole_record_only_where_it_can_open_it() {
     let r = repo("agy-record");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
     let codex = fake(&root(), "codex-agy-record", &codex_script("", &codex_done("all done", (1, 0, 1))));
-    let agy = fake(&root(), "agy-record", "#!/bin/sh\ncat > \"$0.stdin\"\n\
-        echo '{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{\"cwd\":\"x\"}}'\n\
-        echo '{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\",\"response\":\"fine by me\",\"usage\":{\"input_tokens\":7,\"output_tokens\":2}}}'\n");
+    let agy = fake(&root(), "agy-record", &format!("#!/bin/sh\n{RECORD}\
+        echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
+        echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"fine by me\",\"usage\":{{\"input_tokens\":7,\"output_tokens\":2}}}}}}'\n"));
     let mut s = session(&r, agent("codex"), &codex);
     s.programs.insert(agent("agy"), agy.clone());
     for (name, task) in [("codex", "look at a.txt"), ("agy", "and you?"), ("codex", "so?")] {
@@ -2029,8 +2038,25 @@ fn agy_is_not_sent_to_a_file_it_cannot_open() {
     }
     let heard = fs::read_to_string(format!("{}.stdin", agy.display())).unwrap();
     assert!(heard.contains("codex: all done") && heard.contains("and you?") && !heard.contains("record.md"), "{heard}");
+    assert!(!fs::read_to_string(format!("{}.argv", agy.display())).unwrap().contains("--add-dir"),
+            "an edits turn gains no folder: its write_file(*) rule would reach Ringo's own state folder");
     let heard = turn_text(&codex);
     assert!(heard.contains("agy: fine by me") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
+
+    // read mode: the pointer is given, and the turn's --add-dir makes the job's folder part of agy's workspace
+    s.mode = Mode::Read;
+    let id = s.launch_agent(agent("agy"), false, "once more?").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let dir = s.job(id).unwrap().dir.display().to_string();
+    let heard = fs::read_to_string(format!("{}.stdin", agy.display())).unwrap();
+    assert!(heard.contains("once more?") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
+    let argv = fs::read_to_string(format!("{}.argv", agy.display())).unwrap().replace(&dir, "JOB-DIR");
+    let lines: Vec<&str> = argv.lines().collect();
+    let at = lines.iter().position(|a| *a == "--add-dir").expect("a read turn's --add-dir");
+    assert_eq!(lines[at + 1], "JOB-DIR");
+    let permissions = lines.iter().position(|a| *a == "--settings").map_or("", |p| lines[p + 1]);
+    assert!(permissions.contains("\"deny\"") && !permissions.contains("\"allow\""),
+            "a read turn still denies every tool: {permissions}");
 }
 
 /// A stand-in Claude Code that asks other agents as the real one does: it finds the ask server in its `--mcp-config`
