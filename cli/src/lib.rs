@@ -1514,11 +1514,14 @@ impl Session {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
-            // agy is not told where the whole record is: it is outside its folder, and a read agy has no permission
-            // for ends its turn with no reply (live, 11/10: it read the project's files, opened record.md and stopped,
-            // 82.5k tokens in). The others are refused such a read and go on, or may make it.
+            // A read agy follows the pointer now: its turn's --add-dir made this job's folder part of its workspace
+            // (measured with agy 1.5.8) — but only when the record it was handed was cut. Pointed at the file while
+            // the inline record is already whole, agy reads it anyway, and that is the 82.5k-token turn of 11/10
+            // again (measured culture: the pointer costs tokens only where it buys the cut turns back). An edits
+            // turn is given no pointer and no folder; after a read turn of the same conversation it keeps the folder
+            // that turn was given — agy retains --add-dir grants in the conversation (measured, probe 25).
             let whole_at = match agent.spec().adapter {
-                Adapter::Agy => String::new(),
+                Adapter::Agy if self.mode != Mode::Read || whole.trim_end() == record.trim_end() => String::new(),
                 _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
             };
             let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
@@ -2050,21 +2053,43 @@ impl Session {
                 Style::Claude
             }
             Adapter::Agy => {
-                // Measured with agy 1.4.11: print mode cannot ask, so a tool needing a permission it lacks ends the
-                // turn with no reply; a deny rule instead returns an error the model sees and works around. Write turns
-                // edit (accept-edits) but run no commands, MCP tools or browser actions, as claude's write turns run no
-                // Bash; read turns cannot write files either. The rules last for this session only.
+                // Measured with agy 1.5.8 (2026-11-14): headless cannot prompt, and a tool without an allow rule is
+                // auto-denied — write_file included, so the 1.4-era `--mode accept-edits` authorized nothing here and
+                // an edits turn could not edit at all. The rules live in the settings now, and deny wins over allow
+                // (measured): an edits turn allows file edits and sandboxed commands; in auto mode it allows the
+                // owner's MCP servers too (aggressive connector actions are that mode's own promise; ask mode holds
+                // them back, since agy has no prompt channel to bring a connector action to the owner). Measured on
+                // the floor: only the bare `write_file(*)` wildcard matches (every scoped variant — exact path, `/*`,
+                // `**`, `./*`, bare name — denied even a write inside the working folder), and `command(*)` writes
+                // outside the folder too, so agy's sandbox is a network one; the real floor is the deny rules plus
+                // this shell's undo trees. `unsandboxed(*)` and the browser's fetch stay denied everywhere, and a
+                // read turn denies everything it always did. A denied tool returns an error the model sees and works
+                // around.
                 // The prompt goes in on stdin as one stream-json message (verified with agy 1.4.12, which drops a
                 // flag's prompt in this mode): no argument-length limit, and the process table never shows it.
-                let deny = if edits { r#"["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# }
-                           else { r#"["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# };
+                let (allow, deny): (&[&str], &[&str]) = if !edits {
+                    (&[], &["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "execute_url(*)"])
+                } else if self.mode == Mode::Auto {
+                    (&["write_file(*)", "command(*)", "mcp(*)"], &["unsandboxed(*)", "execute_url(*)"])
+                } else {
+                    (&["write_file(*)", "command(*)"], &["unsandboxed(*)", "execute_url(*)", "mcp(*)"])
+                };
+                let permissions = if allow.is_empty() {
+                    format!(r#"{{"permissions":{{"deny":{}}}}}"#, serde_json::json!(deny))
+                } else {
+                    format!(r#"{{"permissions":{{"allow":{},"deny":{}}}}}"#,
+                            serde_json::json!(allow), serde_json::json!(deny))
+                };
                 cmd.args(["--input-format", "stream-json", "--output-format", "stream-json", "--settings"])
-                    .arg(format!(r#"{{"permissions":{{"deny":{deny}}}}}"#));
-                if edits {
-                    cmd.args(["--mode", "accept-edits"]);
+                    .arg(permissions);
+                // A read turn's workspace gains this job's folder (--add-dir, measured 1.5.8), so the pointer to the
+                // whole record is one it can follow. An edits turn gains none: it does not need it (its allow rules
+                // are not path-scoped — measured), and the record it is handed carries its context.
+                if !edits {
+                    cmd.arg("--add-dir").arg(&dir);
                 }
-                // agy's default model has low, medium and high only: given xhigh, every turn failed at once (agy 1.4.12,
-                // gemini-3.8-flash). ceiling: a model of agy's that has xhigh still gets high.
+                // agy's default model has low, medium and high only: given xhigh, every turn failed at once (agy
+                // 1.4.12, gemini-3.8-flash; still true on 1.5.8). ceiling: a model of agy's that has xhigh still gets high.
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", if effort == "xhigh" { "high" } else { effort }]);
                 }
