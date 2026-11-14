@@ -1514,11 +1514,11 @@ impl Session {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
-            // agy is not told where the whole record is: it is outside its folder, and a read agy has no permission
-            // for ends its turn with no reply (live, 11/10: it read the project's files, opened record.md and stopped,
-            // 82.5k tokens in). The others are refused such a read and go on, or may make it.
+            // A read agy follows the pointer now: its turn's --add-dir made this job's folder part of its workspace
+            // (measured with agy 1.5.8). An edits turn is given no folder — its write_file(*) rule would reach
+            // Ringo's own state folder with it — so it reads the record it is handed, as before.
             let whole_at = match agent.spec().adapter {
-                Adapter::Agy => String::new(),
+                Adapter::Agy if self.mode != Mode::Read => String::new(),
                 _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
             };
             let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
@@ -2050,21 +2050,35 @@ impl Session {
                 Style::Claude
             }
             Adapter::Agy => {
-                // Measured with agy 1.4.11: print mode cannot ask, so a tool needing a permission it lacks ends the
-                // turn with no reply; a deny rule instead returns an error the model sees and works around. Write turns
-                // edit (accept-edits) but run no commands, MCP tools or browser actions, as claude's write turns run no
-                // Bash; read turns cannot write files either. The rules last for this session only.
+                // Measured with agy 1.5.8 (2026-11-14): headless cannot prompt, and a tool without an allow rule is
+                // auto-denied — write_file included, so the 1.4-era `--mode accept-edits` authorized nothing here and
+                // an edits turn could not edit at all. The rules live in the settings now, and deny wins over allow
+                // (measured): an edits turn allows file edits, sandboxed commands and the owner's own MCP servers;
+                // `unsandboxed(*)` and the browser's fetch stay denied everywhere, and a read turn denies everything
+                // it always did. A denied tool returns an error the model sees and works around.
                 // The prompt goes in on stdin as one stream-json message (verified with agy 1.4.12, which drops a
                 // flag's prompt in this mode): no argument-length limit, and the process table never shows it.
-                let deny = if edits { r#"["command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# }
-                           else { r#"["write_file(*)","command(*)","unsandboxed(*)","mcp(*)","execute_url(*)"]"# };
+                let (allow, deny): (&[&str], &[&str]) = if edits {
+                    (&["write_file(*)", "command(*)", "mcp(*)"], &["unsandboxed(*)", "execute_url(*)"])
+                } else {
+                    (&[], &["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "execute_url(*)"])
+                };
+                let permissions = if allow.is_empty() {
+                    format!(r#"{{"permissions":{{"deny":{}}}}}"#, serde_json::json!(deny))
+                } else {
+                    format!(r#"{{"permissions":{{"allow":{},"deny":{}}}}}"#,
+                            serde_json::json!(allow), serde_json::json!(deny))
+                };
                 cmd.args(["--input-format", "stream-json", "--output-format", "stream-json", "--settings"])
-                    .arg(format!(r#"{{"permissions":{{"deny":{deny}}}}}"#));
-                if edits {
-                    cmd.args(["--mode", "accept-edits"]);
+                    .arg(permissions);
+                // A read turn's workspace gains this job's folder (--add-dir, measured 1.5.8), so the pointer to the
+                // whole record is one it can follow. An edits turn gains no folder: its write_file(*) rule would
+                // reach Ringo's own state folder with it.
+                if !edits {
+                    cmd.arg("--add-dir").arg(&dir);
                 }
-                // agy's default model has low, medium and high only: given xhigh, every turn failed at once (agy 1.4.12,
-                // gemini-3.8-flash). ceiling: a model of agy's that has xhigh still gets high.
+                // agy's default model has low, medium and high only: given xhigh, every turn failed at once (agy
+                // 1.4.12, gemini-3.8-flash; still true on 1.5.8). ceiling: a model of agy's that has xhigh still gets high.
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", if effort == "xhigh" { "high" } else { effort }]);
                 }

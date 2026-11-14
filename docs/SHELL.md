@@ -223,10 +223,11 @@ While they talk, `/separate` and taking a talker away (`/agent remove`) are refu
 the turn then running: the conversation they talked in is gone.
 
 agy takes part as the others do, since the third run above. Every agent that goes on in the shared conversation is
-told where the whole record of the turns it missed is kept. That file is in Ringo's state folder, and a read agy has
-no permission for ends its turn (the others are refused such a read and go on). So agy is no longer told where it
-is: it gets the record itself, as before, and nothing to open. This holds for any turn of agy's after another
-agent's, not only in a talk.
+told where the whole record of the turns it missed is kept. That file is in Ringo's state folder. An edits turn of
+agy's gains no folder — its file-edit permission would reach Ringo's own state folder with it — so it is not pointed
+there and gets the record itself, as before. A read turn is pointed there, and its `--add-dir` (measured with agy
+1.5.8, 2026-11-14) makes the job's folder part of its workspace, so the pointer is one it can follow. This holds for
+any turn of agy's after another agent's, not only in a talk.
 
 Not done: a talk under way ends with the shell: it is not kept across `/restart`.
 
@@ -277,7 +278,8 @@ How it works:
   agent files load: 10,655 tokens a trivial turn against 10,069. Not reading the settings files was leaner (10,294)
   and would have dropped your deny rules, so it was not taken. Every other turn of Claude's is as it was, to the
   argument.
-- **agy** can be asked and cannot ask: Ringo denies its MCP tools.
+- **agy** can be asked and cannot ask: Ringo gives it no ask tool (its `mcp(*)` permission, an edits turn's, opens
+  the owner's own MCP servers only).
 - Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
   through, and it starts nothing.
 
@@ -794,7 +796,7 @@ A tier changes no prompt: effort is a model setting, not text. The shell starts 
 that spends more is never left on from an earlier day. `deep` is xhigh, not high, because an owner's own settings can
 already run Claude at xhigh (Claude Code reads `effortLevel` from its settings under `--safe-mode` too), and high
 would lower it; a setting of max is lowered to xhigh while `deep` or `ultra` is on. agy gets high: its default model
-has no xhigh, and given it every turn failed at once (agy 1.4.12, gemini-3.8-flash).
+has no xhigh, and given it every turn failed at once (agy 1.4.12, gemini-3.8-flash; still true on 1.5.8).
 
 `ultra` builds on the one extra spend Ringo measured to raise quality. On COMPLEX-01, checks alone passed 3 of 11
 seeded candidates, and one review plus one revision passed 11 of 11. Higher effort alone measured no gain on the
@@ -927,9 +929,11 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   each agent: Codex
   with `workspace-write` (edits and commands inside the folder, no network; in auto mode the network and Codex's own
   reviewer for its approval requests), Claude with `acceptEdits` in ask mode and auto mode in auto mode (edits in the
-  folder allowed; any other command waits for you, or for its review), agy with `--mode accept-edits` and
-  session-only deny rules for `command(*)`, `unsandboxed(*)`, `mcp(*)` and `execute_url(*)` (edits allowed;
-  commands, MCP tools and browser actions refused, as it cannot ask). Grok and agents you add have no sandbox Ringo
+  folder allowed; any other command waits for you, or for its review), agy with session-only permission rules: an
+  edits turn allows `write_file(*)`, `command(*)` and `mcp(*)` and denies `unsandboxed(*)` and `execute_url(*)`
+  (measured with agy 1.5.8: headless cannot prompt, a tool without an allow rule is auto-denied, and deny wins over
+  allow); commands, MCP tools and browser fetches run sandboxed, and a denied tool returns an error agy sees and
+  works around. Grok and agents you add have no sandbox Ringo
   has verified, so they only work in a copy, and a line for one goes there.
 - **Undo:** in a git project, Ringo takes the folder's files (every file git does not ignore, untracked ones too) as
   a git tree before a turn that may edit and again when it ends, with a private copy of the index: your index, stash
@@ -950,7 +954,9 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   and agy has none.
 - **Read mode:** Codex runs with its `read-only` sandbox. Claude runs with deny rules for `Bash`, `Edit`, `Write`
   and `NotebookEdit`, which win over any allow rules in your own settings, and nothing may prompt
-  (`--permission-prompts none`). agy adds `write_file(*)` to its deny rules; asked to edit, it gets an error it can
+  (`--permission-prompts none`). agy denies every tool (`write_file(*)`, `command(*)`, `unsandboxed(*)`, `mcp(*)`,
+  `execute_url(*)`) and gains the job's folder with `--add-dir`, so it can open the whole record it is pointed at;
+  asked to edit, it gets an error it can
   see and answers anyway (checked live with agy 1.4.11: no file appeared). Checked live: asked in a read-only turn to
   create a file, Claude and Codex both refused and no file appeared, but trying cost Claude 98k tokens and Codex 40k.
 - **Copies** (`@agent!`, or several agents at once) run in a worktree under Ringo's private state folder, made from
