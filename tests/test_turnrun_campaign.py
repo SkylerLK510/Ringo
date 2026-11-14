@@ -27,6 +27,22 @@ def record(tokens=100, **data):
 
 
 class CampaignTest(unittest.TestCase):
+    def test_admission_schedule_covers_siblings_margins_and_separate_confirmation(self):
+        protocol = plan()
+        result = rrsi.admission_schedule(protocol)
+        self.assertEqual(result['evaluation_attempts'], {'controls': 18, 'search': 36,
+                                                       'manual': 6, 'confirmation': 12})
+        self.assertEqual(result['proposal_attempts'], 4)
+        self.assertEqual(result['maximum_attempts'], 76)
+        self.assertEqual(result['maximum_reservations']['search'], 36400)
+        self.assertEqual(result['minimum_phase_ceilings']['controls'], 19000)
+        self.assertEqual(result['minimum_phase_ceilings']['manual'], 37400)
+        self.assertEqual(result['minimum_phase_ceilings']['search'], 37400)
+        self.assertTrue(result['full_schedule_fits'])
+        self.assertFalse(result['spending_authorized'])
+        protocol['budgets']['controls'] = 18000
+        self.assertFalse(rrsi.admission_schedule(protocol)['full_schedule_fits'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)

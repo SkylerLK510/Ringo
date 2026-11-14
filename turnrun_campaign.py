@@ -93,6 +93,31 @@ def validate_plan(value):
     return p
 
 
+def admission_schedule(value):
+    """Size the complete finite schedule without inference or spending authorization."""
+    p = validate_plan(value)
+    dev = len(p['splits']['dev'])
+    confirmation = len(p['splits']['validation']) + len(p['splits']['holdout'])
+    counts = {'controls': 2 * dev * p['repetitions'],
+              'search': 3 * dev * p['search_repetitions'] * p['rounds'],
+              'manual': dev * p['search_repetitions'],
+              'confirmation': 3 * confirmation * p['search_repetitions']}
+    tokens = {phase: count * p['run_cap'] for phase, count in counts.items()}
+    proposals = 2 * p['rounds']
+    tokens['search'] += proposals * p['proposal_cap']
+    minimum = {phase: n + p['margin'] for phase, n in tokens.items()}
+    matched = max(minimum['search'], minimum['manual'])
+    minimum.update(search=matched, manual=matched)
+    return {'plan_sha256': digest(p), 'evaluation_attempts': counts, 'proposal_attempts': proposals,
+            'maximum_attempts': sum(counts.values()) + proposals,
+            'maximum_reservations': tokens, 'minimum_phase_ceilings': minimum,
+            'declared_phase_ceilings': p['budgets'],
+            'full_schedule_fits': all(p['budgets'][phase] >= n for phase, n in minimum.items()),
+            'minimum_total_ceiling': sum(minimum.values()),
+            'provider_calls': 0, 'spending_authorized': False,
+            'limits': 'Admission includes cache tokens. A provider turn can overshoot its reservation.'}
+
+
 def code_identity():
     root = Path(__file__).resolve().parent
     return {name: sha256_file(root / name) for name in ('turnrun_campaign.py', 'turnrun_isolation.py',
@@ -427,10 +452,15 @@ def main(argv=None):
     p.add_argument('--campaign', required=True)
     p = sub.add_parser('status')
     p.add_argument('campaign')
+    p = sub.add_parser('budget', help='size the full schedule without inference or authorization')
+    p.add_argument('--plan', required=True)
     p = sub.add_parser('offline-demo', help='synthetic full-loop exercise; zero provider calls')
     p.add_argument('--campaign', required=True)
     sub.add_parser('live-preflight', help='fail closed until the broker is certified')
     args = parser.parse_args(argv)
+    if args.command == 'budget':
+        print(json.dumps(admission_schedule(json.loads(Path(args.plan).read_text())), sort_keys=True))
+        return 0
     if args.command == 'live-preflight':
         print(json.dumps({'ready': False, 'blockers': BLOCKERS}))
         return 2
