@@ -1515,11 +1515,13 @@ impl Session {
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
             // A read agy follows the pointer now: its turn's --add-dir made this job's folder part of its workspace
-            // (measured with agy 1.5.8). An edits turn is given no folder and reads the record it is handed; after a
-            // read turn of the same conversation, it keeps the folder that turn was given — agy retains --add-dir
-            // grants in the conversation (measured, probe 25) — so nothing is opened through the pointer alone.
+            // (measured with agy 1.5.8) — but only when the record it was handed was cut. Pointed at the file while
+            // the inline record is already whole, agy reads it anyway, and that is the 82.5k-token turn of 11/10
+            // again (measured culture: the pointer costs tokens only where it buys the cut turns back). An edits
+            // turn is given no pointer and no folder; after a read turn of the same conversation it keeps the folder
+            // that turn was given — agy retains --add-dir grants in the conversation (measured, probe 25).
             let whole_at = match agent.spec().adapter {
-                Adapter::Agy if self.mode != Mode::Read => String::new(),
+                Adapter::Agy if self.mode != Mode::Read || whole.trim_end() == record.trim_end() => String::new(),
                 _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
             };
             let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \

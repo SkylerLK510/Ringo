@@ -2024,9 +2024,10 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
 }
 
 /// agy hears what the others did as any agent does. An edits turn (ask mode here) is not pointed at the whole
-/// record: giving it the job's folder would put its write_file(*) rule in reach of Ringo's own state folder. A
-/// read turn is pointed there, and its --add-dir makes that folder one it can open (measured with agy 1.5.8).
-/// Codex, which can always open it, is pointed there in both.
+/// record and gains no folder. A read turn gains the job's folder (--add-dir, measured with agy 1.5.8), and is
+/// pointed at the whole record only when the record it was handed was cut: an uncut record is already everything,
+/// and agy opens what it is pointed at, so the pointer there would only spend tokens reading it again. Codex, which
+/// can always open it, is pointed there in both.
 #[test]
 fn agy_is_sent_to_the_whole_record_only_where_it_can_open_it() {
     let r = repo("agy-record");
@@ -2048,20 +2049,39 @@ fn agy_is_sent_to_the_whole_record_only_where_it_can_open_it() {
     let heard = turn_text(&codex);
     assert!(heard.contains("agy: fine by me") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
 
-    // read mode: the pointer is given, and the turn's --add-dir makes the job's folder part of agy's workspace
+    // read mode: --add-dir makes the job's folder part of agy's workspace, and the pointer is given only when the
+    // record it was handed was cut — with this small a conversation the record is whole, so pointing at the file
+    // would only have agy read what it already holds
+    let read_turn = |s: &mut Session, task: &str| -> (String, String) {
+        let id = s.launch_agent(agent("agy"), false, task).unwrap();
+        assert_eq!(wait(s, id), Status::Done);
+        let dir = s.job(id).unwrap().dir.display().to_string();
+        let argv = fs::read_to_string(format!("{}.argv", agy.display())).unwrap().replace(&dir, "JOB-DIR");
+        let heard = fs::read_to_string(format!("{}.stdin", agy.display())).unwrap();
+        (argv, heard)
+    };
     s.mode = Mode::Read;
-    let id = s.launch_agent(agent("agy"), false, "once more?").unwrap();
-    assert_eq!(wait(&mut s, id), Status::Done);
-    let dir = s.job(id).unwrap().dir.display().to_string();
-    let heard = fs::read_to_string(format!("{}.stdin", agy.display())).unwrap();
-    assert!(heard.contains("once more?") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
-    let argv = fs::read_to_string(format!("{}.argv", agy.display())).unwrap().replace(&dir, "JOB-DIR");
+    let (argv, heard) = read_turn(&mut s, "once more?");
+    assert!(heard.contains("once more?") && !heard.contains("The whole record, uncut, is in"),
+            "the record it was handed is whole, so no pointer: {heard}");
     let lines: Vec<&str> = argv.lines().collect();
     let at = lines.iter().position(|a| *a == "--add-dir").expect("a read turn's --add-dir");
     assert_eq!(lines[at + 1], "JOB-DIR");
     let permissions = lines.iter().position(|a| *a == "--settings").map_or("", |p| lines[p + 1]);
     assert!(permissions.contains("\"deny\"") && !permissions.contains("\"allow\""),
             "a read turn still denies every tool: {permissions}");
+
+    // the turns it has not heard grow past what a turn holds (the owner's words go in word for word): now the cut
+    // turns are only in the file, and the pointer is what gets agy there
+    let long = format!("consider this at length: {}", "and more detail. ".repeat(180));
+    for n in 0..30 {
+        let id = s.launch_agent(agent("codex"), false, &format!("{long} ({n})")).unwrap();
+        assert_eq!(wait(&mut s, id), Status::Done);
+    }
+    let (argv, heard) = read_turn(&mut s, "and the record?");
+    assert!(heard.contains("and the record?") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"),
+            "a cut record is pointed at: {heard}");
+    assert!(argv.lines().any(|a| a == "--add-dir"), "{argv}");
 }
 
 /// A stand-in Claude Code that asks other agents as the real one does: it finds the ask server in its `--mcp-config`

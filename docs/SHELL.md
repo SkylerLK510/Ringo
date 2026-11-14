@@ -225,10 +225,12 @@ the turn then running: the conversation they talked in is gone.
 agy takes part as the others do, since the third run above. Every agent that goes on in the shared conversation is
 told where the whole record of the turns it missed is kept. That file is in Ringo's state folder. An edits turn of
 agy's gains no folder and is not pointed there — it gets the record itself, as before (its allow rules are not
-path-scoped, so the folder would add nothing to watch for). A read turn is pointed there, and its `--add-dir`
-(measured with agy 1.5.8, 2026-11-14) makes the job's folder part of its workspace, so the pointer is one it can
-follow; the grant stays with the conversation, so an edits turn that resumes after a read turn can still read that
-folder (measured). This holds for any turn of agy's after another agent's, not only in a talk.
+path-scoped, so the folder would add nothing to watch for). A read turn gains the job's folder with `--add-dir`
+(measured with agy 1.5.8, 2026-11-14), and is pointed at the record only when the record it was handed was cut: an
+uncut record is already everything, and agy opens what it is pointed at, so the pointer there would only have it
+read the same turns again (the 82.5k-token turn of 11/10 was that shape). The `--add-dir` grant stays with the
+conversation, so an edits turn that resumes after a read turn can still read that folder (measured). This holds for
+any turn of agy's after another agent's, not only in a talk.
 
 Not done: a talk under way ends with the shell: it is not kept across `/restart`.
 
