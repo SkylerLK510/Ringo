@@ -52,10 +52,56 @@ def retained_usage(events):
             'counted': False, 'uncounted_calls': 1}
 
 
+class NativeProfileError(ValueError):
+    """A fixed controller diagnostic, safe to retain without provider response text."""
+
+
+def native_diagnostics(events, reason, exit_code=None):
+    """Keep failure categories and status only; never persist raw provider messages."""
+    finals = [event for event in events if event.get('type') == 'result']
+    final = finals[-1] if finals else {}
+    messages = [event for event in events if event.get('isApiErrorMessage') is True or
+                event.get('error') in ('model_not_found', 'authentication_failed', 'rate_limit')]
+    text = ' '.join(str(event.get('error', '')) + ' ' +
+                    json.dumps(event.get('message', {})) for event in messages)
+    if final.get('is_error') is True:
+        text += ' ' + str(final.get('result', '')) + ' ' + json.dumps(final.get('errors', []))
+    text = text.lower()
+    status = final.get('api_error_status')
+    if type(status) is not int or not 100 <= status <= 599:
+        status = None
+    category = None
+    if 'model_not_found' in text or 'issue with the selected model' in text:
+        category = 'model_unavailable'
+    elif any(marker in text for marker in ('authentication_error', 'authentication_failed',
+                                           'invalid_api_key', 'invalid bearer', 'not logged in')) or status == 401:
+        category = 'authentication_failed'
+    elif 'permission_error' in text or 'forbidden' in text or status == 403:
+        category = 'permission_denied'
+    elif 'rate_limit_error' in text or 'rate_limit' in text or status == 429:
+        category = 'rate_limited'
+    elif status == 404:
+        category = 'resource_unavailable'
+    elif 'connection error' in text or 'unable to connect' in text:
+        category = 'connection_failed'
+    elif messages or final.get('is_error') is True:
+        category = 'unclassified_provider_error'
+    subtype = final.get('subtype')
+    if subtype not in ('success', 'error_during_execution', 'error_max_turns',
+                       'error_max_budget_usd', 'error_max_structured_output_retries'):
+        subtype = 'unknown' if finals else None
+    return {'reason': reason, 'native_exit_code': exit_code,
+            'initialization_seen': any(event.get('type') == 'system' and
+                                       event.get('subtype') == 'init' for event in events),
+            'final_result_count': len(finals), 'final_subtype': subtype,
+            'api_error_status': status, 'provider_error_category': category}
+
+
 class NativeAttemptError(ValueError):
-    def __init__(self, reason, events):
+    def __init__(self, reason, events, exit_code=None):
         super().__init__(reason)
-        self.result = {'outcome': 'failed', 'usage': retained_usage(events)}
+        self.result = {'outcome': 'failed', 'usage': retained_usage(events),
+                       'diagnostics': native_diagnostics(events, reason, exit_code)}
 
 
 def oauth_token(path):
@@ -96,26 +142,29 @@ def native_result(events, code, model, worker_required=True):
     finals = [e for e in events if e.get('type') == 'result']
     expected = ['mcp__trial__worker'] if worker_required else []
     if len(initial) != 1 or initial[0].get('tools') != expected:
-        raise ValueError('native tool discovery differs from the fixed profile')
+        raise NativeProfileError('native tool discovery differs from the fixed profile')
     servers = initial[0].get('mcp_servers', [])
     if worker_required and servers != [{'name': 'trial', 'status': 'connected'}]:
-        raise ValueError('the fixed worker MCP server did not connect')
+        raise NativeProfileError('the fixed worker MCP server did not connect')
     if initial[0].get('model') != model or len(finals) != 1:
-        raise ValueError('provider model or final result differs from the pinned request')
+        raise NativeProfileError('provider model or final result differs from the pinned request')
     final = finals[0]
     if set(final.get('modelUsage', {})) != {model}:
-        raise ValueError('native usage includes an unpinned or unknown model')
+        raise NativeProfileError('native usage includes an unpinned or unknown model')
     counts = final.get('usage')
     if not isinstance(counts, dict):
-        raise ValueError('native aggregate usage is incomplete')
+        raise NativeProfileError('native aggregate usage is incomplete')
     usage = {key: counts.get(field) for key, field in USAGE_FIELDS.items()}
     if any(type(n) is not int or n < 0 for n in usage.values()):
-        raise ValueError('native aggregate usage is incomplete')
-    return {'outcome': 'done' if code == 0 and final.get('is_error') is False
+        raise NativeProfileError('native aggregate usage is incomplete')
+    result = {'outcome': 'done' if code == 0 and final.get('is_error') is False
             and final.get('subtype') == 'success' else 'failed',
             'usage': {**usage, 'counted': True, 'uncounted_calls': 0},
             'reply': final.get('result', ''), 'model': model,
             'model_turns': final.get('num_turns'), 'provider_requests': None}
+    if result['outcome'] != 'done':
+        result['diagnostics'] = native_diagnostics(events, 'native process returned failure', code)
+    return result
 
 
 class NativeBroker(DockerSandbox):
@@ -283,7 +332,7 @@ class NativeBroker(DockerSandbox):
                         events.append(event)
                         if event.get('type') == 'system' and event.get('subtype') == 'init':
                             if event.get('tools') != ['mcp__trial__worker'] or event.get('model') != model:
-                                raise ValueError('native startup exposed unexpected tools or model')
+                                raise NativeProfileError('native startup exposed unexpected tools or model')
                     elif kind == 'mcp':
                         send({'type': 'mcp', 'id': key, 'message': endpoint.dispatch(frame['message'])})
                     elif kind == 'open':
@@ -316,7 +365,8 @@ class NativeBroker(DockerSandbox):
                     result['outcome'] = 'budget'
                 return result
             except Exception as exc:
-                raise NativeAttemptError(type(exc).__name__+' during native attempt', events) from None
+                reason = str(exc) if isinstance(exc, NativeProfileError) else type(exc).__name__+' during native attempt'
+                raise NativeAttemptError(reason, events, exit_code) from None
             finally:
                 timer.cancel()
                 stop.set()
@@ -334,7 +384,7 @@ class NativeBroker(DockerSandbox):
                         proc.kill()
                     proc.wait(timeout=10)
                 if cleanup_error:
-                    raise NativeAttemptError('native container cleanup failed', events)
+                    raise NativeAttemptError('native container cleanup failed', events, exit_code)
 
 
 def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, work):
@@ -377,6 +427,8 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
                 usage, total = usage_of(result)
                 report.update(known_tokens=total, reserved_tokens=0 if total is not None else budget_tokens,
                               result=result, worker_calls=endpoint.calls)
+                if 'diagnostics' in result:
+                    report['diagnostics'] = result['diagnostics']
                 ledger_append(ledger, {'kind': 'finish', 'tokens': total, 'result': result})
                 if result['outcome'] != 'done' or total is None or total > budget_tokens:
                     ledger_append(ledger, {'kind': 'halt', 'reason': 'usage or delivery gate failed'})
@@ -393,6 +445,7 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
             counts, total = usage_of(exc.result)
             lower_bound = sum(counts.values())
             report.update(result=exc.result, known_tokens=total,
+                          diagnostics=exc.result['diagnostics'],
                           reserved_tokens=0 if total is not None else max(budget_tokens, lower_bound))
             ledger_append(ledger, {'kind': 'finish', 'tokens': total, 'lower_bound': lower_bound,
                                    'result': exc.result})

@@ -82,6 +82,13 @@ The token ceiling is an admission reservation; the provider may overshoot it.
 The wall timer stops the entire provider container, including detached processes.
 An existing evidence directory is refused; there is no automatic retry.
 
+Failures include a bounded `diagnostics` object in the saved report and CLI output:
+the controller validation reason, native exit code, initialization/final-result
+status, provider HTTP error status when reported, and a provider error category.
+Raw provider messages and credentials are excluded from this diagnostic object.
+An unavailable-model category cannot distinguish a missing model from missing
+subscription access. Unknown usage still retains the admission reservation.
+
 The proof requires the pinned model and exact single-tool initialization, connected
 MCP status, complete usage, successful completion, and a fresh nonce written by the
 assigned worker. The result concerns that process profile only. It is not evidence

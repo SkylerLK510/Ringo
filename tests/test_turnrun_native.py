@@ -1,6 +1,7 @@
 """Native adapter boundary and accounting tests. No provider inference."""
 import copy
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -9,7 +10,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from turnrun_native import NativeBroker, certify, native_result, oauth_token, provider_socket, retained_usage
+from turnrun_native import (NativeAttemptError, NativeBroker, NativeProfileError, certify, main,
+                            native_diagnostics, native_result, oauth_token, provider_socket, retained_usage)
 from turnrun_native_bridge import Bridge, arguments, environment
 from turnrun_broker import WorkerEndpoint
 from turnrun_isolation import DockerSandbox
@@ -29,6 +31,64 @@ def events():
 
 
 class NativeProfileTest(unittest.TestCase):
+    def test_rejected_model_keeps_actionable_diagnostics_and_zero_usage_without_response_text(self):
+        sample = events()
+        sample[-1].update(is_error=True, api_error_status=404, modelUsage={},
+                          result="There's an issue with the selected model. private-response-marker",
+                          usage={'input_tokens': 0, 'cache_creation_input_tokens': 0,
+                                 'cache_read_input_tokens': 0, 'output_tokens': 0})
+        with self.assertRaises(NativeProfileError) as caught:
+            native_result(sample, 1, MODEL)
+        failure = NativeAttemptError(str(caught.exception), sample, 1)
+        self.assertEqual(failure.result['usage']['input'], 0)
+        self.assertTrue(failure.result['usage']['counted'])
+        details = failure.result['diagnostics']
+        self.assertEqual(details['provider_error_category'], 'model_unavailable')
+        self.assertEqual(details['api_error_status'], 404)
+        self.assertEqual(details['native_exit_code'], 1)
+        self.assertEqual(details['reason'], 'native usage includes an unpinned or unknown model')
+        self.assertNotIn('private-response-marker', json.dumps(failure.result))
+
+    def test_failure_categories_are_bounded_and_never_save_credentials_or_raw_messages(self):
+        for status, category in ((401, 'authentication_failed'), (403, 'permission_denied'),
+                                 (404, 'resource_unavailable'), (429, 'rate_limited'),
+                                 (500, 'unclassified_provider_error')):
+            sample = events()
+            sample[-1].update(is_error=True, api_error_status=status,
+                              result='sk-ant-oat01-private-marker', errors=['private-error-marker'])
+            details = native_diagnostics(sample, 'fixed controller reason', 1)
+            with self.subTest(status=status):
+                self.assertEqual(details['provider_error_category'], category)
+                self.assertNotIn('private-marker', json.dumps(details))
+                self.assertNotIn('private-error-marker', json.dumps(details))
+        sample[-1].update(api_error_status='private-status-marker', subtype='private-subtype-marker')
+        details = native_diagnostics(sample, 'fixed controller reason')
+        self.assertIsNone(details['api_error_status'])
+        self.assertEqual(details['final_subtype'], 'unknown')
+        self.assertNotIn('private-', json.dumps(details))
+
+    def test_interrupted_failure_diagnostics_preserve_unknown_usage(self):
+        failure = NativeAttemptError('TimeoutError during native attempt', events()[:1])
+        self.assertFalse(failure.result['usage']['counted'])
+        self.assertEqual(failure.result['usage']['uncounted_calls'], 1)
+        self.assertTrue(failure.result['diagnostics']['initialization_seen'])
+        self.assertEqual(failure.result['diagnostics']['final_result_count'], 0)
+        self.assertIsNone(failure.result['diagnostics']['provider_error_category'])
+
+    def test_cli_prints_failure_diagnostics_without_printing_provider_result(self):
+        details = native_diagnostics([], 'native container cleanup failed')
+        report = {'process_profile_certified': False, 'diagnostics': details,
+                  'result': {'reply': 'private-response-marker'}}
+        argv = ['turnrun_native.py', 'certify', '--image', 'unused', '--worker-image', 'unused',
+                '--model', MODEL, '--token-file', '/unused', '--work', '/unused', '--budget-tokens', '100']
+        output = io.StringIO()
+        with patch('sys.argv', argv), patch('turnrun_native.certify', return_value=report), \
+                patch('sys.stdout', output):
+            self.assertEqual(main(), 2)
+        printed = json.loads(output.getvalue())
+        self.assertEqual(printed['diagnostics'], details)
+        self.assertNotIn('private-response-marker', output.getvalue())
+
     def test_interrupted_usage_retains_deduplicated_message_lower_bound(self):
         partial = [{'type': 'assistant', 'message': {'id': 'one', 'usage': {
             'input_tokens': 200, 'cache_read_input_tokens': 500, 'output_tokens': 10}}},
