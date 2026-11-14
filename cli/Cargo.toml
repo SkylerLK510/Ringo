@@ -32,6 +32,16 @@ name = "turnrun"
 path = "src/bin/turnrun.rs"
 required-features = ["turnrun"]
 
+[[bin]]
+name = "scenariorun"
+path = "src/bin/scenariorun.rs"
+required-features = ["turnrun"]
+
+[[test]]
+name = "gate_scenarios"
+path = "tests/gate_scenarios.rs"
+required-features = ["turnrun"]
+
 [[test]]
 name = "gate_turnrun"
 path = "tests/gate_turnrun.rs"

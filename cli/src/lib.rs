@@ -6,6 +6,7 @@ pub mod parse;
 pub mod rt;
 
 pub mod images;
+pub mod turn_policy;
 use parse::{Note, Parser, Permission, Style, Tokens};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::OsString;
@@ -629,6 +630,7 @@ pub struct Session {
     heard: HashMap<Agent, BTreeSet<usize>>,
     /// Past this, an agent's next turn starts fresh from Ringo's record instead (tests lower it).
     pub handoff_at: u64,
+    turn_policy: turn_policy::TurnPolicy,
     /// /separate: each agent keeps a conversation of its own, and they can take turns here at the same time.
     pub separate: bool,
     /// The owner's lines a turn ended before taking in (`steer`): the job and the line, for the shell to send next
@@ -1025,7 +1027,7 @@ impl Session {
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(), max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
-                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, separate: false,
+                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
@@ -1047,6 +1049,12 @@ impl Session {
     /// session opened).
     pub fn program(&self, agent: Agent) -> PathBuf {
         self.programs.get(&agent).cloned().unwrap_or_else(|| PathBuf::from(&agent.spec().program))
+    }
+
+    /// Select an experimental policy explicitly. Normal sessions retain the exact default behavior.
+    pub fn set_turn_policy(&mut self, policy: turn_policy::TurnPolicy) {
+        self.handoff_at = policy.handoff_at.unwrap_or(HANDOFF_AT);
+        self.turn_policy = policy;
     }
 
     pub fn installed(&self, agent: Agent) -> bool {
@@ -1521,8 +1529,11 @@ impl Session {
                 Adapter::Agy => String::new(),
                 _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
             };
-            let text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
+            let mut text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
                                 and can be wrong; the files here are the truth).{whole_at}\n\n{}\n\n", record.trim_end());
+            if !self.turn_policy.handoff_instruction.is_empty() {
+                text = format!("{}\n\n{text}", self.turn_policy.handoff_instruction);
+            }
             let about = text.len() as u64 / 4; // the owner's message goes either way
             let ids: Vec<usize> = turns.iter().map(|j| j.id).collect();
             (!fresh || resume.is_none() || about * 2 <= fills).then_some((fresh, text, about, span, whole, ids))
@@ -1779,6 +1790,9 @@ impl Session {
             });
         }
         let sandbox = if edits { "workspace-write" } else { "read-only" };
+        if prompt.trim() != "/compact" && !self.turn_policy.instruction.is_empty() {
+            sent = format!("{}\n\n{sent}", self.turn_policy.instruction);
+        }
         // Keep the validated image blocks, with the handoff added to the text alone.
         if let Some(blocks) = content.as_array_mut() {
             blocks[0]["text"] = sent.clone().into();

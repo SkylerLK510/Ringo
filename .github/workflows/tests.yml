@@ -9,6 +9,39 @@ permissions:
   contents: read
 
 jobs:
+  containment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Resolve the offline test image to an immutable local ID
+        run: |
+          docker pull python:3.11
+          python - <<'PY'
+          import os, subprocess
+          image = subprocess.check_output(['docker', 'image', 'inspect', 'python:3.11', '--format', '{{.Id}}'], text=True).strip()
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('RINGO_TEST_IMAGE=' + image + '\n')
+          print(image)
+          PY
+      - run: python -m unittest tests.test_turnrun_isolation tests.test_turnrun_certify tests.test_turnrun_broker -v
+      - name: Build the pinned native CLI image without inference
+        run: |
+          python turnrun_native_image.py --version 2.1.153 --platform linux-x64 \
+            --base "$RINGO_TEST_IMAGE" --work "$RUNNER_TEMP/ringo-native-image"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          image = (Path(os.environ['RUNNER_TEMP']) / 'ringo-native-image/image-id.txt').read_text().strip()
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('RINGO_NATIVE_IMAGE=' + image + '\n')
+          PY
+      - name: Verify native startup and tool execution using local protocol replay
+        run: python -m unittest tests.test_turnrun_native -v
+
   unittest:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
