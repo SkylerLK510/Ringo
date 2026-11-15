@@ -25,7 +25,9 @@ def events(sid='thread-1', inputs=30, cached=10, output=10):
 
 class CodexProfileTests(unittest.TestCase):
     def broker(self):
-        return CodexBroker('sha256:'+'a'*64)
+        # Pure profile/accounting tests never launch a container. Keep them
+        # runnable on macOS/Windows CI hosts without Docker installed.
+        return CodexBroker('sha256:'+'a'*64, docker='unit-test-never-executed')
 
     @unittest.skipIf(os.name == 'nt', 'POSIX credential permissions')
     def test_only_subscription_access_and_account_are_forwarded(self):
