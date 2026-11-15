@@ -162,8 +162,10 @@ the number of calls for each outcome.
 Install it with `cargo install --locked --path cli`, then type `ringo` to open Ringo's own full-screen session.
 
 - Say what you want in plain words. The agent you're talking to (Claude Code, Codex, Google's Antigravity CLI (agy),
-  Grok or an agent you add) does it in that folder, and asks before it runs a command. `/undo` takes a turn's change
-  back.
+  Grok or an agent you add) does it in that folder. The default `ask` mode allows project reads and edits;
+  command execution and approval prompts depend on the agent. See the
+  [permission guide](USER-GUIDE.md#choose-how-much-agents-may-do) for each provider's behavior.
+  `/undo` takes a turn's change back.
 - Give a task to several agents at once, each in its own copy, run Ringo's pipelines with them, and watch every job
   and subagent as it runs.
 - On first start, the shell finds the agents installed on your computer and signs you in.

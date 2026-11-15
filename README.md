@@ -88,8 +88,9 @@ flowchart LR
     B --> C{Fixed checks}
     C -->|Fail, within round limit| B
     C -->|Pass| D[Review]
-    D --> E[Revision and recheck]
-    E -->|If passing| F[Files for human review]
+    D -->|No fixes needed| F[Files for human review]
+    D -->|Fixes needed, within round limit| E[Revision and recheck]
+    E -->|If passing| F
 ```
 
 Try the included small coding task from the checkout:
