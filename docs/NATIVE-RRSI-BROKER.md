@@ -86,6 +86,16 @@ Failures include a bounded `diagnostics` object in the saved report and CLI outp
 the controller validation reason, native exit code, initialization/final-result
 status, provider HTTP error status when reported, and a provider error category.
 Raw provider messages and credentials are excluded from this diagnostic object.
+HTTP 400 is classified as `invalid_request`. An error with empty model usage is
+reported as a provider failure before model usage, rather than a model mismatch;
+successful responses still require the exact pinned model usage.
+On a provider error, certification also saves a bounded error excerpt in
+`provider-error.json` within the private evidence directory, with mode 0600.
+The dedicated credential, Anthropic token strings and bearer values are redacted.
+This file may contain private request details; inspect it locally and share only
+the relevant redacted error. It is excluded from CLI output and the ledger.
+`private_error_saved` reports whether that separate file was saved; a write failure
+does not change the recorded token usage or release an unknown reservation.
 An unavailable-model category cannot distinguish a missing model from missing
 subscription access. Unknown usage still retains the admission reservation.
 

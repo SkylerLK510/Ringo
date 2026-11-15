@@ -11,7 +11,8 @@ import unittest
 from unittest.mock import patch
 
 from turnrun_native import (NativeAttemptError, NativeBroker, NativeProfileError, certify, main,
-                            native_diagnostics, native_result, oauth_token, provider_socket, retained_usage)
+                            native_diagnostics, native_result, oauth_token, provider_socket, retained_usage,
+                            save_native_error)
 from turnrun_native_bridge import Bridge, arguments, environment
 from turnrun_broker import WorkerEndpoint
 from turnrun_isolation import DockerSandbox
@@ -46,11 +47,11 @@ class NativeProfileTest(unittest.TestCase):
         self.assertEqual(details['provider_error_category'], 'model_unavailable')
         self.assertEqual(details['api_error_status'], 404)
         self.assertEqual(details['native_exit_code'], 1)
-        self.assertEqual(details['reason'], 'native usage includes an unpinned or unknown model')
+        self.assertEqual(details['reason'], 'native provider failed before reporting model usage')
         self.assertNotIn('private-response-marker', json.dumps(failure.result))
 
     def test_failure_categories_are_bounded_and_never_save_credentials_or_raw_messages(self):
-        for status, category in ((401, 'authentication_failed'), (403, 'permission_denied'),
+        for status, category in ((400, 'invalid_request'), (401, 'authentication_failed'), (403, 'permission_denied'),
                                  (404, 'resource_unavailable'), (429, 'rate_limited'),
                                  (500, 'unclassified_provider_error')):
             sample = events()
@@ -66,6 +67,77 @@ class NativeProfileTest(unittest.TestCase):
         self.assertIsNone(details['api_error_status'])
         self.assertEqual(details['final_subtype'], 'unknown')
         self.assertNotIn('private-', json.dumps(details))
+
+    def test_native_400_without_model_usage_is_a_provider_failure_and_keeps_zero_usage(self):
+        sample = events()
+        sample[-1].update(is_error=True, api_error_status=400, modelUsage={},
+                          result='API Error: 400 private-rejection-marker',
+                          usage={field: 0 for field in ('input_tokens', 'cache_creation_input_tokens',
+                                                       'cache_read_input_tokens', 'output_tokens')})
+        with self.assertRaisesRegex(NativeProfileError, 'before reporting model usage') as caught:
+            native_result(sample, 1, MODEL)
+        failure = NativeAttemptError(str(caught.exception), sample, 1)
+        self.assertEqual(failure.result['diagnostics']['provider_error_category'], 'invalid_request')
+        self.assertTrue(failure.result['usage']['counted'])
+        self.assertEqual(failure.result['usage']['input'], 0)
+        self.assertNotIn('private-rejection-marker', json.dumps(failure.result))
+        sample[-1]['is_error'] = False
+        with self.assertRaisesRegex(NativeProfileError, 'unpinned or unknown model'):
+            native_result(sample, 0, MODEL)
+
+    @unittest.skipIf(os.name == 'nt', 'private evidence permissions require POSIX')
+    def test_private_error_is_bounded_redacted_and_created_without_overwriting(self):
+        sample = events()
+        sample[-1].update(is_error=True, api_error_status=400,
+                          result='Invalid request: private-rejection-marker credential-value '
+                                 'sk-ant-oat01-secret Bearer private-bearer',
+                          errors=['sk-ant-api01-other-secret'])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'provider-error.json'
+            self.assertTrue(save_native_error(sample, path, 'credential-value'))
+            row = json.loads(path.read_text())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(row['api_error_status'], 400)
+            self.assertIn('private-rejection-marker', row['error_excerpt'])
+            for secret in ('credential-value', 'sk-ant-', 'private-bearer', 'other-secret'):
+                self.assertNotIn(secret, path.read_text())
+            self.assertFalse(row['truncated'])
+            before = path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                save_native_error(sample, path, 'credential-value')
+            self.assertEqual(path.read_bytes(), before)
+            sample[-1]['result'] = 'x' * 20000
+            large = Path(folder) / 'bounded.json'
+            save_native_error(sample, large, '')
+            row = json.loads(large.read_text())
+            self.assertTrue(row['truncated'])
+            self.assertLessEqual(len(row['error_excerpt']), 8192)
+            link = Path(folder) / 'link.json'
+            link.symlink_to(path)
+            with self.assertRaises(FileExistsError):
+                save_native_error(sample, link, '')
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_private_error_requires_one_error_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'provider-error.json'
+            self.assertFalse(save_native_error(events(), path, 'unused'))
+            self.assertFalse(save_native_error(events()[:1], path, 'unused'))
+            sample = events()
+            sample[-1]['is_error'] = True
+            sample.append(copy.deepcopy(sample[-1]))
+            self.assertFalse(save_native_error(sample, path, 'unused'))
+            self.assertFalse(path.exists())
+
+    def test_failed_result_with_pinned_usage_does_not_put_provider_text_in_ledger_result(self):
+        sample = events()
+        sample[-1].update(is_error=True, api_error_status=400,
+                          result='private-rejection-marker', errors=['private-error-marker'])
+        result = native_result(sample, 1, MODEL)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertEqual(result['diagnostics']['provider_error_category'], 'invalid_request')
+        self.assertEqual(result['usage']['input'], 10)
+        self.assertNotIn('private-', json.dumps(result))
 
     def test_interrupted_failure_diagnostics_preserve_unknown_usage(self):
         failure = NativeAttemptError('TimeoutError during native attempt', events()[:1])

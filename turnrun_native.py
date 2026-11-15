@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import socket
 import stat
 import subprocess
@@ -84,6 +85,8 @@ def native_diagnostics(events, reason, exit_code=None):
         category = 'resource_unavailable'
     elif 'connection error' in text or 'unable to connect' in text:
         category = 'connection_failed'
+    elif status == 400:
+        category = 'invalid_request'
     elif messages or final.get('is_error') is True:
         category = 'unclassified_provider_error'
     subtype = final.get('subtype')
@@ -102,6 +105,29 @@ class NativeAttemptError(ValueError):
         super().__init__(reason)
         self.result = {'outcome': 'failed', 'usage': retained_usage(events),
                        'diagnostics': native_diagnostics(events, reason, exit_code)}
+
+
+def save_native_error(events, path, credential):
+    """Keep a bounded error excerpt privately; never add provider text to public diagnostics."""
+    finals = [event for event in events if event.get('type') == 'result']
+    if len(finals) != 1 or finals[0].get('is_error') is not True:
+        return False
+    final = finals[0]
+    text = json.dumps({'result': final.get('result'), 'errors': final.get('errors')},
+                      ensure_ascii=False)
+    if credential:
+        text = text.replace(credential, '[REDACTED]')
+    text = re.sub(r'sk-ant-[A-Za-z0-9_-]+', '[REDACTED]', text)
+    text = re.sub(r'(?i)\bbearer\s+[^\s"\\]+', 'Bearer [REDACTED]', text)
+    target = outside_repo(path, 'private native error evidence')
+    row = {'api_error_status': native_diagnostics(events, 'provider error')['api_error_status'],
+           'error_excerpt': text[:8192], 'truncated': len(text) > 8192}
+    # Refuse preexisting files (including symlinks); never widen credential-file permissions.
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as out:
+        json.dump(row, out, indent=2)
+        out.write('\n')
+    return True
 
 
 def oauth_token(path):
@@ -149,6 +175,8 @@ def native_result(events, code, model, worker_required=True):
     if initial[0].get('model') != model or len(finals) != 1:
         raise NativeProfileError('provider model or final result differs from the pinned request')
     final = finals[0]
+    if final.get('is_error') is True and final.get('modelUsage') == {}:
+        raise NativeProfileError('native provider failed before reporting model usage')
     if set(final.get('modelUsage', {})) != {model}:
         raise NativeProfileError('native usage includes an unpinned or unknown model')
     counts = final.get('usage')
@@ -163,6 +191,7 @@ def native_result(events, code, model, worker_required=True):
             'reply': final.get('result', ''), 'model': model,
             'model_turns': final.get('num_turns'), 'provider_requests': None}
     if result['outcome'] != 'done':
+        result.pop('reply')
         result['diagnostics'] = native_diagnostics(events, 'native process returned failure', code)
     return result
 
@@ -233,7 +262,7 @@ class NativeBroker(DockerSandbox):
                     proc.wait(timeout=10)
 
     def run(self, *, prompt, instruction, model, token_file, endpoint, token_cap,
-            seconds=300, max_turns=8):
+            seconds=300, max_turns=8, error_file=None):
         if 'RINGO_CHILD' in os.environ:
             raise ValueError('live native execution refuses RINGO_CHILD; use a standalone session')
         if not isinstance(model, str) or not model.startswith('claude-') or len(model) > 128:
@@ -251,11 +280,23 @@ class NativeBroker(DockerSandbox):
         if endpoint.worker.id == self.id or endpoint.failed or not endpoint.server:
             raise ValueError('native broker requires a separate active worker endpoint')
         self.probe()
+        credential = oauth_token(token_file)
         request = {'prompt': prompt, 'instruction': instruction, 'model': model,
-                   'oauth_token': oauth_token(token_file), 'max_turns': max_turns}
+                   'oauth_token': credential, 'max_turns': max_turns}
         command = [self.docker, 'exec', '-i', self.id, 'python3', '-I', '/opt/ringo/turnrun_native_bridge.py']
         frames = queue.Queue(maxsize=16)
         events, tunnels = [], {}
+        private_error_saved = False
+        def retain_error(result):
+            nonlocal private_error_saved
+            if error_file is not None:
+                if not private_error_saved:
+                    try:
+                        private_error_saved = save_native_error(events, error_file, credential)
+                    except (OSError, ValueError):
+                        pass
+                result['diagnostics']['private_error_saved'] = private_error_saved
+            return result
         writer_lock = threading.Lock()
         stop = threading.Event()
         with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -361,12 +402,16 @@ class NativeBroker(DockerSandbox):
                         raise ValueError('native bridge failed; preserve the full token reservation')
                 proc.wait(timeout=max(0.1, deadline-time.monotonic()))
                 result = native_result(events, exit_code, model)
+                if result['outcome'] != 'done':
+                    retain_error(result)
                 if sum(result['usage'][k] for k in ('input', 'cache_write', 'cache_read', 'output')) > token_cap:
                     result['outcome'] = 'budget'
                 return result
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, NativeProfileError) else type(exc).__name__+' during native attempt'
-                raise NativeAttemptError(reason, events, exit_code) from None
+                failure = NativeAttemptError(reason, events, exit_code)
+                retain_error(failure.result)
+                raise failure from None
             finally:
                 timer.cancel()
                 stop.set()
@@ -384,7 +429,10 @@ class NativeBroker(DockerSandbox):
                         proc.kill()
                     proc.wait(timeout=10)
                 if cleanup_error:
-                    raise NativeAttemptError('native container cleanup failed', events, exit_code)
+                    failure = NativeAttemptError('native container cleanup failed', events, exit_code)
+                    # A prior failure may already have saved this attempt's private error.
+                    retain_error(failure.result)
+                    raise failure
 
 
 def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, work):
@@ -423,7 +471,8 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
                         ' followed by a newline to /work/native-proof.txt. Then finish.',
                         instruction='Use only the provided worker tool to complete the task.',
                         model=model, token_file=token_file, endpoint=endpoint,
-                        token_cap=budget_tokens, seconds=seconds, max_turns=4)
+                        token_cap=budget_tokens, seconds=seconds, max_turns=4,
+                        error_file=work / 'provider-error.json')
                 usage, total = usage_of(result)
                 report.update(known_tokens=total, reserved_tokens=0 if total is not None else budget_tokens,
                               result=result, worker_calls=endpoint.calls)
