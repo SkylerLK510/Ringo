@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
+mod legacy;
+
 /// The user guide, printed by /usrman as markdown: the same file as docs/USER-GUIDE.md, so the two never differ.
 const MANUAL: &str = include_str!("../../docs/USER-GUIDE.md");
 
@@ -4180,7 +4182,7 @@ impl App {
         Some(path)
     }
 
-    /// Restore structured entries when available; old conversations remain readable as plain text.
+    /// Restore structured entries, recovering the display of text saved by a pre-sidecar shell too.
     fn restore_conversation(&mut self, path: &Path) {
         use sha2::{Digest, Sha256};
         let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -4190,6 +4192,7 @@ impl App {
             && s["text_sha256"].as_str() == Some(&format!("{:x}", Sha256::digest(text.as_bytes()))))
             .and_then(|s| serde_json::from_value::<Vec<Out>>(s["entries"].clone()).ok());
         self.out = entries.unwrap_or_else(|| text.lines().map(Out::text).collect());
+        self.out = legacy::recover(std::mem::take(&mut self.out), path, &self.s.repo, &self.theme);
         if self.theme.name == "mono" {
             let plain = |s: &mut Style| { s.fg = None; s.bg = None; s.underline_color = None; };
             for entry in &mut self.out {
