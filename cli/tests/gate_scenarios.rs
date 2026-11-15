@@ -82,6 +82,40 @@ fn fresh_resume_clear_and_restart_use_real_session_state() {
 }
 
 #[test]
+fn start_over_after_restart_carries_the_record_into_a_fresh_conversation() {
+    let case = Case::new();
+    let (code, record, requests) = case.run(json!([
+        {"op":"turn","message":"Keep the public API stable."},
+        {"op":"restart"}, {"op":"start_over"},
+        {"op":"turn","message":"Continue.\nKeep these bytes."},
+        {"op":"turn","message":"One more turn."}
+    ]), json!({"handoff_instruction":"Recover the earlier contract."}), false);
+    assert_eq!(code, 0, "{record}");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1]["thread"]["method"], "thread/start");
+    let sent = message(&requests[1]);
+    assert!(sent.starts_with("Recover the earlier contract.\n\nRingo's record"), "{sent}");
+    assert!(sent.contains("Keep the public API stable."), "{sent}");
+    assert!(sent.ends_with("The owner's new message:\nContinue.\nKeep these bytes."));
+    assert!(!record["events"][2]["before"].as_array().unwrap().is_empty());
+    assert_eq!(record["events"][2]["after"], json!([]));
+    assert_ne!(record["events"][0]["after"], record["events"][3]["after"]);
+    assert_eq!(requests[2]["thread"]["method"], "thread/resume");
+    assert_eq!(message(&requests[2]), "One more turn.");
+}
+
+#[test]
+fn start_over_without_a_conversation_fails_before_launch() {
+    let case = Case::new();
+    let (code, record, requests) = case.run(json!([
+        {"op":"start_over"}, {"op":"turn","message":"work"}
+    ]), json!({}), false);
+    assert_eq!(code, 2, "{record}");
+    assert!(requests.is_empty());
+    assert!(record["reason"].as_str().unwrap().contains("existing conversation"));
+}
+
+#[test]
 fn handoff_preserves_prior_constraint_and_exact_new_message() {
     let case = Case::new();
     let (code, record, requests) = case.run(json!([seed(64001), {"op":"restart"},
@@ -121,6 +155,7 @@ fn explicit_policy_changes_only_instruction_text_and_clear_drops_seed() {
 fn child_guard_and_invalid_scenario_refuse_before_any_provider_launch() {
     for (actions, policy, child) in [(json!([{"op":"turn","message":"next"}]), json!({}), true),
         (json!([{"op":"shell","command":"true"}]), json!({}), false),
+        (json!([{"op":"start_over","unexpected":true}]), json!({}), false),
         (json!([{"op":"turn","message":"next"}]), json!({"permissions":"all"}), false)] {
         let case = Case::new();
         let (code, _, requests) = case.run(actions, policy, child);
