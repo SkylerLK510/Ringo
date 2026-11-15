@@ -174,6 +174,16 @@ pub fn fmt_tokens(n: u64) -> String {
 }
 
 /// The first line of text, at most `n` characters.
+/// agy's usage, a model call's or a turn's. `input_tokens` is the uncached input alone, and `cache_read_tokens` comes
+/// on top of it: in real agy logs (24 turns, 2026-11-14) one call read 5,518 cached tokens against 5,488 input, and
+/// `total_tokens` is always input + output, cache reads left out. (They were taken as part of the input before, so a
+/// turn's cache reads past its input were dropped: one turn's 3.6M were counted as 249k.) Thinking is part of
+/// `output_tokens`.
+fn agy_tokens(usage: &Value) -> Tokens {
+    Tokens { input: u(usage, "input_tokens"), cache_read: u(usage, "cache_read_tokens"), cache_write: 0,
+             output: u(usage, "output_tokens") }
+}
+
 pub fn short(text: &str, n: usize) -> String {
     let line = text.trim().lines().next().unwrap_or("");
     if line.chars().count() > n {
@@ -508,10 +518,9 @@ impl Parser {
             }
             // The thread's usage so far; a resumed thread's counts its earlier turns too, as `codex exec` did.
             // Told live as well: before, a running codex turn showed no count at all (its total only came at
-            // turn/completed), so a turn reading past the compaction line was invisible while it grew — measured
-            // 2026-11-14: real codex jobs reached 14.9M tokens, one making 255 model calls that re-read ~176k
-            // cached tokens each, compacting only 3 times (the shell knows, 263M tokens for claude and 143M for
-            // codex, 95% of it cache reads).
+            // turn/completed), so a long turn was invisible while it grew — measured 2026-11-14: real codex jobs
+            // reached 14.8M tokens, one making 255 model calls that re-read ~176k cached tokens each, compacting
+            // only 3 times (the shell's ledger: 264M tokens for claude and 149M for codex, 96% of it cache reads).
             ("thread/tokenUsage/updated", _) => {
                 self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
                 notes.push(Note::Live(self.thread_tokens()));
@@ -853,14 +862,12 @@ impl Parser {
                     }
                     ("agent_response", "DONE") => {
                         // A model call's own count, as agy reports it per step (the other adapters report theirs
-                        // live too): the running turn's total for the live row, and the call. agy never compacts
-                        // its conversation (measured 2026-11-14: a real turn ran 498 steps to 2.2M tokens with no
-                        // count at all until it ended), so without this a running turn showed nothing while it
-                        // grew. The final result reports the same total again.
+                        // live too): the running turn's total for the live row, and the call. Without it a running
+                        // agy turn showed no count at all until it ended. Summed, the calls are the turn's own
+                        // total: in 24 real agy turns (2026-11-14) they matched the final result on a fresh
+                        // conversation, and what it added on a resumed one.
                         if let Some(usage) = step.get("usage") {
-                            let cached = u(usage, "cache_read_tokens").min(u(usage, "input_tokens"));
-                            self.total.add(Tokens { input: u(usage, "input_tokens") - cached, cache_read: cached,
-                                                    cache_write: 0, output: u(usage, "output_tokens") });
+                            self.total.add(agy_tokens(usage));
                             notes.push(Note::Call);
                             notes.push(Note::Live(self.total));
                         }
@@ -872,11 +879,7 @@ impl Parser {
                 self.completed += 1;
                 let r = e.get("result").unwrap_or(&NULL);
                 let usage = r.get("usage").unwrap_or(&NULL);
-                // Thinking is part of output_tokens (input + output = total_tokens); cache reads are taken to be part
-                // of input_tokens, as Gemini counts them.
-                let cached = u(usage, "cache_read_tokens").min(u(usage, "input_tokens"));
-                notes.push(Note::Tokens(Tokens { input: u(usage, "input_tokens") - cached, cache_read: cached,
-                                                 cache_write: 0, output: u(usage, "output_tokens") }));
+                notes.push(Note::Tokens(agy_tokens(usage)));
                 self.reply = s(r, "response").to_string();
                 let denied: Vec<&str> = r.get("denied_actions").and_then(Value::as_array).into_iter().flatten()
                     .map(|d| s(d, "action")).collect();
@@ -1367,7 +1370,7 @@ mod tests {
     #[test]
     fn codex_tells_its_thread_usage_live() {
         // `thread/tokenUsage/updated` carries the thread's total so far, told live: before, a running codex turn
-        // showed no count until turn/completed (measured 2026-11-14: real jobs to 14.9M tokens, one making 255
+        // showed no count until turn/completed (measured 2026-11-14: real jobs to 14.8M tokens, one making 255
         // model calls that re-read ~176k cached tokens each with 3 compactions).
         let events = [
             r#"{"method":"thread/started","params":{"threadId":"t-1"}}"#,
@@ -1387,20 +1390,22 @@ mod tests {
     #[test]
     fn agy_reports_its_model_calls_live() {
         // A model call's own count arrives per step (`step_update` usage): summed as the turn goes, it is what the
-        // live row shows while a turn runs — which for agy was nothing at all before (measured 2026-11-14: a real
-        // turn ran 498 steps to 2.2M tokens showing no count until it ended).
+        // live row shows while a turn runs — which for agy was nothing at all before. Cache reads come on top of
+        // the input (a real call: 3,665 input, 125,311 cache reads), and the result's total is the calls' sum.
         let events = [
             r#"{"event":"init","conversation_id":"c","init":{"cwd":"/w"}}"#,
             r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":150000,"cache_read_tokens":0,"output_tokens":10}}}"#,
-            r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":100000,"cache_read_tokens":20000,"output_tokens":10}}}"#,
-            r#"{"event":"result","result":{"status":"SUCCESS","response":"done","usage":{"input_tokens":250000,"cache_read_tokens":20000,"output_tokens":20,"total_tokens":250020}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":3665,"cache_read_tokens":125311,"output_tokens":10}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"done","usage":{"input_tokens":153665,"cache_read_tokens":125311,"output_tokens":20,"total_tokens":153685}}}"#,
         ];
         let (p, notes) = run(Style::Agy, &events);
         assert_eq!(p.finish(), Ok(()));
         let live: Vec<Tokens> = notes.iter().filter_map(|n| match n { Note::Live(t) => Some(*t), _ => None }).collect();
         assert_eq!(live, [Tokens { input: 150_000, cache_read: 0, cache_write: 0, output: 10 },
-                          Tokens { input: 230_000, cache_read: 20_000, cache_write: 0, output: 20 }],
-                   "each model call's count, summed as the turn goes (a call's input includes its cached reads)");
+                          Tokens { input: 153_665, cache_read: 125_311, cache_write: 0, output: 20 }],
+                   "each model call's count, summed as the turn goes, its cache reads on top of its input");
+        assert!(notes.contains(&Note::Tokens(Tokens { input: 153_665, cache_read: 125_311, cache_write: 0, output: 20 })),
+                "the result counts the cache reads too, not only as much of them as the input");
         assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2, "a call a step");
     }
 

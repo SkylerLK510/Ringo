@@ -33,10 +33,11 @@ const STEP_CHARS: usize = 160;
 pub const KEPT: &str = "resume.json";
 /// Where an agent's conversation compacts itself mid-turn, in tokens: Claude's and Codex's (see `launch_agent`).
 const COMPACT_AT: u64 = 200_000;
-/// A running turn is warned in its log each time its own reports pass another `LIVE_WARN_AT` tokens, about where
-/// Claude's and Codex's compaction sits: agy never compacts its conversation (measured 2026-11-14: a real turn ran
-/// 498 steps to 2.2M tokens with no count shown at all until it ended), so past this line a turn only ever reads
-/// more. `/kill N` stops it; the owner decides (measured culture: no turn is stopped behind the owner's back).
+/// A running turn is warned in its log when its tokens so far pass `LIVE_WARN_AT`, then at each doubling (400k, 800k,
+/// …), with `/kill N` named: the owner decides (no turn is stopped behind the owner's back). Doubling, not every
+/// 200k: a turn's sum is mostly cache reads (each model call re-reads the conversation; 95% of the shell's ledger)
+/// and half of all real jobs pass 200k (the median Claude job, 391k, does), so a warning each 200k would have said
+/// 1,975 things over 292 real jobs, 97 in one; doubling says 480, at most 7 in a job (ledger replay, 2026-11-14).
 const LIVE_WARN_AT: u64 = 200_000;
 
 /// How Ringo talks to an agent's program. The protocols are code; which agents use them, and how each one is
@@ -458,7 +459,7 @@ pub struct Job {
     pub tokens: Tokens,
     /// What the running turn has used so far by its own messages' counts, until its final count is in `tokens`.
     pub live: Tokens,
-    /// The highest `LIVE_WARN_AT` line the turn's reports have passed (the warnings in `log` say each next one).
+    /// The last warning line the turn's tokens so far passed (`LIVE_WARN_AT`, doubled each time); 0 before the first.
     warned: u64,
     pub calls: u32,
     pub subs: Vec<Sub>,
@@ -2739,18 +2740,23 @@ impl Session {
                                 }
                                 _ => t,
                             };
-                            // A turn whose own reports pass another LIVE_WARN_AT line is warned in its log, with
-                            // /kill named: the owner decides whether it is wandering (measured culture). agy's
-                            // reports are the only view a running turn of its had at all (2026-11-14's 2.2M turn
-                            // showed no tokens until it ended, 18 hours later).
-                            if job.live.total() >= job.warned + LIVE_WARN_AT {
-                                job.warned = job.live.total() / LIVE_WARN_AT * LIVE_WARN_AT;
+                            // The turn's tokens so far (final counts plus live ones: a line the owner sends while
+                            // it works ends in a final count of its own, and the live count starts again from 0)
+                            // past the next line: a warning in its log, with /kill named.
+                            let so_far = job.tokens_so_far();
+                            let next = if job.warned == 0 { LIVE_WARN_AT } else { job.warned * 2 };
+                            if so_far >= next {
+                                let mut line = next;
+                                while so_far >= line * 2 {
+                                    line *= 2;
+                                }
+                                job.warned = line;
                                 let who = match job.kind {
                                     Kind::Agent { agent, .. } => agent.name(),
                                     Kind::Ringo { .. } => "ringo",
                                 };
-                                job.push_log(format!("⚠ {} has read {} tokens so far and goes on (Claude and Codex compact their conversation about here, {}; agy never does). /kill {} stops it if it is wandering.",
-                                                     who, fmt_k(job.live.total()), fmt_k(COMPACT_AT), job.id));
+                                job.push_log(format!("⚠ {who}'s turn has used {} tokens so far and goes on. /kill {} stops it if it is wandering; the next warning is at {}.",
+                                                     fmt_k(so_far), job.id, fmt_k(line * 2)));
                             }
                         }
                         Note::Context(n) => {

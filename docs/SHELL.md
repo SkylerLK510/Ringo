@@ -734,20 +734,23 @@ unrelated task, or `/separate`. (`--bare` would cut more, but it signs in with a
 use it.)
 
 agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
-sandbox. Its startup event lists them, and no setting Ringo can pass removes them. Nor does agy compact its
-conversation mid-turn, where Claude's and Codex's do (at the 200,000-token window set above; measured 2026-11-14:
-one agy turn in a home folder ran 498 steps and 11 model calls for 18 hours to 2.2M tokens, and two sibling turns
-burned 527k each before failing).
+sandbox. Its startup event lists them, and no setting Ringo can pass removes them. Nor does Ringo set where agy
+compacts its conversation: in 24 real agy turns (2026-11-14) its calls grew past the 200,000 tokens where Claude's
+and Codex's compact (the largest read 256k), and fell back sharply only once (256k to 15k, within one turn).
 
 Whatever the agent, a running turn's own count is told as it goes and warned about: each model call's usage is
-read as it lands (Claude per message, Codex per thread update, agy per step — codex's and agy's were unparsed
-before, so a running turn showed no count at all until it ended), and the job's log is warned each time the
-total passes another 200,000: `/kill N` stops it if it is wandering — the shell never stops a turn behind the
-owner's back. The warning is worth heeding, because compaction bounds each call's window, not the turn's sum:
-every call re-reads the conversation, so a long turn's total is many windows deep. The shell's own ledger
-(`/usage`), measured 2026-11-14: 406M tokens over 286 jobs, 95% of it cache reads — Claude 263M across 151 jobs
-(worst 19.5M), Codex 143M across 85 (worst 14.9M: one turn of 255 model calls re-reading ~176k cached tokens
-each, compacting 3 times), agy 4.4M (worst 2.2M, the never-compacting turn above).
+read as it lands (Claude per message, Codex per thread update, agy per step — Codex's and agy's were unparsed
+before, so a running turn showed no count at all until it ended), and the job's log is warned when the turn's total
+passes 200,000 and again at each doubling (400k, 800k, …), with `/kill N`, which stops it if it is wandering — the
+shell never stops a turn behind the owner's back. Not a warning each 200,000: compaction bounds each call's window,
+not the turn's sum, and every call re-reads the conversation, so a turn's total is mostly cache reads and many
+windows deep, and half of all real jobs pass 200,000 (the median Claude job, 391k). Replayed over the shell's own
+ledger (`/usage`), a warning each 200,000 would have said 1,975 things over 292 jobs, 97 in one; doubling says 480,
+at most 7 in a job. The ledger, measured 2026-11-14: 418M tokens over 292 jobs, 96% of it cache reads — Claude
+264M across 152 jobs (worst 19.5M), Codex 149M across 88 (worst 14.8M: one turn of 255 model calls re-reading
+~176k cached tokens each, compacting 3 times). agy's 24 rows say 4.4M, but they kept only as many of a turn's cache
+reads as its input: agy reports cache reads on top of its input, not inside it, which the shell now counts. Its
+turns' own events add up to 69.5M, 94% cache reads, the worst turn 10.7M.
 
 The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
 memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
