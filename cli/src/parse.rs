@@ -507,8 +507,14 @@ impl Parser {
                 notes.push(activity(format!("plan {finished}/{} done", plan.len())));
             }
             // The thread's usage so far; a resumed thread's counts its earlier turns too, as `codex exec` did.
+            // Told live as well: before, a running codex turn showed no count at all (its total only came at
+            // turn/completed), so a turn reading past the compaction line was invisible while it grew — measured
+            // 2026-11-14: real codex jobs reached 14.9M tokens, one making 255 model calls that re-read ~176k
+            // cached tokens each, compacting only 3 times (the shell knows, 263M tokens for claude and 143M for
+            // codex, 95% of it cache reads).
             ("thread/tokenUsage/updated", _) => {
                 self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                notes.push(Note::Live(self.thread_tokens()));
                 if let Some(last) = p.pointer("/tokenUsage/last") { // the latest call alone; its input counts the cached part
                     notes.push(Note::Context(u(last, "inputTokens") + u(last, "outputTokens")));
                 }
@@ -541,10 +547,15 @@ impl Parser {
     /// The Codex thread's usage so far, as the turn's count (the runner takes off what earlier turns had used).
     fn codex_tokens(&mut self) -> Note {
         self.counted = true;
+        Note::Tokens(self.thread_tokens())
+    }
+
+    /// The Codex thread's usage total, as Tokens (a resumed thread's carries its earlier turns).
+    fn thread_tokens(&self) -> Tokens {
         let usage = &self.usage;
         let cached = u(usage, "cachedInputTokens").min(u(usage, "inputTokens"));
-        Note::Tokens(Tokens { input: u(usage, "inputTokens") - cached, cache_read: cached,
-                              cache_write: u(usage, "cacheWriteInputTokens"), output: u(usage, "outputTokens") })
+        Tokens { input: u(usage, "inputTokens") - cached, cache_read: cached,
+                 cache_write: u(usage, "cacheWriteInputTokens"), output: u(usage, "outputTokens") }
     }
 
     /// What the stream left unsaid when it ended: a Codex turn that failed or was stopped before turn/completed still
@@ -1351,6 +1362,26 @@ mod tests {
         assert!(notes.iter().any(|n| matches!(n, Note::Step(l) if l.contains("run_command refused"))));
         assert!(notes.contains(&Note::Reply("Fixed calc.py.".into())), "the reply is in the conversation");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
+    }
+
+    #[test]
+    fn codex_tells_its_thread_usage_live() {
+        // `thread/tokenUsage/updated` carries the thread's total so far, told live: before, a running codex turn
+        // showed no count until turn/completed (measured 2026-11-14: real jobs to 14.9M tokens, one making 255
+        // model calls that re-read ~176k cached tokens each with 3 compactions).
+        let events = [
+            r#"{"method":"thread/started","params":{"threadId":"t-1"}}"#,
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","tokenUsage":{"total":{"inputTokens":150000,"cachedInputTokens":100000,"cacheWriteInputTokens":0,"outputTokens":500}}}}"#,
+            r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","tokenUsage":{"total":{"inputTokens":280000,"cachedInputTokens":200000,"cacheWriteInputTokens":0,"outputTokens":1000}}}}"#,
+            r#"{"method":"item/completed","params":{"threadId":"t-1","item":{"type":"agentMessage","text":"done"}}}"#,
+            r#"{"method":"turn/completed","params":{"threadId":"t-1","turn":{"status":"completed"}}}"#,
+        ];
+        let (p, notes) = run(Style::Codex, &events);
+        assert_eq!(p.finish(), Ok(()));
+        let live: Vec<Tokens> = notes.iter().filter_map(|n| match n { Note::Live(t) => Some(*t), _ => None }).collect();
+        assert_eq!(live, [Tokens { input: 50_000, cache_read: 100_000, cache_write: 0, output: 500 },
+                          Tokens { input: 80_000, cache_read: 200_000, cache_write: 0, output: 1_000 }],
+                   "the thread's total as each update lands (the shell takes a resumed thread's earlier turns off)");
     }
 
     #[test]

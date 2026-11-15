@@ -765,6 +765,77 @@ fn an_agy_turn_reading_past_the_compaction_line_is_warned_in_its_log() {
     assert!(!s.job(id).unwrap().log.iter().any(|l| l.contains("tokens so far")), "{:?}", s.job(id).unwrap().log);
 }
 
+/// A codex turn whose thread usage passes the compaction line (200k, where its own compaction window sits) is
+/// warned in its log, with /kill named — a running codex turn showed no count at all before (its total only came
+/// at turn/completed), and the shell's ledger says why that mattered: worst codex job 14.9M tokens, one turn of
+/// 255 model calls re-reading ~176k cached tokens each with 3 compactions. Each next line passed warns once more;
+/// below the line, nothing.
+#[test]
+fn a_codex_turn_reading_past_the_compaction_line_is_warned_in_its_log() {
+    let r = repo("codex-warn");
+    let upd = |input: u64, cached: u64, out: u64| format!(r#"echo '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"t-1","tokenUsage":{{"total":{{"inputTokens":{input},"cachedInputTokens":{cached},"outputTokens":{out}}}}}}}}}'"#);
+    let events = format!("{}\n{}\n{}\n{}\n{}",
+        upd(150_000, 100_000, 500),
+        upd(280_000, 200_000, 1_000),
+        upd(460_000, 400_000, 2_000),
+        r#"echo '{"method":"item/completed","params":{"threadId":"t-1","item":{"type":"agentMessage","text":"done"}}}'"#,
+        r#"echo '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"status":"completed"}}}'"#);
+    let codex = fake(&root(), "codex-warn", &codex_script("", &events));
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let job = s.job(id).unwrap();
+    assert_eq!(job.tokens.total(), 462_000, "the final count is the thread's total, the turn's own here");
+    let warns: Vec<&String> = job.log.iter().filter(|l| l.contains("tokens so far")).collect();
+    assert_eq!(warns.len(), 2, "one at 281.0k, one at 462.0k: {:?}", job.log);
+    assert!(warns[0].contains("codex") && warns[0].contains("281.0k") && warns[0].contains("/kill 1"), "{}", warns[0]);
+    assert!(warns[1].contains("462.0k"), "{}", warns[1]);
+    // a turn whose usage stays below the line is not warned
+    let codex = fake(&root(), "codex-quiet", &codex_script("", &codex_done("done", (150_000, 100_000, 500))));
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert!(!s.job(id).unwrap().log.iter().any(|l| l.contains("tokens so far")), "{:?}", s.job(id).unwrap().log);
+}
+
+/// A claude turn whose own messages pass the compaction line (200k, where its own compaction window sits) is
+/// warned in its log, with /kill named — claude's calls each re-read the conversation, so a long turn's sum is
+/// many windows deep (worst claude job 19.5M tokens). Each next line passed warns once more; below the line,
+/// nothing.
+#[test]
+fn a_claude_turn_reading_past_the_compaction_line_is_warned_in_its_log() {
+    let r = repo("claude-warn");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\nhead -n 1 > \"$0.stdin\"\n";
+    let msg = |id: &str, input: u64, cached: u64| format!(r#"echo '{{"type":"assistant","message":{{"id":"{id}","content":[{{"type":"text","text":"working"}}],"usage":{{"input_tokens":{input},"cache_read_input_tokens":{cached},"output_tokens":10}}}}}}'"#);
+    let script = format!("#!/bin/sh\n{RECORD}{}\n{}\n{}\n{}\n",
+        r#"echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'"#,
+        msg("a1", 150_000, 100_000),
+        msg("a2", 150_000, 250_000),
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":300000,"cache_read_input_tokens":350000,"output_tokens":20}}'"#);
+    let claude = fake(&root(), "claude-warn", &script);
+    let mut s = session(&r, agent("codex"), &claude);
+    s.programs.insert(agent("claude"), claude.clone());
+    let id = s.launch_agent(agent("claude"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let job = s.job(id).unwrap();
+    assert_eq!(job.tokens.total(), 650_020, "the final count is the turn's own");
+    let warns: Vec<&String> = job.log.iter().filter(|l| l.contains("tokens so far")).collect();
+    assert_eq!(warns.len(), 2, "one at 250.0k, one at 650.0k: {:?}", job.log);
+    assert!(warns[0].contains("claude") && warns[0].contains("250.0k") && warns[0].contains("/kill 1"), "{}", warns[0]);
+    assert!(warns[1].contains("650.0k"), "{}", warns[1]);
+    // a turn whose messages stay below the line is not warned
+    let quiet = format!("#!/bin/sh\n{RECORD}{}\n{}\n{}\n",
+        r#"echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'"#,
+        msg("a1", 100_000, 50_000),
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":100000,"cache_read_input_tokens":50000,"output_tokens":10}}'"#);
+    let claude = fake(&root(), "claude-quiet", &quiet);
+    let mut s = session(&r, agent("codex"), &claude);
+    s.programs.insert(agent("claude"), claude.clone());
+    let id = s.launch_agent(agent("claude"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert!(!s.job(id).unwrap().log.iter().any(|l| l.contains("tokens so far")), "{:?}", s.job(id).unwrap().log);
+}
+
 /// An agent the owner adds: kept in agents.json beside the set-up list, run with its own command line (the prompt
 /// on stdin when the line has no {prompt}), write turns only.
 #[test]

@@ -737,10 +737,17 @@ agy's floor is its own: it declares 60 tools, about 20 of them for the browser, 
 sandbox. Its startup event lists them, and no setting Ringo can pass removes them. Nor does agy compact its
 conversation mid-turn, where Claude's and Codex's do (at the 200,000-token window set above; measured 2026-11-14:
 one agy turn in a home folder ran 498 steps and 11 model calls for 18 hours to 2.2M tokens, and two sibling turns
-burned 527k each before failing). Its `step_update` events do carry each model call's own count, so the shell
-shows a running turn's tokens as it goes (before, an agy turn showed no count at all until it ended), and warns
-in the job's log each time they pass another 200,000: `/kill N` stops it if it is wandering — the shell never
-stops a turn behind the owner's back.
+burned 527k each before failing).
+
+Whatever the agent, a running turn's own count is told as it goes and warned about: each model call's usage is
+read as it lands (Claude per message, Codex per thread update, agy per step — codex's and agy's were unparsed
+before, so a running turn showed no count at all until it ended), and the job's log is warned each time the
+total passes another 200,000: `/kill N` stops it if it is wandering — the shell never stops a turn behind the
+owner's back. The warning is worth heeding, because compaction bounds each call's window, not the turn's sum:
+every call re-reads the conversation, so a long turn's total is many windows deep. The shell's own ledger
+(`/usage`), measured 2026-11-14: 406M tokens over 286 jobs, 95% of it cache reads — Claude 263M across 151 jobs
+(worst 19.5M), Codex 143M across 85 (worst 14.9M: one turn of 255 model calls re-reading ~176k cached tokens
+each, compacting 3 times), agy 4.4M (worst 2.2M, the never-compacting turn above).
 
 The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
 memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python

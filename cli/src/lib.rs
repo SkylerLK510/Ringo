@@ -2700,7 +2700,19 @@ impl Session {
                         }
                         Note::Live(t) => {
                             job.counted = true;
-                            job.live = t;
+                            // Codex's live total is its thread's so far (its updates carry the earlier turns of a
+                            // resumed conversation), so the turn's own is told the same way its final count is.
+                            // Claude's and agy's totals are each run's own already.
+                            job.live = match job.kind {
+                                Kind::Agent { agent, write: false }
+                                    if matches!(agent.spec().adapter, Adapter::Codex) =>
+                                {
+                                    let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
+                                    let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
+                                    t.since(before)
+                                }
+                                _ => t,
+                            };
                             // A turn whose own reports pass another LIVE_WARN_AT line is warned in its log, with
                             // /kill named: the owner decides whether it is wandering (measured culture). agy's
                             // reports are the only view a running turn of its had at all (2026-11-14's 2.2M turn
