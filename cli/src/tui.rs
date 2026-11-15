@@ -552,9 +552,10 @@ fn fmt_age(d: Duration) -> String {
     if s < 3600 { format!("{}:{:02}", s / 60, s % 60) } else { format!("{}h{:02}", s / 3600, s / 60 % 60) }
 }
 
-/// A line as rows of at most `width` columns: the widest prefix is taken, at the last space that fits when there is
-/// one (its spaces go), else mid-word. Count terminal columns, keeping a wide character together. A character
-/// wider than the whole row is kept alone rather than dropped.
+/// A line as rows of at most `width` columns: the widest prefix is taken, through the last space that fits when
+/// there is one, else mid-word. Preserve every character: these rows show permission commands, whose spaces
+/// may be part of a quoted value. Count terminal columns, keeping a wide character together. A character wider
+/// than the whole row is kept alone rather than dropped.
 fn wrap(line: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let chars: Vec<char> = line.chars().collect();
@@ -578,13 +579,13 @@ fn wrap(line: &str, width: usize) -> Vec<String> {
             break;
         }
         match space {
-            Some(i) if i > at => {
-                rows.push(chars[at..i].iter().collect::<String>().trim_end_matches(' ').to_string());
-                at = chars[i..].iter().position(|c| *c != ' ').map_or(i, |j| i + j);
+            Some(i) => {
+                rows.push(chars[at..=i].iter().collect());
+                at = i + 1;
             }
             _ => {
                 rows.push(chars[at..end].iter().collect());
-                at = chars[end..].iter().position(|c| *c != ' ').map_or(end, |j| end + j);
+                at = end;
             }
         }
     }
@@ -6268,6 +6269,20 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
     }
 
     #[test]
+    fn permission_wrapping_preserves_quoted_values_and_whitespace() {
+        let command = r"Bash printf '%s\n' 'one    two'";
+        assert_eq!(wrap(command, 25), vec![r"Bash printf '%s\n' 'one  ", "  two'"]);
+        for text in [command, "    ", "  leading and trailing   ", "Python print('one    two')", "漢 a\u{301}  字"] {
+            for width in 1..40 {
+                let rows = wrap(text, width);
+                assert_eq!(rows.concat(), text, "permission text changed at width {width}");
+                assert!(rows.iter().all(|row| row.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() <= width.max(2)),
+                        "permission row exceeds width {width}: {rows:?}");
+            }
+        }
+    }
+
+    #[test]
     fn formats() {
         assert_eq!(fmt_tokens(870), "870");
         assert_eq!(fmt_tokens(12_400), "12.4k");
@@ -6279,7 +6294,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert_eq!(fmt_tokens(1_250_000), "1.25M");
         assert_eq!(fmt_age(Duration::from_secs(75)), "1:15");
         assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"], "no space to break at: cut where the row is full");
-        assert_eq!(wrap("run cargo test now", 8), vec!["run", "cargo", "test now"], "break at the last space that fits");
+        assert_eq!(wrap("run cargo test now", 8), vec!["run ", "cargo ", "test now"], "break after the last space that fits");
         assert_eq!(wrap("a漢字b", 3), vec!["a漢", "字b"], "a wide character counts its two columns");
         assert_eq!(wrap("a\u{301}漢字b", 3), vec!["a\u{301}漢", "字b"], "combining marks stay with their base");
         assert_eq!(wrap("abc", 0), vec!["a", "b", "c"], "zero-width layouts still advance");
