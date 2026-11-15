@@ -1759,7 +1759,13 @@ impl Session {
         let (name, spec) = (agent.name(), agent.spec());
         // Validate before creating a job or taking a snapshot. A failed attachment starts no model call.
         let mut content = images::content(spec.adapter, prompt, prompt)?;
-        if !self.installed(agent) {
+        // With the trial broker the turn runs through this process (the client holds no provider program or
+        // credentials; see the Claude branch below), so the provider's own program need not be installed here.
+        #[cfg(feature = "turnrun")]
+        let brokered = self.trial_broker.is_some();
+        #[cfg(not(feature = "turnrun"))]
+        let brokered = false;
+        if !brokered && !self.installed(agent) {
             return Err(format!("{name} is not installed (no `{}` on PATH)", self.program(agent).display()));
         }
         if !spec.read && !write {

@@ -220,7 +220,8 @@ class PreparationTest(unittest.TestCase):
             report = live.run(self.work, '/missing/token', {}, 'controls')
         self.assertFalse(report['ready'])
         self.assertEqual(report['provider_calls'], 0)
-        self.assertEqual(len(report['blockers']), 5)
+        # fail-closed on every platform: Windows adds its own Unix-transport blocker to these
+        self.assertEqual(len(report['blockers']), 5 + (os.name != 'posix'))
         self.assertFalse((self.work / 'campaign').exists())
 
     def test_an_offline_campaign_cannot_supply_live_control_evidence(self):
@@ -232,6 +233,7 @@ class PreparationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'live manifest binding'):
                 live.run(self.work, '/unused/token', {}, 'search')
 
+    @unittest.skipUnless(os.name == 'posix', 'a ready preflight requires the Unix native transport')
     def test_preflight_accepts_only_exact_bound_phase_approval(self):
         live.prepare(self.config, self.work)
         _, manifest, config = live.frozen(self.work)
