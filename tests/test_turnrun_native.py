@@ -350,7 +350,7 @@ class CertificationFinalizationTest(unittest.TestCase):
 
                     def submission(output):
                         output.mkdir()
-                        (output / 'native-proof.txt').write_text('fixed-test-nonce\n')
+                        (output / 'native-proof.txt').write_bytes(b'fixed-test-nonce\n')
                         return output
 
                     worker.submission.side_effect = submission
