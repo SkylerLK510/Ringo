@@ -277,11 +277,14 @@ Every turn and pipeline is a numbered job.
 | `/` or `@` | a menu of commands or agents: Up and Down choose, PgUp/PgDn page, Tab or Enter completes; the input shows your position in the list. When scrolled up, page keys keep scrolling the conversation |
 | PgUp, PgDn | scroll the conversation (the mouse wheel does too); what you are reading then stays where it is while agents write, and the box counts the rows below |
 | Home, End | with nothing typed, the conversation's start and end |
-| drag | select text in the conversation and copy it |
+| drag | in the conversation, select and copy text; in the input, select text to edit or copy |
+| Shift-arrows, Shift-Home, Shift-End | select text in the input; add Ctrl/Alt to Left/Right to select by word |
+| Ctrl-Shift-A | select the whole input |
+| Ctrl-C, Ctrl-X with text selected | copy or cut the input selection; Delete/Backspace removes it, typing or pasting replaces it |
 | Ctrl-A, Ctrl-E | the start or end of the line; Ctrl-U and Ctrl-K cut to either |
 | Alt-Left, Alt-Right | a word back or on (also Alt-B, Alt-F); Ctrl-W cuts the word before |
 | Shift-Tab | change the mode |
-| Ctrl-C | clear a typed line (Up restores it); with the input empty, stop the turn; with nothing running, twice to quit |
+| Ctrl-C | copy selected input; otherwise clear a typed line (Up restores it); with the input empty, stop the turn; with nothing running, twice to quit |
 
 A paste keeps its lines and is not sent until you press Enter. Shift-Enter works where the terminal can report it
 (iTerm2, kitty, WezTerm, Ghostty); Ctrl-J works in terminals that cannot distinguish Shift-Enter, including Windows/WSL terminals.

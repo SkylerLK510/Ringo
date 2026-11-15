@@ -379,8 +379,15 @@ the conversation selects its text alone (never the input or the status line) and
 the system's own clipboard tool (`pbcopy`, `wl-copy`, `xclip`, `xsel`, `clip`) or, where there is none, such as a
 server over ssh, by asking the terminal (OSC 52). `/copy` copies the last answer. Below the conversation are the
 running jobs, the lines queued behind the current turn, a permission request or the input box, and a status line.
+In the input box, drag with the mouse or use Shift with the arrow keys, Home or End to select text. Ctrl-Shift-A
+selects the whole draft (Ctrl-A still moves to the line's start). Ctrl-C copies a selection and Ctrl-X cuts it;
+Backspace or Delete removes it, and typing or pasting replaces it. Esc dismisses a selection before clearing the
+draft. Shift with Ctrl/Alt-Left or Right selects by word. These keys work when the terminal forwards them.
+
 When you quit, the conversation is saved as `conversation.txt` in the session's state folder and the shell prints
-where. `ringo --resume` (`-r`) goes on with one of the folder's conversations after a quit, a crash or a closed
+where. A matching `conversation.json` retains speaker colors, Markdown and layout for `/restart` and `--resume`,
+so earlier replies reflow at the current terminal width. Older text-only conversations remain readable.
+`ringo --resume` (`-r`) goes on with one of the folder's conversations after a quit, a crash or a closed
 terminal: after every turn and at the end, the shell keeps what /restart hands on (each agent's conversation, the turns
 it has yet to hear, its size and Ringo's record, whether /separate is on, and which agent's last turn called a
 connector, so a follow-up keeps them) in `resume.json`, written whole and then renamed. The list shows the

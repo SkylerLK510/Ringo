@@ -675,8 +675,21 @@ struct Stream {
 /// The input as rows of at most `width` columns (a newline starts a row; a wide character takes two columns), and the
 /// cursor's (row, column).
 fn input_rows(input: &[char], cursor: usize, width: usize) -> (Vec<String>, (usize, usize)) {
+    let layout = input_layout(input, cursor, width);
+    (layout.rows, layout.at)
+}
+
+struct InputLayout {
+    rows: Vec<String>,
+    at: (usize, usize),
+    positions: Vec<(usize, usize)>,
+}
+
+/// Character boundaries in the same wrapped layout, for selecting Unicode text with the keyboard or mouse.
+fn input_layout(input: &[char], cursor: usize, width: usize) -> InputLayout {
     let width = width.max(2);
     let (mut rows, mut col, mut at) = (vec![String::new()], 0, (0, 0));
+    let mut positions = Vec::with_capacity(input.len() + 1);
     for (i, &c) in input.iter().enumerate() {
         let w = if c == '\n' { 0 } else { c.width().unwrap_or(0) };
         if col + w > width {
@@ -686,6 +699,7 @@ fn input_rows(input: &[char], cursor: usize, width: usize) -> (Vec<String>, (usi
         if i == cursor {
             at = (rows.len() - 1, col);
         }
+        positions.push((rows.len() - 1, col));
         if c == '\n' {
             rows.push(String::new());
             col = 0;
@@ -701,7 +715,8 @@ fn input_rows(input: &[char], cursor: usize, width: usize) -> (Vec<String>, (usi
         }
         at = (rows.len() - 1, col);
     }
-    (rows, at)
+    positions.push((rows.len() - 1, col));
+    InputLayout { rows, at, positions }
 }
 
 /// Where the word before `at` starts (Ctrl-W, Alt-B), and where the one after it ends (Alt-D, Alt-F): words are runs
@@ -1153,10 +1168,10 @@ fn close(terminal: &mut DefaultTerminal) {
 }
 
 /// A conversation entry. It is fitted to the screen's width when it shows (and again when the width changes).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum Out {
     /// A line; a row past the width continues this many columns in.
-    Line(Line<'static>, usize),
+    Line(#[serde(with = "saved_line")] Line<'static>, usize),
     /// An agent's reply, as markdown, two columns in.
     Reply(String),
     /// A step an agent took, on one row under its job; an edit's changed lines follow it, one row each.
@@ -1166,6 +1181,22 @@ enum Out {
     /// A labelled gauge, four columns in: `label` (padded to `pad`), ▰ cells for `percent` of the row's room, then
     /// `value` and `note`. Its cells take `fill`, else the colour of how much is used (see `used_style`).
     Meter { label: String, pad: usize, percent: f64, value: String, note: String, fill: Option<Style> },
+}
+
+/// Ratatui serializes styles; lines restore owned text.
+mod saved_line {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    pub fn serialize<S: serde::Serializer>(line: &Line<'_>, serializer: S) -> Result<S::Ok, S::Error> {
+        let spans: Vec<_> = line.spans.iter().map(|s| (s.content.as_ref(), s.style)).collect();
+        (line.style, line.alignment, spans).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Line<'static>, D::Error> {
+        let (style, alignment, spans) = <(Style, Option<ratatui::layout::Alignment>, Vec<(String, Style)>)>::deserialize(deserializer)?;
+        Ok(Line { style, alignment, spans: spans.into_iter().map(|(text, style)| Span::styled(text, style)).collect() })
+    }
 }
 
 impl Out {
@@ -1424,6 +1455,12 @@ struct App {
     s: Session,
     input: Vec<char>,
     cursor: usize,
+    /// Selection anchor (the other end is the cursor), and the last drawn input's mouse geometry.
+    input_anchor: Option<usize>,
+    input_dragging: bool,
+    input_view: Rect,
+    input_top: usize,
+    input_mark_w: usize,
     history: Vec<String>,
     hist: usize,
     /// The unfinished line and cursor while browsing history, and the last line cleared with Esc or Ctrl-C.
@@ -1582,7 +1619,8 @@ fn mascot(state: &str) -> Vec<Vec<&'static str>> {
 
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
-        App { s, input: Vec::new(), cursor: 0, hist: history.len(), history, draft: None, cleared: None, out: Vec::new(), fitted: Vec::new(),
+        App { s, input: Vec::new(), cursor: 0, input_anchor: None, input_dragging: false, input_view: Rect::default(),
+              input_top: 0, input_mark_w: 0, hist: history.len(), history, draft: None, cleared: None, out: Vec::new(), fitted: Vec::new(),
               fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, menu_off: false, menu_page: 6, choice: 0, ended: Vec::new(),
@@ -2768,6 +2806,7 @@ impl App {
     }
 
     fn submit(&mut self) {
+        self.input_anchor = None;
         let line: String = self.input.iter().collect();
         self.input.clear();
         self.cursor = 0;
@@ -3146,6 +3185,7 @@ impl App {
 
     /// Ctrl-W, Alt-Backspace: the word before the cursor goes, with the spaces after it.
     fn cut_word_back(&mut self) {
+        if self.delete_input_selection() { return; }
         let start = word_start(&self.input, self.cursor);
         self.input.drain(start..self.cursor);
         self.cursor = start;
@@ -3153,6 +3193,7 @@ impl App {
 
     /// The word before the cursor becomes a menu entry.
     fn complete(&mut self, with: &str) {
+        self.input_anchor = None;
         let start = self.input[..self.cursor].iter().rposition(|c| matches!(c, ' ' | '\n')).map_or(0, |i| i + 1);
         let chars: Vec<char> = with.chars().collect();
         let n = chars.len();
@@ -3163,6 +3204,7 @@ impl App {
     }
 
     fn insert(&mut self, text: &str) {
+        self.delete_input_selection();
         self.menu_off = false;
         let chars: Vec<char> = text.chars().collect();
         let n = chars.len();
@@ -3191,6 +3233,7 @@ impl App {
     }
 
     fn recall(&mut self) {
+        self.input_anchor = None;
         self.menu_off = false;
         if self.hist == self.history.len() {
             (self.input, self.cursor) = self.draft.take().unwrap_or_default();
@@ -3201,6 +3244,7 @@ impl App {
     }
 
     fn clear_input(&mut self) {
+        self.input_anchor = None;
         let visible = (std::mem::take(&mut self.input), self.cursor);
         // A recalled message is already safe in history. Recover the unsent draft it temporarily replaced.
         self.cleared = Some(if self.hist < self.history.len() {
@@ -3211,6 +3255,36 @@ impl App {
         self.draft = None;
         self.menu_off = false;
         self.note("cleared · Up restores your line");
+    }
+
+    fn input_selection(&self) -> Option<std::ops::Range<usize>> {
+        let anchor = self.input_anchor?.min(self.input.len());
+        (anchor != self.cursor).then_some(anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    fn selected_input(&self) -> String {
+        self.input_selection().map(|r| self.input[r].iter().collect()).unwrap_or_default()
+    }
+
+    fn delete_input_selection(&mut self) -> bool {
+        let range = self.input_selection();
+        self.input_anchor = None;
+        if let Some(range) = range {
+            self.cursor = range.start;
+            self.input.drain(range);
+            true
+        } else { false }
+    }
+
+    /// A mouse column names a character boundary, never a UTF-8 byte or half a wide character.
+    fn input_at(&self, column: u16, row: u16) -> usize {
+        if self.input_view.height == 0 { return self.cursor; }
+        let layout = input_layout(&self.input, self.cursor,
+            (self.input_view.width as usize).saturating_sub(self.input_mark_w));
+        let row = row.clamp(self.input_view.y, self.input_view.bottom().saturating_sub(1));
+        let spot = (self.input_top + row.saturating_sub(self.input_view.y) as usize,
+                    column.saturating_sub(self.input_view.x).saturating_sub(self.input_mark_w as u16) as usize);
+        layout.positions.iter().rposition(|p| *p <= spot).unwrap_or(0)
     }
 
     /// The answers a permission request offers, in order: once, for the session (unless an always-ask rule covers
@@ -3289,6 +3363,54 @@ impl App {
         if ctrl && alt && let KeyCode::Char(c) = k.code {
             self.insert(c.encode_utf8(&mut [0; 4]));
             return;
+        }
+        // Selection keys precede completion/history, so Shift-Up never recalls a different draft.
+        if shift && matches!(k.code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End) {
+            self.input_anchor.get_or_insert(self.cursor);
+            self.cursor = match k.code {
+                KeyCode::Left if ctrl || alt => word_start(&self.input, self.cursor),
+                KeyCode::Right if ctrl || alt => word_end(&self.input, self.cursor),
+                KeyCode::Left => self.cursor.saturating_sub(1),
+                KeyCode::Right => (self.cursor + 1).min(self.input.len()),
+                KeyCode::Home if ctrl => 0,
+                KeyCode::End if ctrl => self.input.len(),
+                KeyCode::Home => line_bounds(&self.input, self.cursor).0,
+                KeyCode::End => line_bounds(&self.input, self.cursor).1,
+                KeyCode::Up => vertical(&self.input, self.cursor, true).unwrap_or(0),
+                KeyCode::Down => vertical(&self.input, self.cursor, false).unwrap_or(self.input.len()),
+                _ => self.cursor,
+            };
+            return;
+        }
+        if ctrl && matches!(k.code, KeyCode::Char('c' | 'x')) && self.input_selection().is_some() {
+            let text = self.selected_input();
+            let copied = copy(&text);
+            if k.code == KeyCode::Char('x') { self.delete_input_selection(); }
+            self.note(if copied { "copied selected text" } else { "asked the terminal to copy selected text" });
+            return;
+        }
+        if ctrl && shift && matches!(k.code, KeyCode::Char('a' | 'A')) {
+            self.input_anchor = Some(0);
+            self.cursor = self.input.len();
+            return;
+        }
+        if k.code == KeyCode::Esc && self.input_selection().is_some() {
+            self.input_anchor = None;
+            return;
+        }
+        if matches!(k.code, KeyCode::Backspace | KeyCode::Delete) && self.delete_input_selection() {
+            return;
+        }
+        if self.input_selection().is_some() && matches!(k.code, KeyCode::Left | KeyCode::Right) && !(ctrl || alt) {
+            let range = self.input_selection().expect("selected input");
+            self.cursor = if k.code == KeyCode::Left { range.start } else { range.end };
+            self.input_anchor = None;
+            return;
+        }
+        if matches!(k.code, KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::Esc)
+            || ctrl && matches!(k.code, KeyCode::Char('a' | 'e' | 'u' | 'k'))
+            || alt && matches!(k.code, KeyCode::Char('b' | 'f' | 'd')) {
+            self.input_anchor = None;
         }
         if matches!(k.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
             self.menu_off = false;
@@ -3452,6 +3574,28 @@ impl App {
     /// The wheel scrolls the conversation; a drag over it selects its text and copies it when the button comes up.
     /// The selection's ends are kept as places in entries, so they stay on their text while an agent writes above.
     fn mouse(&mut self, m: MouseEvent) -> bool {
+        let inside_input = self.input_view.contains((m.column, m.row).into());
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) if inside_input => {
+                self.cursor = self.input_at(m.column, m.row);
+                self.input_anchor = Some(self.cursor);
+                self.input_dragging = true;
+                self.sel = None;
+                self.dragging = false;
+                return true;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.input_dragging => {
+                self.cursor = self.input_at(m.column, m.row);
+                return true;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.input_dragging => {
+                self.cursor = self.input_at(m.column, m.row);
+                self.input_dragging = false;
+                return true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => self.input_anchor = None,
+            _ => {}
+        }
         let v = self.view;
         let row = m.row.clamp(v.y, (v.y + v.height).saturating_sub(1));
         let (entry, at) = self.place(self.top + (row - v.y) as usize);
@@ -3807,6 +3951,9 @@ impl App {
             Constraint::Length(live.jobs.len() as u16 + live.queue.len() as u16), Constraint::Length(1),
             Constraint::Length(live.ask_h), Constraint::Length(live.input_h()),
             Constraint::Length(live.menu.len() as u16)]).areas(area);
+        self.input_view = input;
+        self.input_top = live.top;
+        self.input_mark_w = live.mark_w;
         // the head: the mark and the folder; the mode and the session's tokens at the right
         let (mode, tokens) = (self.s.mode.name(), fmt_tokens(self.s.tokens()));
         let tier = match self.s.tier { Tier::Standard => String::new(), t => format!("{} · ", t.name()) };
@@ -3879,6 +4026,7 @@ impl App {
                 // Scrolled away from live output, paging keeps moving through the conversation even with a picker.
                 _ if self.scroll > 0 => format!("scrolled up · {} rows below · {}", self.scroll,
                                                if self.input.is_empty() { "End goes back" } else { "PgDn scrolls" }),
+                _ if self.input_selection().is_some() => "Ctrl-C copy · Ctrl-X cut · Delete removes".into(),
                 _ if !entries.is_empty() => {
                     let position = format!("{}/{}", self.pick.min(entries.len() - 1) + 1, entries.len());
                     let word: String = self.input[..self.cursor].iter().rev().take_while(|c| !matches!(c, ' ' | '\n'))
@@ -3941,6 +4089,21 @@ impl App {
                 }
             }
             f.render_widget(Paragraph::new(rows), input);
+            if let Some(range) = self.input_selection() {
+                let layout = input_layout(&self.input, self.cursor, w.saturating_sub(live.mark_w));
+                for i in range {
+                    let (row, col) = layout.positions[i];
+                    if row < live.top || row >= live.top + live.shown.min(input.height as usize) { continue; }
+                    let x = input.x as usize + live.mark_w + col;
+                    let y = input.y + (row - live.top) as u16;
+                    let width = self.input[i].width().unwrap_or(0).max(1);
+                    for x in x..(x + width).min(input.right() as usize) {
+                        if let Some(cell) = f.buffer_mut().cell_mut((x as u16, y)) {
+                            cell.set_style(t.focus.add_modifier(Modifier::REVERSED));
+                        }
+                    }
+                }
+            }
             if (live.ask.is_none() || !self.input.is_empty()) && input.width > 0 && input.height > 0 {
                 f.set_cursor_position((input.x + (live.mark_w + live.at.1).min(input.width as usize - 1) as u16,
                                        input.y + (live.at.0 - live.top).min(input.height as usize - 1) as u16));
@@ -3994,13 +4157,54 @@ impl App {
 
     /// The conversation as plain text, saved in the session's folder when the shell ends.
     fn save(&self) -> Option<PathBuf> {
+        use sha2::{Digest, Sha256};
         // a reply still being written goes in whole: what the screen keeps back for now (see `steady`) was received
         let whole: std::collections::HashMap<usize, Out> = self.streams.values()
             .map(|s| (s.at, Out::Reply(closed(clean(&s.raw))))).collect();
-        let text: Vec<String> = self.out.iter().enumerate().flat_map(|(i, o)| whole.get(&i).unwrap_or(o).rows(100, &self.theme))
+        let entries: Vec<&Out> = self.out.iter().enumerate().map(|(i, o)| whole.get(&i).unwrap_or(o)).collect();
+        let text: Vec<String> = entries.iter().flat_map(|o| o.rows(100, &self.theme))
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect();
+        let text = text.join("\n") + "\n";
         let path = self.s.dir.join("conversation.txt");
-        std::fs::write(&path, text.join("\n") + "\n").ok().map(|_| path)
+        // Keep the readable export for older versions. The sidecar retains Markdown and layout, and is bound to
+        // that exact export so a crash between the two writes cannot restore a stale display.
+        std::fs::write(&path, &text).ok()?;
+        let snapshot = serde_json::json!({"version": 1, "text_sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
+                                          "entries": entries});
+        let part = path.with_extension("json.part");
+        let saved = std::fs::write(&part, snapshot.to_string()).and_then(|_| std::fs::rename(&part, path.with_extension("json")));
+        if saved.is_err() {
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(path.with_extension("json"));
+        }
+        Some(path)
+    }
+
+    /// Restore structured entries when available; old conversations remain readable as plain text.
+    fn restore_conversation(&mut self, path: &Path) {
+        use sha2::{Digest, Sha256};
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        let snapshot = std::fs::read(path.with_extension("json")).ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let entries = snapshot.filter(|s| s["version"] == 1
+            && s["text_sha256"].as_str() == Some(&format!("{:x}", Sha256::digest(text.as_bytes()))))
+            .and_then(|s| serde_json::from_value::<Vec<Out>>(s["entries"].clone()).ok());
+        self.out = entries.unwrap_or_else(|| text.lines().map(Out::text).collect());
+        if self.theme.name == "mono" {
+            let plain = |s: &mut Style| { s.fg = None; s.bg = None; s.underline_color = None; };
+            for entry in &mut self.out {
+                match entry {
+                    Out::Line(line, _) => {
+                        plain(&mut line.style);
+                        line.spans.iter_mut().for_each(|s| plain(&mut s.style));
+                    }
+                    Out::Meter { fill: Some(style), .. } => plain(style),
+                    _ => {}
+                }
+            }
+        }
+        self.fitted.clear();
+        self.spoke = !self.out.is_empty();
     }
 }
 
@@ -4098,8 +4302,9 @@ pub fn run(start: Start) -> ExitCode {
     }
     match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
-            let text = before["conversation"].as_str().and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-            text.lines().for_each(|line| app.out.push(Out::text(line)));
+            if let Some(path) = before["conversation"].as_str() {
+                app.restore_conversation(Path::new(path));
+            }
             let commit = &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)];
             match resume.as_ref().is_some_and(|(_, picked)| *picked) {
                 true => app.say("  the conversation goes on from where it was kept"),
@@ -4535,6 +4740,144 @@ mod tests {
         let b = terminal.backend().buffer();
         b.content.chunks(b.area.width as usize)
             .map(|r| r.iter().map(|c| c.symbol()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn a_restarted_conversation_keeps_colours_markdown_and_reflows() {
+        let mut a = app(&["codex", "claude"]);
+        a.theme = Theme::named("siamese", crate::theme::Depth::TrueColor).unwrap();
+        a.echo("Keep my earlier message readable, including 漢字 and a long line that must wrap in a narrow terminal.");
+        a.out.push(Out::Line(Line::from(vec![Span::styled(" claude ", a.theme.claude.add_modifier(Modifier::REVERSED)),
+                                            Span::styled(" #1", a.theme.dim)]), 0));
+        a.reply("**Ready.** Keep `code` and [the link](https://example.com).\n\n| Task | State |\n|---|---|\n| restart | fixed |\n\n- One long list item that wraps when the terminal narrows.");
+        a.out.push(Out::Step("Edit main.rs · +1 −1\n- old\n+ new".into()));
+        a.out.push(Out::Looked([2, 1, 0]));
+        a.out.push(Out::Meter { label: "tokens".into(), pad: 8, percent: 25.0, value: "25%".into(),
+                                note: "used".into(), fill: Some(a.theme.ok) });
+        let path = a.save().unwrap();
+        let mut next = app(&["codex", "claude"]);
+        next.theme = a.theme;
+        next.restore_conversation(&path);
+        assert!(next.spoke, "a resumed conversation does not show the new-conversation splash");
+        for width in [30, 80, 140] {
+            let rows = |app: &App| app.out.iter().flat_map(|o| o.rows(width, &app.theme)).collect::<Vec<_>>();
+            assert_eq!(rows(&a), rows(&next), "text, colour, emphasis and layout at {width} columns");
+        }
+        next.reply("A reply after restart stays **formatted** too.");
+        let again_path = next.save().unwrap();
+        let mut again = app(&["codex", "claude"]);
+        again.theme = a.theme;
+        again.restore_conversation(&again_path);
+        assert!(matches!(&again.out[3], Out::Reply(s) if s.contains("**Ready.**")));
+        assert_eq!(serde_json::to_value(&next.out).unwrap(), serde_json::to_value(&again.out).unwrap());
+        // NO_COLOR/mono remains authoritative over saved line colours.
+        again.theme = Theme::mono();
+        again.restore_conversation(&again_path);
+        for line in again.out.iter().flat_map(|o| o.rows(80, &again.theme)) {
+            assert!(line.style.fg.is_none() && line.style.bg.is_none());
+            assert!(line.spans.iter().all(|s| s.style.fg.is_none() && s.style.bg.is_none()));
+        }
+    }
+
+    #[test]
+    fn old_or_interrupted_display_saves_fall_back_to_readable_text() {
+        let mut a = app(&["codex"]);
+        a.echo("original");
+        let path = a.save().unwrap();
+        std::fs::write(&path, "legacy conversation\n  a second line\n").unwrap();
+        a.restore_conversation(&path);
+        assert_eq!(plain(&a.out.iter().flat_map(|o| o.rows(80, &a.theme)).collect::<Vec<_>>()),
+                   ["legacy conversation", "  a second line"]);
+        std::fs::write(path.with_extension("json"), "partial JSON").unwrap();
+        a.restore_conversation(&path);
+        assert_eq!(a.out.len(), 2);
+        std::fs::remove_file(path.with_extension("json")).unwrap();
+        a.restore_conversation(&path);
+        assert_eq!(a.out.len(), 2, "pre-fix conversations need no sidecar");
+    }
+
+    #[test]
+    fn input_selection_edits_unicode_and_multiline_text_without_sending_it() {
+        let mut a = app(&["claude"]);
+        a.insert("one 漢字\nthree");
+        let shifted = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        a.key(shifted(KeyCode::Home));
+        assert_eq!(a.selected_input(), "three");
+        a.insert("four");
+        assert_eq!(a.input.iter().collect::<String>(), "one 漢字\nfour");
+        a.key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL | KeyModifiers::SHIFT));
+        assert_eq!(a.selected_input(), "one 漢字\nfour");
+        a.key(KeyEvent::from(KeyCode::Delete));
+        assert!(a.input.is_empty());
+        assert_eq!(a.cursor, 0);
+        a.paste("a漢🙂b");
+        a.key(shifted(KeyCode::Left));
+        a.key(shifted(KeyCode::Left));
+        assert_eq!(a.selected_input(), "🙂b");
+        a.key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(a.input.iter().collect::<String>(), "a漢");
+        a.key(shifted(KeyCode::Left));
+        a.key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(a.cursor, 1, "Left collapses the selection at its start");
+        assert!(a.input_selection().is_none());
+        assert!(a.s.jobs.is_empty());
+    }
+
+    #[test]
+    fn dragging_in_the_input_selects_the_wrapped_text_and_highlights_it() {
+        let mut a = app(&["claude"]);
+        a.insert("a漢🙂b\nsecond line with enough words to wrap around the narrow terminal");
+        screen(&mut a, 32, 16);
+        // Keep the start of the input visible while selecting across a newline.
+        a.cursor = 0;
+        screen(&mut a, 32, 16);
+        let x = a.input_view.x + a.input_mark_w as u16;
+        let y = a.input_view.y;
+        let mouse = |kind, column, row| MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE };
+        a.mouse(mouse(MouseEventKind::Down(MouseButton::Left), x + 1, y));
+        a.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), x + 3, y + 1));
+        a.mouse(mouse(MouseEventKind::Up(MouseButton::Left), x + 3, y + 1));
+        assert_eq!(a.selected_input(), "漢🙂b\nsec");
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(32, 16)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        assert!(terminal.backend().buffer()[(x + 1, y)].modifier.contains(Modifier::REVERSED));
+        a.paste("replacement");
+        assert_eq!(a.input.iter().collect::<String>(), "areplacementond line with enough words to wrap around the narrow terminal");
+        a.cursor = a.input.len();
+        screen(&mut a, 32, 16);
+        assert_eq!(a.input_at(u16::MAX, a.input_view.bottom() - 1), a.input.len());
+    }
+
+    /// Actual rendered cells, using synthetic conversation text and no running provider or shell.
+    #[test]
+    #[ignore]
+    fn export_restart_and_selection_previews() {
+        let dir = PathBuf::from(std::env::var_os("RINGO_TUI_PREVIEW_DIR").expect("set a private preview directory"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app(&["codex", "claude"]);
+        a.theme = Theme::named("siamese", crate::theme::Depth::TrueColor).unwrap();
+        a.echo("Keep the conversation easy to read after restart.");
+        a.out.push(Out::Line(Line::from(Span::styled(" claude  #1", a.theme.claude.add_modifier(Modifier::REVERSED))), 0));
+        a.reply("**Restart keeps the formatting.**\n\n- Speaker colors and `inline code` survive.\n- Long replies reflow when the terminal width changes.\n\n| Check | Result |\n|---|---|\n| Earlier conversation | Preserved |\n| New replies | Styled normally |");
+        a.out.push(Out::Step("Edit main.rs · +1 −1\n- plain history\n+ styled history".into()));
+        a.spoke = true;
+        let saved = a.save().unwrap();
+        for name in ["before-restart", "after-restart", "input-selection"] {
+            if name == "after-restart" { a.restore_conversation(&saved); }
+            if name == "input-selection" {
+                a.insert("Please copy or replace just this part of my draft.");
+                a.input_anchor = Some(7);
+                a.cursor = 39;
+            }
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 28)).unwrap();
+            terminal.draw(|f| a.draw(f)).unwrap();
+            let cells: Vec<_> = terminal.backend().buffer().content.iter().map(|c| serde_json::json!({
+                "text": c.symbol(), "fg": format!("{:?}", c.fg), "bg": format!("{:?}", c.bg),
+                "bold": c.modifier.contains(Modifier::BOLD), "reverse": c.modifier.contains(Modifier::REVERSED),
+                "dim": c.modifier.contains(Modifier::DIM)
+            })).collect();
+            std::fs::write(dir.join(format!("{name}.json")), serde_json::json!({"width":100,"height":28,"cells":cells}).to_string()).unwrap();
+        }
     }
 
     #[test]
