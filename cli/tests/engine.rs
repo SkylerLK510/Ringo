@@ -1,7 +1,7 @@
 //! The conductor against fake agents in throwaway git repositories (Unix: the fakes are shell scripts).
 #![cfg(unix)]
 
-use ringo_cli::{kept, Agent, Decision, Kept, Mode, Session, Status};
+use ringo_cli::{kept, parse::Tokens, Agent, Decision, Kept, Mode, Session, Status};
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -725,6 +725,115 @@ fn agy_turns_and_their_permissions() {
     let next = s.launch_agent(agent("agy"), false, "and now?").unwrap();
     assert_eq!(wait(&mut s, next), Status::Done);
     assert_eq!(s.job(next).unwrap().tokens.total(), 9, "36 so far, 27 at the last report");
+}
+
+/// An agy turn whose own reports pass 200k tokens is warned in its log, with /kill named — a running agy turn
+/// showed no count at all before, its total only coming when it ended. Each doubling passed warns once more (400k,
+/// 800k, …), not each 200k; below 200k, nothing.
+#[test]
+fn an_agy_turn_past_200k_tokens_is_warned_in_its_log_at_each_doubling() {
+    let r = repo("agy-warn");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
+    let step = |i: usize, input: u64| {
+        format!(r#"echo '{{"event":"step_update","step_update":{{"conversation_id":"c-1","step_index":{i},"state":"DONE","step_type":"agent_response","usage":{{"input_tokens":{input},"output_tokens":10}}}}}}'"#)
+    };
+    let script = format!(
+        "#!/bin/sh\n{RECORD}{}\n{}\n{}\n{}\n{}\n{}\n",
+        r#"echo '{"event":"init","conversation_id":"c-1","init":{"cwd":"x"}}'"#,
+        step(1, 150_000), step(2, 100_000), step(3, 200_000), step(4, 150_000),
+        r#"echo '{"event":"result","result":{"status":"SUCCESS","response":"done","usage":{"input_tokens":600000,"output_tokens":40}}}'"#);
+    let agy = fake(&root(), "agy-warn", &script);
+    let mut s = session(&r, agent("agy"), &agy);
+    let id = s.launch_agent(agent("agy"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let job = s.job(id).unwrap();
+    assert_eq!(job.tokens.total(), 600_040, "the final count is the turn's own");
+    let warns: Vec<&String> = job.log.iter().filter(|l| l.contains("tokens so far")).collect();
+    assert_eq!(warns.len(), 2, "one at 250k, one at 450k, none at 600k (the next is at 800k): {:?}", job.log);
+    assert!(warns[0].contains("agy") && warns[0].contains("250.0k") && warns[0].contains("/kill")
+            && warns[0].contains("next warning is at 400.0k"), "{}", warns[0]);
+    assert!(warns[1].contains("450.0k") && warns[1].contains("next warning is at 800.0k"), "{}", warns[1]);
+    // a turn whose reports stay below the line is not warned
+    let quiet = format!(
+        "#!/bin/sh\n{RECORD}{}\n{}\n",
+        r#"echo '{"event":"init","conversation_id":"c-1","init":{"cwd":"x"}}'"#,
+        r#"echo '{"event":"result","result":{"status":"SUCCESS","response":"done","usage":{"input_tokens":150000,"output_tokens":10}}}'"#);
+    let agy = fake(&root(), "agy-quiet", &quiet);
+    let mut s = session(&r, agent("agy"), &agy);
+    let id = s.launch_agent(agent("agy"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert!(!s.job(id).unwrap().log.iter().any(|l| l.contains("tokens so far")), "{:?}", s.job(id).unwrap().log);
+}
+
+/// A codex turn whose thread usage passes 200k tokens is warned in its log, with /kill named — a running codex turn
+/// showed no count at all before (its total only came at turn/completed), and the shell's ledger says why that
+/// mattered: worst codex job 14.8M tokens, one turn of 255 model calls re-reading ~176k cached tokens each with 3
+/// compactions. Each doubling passed warns once more, not each 200k; below 200k, nothing.
+#[test]
+fn a_codex_turn_past_200k_tokens_is_warned_in_its_log_at_each_doubling() {
+    let r = repo("codex-warn");
+    let upd = |input: u64, cached: u64, out: u64| format!(r#"echo '{{"method":"thread/tokenUsage/updated","params":{{"threadId":"t-1","tokenUsage":{{"total":{{"inputTokens":{input},"cachedInputTokens":{cached},"outputTokens":{out}}}}}}}}}'"#);
+    let events = format!("{}\n{}\n{}\n{}\n{}\n{}",
+        upd(150_000, 100_000, 500),
+        upd(280_000, 200_000, 1_000),
+        upd(460_000, 400_000, 2_000),
+        upd(700_000, 650_000, 3_000),
+        r#"echo '{"method":"item/completed","params":{"threadId":"t-1","item":{"type":"agentMessage","text":"done"}}}'"#,
+        r#"echo '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"status":"completed"}}}'"#);
+    let codex = fake(&root(), "codex-warn", &codex_script("", &events));
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let job = s.job(id).unwrap();
+    assert_eq!(job.tokens.total(), 703_000, "the final count is the thread's total, the turn's own here");
+    let warns: Vec<&String> = job.log.iter().filter(|l| l.contains("tokens so far")).collect();
+    assert_eq!(warns.len(), 2, "one at 281.0k, one at 462.0k, none at 703.0k: {:?}", job.log);
+    assert!(warns[0].contains("codex") && warns[0].contains("281.0k") && warns[0].contains("/kill 1"), "{}", warns[0]);
+    assert!(warns[1].contains("462.0k"), "{}", warns[1]);
+    // a turn whose usage stays below the line is not warned
+    let codex = fake(&root(), "codex-quiet", &codex_script("", &codex_done("done", (150_000, 100_000, 500))));
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert!(!s.job(id).unwrap().log.iter().any(|l| l.contains("tokens so far")), "{:?}", s.job(id).unwrap().log);
+}
+
+/// A claude turn whose own messages pass 200k tokens is warned in its log, with /kill named — claude's calls each
+/// re-read the conversation, so a long turn's sum is many windows deep (worst claude job 19.5M tokens). Each
+/// doubling passed warns once more, not each 200k; below 200k, nothing.
+#[test]
+fn a_claude_turn_past_200k_tokens_is_warned_in_its_log_at_each_doubling() {
+    let r = repo("claude-warn");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\nhead -n 1 > \"$0.stdin\"\n";
+    let msg = |id: &str, input: u64, cached: u64| format!(r#"echo '{{"type":"assistant","message":{{"id":"{id}","content":[{{"type":"text","text":"working"}}],"usage":{{"input_tokens":{input},"cache_read_input_tokens":{cached},"output_tokens":10}}}}}}'"#);
+    let script = format!("#!/bin/sh\n{RECORD}{}\n{}\n{}\n{}\n{}\n",
+        r#"echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'"#,
+        msg("a1", 150_000, 100_000),
+        msg("a2", 150_000, 250_000),
+        msg("a3", 50_000, 50_000),
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":350000,"cache_read_input_tokens":400000,"output_tokens":30}}'"#);
+    let claude = fake(&root(), "claude-warn", &script);
+    let mut s = session(&r, agent("codex"), &claude);
+    s.programs.insert(agent("claude"), claude.clone());
+    let id = s.launch_agent(agent("claude"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let job = s.job(id).unwrap();
+    assert_eq!(job.tokens.total(), 750_030, "the final count is the turn's own");
+    let warns: Vec<&String> = job.log.iter().filter(|l| l.contains("tokens so far")).collect();
+    assert_eq!(warns.len(), 2, "one at 250.0k, one at 650.0k, none at 750.0k: {:?}", job.log);
+    assert!(warns[0].contains("claude") && warns[0].contains("250.0k") && warns[0].contains("/kill 1"), "{}", warns[0]);
+    assert!(warns[1].contains("650.0k"), "{}", warns[1]);
+    // a turn whose messages stay below the line is not warned
+    let quiet = format!("#!/bin/sh\n{RECORD}{}\n{}\n{}\n",
+        r#"echo '{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}'"#,
+        msg("a1", 100_000, 50_000),
+        r#"echo '{"type":"result","subtype":"success","is_error":false,"result":"done","usage":{"input_tokens":100000,"cache_read_input_tokens":50000,"output_tokens":10}}'"#);
+    let claude = fake(&root(), "claude-quiet", &quiet);
+    let mut s = session(&r, agent("codex"), &claude);
+    s.programs.insert(agent("claude"), claude.clone());
+    let id = s.launch_agent(agent("claude"), false, "go").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    assert!(!s.job(id).unwrap().log.iter().any(|l| l.contains("tokens so far")), "{:?}", s.job(id).unwrap().log);
 }
 
 /// An agent the owner adds: kept in agents.json beside the set-up list, run with its own command line (the prompt
@@ -1700,6 +1809,48 @@ fn a_conversation_that_goes_on_after_a_restart_counts_only_what_each_turn_added(
     next.forget();
     let cleared = next.keep(None).unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(cleared).unwrap()).unwrap()["usage"], serde_json::json!([]));
+}
+
+/// An agy conversation kept by a shell from before agy's cache reads were counted in full (it took them as part of
+/// the input, so its kept total holds no more of them than the input) goes on here counting only what each turn
+/// added: the turn's model calls, summed. Taking the old total off the conversation's new one would count all of its
+/// earlier cache reads in the first turn again.
+#[test]
+fn an_agy_conversation_kept_before_cache_reads_were_counted_counts_only_its_turn() {
+    let r = repo("agy-old-total");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
+    let event = |usage: &str, result: &str| format!(
+        "echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
+         echo '{{\"event\":\"step_update\",\"step_update\":{{\"conversation_id\":\"c-1\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"usage\":{usage}}}}}'\n\
+         echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{result}}}}}'");
+    // the first turn: one call, 5,000 cache reads on 100 input; the second, resumed: one call of its own, and the
+    // conversation's total so far
+    let first = event(r#"{"input_tokens":100,"cache_read_tokens":5000,"output_tokens":10}"#,
+                      r#"{"input_tokens":100,"cache_read_tokens":5000,"output_tokens":10}"#);
+    let second = event(r#"{"input_tokens":50,"cache_read_tokens":6000,"output_tokens":5}"#,
+                       r#"{"input_tokens":150,"cache_read_tokens":11000,"output_tokens":15}"#);
+    let script = format!("#!/bin/sh\n{RECORD}case \"$*\" in *--conversation*)\n{second}\n;; *)\n{first}\n;; esac\n");
+    let agy = fake(&root(), "agy-old-total", &script);
+    let mut s = session(&r, agent("agy"), &agy);
+    let one = s.launch_agent(agent("agy"), false, "what is a.txt?").unwrap();
+    assert_eq!(wait(&mut s, one), Status::Done);
+    assert_eq!(s.job(one).unwrap().tokens.total(), 5_110);
+    let kept = s.keep(None).unwrap();
+    drop(s);
+    // as the older shell kept it: the 5,000 cache reads cut to the 100 input, and taken out of it
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&kept).unwrap()).unwrap();
+    assert_eq!(file["usage"], serde_json::json!([["agy", "c-1", [100, 0, 5000, 10]]]));
+    file["usage"] = serde_json::json!([["agy", "c-1", [0, 0, 100, 10]]]);
+    fs::write(&kept, file.to_string()).unwrap();
+    let mut next = session(&r, agent("agy"), &agy);
+    next.go_on(&kept).unwrap();
+    let two = next.launch_agent(agent("agy"), false, "and then?").unwrap();
+    assert_eq!(wait(&mut next, two), Status::Done);
+    assert_eq!(next.job(two).unwrap().tokens, Tokens { input: 50, cache_read: 6_000, cache_write: 0, output: 5 },
+               "the turn's own call, not the first turn's 4,900 cache reads again");
+    // the conversation's total kept from here on is its new one
+    let file: serde_json::Value = serde_json::from_slice(&fs::read(next.keep(None).unwrap()).unwrap()).unwrap();
+    assert_eq!(file["usage"], serde_json::json!([["agy", "c-1", [150, 0, 11000, 15]]]));
 }
 
 #[test]

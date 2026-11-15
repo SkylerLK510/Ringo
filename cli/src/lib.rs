@@ -33,6 +33,12 @@ const STEP_CHARS: usize = 160;
 pub const KEPT: &str = "resume.json";
 /// Where an agent's conversation compacts itself mid-turn, in tokens: Claude's and Codex's (see `launch_agent`).
 const COMPACT_AT: u64 = 200_000;
+/// A running turn is warned in its log when its tokens so far pass `LIVE_WARN_AT`, then at each doubling (400k, 800k,
+/// …), with `/kill N` named: the owner decides (no turn is stopped behind the owner's back). Doubling, not every
+/// 200k: a turn's sum is mostly cache reads (each model call re-reads the conversation; 95% of the shell's ledger)
+/// and half of all real jobs pass 200k (the median Claude job, 391k, does), so a warning each 200k would have said
+/// 1,975 things over 292 real jobs, 97 in one; doubling says 480, at most 7 in a job (ledger replay, 2026-11-14).
+const LIVE_WARN_AT: u64 = 200_000;
 
 /// How Ringo talks to an agent's program. The protocols are code; which agents use them, and how each one is
 /// installed, signed in and updated, is data: agents.json in the binary, plus the owner's own entries.
@@ -453,6 +459,8 @@ pub struct Job {
     pub tokens: Tokens,
     /// What the running turn has used so far by its own messages' counts, until its final count is in `tokens`.
     pub live: Tokens,
+    /// The last warning line the turn's tokens so far passed (`LIVE_WARN_AT`, doubled each time); 0 before the first.
+    warned: u64,
     pub calls: u32,
     pub subs: Vec<Sub>,
     pub log: VecDeque<String>,
@@ -1709,7 +1717,7 @@ impl Session {
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(), tier: self.tier,
-                             elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0,
+                             elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0, warned: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
@@ -2697,7 +2705,17 @@ impl Session {
                                     if t.total() >= before.total() {
                                         self.usage_so_far.insert(key, t);
                                     }
-                                    t.since(before)
+                                    // agy tells each model call's own count as it goes (`Live`), and an agy turn
+                                    // takes no line while it works, so one result ends it: the calls summed are the
+                                    // turn's own, whatever total was kept. A total kept before agy's cache reads were
+                                    // counted in full (2026-11-14) holds too few of them, and taking it off would
+                                    // count the conversation's earlier cache reads in this turn again. A turn whose
+                                    // calls told no count is still counted by what its total added.
+                                    if matches!(agent.spec().adapter, Adapter::Agy) && job.live.total() > 0 {
+                                        job.live
+                                    } else {
+                                        t.since(before)
+                                    }
                                 }
                                 // a job with a conversation of its own (a write job) can still report its total
                                 // more than once: a line the owner sent while it worked ends in a result of its own
@@ -2719,7 +2737,37 @@ impl Session {
                         }
                         Note::Live(t) => {
                             job.counted = true;
-                            job.live = t;
+                            // Codex's live total is its thread's so far (its updates carry the earlier turns of a
+                            // resumed conversation), so the turn's own is told the same way its final count is.
+                            // Claude's and agy's totals are each run's own already.
+                            job.live = match job.kind {
+                                Kind::Agent { agent, write: false }
+                                    if matches!(agent.spec().adapter, Adapter::Codex) =>
+                                {
+                                    let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
+                                    let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
+                                    t.since(before)
+                                }
+                                _ => t,
+                            };
+                            // The turn's tokens so far (final counts plus live ones: a line the owner sends while
+                            // it works ends in a final count of its own, and the live count starts again from 0)
+                            // past the next line: a warning in its log, with /kill named.
+                            let so_far = job.tokens_so_far();
+                            let next = if job.warned == 0 { LIVE_WARN_AT } else { job.warned * 2 };
+                            if so_far >= next {
+                                let mut line = next;
+                                while so_far >= line * 2 {
+                                    line *= 2;
+                                }
+                                job.warned = line;
+                                let who = match job.kind {
+                                    Kind::Agent { agent, .. } => agent.name(),
+                                    Kind::Ringo { .. } => "ringo",
+                                };
+                                job.push_log(format!("⚠ {who}'s turn has used {} tokens so far and goes on. /kill {} stops it if it is wandering; the next warning is at {}.",
+                                                     fmt_k(so_far), job.id, fmt_k(line * 2)));
+                            }
                         }
                         Note::Context(n) => {
                             if let Kind::Agent { agent, write: false } = job.kind {
