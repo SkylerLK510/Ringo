@@ -62,8 +62,8 @@ def tree_hash(folder):
 
 
 def scenario(value):
-    if not isinstance(value, dict) or set(value) - {'agent', 'actions', 'seconds'} or value.get('agent') != 'claude':
-        raise ValueError('live scenarios require the pinned Claude Session profile')
+    if not isinstance(value, dict) or set(value) - {'agent', 'actions', 'seconds'} or value.get('agent') not in ('claude', 'codex'):
+        raise ValueError('live scenarios require a pinned Claude or Codex Session profile')
     actions = value.get('actions')
     if not isinstance(actions, list) or not 1 <= len(actions) <= 64:
         raise ValueError('a scenario requires 1 through 64 actions')
@@ -78,6 +78,8 @@ def scenario(value):
                   'restart': {'op'}, 'start_over': {'op'}, 'seed': {'op', 'threads', 'records'}}.get(op)
         if fields is None or set(action) != fields:
             raise ValueError('unknown scenario action or fields')
+        if op == 'compact' and value['agent'] != 'claude':
+            raise ValueError('compact requires the Claude Session profile')
         if op == 'turn' and (not isinstance(action['message'], str) or len(action['message'].encode()) > 65536):
             raise ValueError('invalid scenario message')
         if op == 'seed':
@@ -85,7 +87,7 @@ def scenario(value):
                 if not isinstance(action[key], list) or len(action[key]) > 64:
                     raise ValueError('invalid scenario seed')
                 for row in action[key]:
-                    if not isinstance(row, list) or len(row) != width or row[0] != 'claude':
+                    if not isinstance(row, list) or len(row) != width or row[0] != value['agent']:
                         raise ValueError('invalid scenario seed row')
                     if width == 2 and row[1] != '$current':
                         raise ValueError('invalid seed thread')
@@ -106,7 +108,10 @@ class SessionTransport:
     and a previously observed native session ID. It cannot select models, tools, caps,
     filesystem paths or Docker arguments. Durable accounting precedes the response.
     """
-    def __init__(self, path, invoke, *, cap, seconds, attempts, ledger):
+    def __init__(self, path, invoke, *, cap, seconds, attempts, ledger, agent='claude'):
+        if agent not in ('claude', 'codex'):
+            raise ValueError('unsupported Session transport agent')
+        self.agent = agent
         if not hasattr(socket, 'AF_UNIX'):
             raise ValueError('the Session broker transport requires Unix')
         if type(cap) is not int or not 1 <= cap <= 10000000 or type(attempts) is not int or not 1 <= attempts <= 64:
@@ -173,8 +178,12 @@ class SessionTransport:
         ledger_append(self.ledger, {'kind': 'finish', 'key': key, 'result': result, 'tokens': tokens})
         if result.get('outcome') != 'done' or tokens is None or tokens > remaining:
             raise ValueError('native usage or delivery gate failed')
-        initial = [e for e in events if e.get('type') == 'system' and e.get('subtype') == 'init']
-        sid = initial[0].get('session_id') if len(initial) == 1 else None
+        if self.agent == 'codex':
+            from turnrun_codex import session_id
+            sid = session_id(events)
+        else:
+            initial = [e for e in events if e.get('type') == 'system' and e.get('subtype') == 'init']
+            sid = initial[0].get('session_id') if len(initial) == 1 else None
         if not isinstance(sid, str) or not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', sid) or resume is not None and sid != resume:
             raise ValueError('native continuation differs from Session request')
         self.sessions.add(sid)
@@ -211,7 +220,11 @@ class SessionTransport:
                         ledger_append(self.ledger, {'kind': 'halt', 'reason': 'Session transport halted'})
                         # No raw provider or credential text is sent on error.
                         try:
-                            connection.sendall(b'{"type":"result","subtype":"error_broker","is_error":true,"result":"Isolated broker halted; private accounting retained."}\n')
+                            failure = ({'method': 'error', 'params': {'error': {'message':
+                                'Isolated broker halted; private accounting retained.'}, 'willRetry': False}}
+                                if self.agent == 'codex' else {'type': 'result', 'subtype': 'error_broker',
+                                'is_error': True, 'result': 'Isolated broker halted; private accounting retained.'})
+                            connection.sendall(json.dumps(failure).encode()+b'\n')
                         except OSError:
                             pass
                         break
@@ -228,8 +241,18 @@ class SessionTransport:
             raise ValueError('native Session transport did not stop')
 
 
-def source_pins():
-    return {name: sha256_file(ROOT / name) for name in SOURCES}
+def source_pins(config=None):
+    names = SOURCES
+    if config is not None and config.get('profile') == 'codex-luna-low':
+        names += ('turnrun_codex.py', 'turnrun_codex_bridge.py')
+    return {name: sha256_file(ROOT / name) for name in names}
+
+
+def profile(config):
+    if config.get('profile') == 'codex-luna-low':
+        from turnrun_codex import CodexBroker, PROCESS_SOURCES
+        return 'codex', CodexBroker, set(PROCESS_SOURCES)
+    return 'claude', NativeBroker, {'turnrun_native.py', 'turnrun_native_bridge.py', 'turnrun_broker.py', 'turnrun_isolation.py'}
 
 
 def input_pins(config):
@@ -242,8 +265,12 @@ def input_pins(config):
 
 def validate_config(config):
     fields = {'version', 'plan', 'image', 'worker_image', 'model', 'binary', 'tasks'}
-    if not isinstance(config, dict) or set(config) != fields or config['version'] != 1:
+    if isinstance(config, dict) and config.get('version') == 2:
+        fields.add('profile')
+    if not isinstance(config, dict) or set(config) != fields or config['version'] not in (1, 2):
         raise ValueError('live configuration differs from schema version 1')
+    if config['version'] == 2 and config['profile'] != 'codex-luna-low':
+        raise ValueError('unknown pinned live profile')
     config = copy.deepcopy(config)
     config['plan'] = validate_plan(config['plan'])
     if not admission_schedule(config['plan'])['full_schedule_fits']:
@@ -251,7 +278,12 @@ def validate_config(config):
     for key in ('image', 'worker_image'):
         if not isinstance(config[key], str) or not IMAGE.fullmatch(config[key]):
             raise ValueError('pin immutable native and grading images')
-    if not isinstance(config['model'], str) or not re.fullmatch(r'claude-[a-zA-Z0-9._-]{1,120}', config['model']):
+    agent, _, _ = profile(config)
+    if agent == 'codex':
+        from turnrun_codex import MODEL
+        if config['model'] != MODEL:
+            raise ValueError('the Codex profile pins gpt-6-luna at low reasoning')
+    elif not isinstance(config['model'], str) or not re.fullmatch(r'claude-[a-zA-Z0-9._-]{1,120}', config['model']):
         raise ValueError('pin the full native model name')
     if not Path(config['binary']).is_absolute() or not Path(config['binary']).is_file():
         raise ValueError('pin an absolute scenario binary path')
@@ -263,6 +295,8 @@ def validate_config(config):
         for key in row:
             row[key] = str(outside_repo(row[key], 'private task input'))
         spec = scenario(read_json(row['scenario']))
+        if spec['agent'] != agent:
+            raise ValueError('scenario agent differs from the pinned profile')
         if spec.get('seconds', 60) > config['plan']['seconds']:
             raise ValueError('scenario wall limit exceeds the plan')
         if config['plan']['seconds'] > 300 or config['plan']['run_cap'] > 10000000:
@@ -276,7 +310,7 @@ def prepare(config, work):
     work = outside_repo(work, 'live campaign evidence')
     pins = input_pins(config)
     work.mkdir(parents=True, exist_ok=False, mode=0o700)
-    manifest = {'version': 1, 'config': config, 'sources': source_pins(), 'inputs': pins}
+    manifest = {'version': 1, 'config': config, 'sources': source_pins(config), 'inputs': pins}
     write_json(work / 'manifest.json', manifest)
     budget = live_schedule(config)
     write_json(work / 'budget.json', budget)
@@ -306,7 +340,7 @@ def frozen(work):
     work = outside_repo(work, 'live campaign evidence')
     manifest = read_json(work / 'manifest.json')
     config = validate_config(manifest['config'])
-    if manifest['sources'] != source_pins() or manifest['inputs'] != input_pins(config):
+    if manifest['sources'] != source_pins(config) or manifest['inputs'] != input_pins(config):
         raise ValueError('pinned live source, binary or private input changed')
     return work, manifest, config
 
@@ -367,10 +401,12 @@ def prerequisites(work, authorization, phase):
         blockers.append('fresh sealed panel, family separation and policy coverage need a recorded review')
     try:
         proof = read_json(work / 'process-proof.json')
+        _, _, expected_sources = profile(config)
         if (proof['process_profile_certified'] is not True or proof['image'] != config['image']
                 or proof['model'] != config['model'] or proof['worker_image'] != config['worker_image']
                 or proof['sources'] != {key: manifest['sources'][key] for key in proof['sources']}
-                or set(proof['sources']) != {'turnrun_native.py', 'turnrun_native_bridge.py', 'turnrun_broker.py', 'turnrun_isolation.py'}):
+                or set(proof['sources']) != expected_sources
+                or config.get('version') == 2 and proof.get('profile') != config['profile']):
             raise ValueError('proof differs from current profile')
     except (OSError, ValueError, KeyError, TypeError):
         blockers.append('a successful process proof pinned to the current profile is required')
@@ -423,6 +459,7 @@ class LiveAdapter:
     def _evaluate(self, selected, task, rep, cap, seconds):
         self.verify()
         config = self.config
+        agent, broker_class, _ = profile(config)
         selected = policy(selected)
         row = config['tasks'][task]
         spec = scenario(read_json(row['scenario']))
@@ -436,7 +473,7 @@ class LiveAdapter:
         with DockerSandbox(config['worker_image'], lifetime=seconds+120) as worker:
             worker.seed(row['fixture'])
             with WorkerEndpoint(worker, lifetime=seconds+60) as endpoint:
-                with NativeBroker(config['image'], lifetime=seconds+90) as broker:
+                with broker_class(config['image'], lifetime=seconds+90) as broker:
                     def invoke(prompt, resume, remaining, left, on_event):
                         endpoint.reconnect()
                         return broker.run(prompt=prompt, instruction='Use only the provided isolated worker tool.',
@@ -446,7 +483,7 @@ class LiveAdapter:
                     # macOS limits Unix socket names to 104 bytes, independent of work path.
                     with tempfile.TemporaryDirectory(prefix='rrsi-', dir='/tmp') as sockets:
                         with SessionTransport(Path(sockets) / 'broker.sock', invoke, cap=cap, seconds=seconds,
-                                              attempts=attempts, ledger=trial / 'native-ledger.jsonl') as transport:
+                                              attempts=attempts, ledger=trial / 'native-ledger.jsonl', agent=agent) as transport:
                             self._transport = transport
                             command = [config['binary'], '--project', str(trial), '--scenario', row['scenario'],
                                 '--policy', str(trial / 'policy.json'), '--broker-socket', str(transport.path),
@@ -499,6 +536,7 @@ class LiveAdapter:
     def propose(self, parent, history, round_no, sibling, cap):
         self.verify()
         config = self.config
+        _, broker_class, _ = profile(config)
         context = {'parent': policy(parent), 'development': projected_history(history),
                    'round': round_no, 'sibling': sibling, 'covered_fields': config['plan']['coverage']}
         prompt = ('Propose one restricted Ringo turn-policy improvement. Change exactly one covered field. '
@@ -512,7 +550,7 @@ class LiveAdapter:
         try:
             with DockerSandbox(config['worker_image'], lifetime=180) as worker:
                 with WorkerEndpoint(worker, lifetime=150) as endpoint:
-                    with NativeBroker(config['image'], lifetime=150) as broker:
+                    with broker_class(config['image'], lifetime=150) as broker:
                         try:
                             result = broker.run(prompt=prompt, instruction='Return the requested JSON policy proposal.',
                                 model=config['model'], token_file=self.token_file, endpoint=endpoint,

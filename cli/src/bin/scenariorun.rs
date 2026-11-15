@@ -22,8 +22,10 @@ fn broker_client(args: &[String]) -> Result<(), String> {
     std::io::stdin().lock().take(131_073).read_line(&mut line).map_err(|e| e.to_string())?;
     if line.len() > 131_072 || !line.ends_with('\n') { return Err("invalid broker prompt".into()) }
     let message: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
-    let prompt = message.pointer("/message/content").and_then(Value::as_str).ok_or("broker requires text")?;
-    let resume = args.get(3);
+    let codex = args[0] == "--codex-broker-client";
+    let prompt = message.pointer(if codex { "/prompt" } else { "/message/content" })
+        .and_then(Value::as_str).ok_or("broker requires text")?;
+    let resume = if codex { message["resume"].as_str() } else { args.get(3).map(String::as_str) };
     let mut socket = UnixStream::connect(&args[1]).map_err(|e| e.to_string())?;
     socket.set_read_timeout(Some(Duration::from_secs(360))).map_err(|e| e.to_string())?;
     writeln!(socket, "{}", json!({"prompt":prompt, "resume":resume})).map_err(|e| e.to_string())?;
@@ -90,7 +92,7 @@ fn run() -> Result<Value, String> {
         return Err("unknown scenario field".into());
     }
     let agent = spec["agent"].as_str().and_then(Agent::from_name).ok_or("unknown agent")?;
-    if broker.is_some() && agent.name() != "claude" { return Err("the broker profile supports Claude only".into()) }
+    if broker.is_some() && !["claude", "codex"].contains(&agent.name()) { return Err("unsupported broker agent".into()) }
     let seconds = spec.get("seconds").map_or(Some(60), Value::as_u64)
         .filter(|n| (1..=300).contains(n)).ok_or("seconds must be from 1 through 300")?;
     let actions = spec["actions"].as_array().filter(|a| !a.is_empty() && a.len() <= 64)
@@ -108,7 +110,7 @@ fn run() -> Result<Value, String> {
         if op == "turn" && !action["message"].is_string() { return Err("turn needs message text".into()) }
         if op == "seed" {
             let threads = serde_json::from_value::<Vec<(String, String)>>(action["threads"].clone()).map_err(|e| e.to_string())?;
-            if broker.is_some() && threads.iter().any(|(a, id)| a != "claude" || id != "$current") {
+            if broker.is_some() && threads.iter().any(|(a, id)| a != agent.name() || id != "$current") {
                 return Err("broker seeds must refer to the current native session".into());
             }
             serde_json::from_value::<Vec<(String, u64, String)>>(action["records"].clone()).map_err(|e| e.to_string())?;
@@ -224,7 +226,7 @@ fn main() -> ExitCode {
     #[cfg(unix)]
     {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.first().is_some_and(|s| s == "--broker-client") {
+        if args.first().is_some_and(|s| s == "--broker-client" || s == "--codex-broker-client") {
             return match broker_client(&args) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => { eprintln!("broker client: {e}"); ExitCode::from(2) }

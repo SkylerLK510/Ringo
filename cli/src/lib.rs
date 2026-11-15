@@ -1874,6 +1874,13 @@ impl Session {
         let (mut input, mut turn) = (Some(sent.clone()), None);
         let style = match spec.adapter {
             #[cfg(feature = "turnrun")]
+            Adapter::Codex if self.trial_broker.is_some() => {
+                cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+                cmd.arg("--codex-broker-client").arg(self.trial_broker.as_ref().unwrap());
+                input = Some(format!("{}\n", serde_json::json!({"prompt": sent, "resume": resume})));
+                Style::Codex
+            }
+            #[cfg(feature = "turnrun")]
             Adapter::Claude if self.trial_broker.is_some() => {
                 // Session still owns policy, handoff, continuation and event accounting. The
                 // client has no provider credentials or task filesystem access: it relays one

@@ -43,6 +43,29 @@ jobs:
         run: python -m unittest tests.test_turnrun_native -v
       - name: Build the trusted scenario runner
         run: cargo build --manifest-path cli/Cargo.toml --locked --features turnrun --bin scenariorun
+      - name: Build the pinned Codex subscription profile without inference
+        run: |
+          curl --fail --location --max-time 300 --output "$RUNNER_TEMP/codex.tar.gz" \
+            https://github.com/openai/codex/releases/download/rust-v0.169.0/codex-x86_64-unknown-linux-musl.tar.gz
+          curl --fail --location --max-time 60 --output "$RUNNER_TEMP/models.json" \
+            https://raw.githubusercontent.com/openai/codex/rust-v0.169.0/codex-rs/models-manager/models.json
+          python turnrun_codex_image.py --archive "$RUNNER_TEMP/codex.tar.gz" \
+            --archive-sha256 9af4d751fce183faedea629437d5252dbf458eeb04130cf4f97be844621ea985 \
+            --catalog "$RUNNER_TEMP/models.json" \
+            --catalog-sha256 1384625c0b6b3e67d3c60da29becea2b017f2c283fc1e2d05b8edafb4698eb10 \
+            --platform x86_64-unknown-linux-musl --base "$RINGO_TEST_IMAGE" \
+            --work "$RUNNER_TEMP/ringo-codex-image"
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          image = (Path(os.environ['RUNNER_TEMP']) / 'ringo-codex-image/image-id.txt').read_text().strip()
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('RINGO_CODEX_IMAGE=' + image + '\n')
+          PY
+      - name: Exercise Codex worker, resume, restart and native usage using local replay
+        run: python -m unittest tests.test_turnrun_codex -v
+        env:
+          RINGO_SCENARIO_BINARY: ${{ github.workspace }}/cli/target/debug/scenariorun
       - name: Exercise real Session and native continuation against local replay
         run: python -m unittest tests.test_turnrun_live -v
         env:

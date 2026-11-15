@@ -1,5 +1,8 @@
 # Native subscription process adapter
 
+The separate [Codex subscription profile](CODEX-RRSI-BROKER.md) supports
+`gpt-6-luna` controls with its own image, authentication and process proof.
+
 `turnrun_native.py` supplies the native process boundary missing from the offline
 campaign implementation. It is separate from the task worker and protected checker.
 The native CLI runs as UID 65532 in a disposable, pinned Docker image with a read-only
