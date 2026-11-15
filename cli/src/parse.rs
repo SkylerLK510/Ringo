@@ -164,11 +164,12 @@ fn s<'a>(v: &'a Value, key: &str) -> &'a str {
     v.get(key).and_then(Value::as_str).unwrap_or("")
 }
 
-/// A count as the shell says it: 950, 12.3k, 1.25M.
+/// A count as the shell says it: 950, 12.3k, 1.25M. A k count that would itself round to 1000.0k (999,950 and up)
+/// reads as M instead, so nothing just under a million shows as 1000.0k.
 pub fn fmt_tokens(n: u64) -> String {
     match n {
         0..1_000 => n.to_string(),
-        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        1_000..999_950 => format!("{:.1}k", n as f64 / 1e3),
         _ => format!("{:.2}M", n as f64 / 1e6),
     }
 }

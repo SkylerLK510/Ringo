@@ -15,7 +15,7 @@ const USAGE: &str = "\
 ringo: Ringo's shell and harness.
 
   ringo                     open the shell (on a terminal); type /help there
-  ringo --resume            go on with a conversation from this folder: after a quit, a crash or a closed terminal
+  ringo --resume | -r       go on with a conversation from this folder: after a quit, a crash or a closed terminal
   ringo setup               add a coding agent (codex, claude, agy, grok, or one you name) and sign in
   ringo review|design|work ...
                             run a Ringo pipeline natively: the same requests as python3 ringo.py ...
