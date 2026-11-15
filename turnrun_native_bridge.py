@@ -37,12 +37,19 @@ def environment(token, proxy):
             'MCP_CONNECTION_NONBLOCKING': '0', 'CLAUDE_CODE_MAX_OUTPUT_TOKENS': '4096'}
 
 
-def arguments(model, mcp, instruction, turns):
-    return [CLI, '--print', '--verbose', '--output-format', 'stream-json', '--model', model,
-            '--tools', '', '--disable-slash-commands', '--no-chrome', '--no-session-persistence',
+def arguments(model, mcp, instruction, turns, *, persistent=False, resume=None, compact=False):
+    args = [CLI, '--print', '--verbose', '--output-format', 'stream-json', '--model', model,
+            '--tools', '', '--no-chrome',
             '--setting-sources', '', '--settings', json.dumps(SETTINGS), '--strict-mcp-config',
             '--mcp-config', json.dumps(mcp), '--permission-mode', 'dontAsk',
             '--max-turns', str(turns), '--append-system-prompt', instruction]
+    if not compact:
+        args.append('--disable-slash-commands')
+    if not persistent:
+        args.append('--no-session-persistence')
+    if resume is not None:
+        args.extend(['--resume', resume])
+    return args
 
 
 class Bridge:
@@ -187,14 +194,20 @@ class Bridge:
         proxy_url = f'http://127.0.0.1:{proxy.server_port}'
         config = {'mcpServers': {'trial': {'type': 'http',
                   'url': f'http://127.0.0.1:{mcp.server_port}/mcp'}}}
+        persistent = request.get('persistent', False)
         for folder in ('home', 'config', 'empty'):
-            Path('/tmp/native', folder).mkdir(parents=True, exist_ok=False)
+            Path('/tmp/native', folder).mkdir(parents=True, exist_ok=persistent)
         env = environment(request['oauth_token'], proxy_url)
+        if persistent:
+            # This switch also suppresses the transcript needed by --resume. Scenario
+            # transcripts stay in this broker's quota-backed, disposable private /tmp.
+            env.pop('CLAUDE_CODE_SKIP_PROMPT_HISTORY', None)
         fake = None
         if offline:
             fake = fake_provider()
             env['ANTHROPIC_BASE_URL'] = f'http://127.0.0.1:{fake.server_port}'
-        args = arguments(request['model'], config, request['instruction'], request['max_turns'])
+        args = arguments(request['model'], config, request['instruction'], request['max_turns'],
+                         persistent=persistent, resume=request.get('resume'), compact=request['prompt'] == '/compact')
         # No session profile, hook, project instruction or credential file is copied in.
         with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, cwd='/tmp/native/empty', env=env) as proc:
@@ -319,6 +332,7 @@ if __name__ == '__main__':
         try:
             exercise = sys.argv[1:] == ['--exercise']
             offline_native = sys.argv[1:] == ['--exercise-native']
+            offline_session = sys.argv[1:] == ['--exercise-session']
             if not exercise and not offline_native:
                 line = sys.stdin.buffer.readline(FRAME_BYTES + 1)
                 if len(line) > FRAME_BYTES or not line.endswith(b'\n'):
@@ -327,10 +341,12 @@ if __name__ == '__main__':
             threading.Thread(target=bridge.receive, daemon=True).start()
             if exercise:
                 bridge.exercise()
-            elif offline_native:
+            elif offline_native or offline_session:
                 bridge.run({'oauth_token': 'sk-ant-oat01-offline-placeholder', 'model': 'claude-sonnet-4-6',
                             'max_turns': 4, 'instruction': 'Use only the provided worker.',
-                            'prompt': 'Write the requested native transport proof using the worker.'}, offline=True)
+                            'prompt': request['prompt'] if offline_session else 'Write the requested native transport proof using the worker.',
+                            'persistent': offline_session,
+                            'resume': request.get('resume') if offline_session else None}, offline=True)
             else:
                 bridge.run(request)
         except Exception:

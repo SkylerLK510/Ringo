@@ -118,9 +118,11 @@ of recursive improvement or approval for a campaign.
 
 ## Campaign work still required
 
-The campaign remains fail-closed. A native process proof does not by itself supply
-the trusted evaluator/proposer implementations, live Session scenario execution,
-fresh sealed scenarios, fix-family-disjoint splits or image-specific sensitivity.
+The [trusted live adapter](LIVE-RRSI-PILOT.md) now supplies evaluator/proposer
+implementations and explicit Session transport, with actual native continuation
+replay. Execution remains gated on current-profile certification, reviewed fresh
+sealed scenarios, family-disjoint splits, image-specific discrimination and numeric
+phase authorization. A native process proof alone supplies none of those campaign gates.
 In particular, do not treat this direct native CLI proof as a test of Session
 handoff thresholds or restart behavior. Those remain on the real Session path.
 

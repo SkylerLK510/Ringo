@@ -207,6 +207,17 @@ class WorkerEndpoint:
         return {'mcpServers': {'worker': {'type': 'http', 'url': f'http://{self.authority}/mcp',
                 'headers': {'Authorization': 'Bearer '+self.token}}}}
 
+    def reconnect(self):
+        """Controller-only: a serial native turn reconnects to the same leased worker.
+
+        Request identities belong to a connection. Trial call limits, failure state and
+        the absolute deadline do not reset. This is deliberately not an MCP method.
+        """
+        if not self.server or self.failed or time.monotonic() >= self.deadline:
+            raise ValueError('worker endpoint is unavailable')
+        self.initialized = self.ready = False
+        self.seen.clear()
+
     def __exit__(self, *exc):
         self.server.shutdown()
         self.server.server_close()

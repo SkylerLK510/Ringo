@@ -216,12 +216,18 @@ class NativeBroker(DockerSandbox):
             raise ValueError('native image bridge differs from the selected controller source')
         return {**row, 'image': self.image, 'provider_calls': 0, 'live_certified': False}
 
-    def exercise_transport(self, endpoint, *, native=False):
+    def exercise_transport(self, endpoint, *, native=False, session_request=None, on_event=None, error_file=None):
         """Exercise real broker-container -> controller -> worker transport with no model."""
         self.probe()
+        if session_request is not None:
+            native = True
+        mode = '--exercise-session' if session_request is not None else '--exercise-native' if native else '--exercise'
         with subprocess.Popen([self.docker, 'exec', '-i', self.id, 'python3', '-I',
-                               '/opt/ringo/turnrun_native_bridge.py', '--exercise-native' if native else '--exercise'],
+                               '/opt/ringo/turnrun_native_bridge.py', mode],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+            if session_request is not None:
+                proc.stdin.write(json.dumps(session_request).encode()+b'\n')
+                proc.stdin.flush()
             messages = queue.Queue(maxsize=8)
             def read():
                 try:
@@ -246,11 +252,14 @@ class NativeBroker(DockerSandbox):
                         proc.stdin.flush()
                     elif native and frame.get('type') == 'event':
                         events.append(frame['event'])
+                        if on_event is not None:
+                            on_event(frame['event'])
                     elif native and frame.get('type') == 'exit':
                         code = frame['code']
                     elif native and frame.get('type') == 'offline-native':
                         result = native_result(events, code, 'claude-sonnet-4-6')
-                        if result['outcome'] != 'done' or not frame['tool_result_seen'] or frame['replay_requests'] != 2:
+                        if result['outcome'] != 'done' or (session_request is None and (
+                                not frame['tool_result_seen'] or frame['replay_requests'] != 2)):
                             raise ValueError('actual native CLI protocol replay failed')
                         proc.wait(timeout=5)
                         return {**frame, 'result': result}
@@ -261,6 +270,13 @@ class NativeBroker(DockerSandbox):
                         return frame
                     else:
                         raise ValueError(f'native transport probe failed ({frame.get("type")})')
+            except Exception as exc:
+                if native:
+                    if error_file is not None:
+                        save_native_error(events, error_file, 'sk-ant-oat01-offline-placeholder')
+                    failure = NativeAttemptError('offline replay: '+str(exc), events, code)
+                    raise failure from None
+                raise
             finally:
                 if proc.poll() is None:
                     self._call(['stop', '--time', '1', self.id], timeout=15, limit=8192)
@@ -269,8 +285,26 @@ class NativeBroker(DockerSandbox):
                     proc.wait(timeout=10)
 
     def run(self, *, prompt, instruction, model, token_file, endpoint, token_cap,
-            seconds=300, max_turns=8, error_file=None):
-        if 'RINGO_CHILD' in os.environ:
+            seconds=300, max_turns=8, error_file=None, persistent=False, resume=None, on_event=None):
+        return self._run(prompt=prompt, instruction=instruction, model=model, token_file=token_file,
+                         endpoint=endpoint, token_cap=token_cap, seconds=seconds, max_turns=max_turns,
+                         error_file=error_file, persistent=persistent, resume=resume, on_event=on_event)
+
+    def replay(self, *, prompt, endpoint, token_cap, seconds=120, resume=None, on_event=None, error_file=None):
+        """Exercise the same controller and native continuation against local synthetic HTTP.
+
+        No credential is read and upstream sockets are unconditionally refused. This
+        cannot select a live model/provider or turn a replay into inference.
+        """
+        result = self._run(prompt=prompt, instruction='Use only the provided worker.',
+                          model='claude-sonnet-4-6', token_file=None, endpoint=endpoint,
+                          token_cap=token_cap, seconds=seconds, max_turns=4, persistent=True,
+                          resume=resume, on_event=on_event, error_file=error_file, offline=True)
+        return {**result, 'synthetic': True, 'provider_calls': 0}
+
+    def _run(self, *, prompt, instruction, model, token_file, endpoint, token_cap,
+             seconds, max_turns, error_file=None, persistent=False, resume=None, on_event=None, offline=False):
+        if 'RINGO_CHILD' in os.environ and not offline:
             raise ValueError('live native execution refuses RINGO_CHILD; use a standalone session')
         if not isinstance(model, str) or not model.startswith('claude-') or len(model) > 128:
             raise ValueError('pin a full Claude model name')
@@ -286,11 +320,18 @@ class NativeBroker(DockerSandbox):
             raise ValueError('a numeric per-attempt token reservation is required')
         if endpoint.worker.id == self.id or endpoint.failed or not endpoint.server:
             raise ValueError('native broker requires a separate active worker endpoint')
+        if type(persistent) is not bool or resume is not None and (not persistent or not isinstance(resume, str)
+                or not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', resume)):
+            raise ValueError('invalid native continuation request')
         self.probe()
-        credential = oauth_token(token_file)
+        credential = 'sk-ant-oat01-offline-placeholder' if offline else oauth_token(token_file)
         request = {'prompt': prompt, 'instruction': instruction, 'model': model,
                    'oauth_token': credential, 'max_turns': max_turns}
+        if persistent:
+            request.update(persistent=True, resume=resume)
         command = [self.docker, 'exec', '-i', self.id, 'python3', '-I', '/opt/ringo/turnrun_native_bridge.py']
+        if offline:
+            command.append('--exercise-session')
         frames = queue.Queue(maxsize=16)
         events, tunnels = [], {}
         private_error_saved = False
@@ -347,6 +388,7 @@ class NativeBroker(DockerSandbox):
                             pass
 
             total, network_bytes, opened, exit_code = 0, 0, set(), None
+            succeeded = False
             deadline = time.monotonic() + seconds
             def expire():
                 stop.set()
@@ -381,9 +423,13 @@ class NativeBroker(DockerSandbox):
                         if event.get('type') == 'system' and event.get('subtype') == 'init':
                             if event.get('tools') != ['mcp__trial__worker'] or event.get('model') != model:
                                 raise NativeProfileError('native startup exposed unexpected tools or model')
+                        if on_event is not None:
+                            on_event(event)
                     elif kind == 'mcp':
                         send({'type': 'mcp', 'id': key, 'message': endpoint.dispatch(frame['message'])})
                     elif kind == 'open':
+                        if offline:
+                            raise ValueError('upstream traffic is forbidden in offline replay')
                         if type(key) is not int or key in opened or len(opened) >= 256 or len(tunnels) >= 8:
                             raise ValueError('native tunnel admission limit reached')
                         conn = provider_socket(frame.get('authority'))
@@ -413,6 +459,7 @@ class NativeBroker(DockerSandbox):
                     retain_error(result)
                 if sum(result['usage'][k] for k in ('input', 'cache_write', 'cache_read', 'output')) > token_cap:
                     result['outcome'] = 'budget'
+                succeeded = result['outcome'] == 'done'
                 return result
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, NativeProfileError) else type(exc).__name__+' during native attempt'
@@ -424,11 +471,13 @@ class NativeBroker(DockerSandbox):
                 stop.set()
                 for conn in tunnels.values():
                     conn.close()
-                # Kill the whole provider container, including descendants, on every outcome.
+                # A successful scenario turn may keep its private native session for the next
+                # turn. Failure always stops it; the enclosing broker owns the scenario lease.
                 cleanup_error = False
                 try:
-                    self._call(['stop', '--time', '1', self.id], timeout=15, limit=8192)
-                    self.stopped = True
+                    if not persistent or not succeeded:
+                        self._call(['stop', '--time', '1', self.id], timeout=15, limit=8192)
+                        self.stopped = True
                 except Exception:
                     cleanup_error = True
                 finally:

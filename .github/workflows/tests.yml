@@ -41,6 +41,12 @@ jobs:
           PY
       - name: Verify native startup and tool execution using local protocol replay
         run: python -m unittest tests.test_turnrun_native -v
+      - name: Build the trusted scenario runner
+        run: cargo build --manifest-path cli/Cargo.toml --locked --features turnrun --bin scenariorun
+      - name: Exercise real Session and native continuation against local replay
+        run: python -m unittest tests.test_turnrun_live -v
+        env:
+          RINGO_SCENARIO_BINARY: ${{ github.workspace }}/cli/target/debug/scenariorun
 
   unittest:
     runs-on: ${{ matrix.os }}

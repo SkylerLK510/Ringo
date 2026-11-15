@@ -121,7 +121,8 @@ def admission_schedule(value):
 def code_identity():
     root = Path(__file__).resolve().parent
     return {name: sha256_file(root / name) for name in ('turnrun_campaign.py', 'turnrun_isolation.py',
-            'turnrun_broker.py', 'turnrun_certify.py',
+            'turnrun_broker.py', 'turnrun_certify.py', 'turnrun_live.py',
+            'turnrun_native.py', 'turnrun_native_bridge.py',
             'turnrun.py', 'cli/src/turn_policy.rs', 'cli/src/bin/scenariorun.rs',
             'cli/src/bin/turnrun.rs', 'cli/src/lib.rs', 'cli/src/parse.rs')}
 

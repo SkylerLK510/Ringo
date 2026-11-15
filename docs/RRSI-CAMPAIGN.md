@@ -1,7 +1,7 @@
-# Recursive turn-policy experiments: offline implementation
+# Recursive turn-policy experiments
 
-The infrastructure below implements the next, **offline** stage of the revised RRSI plan. It
-does not enable live self-improvement. No live baseline, negative control, recursive model search,
+The controller below has an **offline** reference executor and a separately gated
+[trusted live adapter](LIVE-RRSI-PILOT.md). No live baseline, negative control, recursive model search,
 policy adoption or release claim is supplied by this change. Existing review evaluation and
 release certification remain separate.
 
@@ -15,9 +15,10 @@ authorizing an experiment. An inconclusive control is a stop, not permission to 
 | `turnrun_broker.py` | Authenticated, leased MCP transport exposing one fixed worker tool; no provider launcher or native authentication. |
 | `turnrun_native.py`, `turnrun_native_bridge.py` | Separate network-disabled native provider container, fixed TLS/MCP stdio relay, offline native protocol replay and one bounded standalone subscription proof. Campaign and Session integration remain gated. |
 | `turnrun_certify.py` | Check discrimination against pristine historical snapshots inside the exact pinned grading image, with private hashed evidence. |
-| `scenariorun` (`turnrun` feature) | Scripted turns, clear, restart, seeded handoffs, threshold boundaries and Claude compact through the actual `Session`. Offline providers only. |
+| `scenariorun` (`turnrun` feature) | Scripted turns, clear, restart, seeded handoffs, threshold boundaries and Claude compact through the actual `Session`. Offline programs or an explicit controller-owned broker socket; live compatibility remains gated. |
 | `cli/src/turn_policy.rs` | Explicit restricted policy loading. Empty policy preserves the normal runtime. |
 | `turnrun_campaign.py` | Frozen three-way splits, controls, two sibling proposals, recursive incumbent advancement, complete dev history, separate budgets, validation and final holdout gates. |
+| `turnrun_live.py` | Pinned Session/native evaluator and proposer, private input preparation, grader discrimination, phase-specific preflight and standalone execution. Offline native continuation replay supplies integration evidence, not live certification. |
 
 ## Isolation and protected grading
 
@@ -119,10 +120,10 @@ Unknown fields fail validation. A task and its cluster belong to exactly one spl
 checks actual membership and stage before invoking the evaluator, not just a caller's split label.
 
 The `Campaign` Python API takes trusted evaluator/proposer callables. They are **not** model-facing
-extension points or a certified live executor. An evaluator returns protected outcome and usage
-records; a proposer returns a hypothesis, complete candidate policy and usage record. The eventual
-live adapter must pin binaries/images/checks/provider configuration as well as the sources, enforce
-wall limits and supply the isolated broker described below.
+extension points or themselves a certified live executor. An evaluator returns protected outcome and usage
+records; a proposer returns a hypothesis, complete candidate policy and usage record. The trusted
+live adapter pins binaries/images/checks/provider configuration as well as the sources, enforces
+wall limits and supplies the isolated broker described below.
 
 Controls interleave unchanged and preregistered degraded arms on dev tasks with at least three
 repetitions. Scoring weights fix-family clusters equally. Advancement requires baseline competence
@@ -169,6 +170,12 @@ For an actual private protocol, `prepare --plan FILE --campaign DIR` records it 
 `live-preflight` exits unsuccessfully and lists blockers; there is no enable-live flag.
 
 ## Remaining live prerequisites
+
+The live evaluator/proposer and explicit Session broker transport are implemented
+in [LIVE-RRSI-PILOT.md](LIVE-RRSI-PILOT.md). Use that adapter's manifest-bound preflight
+for a concrete pilot. The original controller CLI's `live-preflight` retains its
+static fail-closed response. A prior native process proof does not automatically
+certify the changed persistent profile or any new image/source combination.
 
 The native process adapter and its zero-inference checks are now implemented; see
 [NATIVE-RRSI-BROKER.md](NATIVE-RRSI-BROKER.md). Its offline native replay does not

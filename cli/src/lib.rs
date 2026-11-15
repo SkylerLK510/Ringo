@@ -642,6 +642,9 @@ pub struct Session {
     /// Past this, an agent's next turn starts fresh from Ringo's record instead (tests lower it).
     pub handoff_at: u64,
     turn_policy: turn_policy::TurnPolicy,
+    /// Evaluation-only transport to a controller-owned isolated native broker.
+    #[cfg(feature = "turnrun")]
+    trial_broker: Option<PathBuf>,
     /// /separate: each agent keeps a conversation of its own, and they can take turns here at the same time.
     pub separate: bool,
     /// The owner's lines a turn ended before taking in (`steer`): the job and the line, for the shell to send next
@@ -1039,6 +1042,8 @@ impl Session {
                      backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
+                     #[cfg(feature = "turnrun")]
+                     trial_broker: None,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
@@ -1066,6 +1071,12 @@ impl Session {
     pub fn set_turn_policy(&mut self, policy: turn_policy::TurnPolicy) {
         self.handoff_at = policy.handoff_at.unwrap_or(HANDOFF_AT);
         self.turn_policy = policy;
+    }
+
+    /// Only the dedicated scenario binary uses this; normal shell startup never sets it.
+    #[cfg(feature = "turnrun")]
+    pub fn set_trial_broker(&mut self, socket: PathBuf) {
+        self.trial_broker = Some(socket);
     }
 
     pub fn installed(&self, agent: Agent) -> bool {
@@ -1856,6 +1867,17 @@ impl Session {
         // decides the turn's settings
         let (mut input, mut turn) = (Some(sent.clone()), None);
         let style = match spec.adapter {
+            #[cfg(feature = "turnrun")]
+            Adapter::Claude if self.trial_broker.is_some() => {
+                // Session still owns policy, handoff, continuation and event accounting. The
+                // client has no provider credentials or task filesystem access: it relays one
+                // request to the trusted controller, which owns all execution authority.
+                cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
+                cmd.arg("--broker-client").arg(self.trial_broker.as_ref().unwrap());
+                if let Some(session) = &resume { cmd.args(["--resume", session]); }
+                input = Some(format!("{}\n", serde_json::json!({"type": "user", "message": {"role": "user", "content": content}})));
+                Style::Claude
+            }
             Adapter::Codex => {
                 // One `codex app-server` per turn, so the reply streams as it is written: the same agent and settings
                 // as `codex exec`, and the same model input, compared request for request against a local stand-in
