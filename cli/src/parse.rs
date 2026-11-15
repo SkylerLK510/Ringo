@@ -132,6 +132,8 @@ pub struct Parser {
     seen: Vec<(String, Tokens)>,
     /// Claude reported a compaction (`/compact`), whose result may carry no text.
     compacted: bool,
+    /// agy's model calls' counts so far (`step_update` usage): the running turn's own total, told live.
+    total: Tokens,
     /// A step's read was refused (see `refused`), said once a turn.
     refused: bool,
     /// Codex: the turn/start request, sent once the thread's id is known; the thread; its usage so far.
@@ -308,7 +310,8 @@ impl Parser {
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
-                 writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None }
+                 writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
+                 total: Tokens::default() }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -804,7 +807,8 @@ impl Parser {
     }
 
     /// agy 1.4.11 stream-json: `init`, `step_update` per model step or tool (ACTIVE, then DONE or ERROR; text arrives
-    /// as `text_delta`), and one `result` with the reply and the whole turn's usage.
+    /// as `text_delta`, a model call's own count as `usage`), and one `result` with the reply and the whole turn's
+    /// usage.
     fn agy(&mut self, e: &Value) -> Vec<Note> {
         let mut notes = Vec::new();
         match s(e, "event") {
@@ -834,6 +838,20 @@ impl Parser {
                         notes.push(Note::Activity { node: None, text: "writing".into() });
                         if let Some(delta) = step.get("text_delta").and_then(Value::as_str).filter(|d| !d.is_empty()) {
                             notes.push(Note::Partial(delta.to_string()));
+                        }
+                    }
+                    ("agent_response", "DONE") => {
+                        // A model call's own count, as agy reports it per step (the other adapters report theirs
+                        // live too): the running turn's total for the live row, and the call. agy never compacts
+                        // its conversation (measured 2026-11-14: a real turn ran 498 steps to 2.2M tokens with no
+                        // count at all until it ended), so without this a running turn showed nothing while it
+                        // grew. The final result reports the same total again.
+                        if let Some(usage) = step.get("usage") {
+                            let cached = u(usage, "cache_read_tokens").min(u(usage, "input_tokens"));
+                            self.total.add(Tokens { input: u(usage, "input_tokens") - cached, cache_read: cached,
+                                                    cache_write: 0, output: u(usage, "output_tokens") });
+                            notes.push(Note::Call);
+                            notes.push(Note::Live(self.total));
                         }
                     }
                     _ => {}
@@ -1333,6 +1351,26 @@ mod tests {
         assert!(notes.iter().any(|n| matches!(n, Note::Step(l) if l.contains("run_command refused"))));
         assert!(notes.contains(&Note::Reply("Fixed calc.py.".into())), "the reply is in the conversation");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
+    }
+
+    #[test]
+    fn agy_reports_its_model_calls_live() {
+        // A model call's own count arrives per step (`step_update` usage): summed as the turn goes, it is what the
+        // live row shows while a turn runs — which for agy was nothing at all before (measured 2026-11-14: a real
+        // turn ran 498 steps to 2.2M tokens showing no count until it ended).
+        let events = [
+            r#"{"event":"init","conversation_id":"c","init":{"cwd":"/w"}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":1,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":150000,"cache_read_tokens":0,"output_tokens":10}}}"#,
+            r#"{"event":"step_update","step_update":{"conversation_id":"c","step_index":2,"state":"DONE","step_type":"agent_response","usage":{"input_tokens":100000,"cache_read_tokens":20000,"output_tokens":10}}}"#,
+            r#"{"event":"result","result":{"status":"SUCCESS","response":"done","usage":{"input_tokens":250000,"cache_read_tokens":20000,"output_tokens":20,"total_tokens":250020}}}"#,
+        ];
+        let (p, notes) = run(Style::Agy, &events);
+        assert_eq!(p.finish(), Ok(()));
+        let live: Vec<Tokens> = notes.iter().filter_map(|n| match n { Note::Live(t) => Some(*t), _ => None }).collect();
+        assert_eq!(live, [Tokens { input: 150_000, cache_read: 0, cache_write: 0, output: 10 },
+                          Tokens { input: 230_000, cache_read: 20_000, cache_write: 0, output: 20 }],
+                   "each model call's count, summed as the turn goes (a call's input includes its cached reads)");
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2, "a call a step");
     }
 
     #[test]

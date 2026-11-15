@@ -734,7 +734,13 @@ unrelated task, or `/separate`. (`--bare` would cut more, but it signs in with a
 use it.)
 
 agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
-sandbox. Its startup event lists them, and no setting Ringo can pass removes them.
+sandbox. Its startup event lists them, and no setting Ringo can pass removes them. Nor does agy compact its
+conversation mid-turn, where Claude's and Codex's do (at the 200,000-token window set above; measured 2026-11-14:
+one agy turn in a home folder ran 498 steps and 11 model calls for 18 hours to 2.2M tokens, and two sibling turns
+burned 527k each before failing). Its `step_update` events do carry each model call's own count, so the shell
+shows a running turn's tokens as it goes (before, an agy turn showed no count at all until it ended), and warns
+in the job's log each time they pass another 200,000: `/kill N` stops it if it is wandering — the shell never
+stops a turn behind the owner's back.
 
 The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
 memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python
