@@ -85,6 +85,27 @@ class NativeProfileTest(unittest.TestCase):
         with self.assertRaisesRegex(NativeProfileError, 'unpinned or unknown model'):
             native_result(sample, 0, MODEL)
 
+    def test_native_version_rejection_has_a_specific_category_without_raw_error_text(self):
+        sample = events()
+        sample[-1].update(is_error=True, api_error_status=400, modelUsage={},
+                          result='API Error: 400 Claude Code 2.1.153 does not support this model; '
+                                 'version 2.1.290 or newer is required. private-marker')
+        details = native_diagnostics(sample, 'native provider failure', 1)
+        self.assertEqual(details['provider_error_category'], 'native_cli_incompatible')
+        self.assertNotIn('private-marker', json.dumps(details))
+
+    def test_invalid_model_usage_keeps_the_complete_reported_spend_on_rejection(self):
+        for usage in (None, [], [MODEL], 'invalid', {}, {MODEL: {}, 'fallback': {}}):
+            sample = events()
+            sample[-1]['modelUsage'] = usage
+            with self.subTest(model_usage=usage):
+                with self.assertRaisesRegex(NativeProfileError, 'unpinned or unknown model') as caught:
+                    native_result(sample, 0, MODEL)
+                failure = NativeAttemptError(str(caught.exception), sample, 0)
+                self.assertTrue(failure.result['usage']['counted'])
+                self.assertEqual(sum(failure.result['usage'][key] for key in
+                                     ('input', 'cache_write', 'cache_read', 'output')), 100)
+
     @unittest.skipIf(os.name == 'nt', 'private evidence permissions require POSIX')
     def test_private_error_is_bounded_redacted_and_created_without_overwriting(self):
         sample = events()
@@ -181,6 +202,32 @@ class NativeProfileTest(unittest.TestCase):
         self.assertEqual(result['model_turns'], 2)
         self.assertIsNone(result['provider_requests'])
         self.assertEqual(native_result(events(), 1, MODEL)['outcome'], 'failed')
+
+    def test_mcp_connection_metadata_preserves_the_single_fixed_server_gate(self):
+        sample = events()
+        sample[0]['mcp_servers'][0]['source'] = 'dynamic'
+        self.assertEqual(native_result(sample, 0, MODEL)['outcome'], 'done')
+        for servers in (None, {}, ['trial'],
+                        [{'name': 'other', 'status': 'connected', 'source': 'dynamic'}],
+                        [{'name': 'trial', 'status': 'failed', 'source': 'dynamic'}],
+                        [{'name': 'trial', 'source': 'dynamic'}],
+                        [{'status': 'connected', 'source': 'dynamic'}],
+                        sample[0]['mcp_servers'] * 2,
+                        sample[0]['mcp_servers'] + [{'name': 'other', 'status': 'connected'}]):
+            with self.subTest(servers=servers):
+                sample[0]['mcp_servers'] = servers
+                with self.assertRaisesRegex(NativeProfileError, 'fixed worker MCP server'):
+                    native_result(sample, 0, MODEL)
+
+    def test_profile_without_worker_requires_no_tools_and_no_mcp_servers(self):
+        sample = events()
+        sample[0].update(tools=[], mcp_servers=[])
+        self.assertEqual(native_result(sample, 0, MODEL, worker_required=False)['outcome'], 'done')
+        for servers in (None, {}, [{'name': 'other', 'status': 'connected'}]):
+            sample[0]['mcp_servers'] = servers
+            with self.subTest(servers=servers):
+                with self.assertRaisesRegex(NativeProfileError, 'unexpected MCP server'):
+                    native_result(sample, 0, MODEL, worker_required=False)
 
     def test_missing_usage_tools_model_connection_or_final_refuses(self):
         mutations = [lambda e: e.pop(), lambda e: e.append(copy.deepcopy(e[-1])),

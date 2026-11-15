@@ -15,8 +15,11 @@ owns task authority and rejects every tool except the assigned worker. Neither
 provider traffic nor credentials are relayed into the worker or checker.
 
 The CLI gets a fresh home/configuration directory, no built-in tools, no slash
-commands, no Chrome integration, strict MCP selection, disabled hooks/plugins,
+commands, no Chrome integration, strict MCP selection, disabled hooks,
+an empty configured plugin set,
 explicit model selection and disabled retries. No owner settings are inherited.
+The pinned CLI may still list bundled plugins and built-in agent definitions in
+startup metadata; that listing does not add tools to the exact worker-only profile.
 Safe mode is not used because it also removes the required MCP tool. The adapter
 does not use bare mode, API keys, model fallbacks or a billing-provider switch.
 
@@ -29,7 +32,7 @@ verifies its publisher manifest checksum and size, and records the exact image,
 binary and bridge hashes. Only the binary and bridge enter the image build context.
 
 ```sh
-python3 turnrun_native_image.py --version 2.1.153 --platform linux-arm64 \
+python3 turnrun_native_image.py --version 2.1.290 --platform linux-arm64 \
   --base sha256:PINNED_PYTHON_IMAGE --work PRIVATE_NEW_BUILD_DIR
 python3 turnrun_native.py probe --image sha256:BUILT_IMAGE \
   --report PRIVATE_NEW_REPORT.json
@@ -39,6 +42,13 @@ Use `linux-x64` on an x86-64 Docker host. The probe checks native startup, UID,
 blocked direct networking, absent owner/Docker/managed-settings paths, empty
 workspace and equality of the image bridge hash with the selected source. It makes
 zero provider inference calls and always reports `live_certified: false`.
+
+Pin a CLI version compatible with the selected model. The provider rejected
+2.1.153 for `claude-fable-5-2` with HTTP 400 and explicitly required 2.1.290 or
+newer. Updating the host CLI does not update the binary in an immutable Docker
+image. Rebuild the image, rerun the containment probe and offline protocol replay,
+then pin the new image in a separately authorized proof plan. Offline replay
+checks the adapter and tools; it cannot establish live model compatibility.
 
 ```sh
 RINGO_TEST_IMAGE=sha256:PINNED_GRADER_IMAGE RINGO_NATIVE_IMAGE=sha256:BUILT_IMAGE \
@@ -86,7 +96,9 @@ Failures include a bounded `diagnostics` object in the saved report and CLI outp
 the controller validation reason, native exit code, initialization/final-result
 status, provider HTTP error status when reported, and a provider error category.
 Raw provider messages and credentials are excluded from this diagnostic object.
-HTTP 400 is classified as `invalid_request`. An error with empty model usage is
+HTTP 400 is classified as `invalid_request`, except that an explicit rejection
+of the Claude Code version for the selected model is `native_cli_incompatible`.
+An error with empty model usage is
 reported as a provider failure before model usage, rather than a model mismatch;
 successful responses still require the exact pinned model usage.
 On a provider error, certification also saves a bounded error excerpt in

@@ -30,7 +30,7 @@ jobs:
       - run: python -m unittest tests.test_turnrun_isolation tests.test_turnrun_certify tests.test_turnrun_broker -v
       - name: Build the pinned native CLI image without inference
         run: |
-          python turnrun_native_image.py --version 2.1.153 --platform linux-x64 \
+          python turnrun_native_image.py --version 2.1.290 --platform linux-x64 \
             --base "$RINGO_TEST_IMAGE" --work "$RUNNER_TEMP/ringo-native-image"
           python - <<'PY'
           import os

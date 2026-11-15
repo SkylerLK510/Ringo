@@ -72,7 +72,9 @@ def native_diagnostics(events, reason, exit_code=None):
     if type(status) is not int or not 100 <= status <= 599:
         status = None
     category = None
-    if 'model_not_found' in text or 'issue with the selected model' in text:
+    if 'claude code' in text and 'does not support this model' in text:
+        category = 'native_cli_incompatible'
+    elif 'model_not_found' in text or 'issue with the selected model' in text:
         category = 'model_unavailable'
     elif any(marker in text for marker in ('authentication_error', 'authentication_failed',
                                            'invalid_api_key', 'invalid bearer', 'not logged in')) or status == 401:
@@ -170,14 +172,19 @@ def native_result(events, code, model, worker_required=True):
     if len(initial) != 1 or initial[0].get('tools') != expected:
         raise NativeProfileError('native tool discovery differs from the fixed profile')
     servers = initial[0].get('mcp_servers', [])
-    if worker_required and servers != [{'name': 'trial', 'status': 'connected'}]:
+    if worker_required and (not isinstance(servers, list) or len(servers) != 1
+            or not isinstance(servers[0], dict) or servers[0].get('name') != 'trial'
+            or servers[0].get('status') != 'connected'):
         raise NativeProfileError('the fixed worker MCP server did not connect')
+    if not worker_required and servers != []:
+        raise NativeProfileError('native startup exposed an unexpected MCP server')
     if initial[0].get('model') != model or len(finals) != 1:
         raise NativeProfileError('provider model or final result differs from the pinned request')
     final = finals[0]
-    if final.get('is_error') is True and final.get('modelUsage') == {}:
+    model_usage = final.get('modelUsage')
+    if final.get('is_error') is True and model_usage == {}:
         raise NativeProfileError('native provider failed before reporting model usage')
-    if set(final.get('modelUsage', {})) != {model}:
+    if not isinstance(model_usage, dict) or set(model_usage) != {model}:
         raise NativeProfileError('native usage includes an unpinned or unknown model')
     counts = final.get('usage')
     if not isinstance(counts, dict):
