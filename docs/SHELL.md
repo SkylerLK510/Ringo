@@ -750,7 +750,9 @@ at most 7 in a job. The ledger, measured 2026-11-14: 418M tokens over 292 jobs, 
 264M across 152 jobs (worst 19.5M), Codex 149M across 88 (worst 14.8M: one turn of 255 model calls re-reading
 ~176k cached tokens each, compacting 3 times). agy's 24 rows say 4.4M, but they kept only as many of a turn's cache
 reads as its input: agy reports cache reads on top of its input, not inside it, which the shell now counts. Its
-turns' own events add up to 69.5M, 94% cache reads, the worst turn 10.7M.
+turns' own events add up to 69.5M, 94% cache reads, the worst turn 10.7M. An agy turn's count is its model calls'
+counts summed, not what its conversation's total added, so a conversation kept by an older shell (its total short of
+those cache reads) is not counted with them again when it goes on.
 
 The program itself: a 3.2 MB binary (the pipelines included) that starts in 2.1 ms and idles at 2.5 MB of
 memory with no measurable CPU. A native pipeline peaks at 8.1 MB, against 24.5 MB for the same run under Python

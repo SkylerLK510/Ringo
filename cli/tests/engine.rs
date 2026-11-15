@@ -1,7 +1,7 @@
 //! The conductor against fake agents in throwaway git repositories (Unix: the fakes are shell scripts).
 #![cfg(unix)]
 
-use ringo_cli::{kept, Agent, Decision, Kept, Mode, Session, Status};
+use ringo_cli::{kept, parse::Tokens, Agent, Decision, Kept, Mode, Session, Status};
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -1809,6 +1809,48 @@ fn a_conversation_that_goes_on_after_a_restart_counts_only_what_each_turn_added(
     next.forget();
     let cleared = next.keep(None).unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&fs::read(cleared).unwrap()).unwrap()["usage"], serde_json::json!([]));
+}
+
+/// An agy conversation kept by a shell from before agy's cache reads were counted in full (it took them as part of
+/// the input, so its kept total holds no more of them than the input) goes on here counting only what each turn
+/// added: the turn's model calls, summed. Taking the old total off the conversation's new one would count all of its
+/// earlier cache reads in the first turn again.
+#[test]
+fn an_agy_conversation_kept_before_cache_reads_were_counted_counts_only_its_turn() {
+    let r = repo("agy-old-total");
+    const RECORD: &str = "for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\ncat > \"$0.stdin\"\n";
+    let event = |usage: &str, result: &str| format!(
+        "echo '{{\"event\":\"init\",\"conversation_id\":\"c-1\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
+         echo '{{\"event\":\"step_update\",\"step_update\":{{\"conversation_id\":\"c-1\",\"step_index\":1,\"state\":\"DONE\",\"step_type\":\"agent_response\",\"usage\":{usage}}}}}'\n\
+         echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{result}}}}}'");
+    // the first turn: one call, 5,000 cache reads on 100 input; the second, resumed: one call of its own, and the
+    // conversation's total so far
+    let first = event(r#"{"input_tokens":100,"cache_read_tokens":5000,"output_tokens":10}"#,
+                      r#"{"input_tokens":100,"cache_read_tokens":5000,"output_tokens":10}"#);
+    let second = event(r#"{"input_tokens":50,"cache_read_tokens":6000,"output_tokens":5}"#,
+                       r#"{"input_tokens":150,"cache_read_tokens":11000,"output_tokens":15}"#);
+    let script = format!("#!/bin/sh\n{RECORD}case \"$*\" in *--conversation*)\n{second}\n;; *)\n{first}\n;; esac\n");
+    let agy = fake(&root(), "agy-old-total", &script);
+    let mut s = session(&r, agent("agy"), &agy);
+    let one = s.launch_agent(agent("agy"), false, "what is a.txt?").unwrap();
+    assert_eq!(wait(&mut s, one), Status::Done);
+    assert_eq!(s.job(one).unwrap().tokens.total(), 5_110);
+    let kept = s.keep(None).unwrap();
+    drop(s);
+    // as the older shell kept it: the 5,000 cache reads cut to the 100 input, and taken out of it
+    let mut file: serde_json::Value = serde_json::from_slice(&fs::read(&kept).unwrap()).unwrap();
+    assert_eq!(file["usage"], serde_json::json!([["agy", "c-1", [100, 0, 5000, 10]]]));
+    file["usage"] = serde_json::json!([["agy", "c-1", [0, 0, 100, 10]]]);
+    fs::write(&kept, file.to_string()).unwrap();
+    let mut next = session(&r, agent("agy"), &agy);
+    next.go_on(&kept).unwrap();
+    let two = next.launch_agent(agent("agy"), false, "and then?").unwrap();
+    assert_eq!(wait(&mut next, two), Status::Done);
+    assert_eq!(next.job(two).unwrap().tokens, Tokens { input: 50, cache_read: 6_000, cache_write: 0, output: 5 },
+               "the turn's own call, not the first turn's 4,900 cache reads again");
+    // the conversation's total kept from here on is its new one
+    let file: serde_json::Value = serde_json::from_slice(&fs::read(next.keep(None).unwrap()).unwrap()).unwrap();
+    assert_eq!(file["usage"], serde_json::json!([["agy", "c-1", [150, 0, 11000, 15]]]));
 }
 
 #[test]

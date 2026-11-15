@@ -2705,7 +2705,17 @@ impl Session {
                                     if t.total() >= before.total() {
                                         self.usage_so_far.insert(key, t);
                                     }
-                                    t.since(before)
+                                    // agy tells each model call's own count as it goes (`Live`), and an agy turn
+                                    // takes no line while it works, so one result ends it: the calls summed are the
+                                    // turn's own, whatever total was kept. A total kept before agy's cache reads were
+                                    // counted in full (2026-11-14) holds too few of them, and taking it off would
+                                    // count the conversation's earlier cache reads in this turn again. A turn whose
+                                    // calls told no count is still counted by what its total added.
+                                    if matches!(agent.spec().adapter, Adapter::Agy) && job.live.total() > 0 {
+                                        job.live
+                                    } else {
+                                        t.since(before)
+                                    }
                                 }
                                 // a job with a conversation of its own (a write job) can still report its total
                                 // more than once: a line the owner sent while it worked ends in a result of its own
