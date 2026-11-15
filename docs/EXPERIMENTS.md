@@ -286,5 +286,5 @@ A deep-research pass checked 25 published claims: 19 were confirmed and 6 refute
   (arXiv 2605.12947) and execution-based selection (DiffCodeGen, arXiv 2605.20473) are the starting points; both
   spend far more samples than Ringo, so the question is a gate that pays only when drafts disagree.
 - **The IDE.** Two of the largest gains need a person in the loop: asking at the fork (a one-click choice where the
-  spec has two readings) and remembering the user's conventions. Both belong in the IDE (see the [Roadmap](../README.md#roadmap)).
+  spec has two readings) and remembering the user's conventions. Both belong in the IDE (see the [Roadmap](../ROADMAP.md)).
 

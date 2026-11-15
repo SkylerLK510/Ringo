@@ -1,0 +1,41 @@
+name: Bug report
+description: Help reproduce a problem with Ringo.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us what you were trying to do. Redact credentials, private code and personal paths from logs or screenshots.
+        For security-sensitive reports, use private vulnerability reporting if available, or ask for a private reporting route without posting sensitive details.
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the smallest task or command sequence that shows the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the error, or a redacted screenshot for a visual issue.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, terminal, Ringo commit/version, agent CLI and its version. Add Python/Rust versions for install problems.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Recent updates, restart/resume steps, or a workaround you found.
