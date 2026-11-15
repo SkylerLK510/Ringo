@@ -759,7 +759,11 @@ originals every time, so it is never a summary of a summary:
 
 - the owner's message, word for word (one past 4,000 characters is cut, and the cut said);
 - the agent's reply: the newest whole (to 6,000 characters), older ones' first paragraph (to 600);
-- the steps it took: every failed one (up to five) and, for the newest turn, its last five;
+- the steps it took: every failed one (up to five) and, for the newest turn, its last five. Each step keeps a head
+  (to 160 characters — what ran; the step's whole text is in the job's events file), and a step run again in the
+  same turn is told as "same again", which loses nothing a repeat said. Measured 2026-11-14: in two real 11-turn
+  sessions the step echoes were 71–75% of the record's characters, owner's words and replies 2% each; these bounds
+  took about a fifth off the record uncut where the echoes dominated;
 - the files it changed, and whether `/undo` took them back; where git cannot say (a folder with no `/undo`, such as
   the home folder, or another turn at work here that ran commands), the files it said it edited;
 - the change the turns made, as `git diff` from before the first to after the last, in those files only.

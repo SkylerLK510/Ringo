@@ -1335,6 +1335,43 @@ fn a_long_conversation_starts_fresh_after_a_restart_and_keeps_the_turns_before_i
     assert_eq!(turn_text(&codex), "new");
 }
 
+/// A record tells a step by its head and a step run again as "same again": in two real 11-turn sessions the step
+/// echoes were 71-75% of the record's characters (measured 2026-11-14), and most of an old command's tail is globs
+/// and paths the changed files and the diff already tell — while the step's whole text stays in the job's events
+/// file. The count still says how many steps there were.
+#[test]
+fn a_record_tells_a_step_by_its_head_and_a_run_again_as_same_again() {
+    let r = repo("record-steps");
+    // a command whose parsed step (capped at 300 by the parser) is longer than what a record keeps; its tail is
+    // distinctive, not a repeat of the head's pattern
+    let long = format!("rg -n --hidden needle {}echo found-the-needle", "very/long/path/part/".repeat(12));
+    let call = |id: &str, cmd: &str| format!(
+        r#"echo '{{"type":"assistant","message":{{"id":"a-{id}","content":[{{"type":"tool_use","id":"tu-{id}","name":"Bash","input":{{"command":"{cmd}"}}}}]}},"parent_tool_use_id":null}}'
+echo '{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tu-{id}","content":"ok"}}]}},"parent_tool_use_id":null}}'"#);
+    let script = format!(r#"#!/bin/sh
+for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
+head -n 1 > "$0.stdin"
+echo '{{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none"}}'
+{}
+{}
+{}
+echo '{{"type":"assistant","message":{{"id":"m","content":[],"usage":{{"input_tokens":10,"output_tokens":5}}}},"parent_tool_use_id":null}}'
+echo '{{"type":"result","subtype":"success","is_error":false,"result":"done"}}'
+"#, call("1", &long), call("2", "pwd"), call("3", &long));
+    let (claude, codex) = (fake(&root(), "claude-record-steps", &script), fake(&root(), "codex-record-steps", &codex_ok()));
+    let mut s = session(&r, agent("claude"), &claude);
+    s.programs.insert(agent("codex"), codex.clone());
+    said(&mut s, "claude", "look around");
+    let id = said(&mut s, "codex", "and?"); // codex has yet to hear claude's turn: it goes in as its record
+    let whole = fs::read_to_string(s.job(id).unwrap().dir.join("record.md")).unwrap();
+    let head = long.chars().take(140).collect::<String>();
+    let tail: String = long.chars().skip(200).collect();
+    assert!(whole.contains("steps (3 in all):") && whole.contains(&head) && whole.contains("pwd"), "{whole}");
+    assert!(!whole.contains(&tail), "the tail of a long step is not in the record: {whole}");
+    assert_eq!(whole.matches(&head).count(), 1, "the run-again step is told once, as same again: {whole}");
+    assert!(whole.contains("…") && whole.contains("same again"), "a cut step is marked, a repeat is same again: {whole}");
+}
+
 #[test]
 fn a_fresh_start_after_an_older_shells_restart_still_hears_the_turns_before_it() {
     let r = repo("restart-older");

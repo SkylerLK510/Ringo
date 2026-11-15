@@ -26,6 +26,9 @@ pub const HANDOFF_AT: u64 = 64_000;
 /// How much of Ringo's record goes into a turn, in characters (about four a token): the turns, newest first, then
 /// the change they made.
 const RECORD_CHARS: usize = 60_000;
+/// How much of one step's text a record keeps (`Session::record`): the head says what ran; the step's whole text is
+/// in the job's events file either way.
+const STEP_CHARS: usize = 160;
 /// What a shell keeps in its folder for a later one to go on from (`Session::keep`, `ringo --resume`).
 pub const KEPT: &str = "resume.json";
 /// Where an agent's conversation compacts itself mid-turn, in tokens: Claude's and Codex's (see `launch_agent`).
@@ -1613,6 +1616,19 @@ impl Session {
                         .filter(|s| !s.starts_with(parse::FAILED))).collect(),
             };
             if !steps.is_empty() {
+                // The steps are the agents' own account, and in real records they are most of it (71-75% of the
+                // chars in two real 11-turn sessions, measured 2026-11-14). So each keeps a head of STEP_CHARS —
+                // what a step did is told by the changed files and the diff below, and its whole text stays in the
+                // job's events file — and a step run again is "same again", which loses nothing a repeat said.
+                let mut run: Vec<&str> = Vec::new();
+                let steps: Vec<String> = steps.iter().map(|s| {
+                    if run.contains(s) { return "same again".to_string(); }
+                    run.push(s);
+                    match s.char_indices().nth(STEP_CHARS) {
+                        Some((at, _)) => format!("{}…", &s[..at]),
+                        None => s.to_string(),
+                    }
+                }).collect();
                 part += &format!("steps ({} in all): {}\n", j.steps.len(), steps.join(" | "));
             }
             if !j.changed.is_empty() {
