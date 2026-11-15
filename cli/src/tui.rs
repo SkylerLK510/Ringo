@@ -552,13 +552,47 @@ fn fmt_age(d: Duration) -> String {
     if s < 3600 { format!("{}:{:02}", s / 60, s % 60) } else { format!("{}h{:02}", s / 3600, s / 60 % 60) }
 }
 
-/// Wraps text to `width` columns (one column per character).
+/// A line as rows of at most `width` columns: the widest prefix is taken, through the last space that fits when
+/// there is one, else mid-word. Preserve every character: these rows show permission commands, whose spaces
+/// may be part of a quoted value. Count terminal columns, keeping a wide character together. A character wider
+/// than the whole row is kept alone rather than dropped.
 fn wrap(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let chars: Vec<char> = line.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
+    let mut rows = Vec::new();
+    let mut at = 0; // where the next row starts
+    while at < chars.len() {
+        let (mut col, mut end, mut space) = (0usize, at, None); // chars[at..end] fit; `space` just after the last one
+        while end < chars.len() {
+            let w = chars[end].width().unwrap_or(0);
+            if w > 0 && col + w > width && end > at {
+                break; // the first character of a row always goes in, however wide it is
+            }
+            if chars[end] == ' ' {
+                space = Some(end);
+            }
+            col += w;
+            end += 1;
+        }
+        if end == chars.len() {
+            rows.push(chars[at..].iter().collect());
+            break;
+        }
+        match space {
+            Some(i) => {
+                rows.push(chars[at..=i].iter().collect());
+                at = i + 1;
+            }
+            _ => {
+                rows.push(chars[at..end].iter().collect());
+                at = end;
+            }
+        }
     }
-    chars.chunks(width.max(1)).map(|c| c.iter().collect()).collect()
+    if rows.is_empty() {
+        rows.push(String::new());
+    }
+    rows
 }
 
 /// Text as the terminal should show it: line ends as `\n`, a tab as four spaces, and no other control character (an
@@ -2277,8 +2311,9 @@ impl App {
         let sums = |m: BTreeMap<String, ringo_cli::parse::Tokens>| -> BTreeMap<String, u64> {
             m.into_iter().map(|(k, t)| (k, t.total())).collect()
         };
-        let (day, first) = self.s.used_since(86_400);
-        let (day, week) = (sums(day), sums(self.s.used_since(7 * 86_400).0));
+        let (mut windows, first) = self.s.used_windows(&[86_400, 7 * 86_400]);
+        let week = sums(windows.pop().expect("the week's window"));
+        let day = sums(windows.pop().expect("the day's window"));
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kept = match first {
             Some(at) if now.saturating_sub(at) < 7 * 86_400 => format!(" (Ringo has kept this record for {})", fmt_until(now - at)),
@@ -2371,8 +2406,9 @@ impl App {
                 (Some(file), Ok(Some(text))) => {
                     let file = ringo_cli::home_path(file);
                     used.push(file.canonicalize().unwrap_or_else(|_| file.clone()));
-                    format!("on {on} · {} · {} characters, about {} tokens more on each of its calls{}", home_short(&file),
-                            text.len(), fmt_tokens(text.len() as u64 / 4),
+                    let chars = String::from_utf8_lossy(&text).chars().count();
+                    format!("on {on} · {} · {chars} characters, about {} tokens more on each of its calls{}", home_short(&file),
+                            fmt_tokens(text.len() as u64 / 4),
                             if spec.skills { " · with your Claude Code skills" } else { "" })
                 }
                 (Some(_), Err(e)) => format!("on {on} · {e}"),
@@ -2442,7 +2478,7 @@ impl App {
                                        "company": format!("your own, on {}", base.name()), "login": base.spec().login,
                                        "instructions": path, "skills": skills});
         let file = ringo_cli::own_file(&ringo_cli::Spec::from_json(&entry, true)?)?.unwrap_or_default();
-        let size = file.text.len();
+        let size = String::from_utf8_lossy(&file.text).chars().count();
         // what the file's opening lines say of its model and tools is Claude Code's, and goes to Claude alone
         let offered = file.tools.as_ref().map(|tools| match tools.len() {
             0 => "it is offered none of Claude Code's tools".to_string(),
@@ -2465,7 +2501,7 @@ impl App {
                     tokens more on each of its calls){}{lines}.\n  @{name} talks to it. It keeps a conversation of its own and hears \
                     what the others do, as they hear it. /model {name} NAME picks its model, an edit to the file is in its \
                     next turn, and /agent remove {name} takes it away",
-                   base.name(), home_short(&path), fmt_tokens(size as u64 / 4),
+                   base.name(), home_short(&path), fmt_tokens(file.text.len() as u64 / 4),
                    if skills { ", with your Claude Code skills, plugins and connectors loaded in its turns" } else { "" }))
     }
 
@@ -2741,8 +2777,9 @@ impl App {
                 reviewer(&backend, read, now)
             })));
         }
-        Ok((expanded.len() != task.len()).then(|| {
-            format!("  the handoff adds {} characters to the task:\n{expanded}", expanded.len() - task.len())
+        let (expanded_chars, task_chars) = (expanded.chars().count(), task.chars().count());
+        Ok((expanded_chars != task_chars).then(|| {
+            format!("  the handoff adds {} characters to the task:\n{expanded}", expanded_chars - task_chars)
         }))
     }
 
@@ -3159,8 +3196,9 @@ impl App {
                 }
                 let expanded = self.s.expand(&prompt)?;
                 let mut notes = Vec::new();
-                if expanded.len() != prompt.len() {
-                    notes.push(format!("  the handoff adds {} characters to the task:", expanded.len() - prompt.len()));
+                let (expanded_chars, prompt_chars) = (expanded.chars().count(), prompt.chars().count());
+                if expanded_chars != prompt_chars {
+                    notes.push(format!("  the handoff adds {} characters to the task:", expanded_chars - prompt_chars));
                     notes.push(expanded.clone());
                 }
                 for (agent, _) in agents {
@@ -5217,7 +5255,7 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         // nothing of the owner's yet: how to make one, and the agents they made for Claude Code, found by name
         let made = a.s.home.join(".claude/agents");
         std::fs::create_dir_all(&made).unwrap();
-        std::fs::write(made.join("shop-billing.md"), "---\nname: shop-billing\n---\nYou know the billing code.\n").unwrap();
+        std::fs::write(made.join("shop-billing.md"), "---\nname: shop-billing\n---\nCafé 漢字.\n").unwrap();
         a.run(Cmd::Agent(None), "").unwrap();
         let rows = screen(&mut a, 100, 16).join("\n");
         assert!(rows.contains("none yet. A specialist is a file of instructions") && rows.contains("/agent add shop-billing"), "{rows}");
@@ -5230,7 +5268,7 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
         }
         // made: on claude unless another is named, from the Claude Code agent of that name
         let said = a.run(add("shop-billing", None, None, false), "").unwrap().unwrap();
-        assert!(said.starts_with("  shop-billing is an agent here now: claude with ") && said.contains("(26 characters, about 6 tokens more"), "{said}");
+        assert!(said.starts_with("  shop-billing is an agent here now: claude with ") && said.contains("(8 characters, about 3 tokens more"), "{said}");
         let own = Agent::from_name("shop-billing").unwrap();
         assert_eq!((a.agents.last(), own.spec().adapter, own.spec().read, own.spec().skills), (Some(&own), ringo_cli::Adapter::Claude, true, false));
         assert_eq!(parse("@shop-billing why is the invoice late?", &a.agents), Ok(Cmd::Agents(vec![(own, false)], "why is the invoice late?".into())));
@@ -5249,7 +5287,7 @@ printf '%s\n' "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\
             let rows = a.out[listing_start..].iter().flat_map(|entry| entry.rows(width, &a.theme))
                 .map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
             let words = rows.split_whitespace().collect::<Vec<_>>().join(" ");
-            assert!(words.contains("shop-billing on claude · ") && words.contains("26 characters")
+            assert!(words.contains("shop-billing on claude · ") && words.contains("8 characters, about 3 tokens")
                     && !words.contains("/agent add shop-billing"), "width {width}: {rows}");
         }
         // the same name again, and taken away: its file stays
@@ -6231,11 +6269,38 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
     }
 
     #[test]
+    fn permission_wrapping_preserves_quoted_values_and_whitespace() {
+        let command = r"Bash printf '%s\n' 'one    two'";
+        assert_eq!(wrap(command, 25), vec![r"Bash printf '%s\n' 'one  ", "  two'"]);
+        for text in [command, "    ", "  leading and trailing   ", "Python print('one    two')", "漢 a\u{301}  字"] {
+            for width in 1..40 {
+                let rows = wrap(text, width);
+                assert_eq!(rows.concat(), text, "permission text changed at width {width}");
+                assert!(rows.iter().all(|row| row.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() <= width.max(2)),
+                        "permission row exceeds width {width}: {rows:?}");
+            }
+        }
+    }
+
+    #[test]
     fn formats() {
         assert_eq!(fmt_tokens(870), "870");
         assert_eq!(fmt_tokens(12_400), "12.4k");
+        assert_eq!(fmt_tokens(999_500), "999.5k", "keep the displayed decimal precision below a million");
+        assert_eq!(fmt_tokens(999_949), "999.9k");
+        assert_eq!(fmt_tokens(999_950), "1.00M", "promote only when the display would round to 1000.0k");
+        assert_eq!(fmt_tokens(999_999), "1.00M");
+        assert_eq!(fmt_tokens(1_000_000), "1.00M");
+        assert_eq!(fmt_tokens(1_250_000), "1.25M");
         assert_eq!(fmt_age(Duration::from_secs(75)), "1:15");
-        assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"]);
+        assert_eq!(wrap("abcdef", 4), vec!["abcd", "ef"], "no space to break at: cut where the row is full");
+        assert_eq!(wrap("run cargo test now", 8), vec!["run ", "cargo ", "test now"], "break after the last space that fits");
+        assert_eq!(wrap("a漢字b", 3), vec!["a漢", "字b"], "a wide character counts its two columns");
+        assert_eq!(wrap("a\u{301}漢字b", 3), vec!["a\u{301}漢", "字b"], "combining marks stay with their base");
+        assert_eq!(wrap("abc", 0), vec!["a", "b", "c"], "zero-width layouts still advance");
+        assert_eq!(wrap("漢字", 1), vec!["漢", "字"], "a character wider than the row is retained");
+        assert_eq!(wrap("漢\u{301}字", 1), vec!["漢\u{301}", "字"], "an overwide base retains its combining mark");
+        assert_eq!(wrap("", 4), vec![""], "an empty line is a row");
         assert_eq!([base64(b"hi"), base64(b"hey"), base64(b"heya")], ["aGk=", "aGV5", "aGV5YQ=="]);
         assert_eq!(slice_cols("a漢字b", 1, 3), "漢", "a wide character counts where it starts");
     }

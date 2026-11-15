@@ -2848,18 +2848,28 @@ impl Session {
 
     /// What finished jobs used in the last `secs` seconds, by agent, from `usage.jsonl` (every session's), and when its
     /// first record was written.
-    // ceiling: reads the whole file, one short line a job; a year of daily use is a few MB.
     pub fn used_since(&self, secs: u64) -> (BTreeMap<String, Tokens>, Option<u64>) {
+        let (mut windows, first) = self.used_windows(&[secs]);
+        (windows.remove(0), first)
+    }
+
+    /// The same counts for each of several windows in one read of `usage.jsonl`: /usage asks for a day and a week,
+    /// and the record is one short line a job (a year of daily use is a few MB).
+    pub fn used_windows(&self, secs: &[u64]) -> (Vec<BTreeMap<String, Tokens>>, Option<u64>) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-        let (mut by, mut first) = (BTreeMap::new(), None);
+        let mut by: Vec<BTreeMap<String, Tokens>> = secs.iter().map(|_| BTreeMap::new()).collect();
+        let mut first = None;
         for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
             let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
             let at = r["at"].as_u64().unwrap_or(0);
             first = first.or(Some(at));
-            if now.saturating_sub(at) <= secs {
-                let n = |k: &str| r[k].as_u64().unwrap_or(0);
-                let t: &mut Tokens = by.entry(r["agent"].as_str().unwrap_or("?").to_string()).or_default();
-                t.add(Tokens { input: n("input"), cache_read: n("cache_read"), cache_write: n("cache_write"), output: n("output") });
+            let age = now.saturating_sub(at);
+            let n = |k: &str| r[k].as_u64().unwrap_or(0);
+            for (window, &limit) in by.iter_mut().zip(secs) {
+                if age <= limit {
+                    let t: &mut Tokens = window.entry(r["agent"].as_str().unwrap_or("?").to_string()).or_default();
+                    t.add(Tokens { input: n("input"), cache_read: n("cache_read"), cache_write: n("cache_write"), output: n("output") });
+                }
             }
         }
         (by, first)

@@ -1195,6 +1195,37 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
 }
 
 #[test]
+fn daily_and_weekly_usage_keep_each_agents_complete_token_counts() {
+    let r = repo("usage-windows");
+    let state = root().join("usage-windows-state");
+    let _ = fs::remove_dir_all(&state);
+    let s = Session::with_state(&r, &state).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let old = now - 8 * 86_400;
+    let rows = [
+        serde_json::json!({"at":old,"agent":"codex","input":999}),
+        serde_json::json!({"at":now - 2 * 86_400,"agent":"claude","input":20,"cache_read":30,"cache_write":40,"output":50}),
+        serde_json::json!({"at":now - 3600,"agent":"claude","input":1,"cache_read":2,"cache_write":3,"output":4}),
+        serde_json::json!({"at":now - 3600,"agent":"codex","input":7,"output":8}),
+    ];
+    let log = rows.iter().map(|row| row.to_string()).collect::<Vec<_>>().join("\n") + "\npartial record\n";
+    fs::write(state.join("usage.jsonl"), log).unwrap();
+    let (windows, first) = s.used_windows(&[86_400, 7 * 86_400]);
+    assert_eq!(first, Some(old), "retention includes records outside the requested windows");
+    let today = windows[0].get("claude").unwrap();
+    assert_eq!((today.input, today.cache_read, today.cache_write, today.output), (1, 2, 3, 4));
+    assert_eq!(windows[1].get("claude").unwrap().total(), 150);
+    for window in &windows {
+        assert_eq!(window.get("codex").unwrap().total(), 15, "old usage is excluded from both windows");
+        assert_eq!(window.len(), 2, "a partial record adds no agent");
+    }
+    assert_eq!(s.used_since(86_400).0.get("claude").unwrap().total(), today.total());
+    let (none, first) = s.used_windows(&[]);
+    assert!(none.is_empty());
+    assert_eq!(first, Some(old));
+}
+
+#[test]
 fn a_turn_stopped_by_quitting_is_still_in_the_usage_record() {
     let r = repo("quit-usage");
     let state = root().join("quit-usage-state");
