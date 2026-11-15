@@ -1335,19 +1335,23 @@ fn a_long_conversation_starts_fresh_after_a_restart_and_keeps_the_turns_before_i
     assert_eq!(turn_text(&codex), "new");
 }
 
-/// A record tells a step by its head and a step run again as "same again": in two real 11-turn sessions the step
-/// echoes were 71-75% of the record's characters (measured 2026-11-14), and most of an old command's tail is globs
-/// and paths the changed files and the diff already tell — while the step's whole text stays in the job's events
-/// file. The count still says how many steps there were.
+/// A record tells a step by its head, and a step run more than once once, with how many times it ran: in two real
+/// 11-turn sessions the step echoes were 71-75% of the record's characters (measured 2026-11-14), and most of an old
+/// command's tail is globs and paths the changed files and the diff already tell — while the step's whole text stays
+/// in the job's events file. A failed step's cut keeps its end, why it failed. The count still says how many steps
+/// there were.
 #[test]
-fn a_record_tells_a_step_by_its_head_and_a_run_again_as_same_again() {
+fn a_record_tells_a_step_by_its_head_and_a_repeat_once_with_its_count() {
     let r = repo("record-steps");
     // a command whose parsed step (capped at 300 by the parser) is longer than what a record keeps; its tail is
     // distinctive, not a repeat of the head's pattern
     let long = format!("rg -n --hidden needle {}echo found-the-needle", "very/long/path/part/".repeat(12));
-    let call = |id: &str, cmd: &str| format!(
+    // a long command that fails: its step ends in the tool's error, past where a record cuts
+    let failing = format!("cargo test --locked {}--no-fail-fast", "another/long/path/part/".repeat(10));
+    let call = |id: &str, cmd: &str, error: bool| format!(
         r#"echo '{{"type":"assistant","message":{{"id":"a-{id}","content":[{{"type":"tool_use","id":"tu-{id}","name":"Bash","input":{{"command":"{cmd}"}}}}]}},"parent_tool_use_id":null}}'
-echo '{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tu-{id}","content":"ok"}}]}},"parent_tool_use_id":null}}'"#);
+echo '{{"type":"user","message":{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"tu-{id}","content":"{}","is_error":{error}}}]}},"parent_tool_use_id":null}}'"#,
+        if error { "Exit code 101" } else { "ok" });
     let script = format!(r#"#!/bin/sh
 for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
 head -n 1 > "$0.stdin"
@@ -1355,9 +1359,10 @@ echo '{{"type":"system","subtype":"init","session_id":"s-1","apiKeySource":"none
 {}
 {}
 {}
+{}
 echo '{{"type":"assistant","message":{{"id":"m","content":[],"usage":{{"input_tokens":10,"output_tokens":5}}}},"parent_tool_use_id":null}}'
 echo '{{"type":"result","subtype":"success","is_error":false,"result":"done"}}'
-"#, call("1", &long), call("2", "pwd"), call("3", &long));
+"#, call("1", &long, false), call("2", "pwd", false), call("3", &long, false), call("4", &failing, true));
     let (claude, codex) = (fake(&root(), "claude-record-steps", &script), fake(&root(), "codex-record-steps", &codex_ok()));
     let mut s = session(&r, agent("claude"), &claude);
     s.programs.insert(agent("codex"), codex.clone());
@@ -1366,10 +1371,14 @@ echo '{{"type":"result","subtype":"success","is_error":false,"result":"done"}}'
     let whole = fs::read_to_string(s.job(id).unwrap().dir.join("record.md")).unwrap();
     let head = long.chars().take(140).collect::<String>();
     let tail: String = long.chars().skip(200).collect();
-    assert!(whole.contains("steps (3 in all):") && whole.contains(&head) && whole.contains("pwd"), "{whole}");
+    assert!(whole.contains("steps (4 in all):") && whole.contains(&head) && whole.contains("$ pwd"), "{whole}");
     assert!(!whole.contains(&tail), "the tail of a long step is not in the record: {whole}");
-    assert_eq!(whole.matches(&head).count(), 1, "the run-again step is told once, as same again: {whole}");
-    assert!(whole.contains("…") && whole.contains("same again"), "a cut step is marked, a repeat is same again: {whole}");
+    assert_eq!(whole.matches(&head).count(), 1, "the step run twice is told once: {whole}");
+    assert!(whole.contains("… (2 times) | $ pwd"), "a cut step is marked, and a repeat says how many times it ran: {whole}");
+    assert!(!whole.contains("same again"), "{whole}");
+    // the failed step is cut, but its end — why it failed — is kept
+    assert!(whole.contains("✗ $ cargo test --locked another/long/path/part/") && whole.contains("… · Exit code 101"), "{whole}");
+    assert!(!whole.contains("--no-fail-fast"), "the failed step's middle is cut: {whole}");
 }
 
 #[test]

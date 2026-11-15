@@ -1595,6 +1595,24 @@ impl Session {
             Some((at, _)) => format!("{}… (cut; the whole is in the record)", &text[..at]),
             None => text.to_string(),
         };
+        // A step as a record keeps it: to STEP_CHARS, marked "…" where cut. A failed step ends in what became of it
+        // (` · exit 2`, or the tool's error), and that end is kept inside the bound: a cut never hides why it failed.
+        let step_head = |step: &str| -> String {
+            let upto = |text: &str, n: usize| match text.char_indices().nth(n) {
+                Some((at, _)) => format!("{}…", &text[..at]),
+                None => text.to_string(),
+            };
+            if step.chars().count() <= STEP_CHARS {
+                return step.to_string();
+            }
+            match step.rsplit_once(" · ").filter(|_| step.starts_with(parse::FAILED)) {
+                Some((body, end)) => {
+                    let end = upto(end, STEP_CHARS / 2);
+                    format!("{} · {end}", upto(body, STEP_CHARS - 3 - end.chars().count()))
+                }
+                None => upto(step, STEP_CHARS),
+            }
+        };
         let render = |j: &Job, whole: bool, full: bool| {
             let who = match j.kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
             let said = j.title_full.trim();
@@ -1608,7 +1626,13 @@ impl Session {
                 Status::Failed(why) => format!("{who}: (failed: {why})\n"),
                 _ => format!("{who}: (stopped before it finished)\n"),
             };
-            let failed: Vec<&str> = j.steps.iter().map(String::as_str).filter(|s| s.starts_with(parse::FAILED)).collect();
+            // the failed steps, each told once: five different ones, not one failure run five times
+            let mut failed: Vec<&str> = Vec::new();
+            for s in j.steps.iter().map(String::as_str).filter(|s| s.starts_with(parse::FAILED)) {
+                if !failed.contains(&s) {
+                    failed.push(s);
+                }
+            }
             let steps: Vec<&str> = match full {
                 true => j.steps.iter().map(String::as_str).collect(),
                 false => failed.iter().copied().take(5)
@@ -1617,17 +1641,19 @@ impl Session {
             };
             if !steps.is_empty() {
                 // The steps are the agents' own account, and in real records they are most of it (71-75% of the
-                // chars in two real 11-turn sessions, measured 2026-11-14). So each keeps a head of STEP_CHARS —
+                // chars in two real 11-turn sessions, measured 2026-11-14). So each keeps a head (`step_head`) —
                 // what a step did is told by the changed files and the diff below, and its whole text stays in the
-                // job's events file — and a step run again is "same again", which loses nothing a repeat said.
-                let mut run: Vec<&str> = Vec::new();
-                let steps: Vec<String> = steps.iter().map(|s| {
-                    if run.contains(s) { return "same again".to_string(); }
-                    run.push(s);
-                    match s.char_indices().nth(STEP_CHARS) {
-                        Some((at, _)) => format!("{}…", &s[..at]),
-                        None => s.to_string(),
+                // job's events file — and a step run more than once is told once, with how many times the turn ran
+                // it: "(3 times)" names the step it means, where a bare "same again" read as the one before it.
+                let mut once: Vec<&str> = Vec::new();
+                for s in steps {
+                    if !once.contains(&s) {
+                        once.push(s);
                     }
+                }
+                let steps: Vec<String> = once.iter().map(|s| match j.steps.iter().filter(|t| t.as_str() == *s).count() {
+                    1 => step_head(s),
+                    n => format!("{} ({n} times)", step_head(s)),
                 }).collect();
                 part += &format!("steps ({} in all): {}\n", j.steps.len(), steps.join(" | "));
             }
