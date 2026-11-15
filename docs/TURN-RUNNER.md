@@ -1,5 +1,9 @@
 # Turn runner: offline measurement for harness self-improvement
 
+The follow-up [recursive campaign implementation](RRSI-CAMPAIGN.md) adds a contained worker/checker,
+scripted Session scenarios and a gated offline search controller. It keeps live execution disabled;
+the host-side check path described here is not a contained live evaluator.
+
 This is Phase 1 of the plan to improve Ringo's shell harness the way RRSI does (Xia et al., 2026,
 [arXiv:2609.24972](https://arxiv.org/abs/2609.24972)): **measure first**. It adds a runner that
 puts one shell turn through the real `Session`, a driver that turns task commits into fixtures and

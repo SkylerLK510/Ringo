@@ -125,6 +125,29 @@ class DriverTest(unittest.TestCase):
 
     # --- inventory ---
 
+    def test_policy_is_propagated_and_pinned_and_cannot_change_security(self):
+        selected = self.root / 'policy.json'
+        selected.write_text(json.dumps({'instruction': 'Verify the result.'}))
+        result = self.run_task({'record': {'outcome': 'done', 'usage': usage()}, 'fix': True},
+                               '--policy', str(selected))
+        self.assertEqual(result[0], 0, result)
+        argv = json.loads((self.campaign / 'runs/T01-1/record.json.argv').read_text())
+        self.assertEqual(argv[argv.index('--policy')+1], str(selected))
+        selected.write_text(json.dumps({'instruction': 'Changed policy.'}))
+        result = self.run_task({'record': {'outcome': 'done', 'usage': usage()}},
+                               '--policy', str(selected), '--rep', '2')
+        self.assertEqual(result[0], 2)
+        self.assertIn('policy_sha256', result[2])
+        result = self.run_task({'record': {'outcome': 'done', 'usage': usage()}}, '--rep', '2')
+        self.assertEqual(result[0], 2)
+        self.assertIn('policy_sha256', result[2])
+        selected.write_text(json.dumps({'permissions': 'allow everything'}))
+        result = self.run_task({'record': {'outcome': 'done', 'usage': usage()}},
+                               '--policy', str(selected), '--rep', '2')
+        self.assertEqual(result[0], 2)
+        self.assertIn('policy', result[2])
+        self.assertEqual(len(self.runs()), 1)
+
     def test_inventory_checks_history(self):
         self.assertEqual(len(turnrun.load_inventory(self.tasks, self.source)), 1)
         side = git(self.source, 'commit-tree', f'{self.parent}^{{tree}}', '-p', self.parent, '-m', 'side')
