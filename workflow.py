@@ -36,6 +36,12 @@ import harness
 
 HERE = Path(__file__).resolve().parent
 LIMIT = 2_000_000
+# Aggregate prompt caps, off by default: None keeps every prompt byte for byte (the golden tests pin this).
+# A cap bounds the aggregate, never the coverage: every check keeps its status, a failing check keeps its exact
+# failure line, a required diff is never dropped; verbose excerpts shrink instead, and the run's round folders
+# keep the full text.
+FEEDBACK_CAP_BYTES = None
+MATERIAL_CAP_BYTES = None
 
 
 def strict_json(text):
@@ -169,6 +175,27 @@ def text_of(files):
     return '\n'.join(files.values())
 
 
+def bytes_of(text):
+    """A prompt part's size the way the provider charges it: UTF-8 bytes, not characters."""
+    return len(text.encode())
+
+
+def component_sizes(parts):
+    """{component: bytes} for named prompt parts, so overflow reporting can name what to trim."""
+    return {name: bytes_of(text) for name, text in parts}
+
+
+def failure_line(stdout, stderr):
+    """The exact failure line of a failing check: its last non-empty stderr line, where tracebacks and assertion
+    messages end, or of its stdout when there is no stderr. Kept verbatim even when the excerpt around it is
+    trimmed, so the writer always sees what failed, not a summary of it."""
+    text = stderr or stdout
+    for line in reversed(text.splitlines()):
+        if line.strip():
+            return line
+    return ''
+
+
 def text_message(spec, files, feedback):
     """The writer's input as plain sections: code is not JSON-escaped, so it costs fewer tokens and reads as code."""
     parts = [f"=== BRIEF ===\n{spec['brief']}"]
@@ -221,6 +248,142 @@ def render_feedback(feedback):
     if feedback.get('previous_council'):
         out.append('Earlier council assessment:\n' + json.dumps(feedback['previous_council'], ensure_ascii=False))
     return '\n\n'.join(out) or 'None.'
+
+
+def _bounded_excerpt(text, failure, budget):
+    """A failing excerpt within budget bytes: the exact failure line first, then as much of the output's tail
+    (where tracebacks end) as fits. Byte arithmetic, so the bound holds whatever the text contains."""
+    if bytes_of(text) <= budget:
+        return text
+    room = budget - bytes_of(failure + '\n...\n')
+    if room < 0:
+        return failure
+    raw = text.encode()
+    return failure + '\n...\n' + raw[len(raw) - room:].decode('utf-8', 'ignore')
+
+
+def _excerpt_slots(feedback):
+    """[(slot, output text)] of every trimmable failing excerpt: the declared checks, a regression's checks and
+    the writer script, in that order, so bounding treats them alike."""
+    slots = [(f'check:{i}:{c["name"]}', c['stdout'] + c['stderr'])
+             for i, c in enumerate(feedback.get('checks') or [], 1) if c['status'] != 'pass']
+    reg = feedback.get('regression') or {}
+    slots += [(f'regression:{i}:{c["name"]}', c['stdout'] + c['stderr'])
+              for i, c in enumerate(reg.get('checks') or [], 1) if c['status'] != 'pass']
+    script = feedback.get('script')
+    if isinstance(script, dict):
+        slots.append(('script', script['stdout'] + script['stderr']))
+    return slots
+
+
+def _slot_part(feedback, slot):
+    """(stdout, stderr) of one slot's source entry."""
+    kind, index, name = (slot.split(':') + ['', ''])[:3]
+    if kind == 'script':
+        script = feedback['script']
+        return script['stdout'], script['stderr']
+    source = feedback['checks'] if kind == 'check' else feedback['regression']['checks']
+    entry = source[int(index) - 1]
+    return entry['stdout'], entry['stderr']
+
+
+def bound_feedback(feedback, cap):
+    """(bounded copy, report): writer feedback that renders within cap bytes, for either protocol.
+
+    Coverage is never traded away: every check keeps its entry and status, a failing check keeps its exact
+    failure line, and a failing spec test keeps its id and error. Reduction order: failing spec-test and
+    regression-test sources first (the id and error stay), then each failing check's and the script's excerpt
+    trimmed to a proportional share of what is left. The full text is never lost: the run's round folders keep
+    the check logs and shortcomings.json records the unbounded feedback; report names each component, what was
+    dropped and what cannot fit."""
+    def with_excerpts(source, budget_for):
+        out = dict(source)
+        checks = source.get('checks') or []
+        out['checks'] = [_excerpted(f'check:{i}:{c["name"]}', c, budget_for) for i, c in enumerate(checks, 1)]
+        reg = source.get('regression')
+        if isinstance(reg, dict) and reg.get('checks'):
+            out['regression'] = {**reg, 'checks': [_excerpted(f'regression:{i}:{c["name"]}', c, budget_for)
+                                                   for i, c in enumerate(reg['checks'], 1)]}
+        script = source.get('script')
+        if isinstance(script, dict):
+            stdout, stderr = script['stdout'], script['stderr']
+            out['script'] = {**script, 'stdout': '', 'stderr': _bounded_excerpt(
+                stdout + stderr, failure_line(stdout, stderr), budget_for.get('script', 0))}
+        return out
+
+    def _excerpted(slot, c, budget_for):
+        if c['status'] == 'pass':
+            return c
+        stdout, stderr = c['stdout'], c['stderr']
+        return {**c, 'stdout': '', 'stderr': _bounded_excerpt(stdout + stderr, failure_line(stdout, stderr),
+                                                              budget_for.get(slot, 0))}
+
+    def component_of(slot):
+        kind, _, name = slot.partition(':')
+        return 'script' if kind == 'script' else f'{kind}:{name.partition(":")[2]}'
+
+    def components(source):
+        sizes = {}
+        for c in source.get('checks') or []:
+            if c['status'] != 'pass':
+                sizes[f'check:{c["name"]}'] = bytes_of(c['stdout'] + c['stderr'])
+        reg = source.get('regression')
+        if isinstance(reg, dict):
+            for c in reg.get('checks') or []:
+                if c['status'] != 'pass':
+                    sizes[f'regression:{c["name"]}'] = bytes_of(c['stdout'] + c['stderr'])
+            if reg.get('tests'):
+                sizes['regression.sources'] = sum(bytes_of(t.get('source') or '') for t in reg['tests'])
+        script = source.get('script')
+        if isinstance(script, dict):
+            sizes['script'] = bytes_of(script['stdout'] + script['stderr'])
+        st = source.get('spec_tests')
+        if isinstance(st, dict) and st.get('failing'):
+            sizes['spec_tests.sources'] = sum(bytes_of(t.get('source') or '') for t in st['failing'])
+        return sizes
+
+    report = {'limit': cap, 'total': bytes_of(render_feedback(feedback)), 'components': components(feedback),
+              'dropped': {}, 'total_after': None, 'unreduced': 0}
+    left = report['total']
+    if cap is None or left <= cap:
+        report['total_after'] = left
+        return dict(feedback), report
+    out = dict(feedback)
+    # The source code of failing spec and regression tests: the id and exact error stay, the test's text goes.
+    for key, field, label in (('spec_tests', 'failing', 'spec_tests.sources'),
+                              ('regression', 'tests', 'regression.sources')):
+        block = out.get(key)
+        if isinstance(block, dict) and block.get(field):
+            dropped = sum(bytes_of(t.get('source') or '') for t in block[field])
+            if dropped:
+                out[key] = {**block, field: [{**t, 'source': '(test source not shown; spec_tests.py keeps it)'}
+                                             for t in block[field]]}
+                report['dropped'][label] = dropped
+                left -= dropped
+                if left <= cap:
+                    report['total_after'] = bytes_of(render_feedback(out))
+                    return out, report
+    slots = _excerpt_slots(out)
+    if slots:
+        fixed = bytes_of(render_feedback(with_excerpts(out, {slot: 0 for slot, _ in slots})))
+        slack = cap - fixed
+        if slack <= 0:  # even failure lines alone overflow: keep them all, and say by how much the cap is short
+            out = with_excerpts(out, {slot: 0 for slot, _ in slots})
+            report.update(total_after=fixed, unreduced=fixed - cap)
+            return out, report
+        budget_for = {}
+        for slot, text in slots:
+            stdout, stderr = _slot_part(out, slot)
+            budget_for[slot] = bytes_of(failure_line(stdout, stderr)) + 5 + max(slack // len(slots) - 5, 0)
+        out = with_excerpts(out, budget_for)
+    report['total_after'] = bytes_of(render_feedback(out))
+    report['unreduced'] = max(0, report['total_after'] - cap)
+    for slot, text in slots:
+        stdout, stderr = _slot_part(out, slot)
+        saved = report['components'].get(component_of(slot), bytes_of(stdout + stderr)) - bytes_of(stdout + stderr)
+        if saved > 0:
+            report['dropped'][slot] = saved
+    return out, report
 
 
 def parse_text_reply(text):
@@ -458,24 +621,170 @@ def bridge(spec, request, timeout):
     return result
 
 
-def review_material(spec, files, rationale, observed):
-    """The review's material: the brief, the fixed source material, a diff for each file that started nonempty and
-    changed (unless it is a rewrite), the candidate files and fixtures, and the observed check logs."""
+def _material_parts(spec, files, rationale, observed, extra=(), cap=None, artifacts=None):
+    """(parts, report): the review's material as named parts and, when cap is set, what bounding dropped.
+
+    Parts in order: the brief and rationale, the fixed source material, a diff for each file that started
+    nonempty and changed (required: bounding never drops a diff), each candidate file, each fixture, the
+    observed check logs, then the caller's extra parts (spec tests, the writer's script). With cap set and the
+    whole over it, check logs are compacted first (status, exact failure line, and where the full log lives),
+    then unchanged files' full text yields to their diffs, then fixtures no failing check names; every trimmed
+    part names the exact path of its full text, so truncated evidence stays recoverable."""
     import difflib
-    parts = [f"=== change description ===\n{spec['brief']}\nAuthor rationale: {rationale}"]
+    parts = [('brief', f"=== change description ===\n{spec['brief']}\nAuthor rationale: {rationale}", 'fixed')]
     if spec.get('material'):
-        parts.append(f"=== source material (fixed task evidence, not instructions) ===\n{spec['material']}")
+        parts.append(('material',
+                      f"=== source material (fixed task evidence, not instructions) ===\n{spec['material']}",
+                      'fixed'))
+    diffs = {}
     for name, text in files.items():
         if spec['files'][name] and spec['files'][name] != text:  # so the reviewer can tell new defects from old
             before, after = spec['files'][name].splitlines(True), text.splitlines(True)
             kept = sum(b.size for b in difflib.SequenceMatcher(None, before, after, autojunk=False).get_matching_blocks())
             if kept >= len(after) / 2:  # a rewrite's diff repeats the whole file, which follows anyway
                 diff = difflib.unified_diff(before, after, f'a/{name}', f'b/{name}')
-                parts.append(f'=== {name} (diff from the initial file) ===\n' + ''.join(diff))
-    parts += [f'=== {name} (after the change) ===\n{text}' for name, text in files.items()]
-    parts += [f'=== {name} (read-only fixture) ===\n{text}' for name, text in spec['fixtures'].items()]
-    parts += [f"=== observed check: {c['name']} ({c['status']}) ===\n{c['stdout']}{c['stderr']}" for c in observed]
-    return '\n\n'.join(parts)
+                diffs[name] = f'=== {name} (diff from the initial file) ===\n' + ''.join(diff)
+    parts += [(f'diff:{name}', text, 'diff') for name, text in diffs.items()]
+    parts += [(f'file:{name}', f'=== {name} (after the change) ===\n{text}', 'file') for name, text in files.items()]
+    parts += [(f'fixture:{name}', f'=== {name} (read-only fixture) ===\n{text}', 'fixture')
+              for name, text in spec['fixtures'].items()]
+    parts += [(f'check:{c["name"]}', f"=== observed check: {c['name']} ({c['status']}) ===\n{c['stdout']}{c['stderr']}",
+               'check') for c in observed]
+    parts += [(f'extra:{name}', text, 'fixed') for name, text in extra]
+    report = {'components': component_sizes((name, text) for name, text, _ in parts), 'dropped': {},
+              'total': None, 'total_after': None, 'unreduced': 0}
+    if cap is None:
+        return parts, report
+    separators = 2 * (len(parts) - 1)  # the '\n\n' between parts
+    report['total'] = sum(bytes_of(text) for _, text, _ in parts) + separators
+    if report['total'] <= cap:
+        return parts, report
+    # Direct dependencies from spec data: the executable argv of a failing check names the files it reads.
+    failed_argv = ' '.join(' '.join(check['argv']) for check, c in zip(spec['checks'], observed)
+                           if c['status'] != 'pass')
+
+    def check_text(c, i, tail):
+        head = f"=== observed check: {c['name']} ({c['status']}) ===\n"
+        text = c['stdout'] + c['stderr']
+        where = f'{artifacts}/check-{i}.out' if artifacts else None
+        if where:
+            note = (f'(full log at {where})\n' if Path(where).exists()
+                    else f'(full log missing; it was at {where})\n')
+        else:
+            note = ''
+        if c['status'] == 'pass':
+            return head + note
+        line = failure_line(c['stdout'], c['stderr'])
+        return head + (line + '\n' if line else '') \
+            + (_bounded_excerpt(text, line, bytes_of(line) + 5 + tail) + '\n' if tail else '') + note
+
+    def rebuilt(parts_list, tails):
+        out, i = [], 0
+        for name, text, kind in parts_list:
+            if kind == 'check':
+                i += 1
+                out.append((name, check_text(observed[i - 1], i, tails.get(i, 0)), kind))
+            else:
+                out.append((name, text, kind))
+        return out
+
+    total = lambda ps: sum(bytes_of(text) for _, text, _ in ps) + 2 * (len(ps) - 1)
+    parts = rebuilt(parts, {})
+    if total(parts) > cap:  # unchanged files that no failing check reads: the diff keeps what changed visible
+        trimmed = []
+        for name, text, kind in parts:
+            if kind == 'file' and name[5:] not in diffs and name[5:] not in failed_argv:
+                where = f'{artifacts}/candidate/{name[5:]}' if artifacts else None
+                marker = f'=== {name[5:]} (after the change; '
+                marker += f'full text at {where})\n' if where and Path(where).exists() \
+                    else f'full text missing; it was at {where})\n' if where else 'full text not shown)\n'
+                trimmed.append((name, marker, kind))
+                report['dropped'][name] = report['components'][name] - bytes_of(marker)
+            else:
+                trimmed.append((name, text, kind))
+        parts = trimmed
+    if total(parts) > cap:  # fixtures no failing check reads: named by path, recoverable from the round folder
+        trimmed = []
+        for name, text, kind in parts:
+            if kind == 'fixture' and name[8:] not in failed_argv:
+                where = f'{artifacts}/candidate/{name[8:]}' if artifacts else None
+                marker = f'=== {name[8:]} (read-only fixture; '
+                marker += f'full text at {where})\n' if where and Path(where).exists() \
+                    else f'full text missing; it was at {where})\n' if where else 'full text not shown)\n'
+                trimmed.append((name, marker, kind))
+                report['dropped'][name] = report['components'][name] - bytes_of(marker)
+            else:
+                trimmed.append((name, text, kind))
+        parts = trimmed
+    if total(parts) > cap:  # failing check excerpts get proportional tails; failure lines are always kept
+        failing = [i for i, c in enumerate(observed, 1) if c['status'] != 'pass']
+        if failing:
+            share = max((cap - total(parts)) // len(failing) - 5, 0)
+            candidate = rebuilt(parts, {i: share for i in failing})
+            if total(candidate) <= cap:
+                parts = candidate
+    report['total_after'] = total(parts)
+    report['unreduced'] = max(0, report['total_after'] - cap)
+    return parts, report
+
+
+def review_material(spec, files, rationale, observed, cap=None, artifacts=None, extra=()):
+    """The review's material: the brief, the fixed source material, a diff for each file that started nonempty and
+    changed (unless it is a rewrite), the candidate files and fixtures, and the observed check logs. With cap set
+    the material is bounded (_material_parts); unchanged, it is byte-identical to the unbounded form."""
+    parts, _report = _material_parts(spec, files, rationale, observed, extra, cap, artifacts)
+    return '\n\n'.join(text for _, text, _ in parts)
+
+
+def review_batches(spec, files, rationale, observed, cap, artifacts=None, extra=()):
+    """The review material as explicit batches, for a tool-free reviewer that cannot page: every batch carries
+    the brief header and records which parts it covers, and the union of the covers is every diff, file, fixture
+    and check log exactly once. A part larger than a batch's room gets a batch of its own rather than being
+    cut, so nothing is silently truncated here; its batch is marked over, and the caller decides."""
+    parts, _report = _material_parts(spec, files, rationale, observed, extra)
+    header = next(text for name, text, _ in parts if name == 'brief')
+    rest = [(name, text) for name, text, _ in parts if name != 'brief']
+    reserve = bytes_of('=== review batch 99 of 99 ===') + 2
+    batches, current, used = [], [], bytes_of(header) + 2 + reserve
+    for name, text in rest:
+        size = bytes_of(text) + 2
+        if current and used + size > cap:
+            batches.append(current)
+            current, used = [], bytes_of(header) + 2 + reserve
+        current.append((name, text))
+        used += size
+    batches.append(current)
+    out = []
+    for i, batch in enumerate(batches, 1):
+        text = '\n\n'.join([f'=== review batch {i} of {len(batches)} ===', header, *(t for _, t in batch)])
+        out.append({'batch': i, 'of': len(batches), 'covers': ['brief', *(name for name, _ in batch)],
+                    'bytes': bytes_of(text), 'over': bytes_of(text) > cap, 'material': text})
+    return out
+
+
+def merge_review_batches(replies):
+    """One review text from per-batch replies: the first preamble that is not 'no defects', every finding
+    renumbered in batch order, and the open questions and not-checked notes of every batch, deduplicated."""
+    import pipelines
+    pre, bodies, sections = '', [], {}
+    for reply in replies:
+        head, found, secs = pipelines.findings('review', reply)
+        pre = pre or '\n'.join(line for line in head.splitlines() if not pipelines.NO_DEFECTS.search(line)).strip()
+        bodies += list(found.values())
+        for key, lines in secs.items():
+            sections.setdefault(key, []).extend(line for line in lines.splitlines() if line.strip())
+    out = [pre, ''] if pre else []
+    out += [pipelines.HEAD.sub(lambda m, n=n: f'### {n}. {m.group(2)}', body, count=1)
+            for n, body in enumerate(bodies, 1)]
+    out = [line for pair in ([body, ''] for body in out) for line in pair]
+    if not bodies:
+        out += ['No defects found in any batch.', '']
+    questions = [line if line.startswith('-') else f'- {line}'
+                 for line in dict.fromkeys(sections.get('open questions', []))
+                 if line.strip('- ').lower() != 'none']
+    out += ['### Open questions (not findings)', *(questions or ['none'])]
+    out += ['', '### Not checked', *(list(dict.fromkeys(sections.get('not checked', []))) or ['n/a'])]
+    return '\n'.join(out).strip()
 
 
 def review_findings(text):
@@ -525,7 +834,8 @@ def checks(spec, root, logdir, remaining):
     return results
 
 
-def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
+def run(spec_path, out, call_fn=harness.call, *, progress='auto',
+        feedback_cap=FEEDBACK_CAP_BYTES, material_cap=MATERIAL_CAP_BYTES):
     import releases
     started = time.perf_counter_ns()
     spec = load_spec(spec_path)
@@ -618,7 +928,7 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
             accounting.finish(kind, seconds, usage)
             return reply
 
-    def review(files, rationale, observed):
+    def review(files, rationale, observed, folder):
         import pipelines
 
         # Each attempt gets the time still left (run_plan caps its limits by it). timeout_s is soft here too: a
@@ -635,15 +945,33 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
                 guard(timeout)
                 return call_fn(backend, system, message, timeout)
         plan = pipelines.load_plan(HERE / 'plans' / 'review-doc.json' if kind == 'doc' else None, 'review')
-        material = review_material(spec, files, rationale, observed)
+        backend = role_backend(harness.backend(spec['judge']), spec['roles'].get('review'))
+        extra = []
         if spec_suite:
-            material += '\n\n=== spec tests written from the brief alone ===\n' + spec_summary(last_spec)
+            extra.append(('spec_tests', '=== spec tests written from the brief alone ===\n' + spec_summary(last_spec)))
         if last_script:
-            material += (f"\n\n=== the writer's script ({last_script['status']}) ===\n{last_script['source']}"
-                         f"\n=== its output ===\n{(last_script['stdout'] + last_script['stderr'])[-6000:]}")
-        text, _ = harness.run_plan(plan, material, role_backend(harness.backend(spec['judge']), spec['roles'].get('review')),
-                                   accounting, call_fn=bounded, timeout_s=spec['timeout_s'], left=remaining)
-        return text
+            extra.append(('script', f"=== the writer's script ({last_script['status']}) ===\n{last_script['source']}"
+                                    f"\n=== its output ===\n{(last_script['stdout'] + last_script['stderr'])[-6000:]}"))
+        if material_cap is None:
+            material = review_material(spec, files, rationale, observed, extra=extra)
+            text, _ = harness.run_plan(plan, material, backend, accounting, call_fn=bounded,
+                                       timeout_s=spec['timeout_s'], left=remaining)
+            return text, None
+        parts, report = _material_parts(spec, files, rationale, observed, extra, material_cap, str(folder))
+        if report['unreduced']:  # required evidence cannot fit one review: explicit coverage-tracked batches
+            batches = review_batches(spec, files, rationale, observed, material_cap, artifacts=str(folder),
+                                     extra=extra)
+            texts = [harness.run_plan(plan, b['material'], backend, accounting, call_fn=bounded,
+                                      timeout_s=spec['timeout_s'], left=remaining)[0] for b in batches]
+            return merge_review_batches(texts), {'limit': material_cap, 'components': report['components'],
+                                                 'dropped': report['dropped'],
+                                                 'batches': [{'batch': b['batch'], 'of': b['of'],
+                                                              'covers': b['covers'], 'bytes': b['bytes'],
+                                                              'over': b['over']} for b in batches]}
+        material = '\n\n'.join(text for _, text, _ in parts)
+        text, _ = harness.run_plan(plan, material, backend, accounting, call_fn=bounded,
+                                   timeout_s=spec['timeout_s'], left=remaining)
+        return text, report
 
     # Spec tests: one call that sees the brief and the starting files (the interface) but never a candidate,
     # writes a unittest module, and runs after the declared checks pass. Its failures go back to the writer,
@@ -751,11 +1079,14 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
                          root, logs, remaining)[0]
             return {**ran, 'source': script}
 
-        def writer_message(feedback):
-            if text_protocol:
-                return text_message(spec, current, feedback)
-            return json.dumps({'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
-                               'fixtures': spec['fixtures'], 'feedback': feedback}, ensure_ascii=False)
+        def writer_message(fb):
+            report = None
+            if feedback_cap is not None:  # bounded for the model; the unbounded feedback stays in the record
+                fb, report = bound_feedback(fb, feedback_cap)
+            message = text_message(spec, current, fb) if text_protocol else json.dumps(
+                {'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
+                 'fixtures': spec['fixtures'], 'feedback': fb}, ensure_ascii=False)
+            return message, report
 
         def undisputed(result):
             """A spec-test result without the tests disputed since it ran."""
@@ -777,7 +1108,9 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
             entry = {'round': n}
             report['rounds'].append(entry)
             answering = feedback  # what this round's writer answers; a rejected revision answers it again
-            message = writer_message(feedback)
+            message, writer_report = writer_message(feedback)
+            if writer_report is not None:
+                entry['prompt_report'] = writer_report
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
             k = spec['candidates'] if n == 1 else 1
@@ -802,10 +1135,9 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
                 # One immediate repair call with the exact error, so a reply that cannot be applied costs a call,
                 # not the round (and the review or check feedback it was answering).
                 entry['repair'] = errors[0]['protocol_error']
-                repaired = call(f'writer-{n}.repair', spec['writer'], writer_prompt,
-                                writer_message({**feedback, 'protocol_error': errors[0]['protocol_error']
-                                                + (REPAIR if text_protocol else REPAIR_JSON)}),
-                                role=role)
+                repair_message, _report = writer_message({**feedback, 'protocol_error': errors[0]['protocol_error']
+                                                          + (REPAIR if text_protocol else REPAIR_JSON)})
+                repaired = call(f'writer-{n}.repair', spec['writer'], writer_prompt, repair_message, role=role)
                 try:
                     parsed.append((k + 1, *parse(repaired)))
                 except ValueError as exc:
@@ -937,7 +1269,9 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
                 continue
             if not council:
                 if reviewed is None:
-                    review_text = review(current, candidate['rationale'], observed)
+                    review_text, material_report = review(current, candidate['rationale'], observed, folder)
+                    if material_report is not None:
+                        entry['review_report'] = material_report
                     (folder / 'review.md').write_text(review_text + '\n', encoding='utf-8')
                     entry['review_findings'] = review_findings(review_text)
                     report['review'] = str(folder / 'review.md')
