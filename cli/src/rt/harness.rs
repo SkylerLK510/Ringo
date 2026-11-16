@@ -71,6 +71,17 @@ fn group_thousands(digits: &str) -> String {
     format!("{sign}{out}")
 }
 
+fn grouped_number(number: Num) -> String {
+    let text = number.py_str();
+    if text.contains(['e', 'E']) || !number.as_f64().is_finite() {
+        return text;
+    }
+    match text.split_once('.') {
+        Some((whole, fraction)) => format!("{}.{fraction}", group_thousands(whole)),
+        None => group_thousands(&text),
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Python values: type names, truth, str()
 
@@ -108,7 +119,7 @@ fn py_add(acc: Num, x: &Value, op: &str) -> Result<Num> {
 
 /// `sum(values)`, as CPython 3.14 sums: ints exactly; once the total is a float, every number as a float with
 /// Neumaier's compensation; anything else is a TypeError.
-fn py_sum(values: &[Operand]) -> Result<Num> {
+pub(crate) fn py_sum(values: &[Operand]) -> Result<Num> {
     let mut it = values.iter();
     let mut total = Num::Int(0);
     for v in it.by_ref() {
@@ -841,6 +852,12 @@ struct Totals {
     finished: HashMap<String, Vec<Finished>>,
     incident_dir: Option<PathBuf>,
     last: Value,
+    max_tokens: Option<Num>,
+    blocker_threshold: Option<i128>,
+    budget_overshoot_calls: i64,
+    /// One compact entry per repeated-failure signature past the threshold (measurement only).
+    blockers: Vec<Value>,
+    _blocker_counts: HashMap<String, i64>,
 }
 
 /// Cost budget, totals and trace of one pipeline run; shared by the parallel steps, so it holds a lock. It counts
@@ -860,7 +877,25 @@ impl Run {
     /// `Run(trace_dir, max_cost, unpriced_call_usd)`: None or null means Python's None. unpriced_call_usd is a
     /// declared cost per call for backends that report none. A trace folder must be new or empty; it is created
     /// with steps/ (exclusively, so two writers cannot share one) and made 0700, and state.json says running.
-    pub fn new(trace_dir: Option<&Path>, max_cost: Option<&Value>, unpriced_call_usd: Option<&Value>) -> Result<Run> {
+    /// max_tokens: a whole-task token cap over every recorded call (None: off, today's behavior exactly). It
+    /// stops ADMITTING new calls; it never kills a call that is already running — an in-flight call that pushes
+    /// past the cap is recorded as overshoot and counted. blocker_threshold: after this many failures with an
+    /// identical signature, each further one is flagged as a repeated blocker (None: off).
+    pub fn new(
+        trace_dir: Option<&Path>,
+        max_cost: Option<&Value>,
+        unpriced_call_usd: Option<&Value>,
+    ) -> Result<Run> {
+        Self::new_with_options(trace_dir, max_cost, unpriced_call_usd, None, Some(&Value::from(3)))
+    }
+
+    pub fn new_with_options(
+        trace_dir: Option<&Path>,
+        max_cost: Option<&Value>,
+        unpriced_call_usd: Option<&Value>,
+        max_tokens: Option<&Value>,
+        blocker_threshold: Option<&Value>,
+    ) -> Result<Run> {
         let max_cost = max_cost.filter(|v| !v.is_null());
         let unpriced_call_usd = unpriced_call_usd.filter(|v| !v.is_null());
         for (label, value) in [("max_cost", max_cost), ("unpriced_call_usd", unpriced_call_usd)] {
@@ -868,6 +903,16 @@ impl Run {
                 return Err(Error::value(format!("{label} must be a finite, non-negative number")));
             }
         }
+        let max_tokens: Option<Num> = max_tokens
+            .filter(|v| !v.is_null())
+            .map(|v| nonneg_int(Some(v)).map(Num::Int)
+                .ok_or_else(|| Error::value("max_tokens must be a non-negative integer or None")))
+            .transpose()?;
+        let blocker_threshold: Option<i128> = blocker_threshold
+            .filter(|v| !v.is_null())
+            .map(|v| nonneg_int(Some(v)).filter(|n| *n >= 1)
+                .ok_or_else(|| Error::value("blocker_threshold must be a positive integer or None")))
+            .transpose()?;
         let trace = trace_dir.filter(|p| !p.as_os_str().is_empty()).map(py::path);
         if let Some(t) = &trace {
             if fs::metadata(t).is_ok() {
@@ -902,15 +947,23 @@ impl Run {
                 finished: HashMap::new(),
                 incident_dir: None,
                 last: Value::Null,
+                max_tokens,
+                blocker_threshold,
+                budget_overshoot_calls: 0,
+                blockers: vec![],
+                _blocker_counts: HashMap::new(),
             }),
         };
         run.state("running", &[])?;
         Ok(run)
     }
 
-    /// Count a call about to start, or raise BudgetExceeded under a cost cap. A cost cap needs every earlier
-    /// call's cost: once one is unknown (a backend that reports none, a failed call) the cap cannot be kept, so no
-    /// call starts. The cap stops new calls; calls under a cost cap run one at a time.
+    /// Count a call about to start, or raise BudgetExceeded under a cap. A cost cap needs every earlier call's
+    /// cost: once one is unknown (a backend that reports none, a failed call) the cap cannot be kept, so no call
+    /// starts. The token cap is the same at the task's scope: it sums every recorded call's tokens (delegation,
+    /// repair and review included), and once a paid call reported no token counts the cap cannot be kept either.
+    /// Caps stop new calls only: a call that is already running is never killed, and one that overshoots the
+    /// token cap is recorded as overshoot.
     pub fn reserve(&self) -> Result<()> {
         let mut t = lock(&self.totals);
         if let Some(cap) = self.max_cost {
@@ -923,6 +976,23 @@ impl Run {
             }
             if matches!(Num::Float(t.cost).py_cmp(cap), Some(Ordering::Greater | Ordering::Equal)) {
                 return Err(budget_exceeded(format!("cost cap reached (${:.4} of ${})", t.cost, cap.format_f(4))));
+            }
+        }
+        let recorded = py_sum(&t.tokens.iter().cloned().map(Ok).collect::<Vec<Operand>>())?;
+        if let Some(cap) = &t.max_tokens {
+            if t.untokened != 0 {
+                return Err(budget_exceeded(format!(
+                    "{} calls reported no token counts, so the {}-token cap cannot be kept",
+                    t.untokened,
+                    group_thousands(&cap.py_str())
+                )));
+            }
+            if matches!(recorded.py_cmp(cap.clone()), Some(Ordering::Greater | Ordering::Equal)) {
+                return Err(budget_exceeded(format!(
+                    "token cap reached ({} of {} tokens)",
+                    grouped_number(recorded),
+                    group_thousands(&cap.py_str())
+                )));
             }
         }
         t.calls += 1;
@@ -940,8 +1010,8 @@ impl Run {
         Ok(())
     }
 
-    /// Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, kept (first
-    /// RAW_LIMIT bytes) so the failure can be diagnosed. Token sums stay ints: a paid attempt that reported no
+    /// Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, written whole
+    /// to a private artifact while the record keeps a bounded, hashed excerpt. Token sums stay ints: a paid attempt that reported no
     /// usage, or usage without token fields, counts under untokened_calls, as an unknown price counts under
     /// unpriced_calls. As in Python, a failure part way leaves the totals it already changed.
     pub fn record(&self, rec: &Map<String, Value>, reply: Option<&str>, raw: Option<&str>) -> Result<()> {
@@ -978,28 +1048,95 @@ impl Run {
                     None => t.unpriced += 1,
                 },
             }
+            if t.max_tokens.is_some() && TOKEN_KEYS.iter().all(|k| fields.map(|m| m.contains_key(*k)).unwrap_or(false)) {
+                let recorded = py_sum(&t.tokens.iter().cloned().map(Ok).collect::<Vec<Operand>>())?;
+                if matches!(recorded.py_cmp(t.max_tokens.clone().expect("checked above")), Some(Ordering::Greater)) {
+                    let over = match (recorded, t.max_tokens.expect("checked above")) {
+                        (Num::Int(a), Num::Int(b)) => Num::Int(a.checked_sub(b).ok_or_else(py::too_big)?),
+                        (a, b) => Num::Float(a.as_f64() - b.as_f64()),
+                    };
+                    rec.insert("budget_overshoot_tokens".into(), over.to_value());
+                    t.budget_overshoot_calls += 1;
+                }
+            }
         }
-        if let Some(progress) = lock(&self.progress).as_ref() { progress.update(&rec); }
-        let Some(trace) = &self.trace else { return Ok(()) };
-        let path = py::join(trace, "trace.jsonl");
-        let mut f = fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| py::path_error(&e, &path))?;
-        f.write_all(format!("{}\n", pyjson::dumps(&Value::Object(rec.clone()))).as_bytes())?;
-        drop(f);
-        t.last = Value::Object(
-            ["step", "attempt", "status"].iter().filter_map(|k| rec.get(*k).map(|v| ((*k).to_string(), v.clone()))).collect(),
-        );
-        self.write_state(&t, "running", &[])?;
-        if reply.is_some() || raw.is_some_and(|r| !r.is_empty()) {
-            let step = py::value_str(rec.get("step").ok_or_else(|| key_error("step"))?);
-            let attempt = py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?);
-            let steps = py::join(trace, "steps");
-            if let Some(reply) = reply {
-                py::write_file(&py::join(&steps, &format!("{step}.{attempt}.txt")), reply.as_bytes())?;
-            }
+        if t.blocker_threshold.is_some()
+            && matches!(rec.get("status"), Some(Value::String(s)) if ["error", "fatal"].contains(&s.as_str()))
+        {
+            self.blocker(&mut rec, raw, &mut t)?;
+        }
+        if let Some(trace) = &self.trace {
             if let Some(raw) = raw.filter(|r| !r.is_empty()) {
-                let bytes = raw.as_bytes();
-                py::write_file(&py::join(&steps, &format!("{step}.{attempt}.raw.txt")), &bytes[..bytes.len().min(RAW_LIMIT)])?;
+                // the artifact keeps the whole output, the record a bounded head of it
+                let data = raw.as_bytes();
+                let excerpt = data.len().min(RAW_LIMIT);
+                rec.insert(
+                    "raw_excerpt".into(),
+                    Value::Object(Map::from_iter([
+                        ("artifact", Value::String(format!("steps/{}.{}.raw.txt", py::value_str(rec.get("step").ok_or_else(|| key_error("step"))?), py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?)))),
+                        ("total_bytes", Value::from(data.len())),
+                        ("excerpt_bytes", Value::from(excerpt)),
+                        ("sha256", Value::String(crate::rt::sha256_hex(data))),
+                        ("head_bytes", Value::from(excerpt)),
+                        ("omitted_bytes", Value::from(data.len() - excerpt)),
+                        ("omission_note", Value::String("the record keeps only the head; the artifact holds the whole output, and its sha256 above proves it".into())),
+                        ("head", Value::String(String::from_utf8_lossy(&data[..excerpt]).into_owned())),
+                    ].into_iter().map(|(k, v)| (k.into(), v)))),
+                );
             }
+            let path = py::join(trace, "trace.jsonl");
+            let mut f = fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| py::path_error(&e, &path))?;
+            f.write_all(format!("{}\n", pyjson::dumps(&Value::Object(rec.clone()))).as_bytes())?;
+            drop(f);
+            t.last = Value::Object(
+                ["step", "attempt", "status"].iter().filter_map(|k| rec.get(*k).map(|v| ((*k).to_string(), v.clone()))).collect(),
+            );
+            self.write_state(&t, "running", &[])?;
+            if reply.is_some() || raw.is_some_and(|r| !r.is_empty()) {
+                let step = py::value_str(rec.get("step").ok_or_else(|| key_error("step"))?);
+                let attempt = py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?);
+                let steps = py::join(trace, "steps");
+                if let Some(reply) = reply {
+                    py::write_file(&py::join(&steps, &format!("{step}.{attempt}.txt")), reply.as_bytes())?;
+                }
+                if let Some(raw) = raw.filter(|r| !r.is_empty()) {
+                    py::write_file(&py::join(&steps, &format!("{step}.{attempt}.raw.txt")), raw.as_bytes())?;
+                }
+            }
+        }
+        if let Some(progress) = lock(&self.progress).as_ref() {
+            progress.update(&rec);
+        }
+        Ok(())
+    }
+
+    fn blocker(&self, rec: &mut Map<String, Value>, raw: Option<&str>, t: &mut Totals) -> Result<()> {
+        let error = rec.get("error").filter(|v| py::truthy(v));
+        let data = match raw.filter(|r| !r.is_empty()) {
+            Some(raw) => raw.as_bytes(),
+            None => match error {
+                Some(Value::String(error)) => error.as_bytes(),
+                Some(v) => return Err(Error::new(Exc::Attribute, format!("'{}' object has no attribute 'encode'", py::type_name(v)))),
+                None => b"",
+            },
+        };
+        let length = data.len();
+        let hash = crate::rt::sha256_hex(data);
+        let signature = format!("{}:{hash}", py::value_str(rec.get("status").unwrap_or(&Value::Null)));
+        let count = t._blocker_counts.entry(signature.clone()).or_default();
+        *count += 1;
+        if (*count as i128) < t.blocker_threshold.expect("checked before calling blocker") {
+            return Ok(());
+        }
+        rec.insert("blocker_repeat".into(), Value::from(*count));
+        let entry = serde_json::json!({
+            "signature": signature, "count": *count, "step": rec.get("step"), "attempt": rec.get("attempt"),
+            "sha256": hash, "total_bytes": length, "at": rec.get("started")
+        });
+        if let Some(previous) = t.blockers.iter_mut().find(|previous| previous.get("signature") == entry.get("signature")) {
+            *previous = entry;
+        } else {
+            t.blockers.push(entry);
         }
         Ok(())
     }
@@ -1040,7 +1177,53 @@ impl Run {
     /// an extra that is null is left out (Python's `**extra` without the None values).
     pub fn state(&self, status: &str, extra: &[(&str, Value)]) -> Result<()> {
         let t = lock(&self.totals);
-        self.write_state(&t, status, extra)
+        let mut fields = Vec::new();
+        if status != "running" && let Some(trace) = &self.trace {
+            let result = self.task_report_from_totals(&t, status).and_then(|report| {
+                py::write_file(&py::join(trace, "task-report.json"), format!("{}\n", pyjson::dumps_indent(&report, 1)).as_bytes())
+            });
+            match result {
+                Ok(()) => fields.push(("task_report", Value::String("task-report.json".into()))),
+                Err(e) => eprintln!("ringo: task report could not be written: {e}"),
+            }
+        }
+        if let Some(cap) = t.max_tokens {
+            let budget = serde_json::json!({
+                "max_tokens": cap.to_value(),
+                "recorded_tokens": py_sum(&t.tokens.iter().copied().map(Ok).collect::<Vec<Operand>>())?.to_value(),
+                "overshoot": t.budget_overshoot_calls,
+                "note": "a cap stops new calls only; it never kills a running call, and a budget stop is an incomplete outcome"
+            });
+            // Python inserts the budget before the task-report path.
+            fields.insert(0, ("budget", budget));
+        }
+        fields.extend_from_slice(extra);
+        self.write_state(&t, status, &fields)
+    }
+
+    pub fn task_report(&self, final_state: &str) -> Result<Value> {
+        self.task_report_from_totals(&lock(&self.totals), final_state)
+    }
+
+    fn task_report_from_totals(&self, t: &Totals, final_state: &str) -> Result<Value> {
+        let mut records = Vec::new();
+        if let Some(trace) = &self.trace {
+            let path = py::join(trace, "trace.jsonl");
+            if path.exists() {
+                let text = fs::read_to_string(&path).map_err(|e| py::path_error(&e, &path))?;
+                for line in py::splitlines(&text, false) {
+                    records.push(pyjson::loads(line).unwrap_or(Value::Null));
+                }
+            }
+        }
+        super::taskreport::build(
+            &records, Some(&summary_of(t, self.clock_started.elapsed().as_secs_f64())), &t.blockers,
+            final_state, self.trace.as_deref(), t.max_tokens,
+            t.max_tokens.map(|_| t.budget_overshoot_calls),
+            (t.unpriced == 0).then(|| py::round(t.cost, 6)),
+            self.trace.as_ref().and_then(|trace| trace.file_name()).map(|s| s.to_string_lossy().into_owned()),
+            self.trace.as_ref().map(|_| py::round(self.started, 3)),
+        )
     }
 
     fn write_state(&self, t: &Totals, status: &str, extra: &[(&str, Value)]) -> Result<()> {

@@ -52,7 +52,8 @@ def files(base):
                 found[rel] = ['dir', st.st_mode & 0o777]
             else:
                 data = open(p, 'rb').read()
-                found[rel] = ['file', st.st_mode & 0o777, len(data), hashlib.sha256(data).hexdigest()]
+                found[rel] = (['file', st.st_mode & 0o777, json.loads(data)] if name == 'task-report.json' else
+                              ['file', st.st_mode & 0o777, len(data), hashlib.sha256(data).hexdigest()])
     return dict(sorted(found.items()))
 
 def state_text(run):
@@ -80,7 +81,8 @@ def script(case):
             elif kind == 'new':
                 trace = op['trace_raw'] if 'trace_raw' in op else (os.path.join(base, op['trace']) if op['trace'] is not None else None)
                 run = None
-                run = harness.Run(trace, op.get('max_cost'), op.get('unpriced'))
+                run = harness.Run(trace, op.get('max_cost'), op.get('unpriced'),
+                                  max_tokens=op.get('max_tokens'), blocker_threshold=op.get('blocker_threshold', 3))
             elif kind == 'reserve':
                 run.reserve()
             elif kind == 'refuse':
@@ -99,6 +101,8 @@ def script(case):
                 run.state(op['status'], **dict(op.get('extra', [])))
             elif kind == 'summary':
                 res = run.summary()
+            elif kind == 'task_report':
+                res = run.task_report(op.get('status', 'unknown'))
             r = {'ok': res}
         except Exception as e:
             r = err(e)
@@ -487,7 +491,11 @@ fn files(base: &Path) -> Value {
                 walk(base, &p, out);
             } else {
                 let data = fs::read(&p).unwrap();
-                out.insert(rel, json!(["file", mode, data.len(), sha_bytes(&data)]));
+                if p.file_name().is_some_and(|n| n == "task-report.json") {
+                    out.insert(rel, json!(["file", mode, parse_line(std::str::from_utf8(&data).unwrap())]));
+                } else {
+                    out.insert(rel, json!(["file", mode, data.len(), sha_bytes(&data)]));
+                }
             }
         }
     }
@@ -552,7 +560,9 @@ fn parse_line(line: &str) -> Value {
 fn normalise_files(files: &mut Value) {
     for (name, entry) in files.as_object_mut().unwrap() {
         // state.json and an incident record carry wall-clock times; their contents are compared normalised elsewhere
-        if name.ends_with("state.json") || (name.contains("incidents/") && name.ends_with(".json")) {
+        if name.ends_with("task-report.json") {
+            normalise_report(&mut entry[2]);
+        } else if name.ends_with("state.json") || (name.contains("incidents/") && name.ends_with(".json")) {
             entry.as_array_mut().unwrap().truncate(2);
         }
     }
@@ -581,7 +591,7 @@ fn normalise_temp(s: &str, prefix: &str) -> String {
 fn normalise_throughput(v: &mut Value) {
     match v {
         Value::Object(m) => for (k, x) in m {
-            if ["elapsed_s", "output_tokens_per_second"].contains(&k.as_str()) && x.is_number() {
+            if ["elapsed_s", "elapsed_seconds", "output_tokens_per_second"].contains(&k.as_str()) && x.is_number() {
                 assert!(x.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0));
                 *x = json!(format!("<{k}>"));
             } else { normalise_throughput(x); }
@@ -605,11 +615,19 @@ fn normalise_state(text: &str) -> String {
     { let mut v = Value::Object(state); normalise_throughput(&mut v); pyjson::dumps_compact(&v) }
 }
 
+fn normalise_report(report: &mut Value) {
+    if report["identifiers"]["started"].is_number() {
+        report["identifiers"]["started"] = json!("<started>");
+    }
+    normalise_throughput(report);
+}
+
 fn normalise_script(line: &str) -> String {
     let mut v = parse_line(line);
     normalise_throughput(&mut v);
     normalise_files(&mut v["files"]);
     for step in v["steps"].as_array_mut().unwrap() {
+        if step["ok"].get("schema_version").is_some() { normalise_report(&mut step["ok"]); }
         if let Some(text) = step["state"].as_str() {
             step["state"] = json!(normalise_state(text));
         }
@@ -1026,6 +1044,40 @@ fn script_cases(base: &Path) -> Vec<Value> {
     for (k, ops) in fixed.iter().enumerate() {
         cases.push(v(&format!(r#"{{"base": {}, "ops": {ops}}}"#, pyjson::quote(&base.join(format!("f{k}")).to_string_lossy()))));
     }
+    for (i, ops) in [
+        json!([{"op":"new","trace":"t","max_tokens":5}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"ok","usage":{"input":5,"cache_write":0,"cache_read":0,"output":2}}},
+            {"op":"reserve"}, {"op":"state","status":"done","extra":[]}, {"op":"task_report","status":"done"}]),
+        json!([{"op":"new","trace":null,"max_tokens":0}, {"op":"reserve"}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t","blocker_threshold":2},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"error","error":"same"}},
+            {"op":"record","rec":{"step":"s","attempt":2,"status":"error","error":"same"}},
+            {"op":"record","rec":{"step":"s","attempt":3,"status":"error","error":"same"}},
+            {"op":"record","rec":{"step":"s","attempt":4,"status":"fatal","error":"same"}},
+            {"op":"state","status":"failed","extra":[]}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":null,"blocker_threshold":null},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"error","error":7}}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":null,"blocker_threshold":18446744073709551616u128,"max_tokens":18446744073709551616u128},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"error","error":"same"}}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":null,"max_tokens":100}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"ok","usage":{}}},
+            {"op":"reserve"}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t","max_tokens":5}, {"op":"reserve"}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"ok","usage":{"input":5,"cache_write":0,"cache_read":0,"output":2}}},
+            {"op":"record","rec":{"step":"s","attempt":2,"status":"ok","usage":{"input":1,"cache_write":0,"cache_read":0,"output":1}}},
+            {"op":"reserve"}, {"op":"state","status":"done","extra":[]}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t","blocker_threshold":1},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"error","error":"ignored"},"raw":"same output"},
+            {"op":"record","rec":{"step":"s","attempt":2,"status":"error","error":"ignored"},"raw":"another output"},
+            {"op":"record","rec":{"step":"s","attempt":3,"status":"error","error":"different"},"raw":"same output"},
+            {"op":"task_report"}]),
+    ].into_iter().enumerate() {
+        cases.push(json!({"base":base.join(format!("options{i}")),"ops":ops}));
+    }
+    for (i, value) in [json!(-1),json!(true),json!(1.5),json!("5")].into_iter().enumerate() {
+        cases.push(json!({"base":base.join(format!("invalid-cap{i}")),"ops":[{"op":"new","trace":null,"max_tokens":value}]}));
+        cases.push(json!({"base":base.join(format!("invalid-blocker{i}")),"ops":[{"op":"new","trace":null,"blocker_threshold":value}]}));
+    }
     let mut big = v(&format!(r#"{{"base": {}, "ops": [{{"op": "new", "trace": "t"}}, {{"op": "reserve"}}]}}"#,
                              pyjson::quote(&base.join("raw").to_string_lossy())));
     big["ops"].as_array_mut().unwrap().push(json!({"op": "record", "rec": {"step": "review", "attempt": 1, "status": "error",
@@ -1064,7 +1116,8 @@ fn rust_script(case: &Value) -> String {
                     Some(raw) => Some(PathBuf::from(raw.as_str().unwrap())),
                     None => text("trace").map(|t| base.join(t)),
                 };
-                Run::new(trace.as_deref(), op.get("max_cost"), op.get("unpriced")).map(|r| {
+                Run::new_with_options(trace.as_deref(), op.get("max_cost"), op.get("unpriced"),
+                    op.get("max_tokens"), op.get("blocker_threshold").or(Some(&Value::from(3)))).map(|r| {
                     run = Some(r);
                     Value::Null
                 })
@@ -1117,6 +1170,7 @@ fn rust_op(r: &Run, op: &Value, kind: &str) -> Result<Value, Error> {
             r.state(op["status"].as_str().unwrap(), &extra).map(|_| Value::Null)?
         }
         "summary" => Value::Object(r.summary()),
+        "task_report" => r.task_report(op.get("status").and_then(Value::as_str).unwrap_or("unknown"))?,
         other => panic!("{other}"),
     })
 }
@@ -1155,7 +1209,7 @@ fn run_trace_state_and_summary_match_python() {
     eprintln!("Run scripts: {errors} raised steps; {budget} scripts hit a budget refusal");
     assert!(budget > 10 && errors > 200);
     let raw = rs.last().unwrap();
-    assert!(raw.contains(r#""t/steps/review.1.raw.txt": ["file", "#) && raw.contains(", 1000000, "), "{}", short(raw));
+    assert!(raw.contains(r#""t/steps/review.1.raw.txt": ["file", "#) && raw.contains(&format!(", {}, ", 1 + 2 * RAW_CHARS + 4)), "{}", short(raw));
     fs::remove_dir_all(&base).unwrap();
 }
 

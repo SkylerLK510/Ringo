@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -81,14 +82,14 @@ class LedgerTest(unittest.TestCase):
         kinds = [g['kind'] for g in report['coverage']['gaps']]
         self.assertEqual(kinds.count('invalid_counter'), 2)
 
-    def test_aggregate_usage_is_scoped_so_child_usage_is_never_added_twice(self):
+    def test_aggregate_subtotals_are_not_added_and_unlinked_call_overlap_is_unknown(self):
         records = [ok(1, 'parent', 1, input=1000, output=50, models=['m', 'n'], cost_usd=0.1),
                    ok(2, 'child', 1, input=100, output=5)]
         report = taskreport.build(records)
         scopes = {r['step']: r['scope'] for r in report['consumption']['requests']}
-        self.assertEqual(scopes, {'parent': 'provider_turn_aggregate', 'child': 'single_request'})
-        self.assertIn('never added again', report['consumption']['normalization']['accounting_scopes'])
-        self.assertTrue(any('never added again' in x for x in report['coverage']['exclusions']))
+        self.assertEqual(scopes, {'parent': 'provider_turn_aggregate', 'child': 'backend_call'})
+        self.assertEqual(report['consumption']['whole_task']['input'], 1100)
+        self.assertIn('aggregate_attribution_unknown', [g['kind'] for g in report['coverage']['gaps']])
 
     def test_usage_on_a_record_that_never_settled_is_flagged(self):
         report = taskreport.build([rec('s', 1, 'started', 1, {'input': 5})])
@@ -110,6 +111,13 @@ class LedgerTest(unittest.TestCase):
 
 
 class ContextAndAmplificationTest(unittest.TestCase):
+    def test_capacity_and_disabled_compaction_are_not_active_context_or_events(self):
+        records = [ok(1, context_window=1000000, compaction_count=0, compacted=False),
+                   ok(2, compact_threshold=800000, context_compacted=False)]
+        report = taskreport.build(records)
+        self.assertFalse(report['active_context']['available'])
+        self.assertEqual(report['amplification']['compactions']['count'], 0)
+
     def test_lifetime_consumption_is_never_substituted_for_active_context(self):
         report = taskreport.build([ok(1, input=900, output=5)])
         self.assertFalse(report['active_context']['available'])
@@ -124,13 +132,13 @@ class ContextAndAmplificationTest(unittest.TestCase):
 
     def test_amplification_is_null_when_not_defined(self):
         report = taskreport.build([ok(1, input=310, output=5)], final_state='failed')
-        self.assertEqual(report['amplification']['input_per_request'], 310.0)
-        self.assertIsNone(report['amplification']['cumulative_input_per_accepted_call'])
-        self.assertIsNone(report['amplification']['tool_result_bytes'])
+        self.assertEqual(report['amplification']['uncached_input_per_usage_record'], 310.0)
+        self.assertIsNone(report['amplification']['uncached_input_at_completed_state'])
+        self.assertIsNone(report['amplification']['raw_artifact_bytes'])
         accepted = taskreport.build([ok(1, input=310, output=5)], final_state='done')
-        self.assertEqual(accepted['amplification']['cumulative_input_per_accepted_call'], 310)
+        self.assertEqual(accepted['amplification']['uncached_input_at_completed_state'], 310)
         empty = taskreport.build([])
-        self.assertIsNone(empty['amplification']['input_per_request'])
+        self.assertIsNone(empty['amplification']['uncached_input_per_usage_record'])
 
     def test_tool_artifact_bytes_come_from_the_trace_and_stay_out_of_tokens(self):
         with tempfile.TemporaryDirectory() as d:
@@ -138,7 +146,7 @@ class ContextAndAmplificationTest(unittest.TestCase):
             steps.mkdir()
             (steps / 's.1.raw.txt').write_bytes(b'x' * 77)
             report = taskreport.build([ok(1, input=5)], trace=d)
-            self.assertEqual(report['amplification']['tool_result_bytes'], 77)
+            self.assertEqual(report['amplification']['raw_artifact_bytes'], 77)
             self.assertEqual(report['amplification']['raw_artifacts'], 1)
         self.assertIn('outside every token count', report['amplification']['notes'][1])
 
@@ -149,16 +157,29 @@ class ContextAndAmplificationTest(unittest.TestCase):
         marked = taskreport.build([ok(1, input=5), rec('s', 1, 'ok', 2, {'input': 5, 'compacted': True})])
         self.assertEqual(marked['amplification']['compactions']['count'], 1)
 
-    def test_blockers_reach_the_report_under_repeated_unchanged_reads(self):
+    def test_blockers_reach_the_report_under_repeated_failure_outputs(self):
         blocker = {'signature': 'error:abc', 'count': 4, 'step': 's', 'attempt': 1, 'sha256': 'abc',
                    'total_bytes': 10, 'at': 1.0}
         report = taskreport.build([rec('s', 1, 'error', 1)], blockers=[blocker])
-        reads = report['amplification']['repeated_unchanged_reads']
+        reads = report['amplification']['repeated_failure_outputs']
         self.assertEqual((reads['signatures'], reads['repeat_events']), (1, 3))
         self.assertEqual(report['amplification']['blockers'], [blocker])
 
 
 class OutcomeTest(unittest.TestCase):
+    def test_failures_and_stops_are_counted_without_usage(self):
+        report = taskreport.build([rec('a', 1, 'error', 1),
+                                   rec('b', 1, 'fatal', 2, stopped='timeout')])
+        self.assertEqual(report['outcome']['calls_failed'], 2)
+        self.assertEqual(report['outcome']['stopped_calls'], 1)
+        self.assertEqual(report['consumption']['unknown_usage_requests'], 1)
+
+    def test_missing_status_does_not_break_mixed_status_accounting(self):
+        report = taskreport.build([{'usage': {'input': 99}}, ok(1, input=5)])
+        self.assertEqual(report['consumption']['whole_task']['input'], 5)
+        self.assertIn('unknown', report['consumption']['by_status'])
+        self.assertIn('invalid_status', [g['kind'] for g in report['coverage']['gaps']])
+
     def test_cost_is_reported_only_where_supportable(self):
         priced = taskreport.build([ok(1, input=1, cost_usd=0.02)], summary={'calls': 1, 'unfinished_calls': 0,
                                                                            'unpriced_calls': 0, 'elapsed_s': 1.0},
@@ -203,6 +224,21 @@ class OutcomeTest(unittest.TestCase):
 
 
 class RunHookTest(unittest.TestCase):
+    def test_interleaved_blockers_keep_one_latest_entry_per_signature(self):
+        run = harness.Run(blocker_threshold=1)
+        for attempt, output in enumerate(('a', 'b', 'a', 'b', 'a'), 1):
+            run.record({'step': 's', 'attempt': attempt, 'status': 'error'}, raw=output)
+        self.assertEqual([b['count'] for b in run.blockers], [3, 2])
+        self.assertEqual(len({b['signature'] for b in run.blockers}), 2)
+
+    def test_report_failure_does_not_prevent_final_state(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d, 't'))
+            with patch.object(run, 'task_report', side_effect=ValueError('invalid telemetry')):
+                with patch('sys.stderr'):
+                    run.state('done')
+            self.assertEqual(json.loads(Path(d, 't', 'state.json').read_text())['status'], 'done')
+
     def test_the_whole_output_lands_in_the_artifact_and_the_excerpt_names_the_omission(self):
         with tempfile.TemporaryDirectory() as d:
             head = b'x' * 600_000 + b'\nIMPORTANT-ERROR-IN-THE-MIDDLE\n' + b'y' * 500_000 + b'\nTAIL-ERROR\n'
@@ -239,7 +275,7 @@ class RunHookTest(unittest.TestCase):
             rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
             self.assertIsNone(rows[-1].get('blocker_repeat'))
             report = run.task_report()
-            self.assertEqual(report['amplification']['repeated_unchanged_reads']['signatures'], 1)
+            self.assertEqual(report['amplification']['repeated_failure_outputs']['signatures'], 1)
 
     def test_blocker_threshold_none_disables_detection(self):
         run = harness.Run(blocker_threshold=None)

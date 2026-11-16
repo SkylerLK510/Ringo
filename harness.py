@@ -808,8 +808,10 @@ class Run:
         rec['blocker_repeat'] = count
         entry = {'signature': signature, 'count': count, 'step': rec.get('step'), 'attempt': rec.get('attempt'),
                  'sha256': hashlib.sha256(data).hexdigest(), 'total_bytes': len(data), 'at': rec.get('started')}
-        if self.blockers and self.blockers[-1]['signature'] == signature:
-            self.blockers[-1] = entry
+        for i, previous in enumerate(self.blockers):
+            if previous['signature'] == signature:
+                self.blockers[i] = entry
+                break
         else:
             self.blockers.append(entry)
 
@@ -876,12 +878,12 @@ class Run:
                                 started=round(self.started, 3) if self.trace else None)
 
     def _write_task_report(self, final_state):
-        """Write <trace>/task-report.json; returns its name, or None if the write failed (never raises)."""
+        """Write <trace>/task-report.json; recoverable reporting errors return None."""
         try:
             (self.trace / 'task-report.json').write_text(
                 json.dumps(self.task_report(final_state), indent=1) + '\n', encoding='utf-8')
             return 'task-report.json'
-        except OSError as exc:
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
             print(f'ringo: task report could not be written: {exc}', file=sys.stderr)
             return None
 

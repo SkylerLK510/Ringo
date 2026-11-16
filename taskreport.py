@@ -3,10 +3,9 @@
 The report is a private measurement artifact for the person and later offline analysis, never a prompt: nothing
 reads it back into a model-facing message. It is derived only from the trace records a run already wrote
 (trace.jsonl) plus the run's own summary, so writing it cannot change what the run measured and stays possible
-after the process is gone. Groups: identifiers; whole-task consumption in nonoverlapping accounting scopes (a
-usage dict that already aggregates child usage is counted once and separately reported child usage is never
-added again); active context (provider-reported estimates only — lifetime consumption is never substituted for
-it); amplification; outcome; coverage. Every unknown is an explicit null with a note, never a zero.
+after the process is gone. Totals are sums of known normalized counters, with missing categories and
+unavailable attribution reported separately. Backend call records are not necessarily individual provider
+requests. Active context is reported only when an explicit estimate is captured.
 """
 import getpass
 import json
@@ -16,11 +15,11 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 TOKEN_KEYS = ('input', 'cache_write', 'cache_read', 'output')
-PAID = ('ok', 'malformed', 'error')  # every attempt is paid for, a failed one too (as harness.py records it)
+PAID = ('ok', 'malformed', 'error')  # settled attempts included in the harness's usage ledger
 FAILED = ('error', 'fatal')
 ACCEPTED = ('done', 'ready_for_review')  # final states that mean the task's output was accepted by its checks
-CONTEXT_KEY = re.compile(r'context', re.I)
-COMPACT_KEY = re.compile(r'compact', re.I)
+CONTEXT_KEYS = {'context_tokens', 'active_context_tokens', 'context_size_tokens'}
+COMPACT_KEYS = {'compacted', 'compaction_count', 'context_compacted'}
 CUMULATIVE_KEY = re.compile(r'total|cumulative', re.I)
 AGGREGATE_KEY = 'models'  # claude-style usage names the models of every sub-call its own totals already include
 
@@ -28,12 +27,11 @@ NORMALIZATION_NOTE = ("'input' is uncached input: the capture paths already sepa
                       "path subtracts cached_input_tokens from the provider's total input; the Claude path's "
                       "input_tokens excludes the cache fields by the provider's own accounting), so cache-write "
                       "and cache-read are never added into it.")
-SCOPE_NOTE = ("a usage dict that names its models (claude-style 'models') is the provider's aggregate for the "
-              "whole CLI turn, including any native child calls it covered: it is counted once, and separately "
-              "reported child usage is never added again. Every other usage dict covers exactly one provider "
-              "request whose tokens are its own.")
-RAW_FIELDS_NOTE = ("requests[].raw_usage keeps each usage dict exactly as the backend reported it (raw provider "
-                   "field names and values), with a warning-text list bounded to a warning_count.")
+SCOPE_NOTE = ("Each distinct backend call record is counted once. A 'models' usage field marks a CLI-turn "
+              "aggregate; its model subtotals are not added again. Backend call records can cover multiple "
+              "provider requests. Separately recorded parent/child overlap cannot be resolved without linkage.")
+RAW_FIELDS_NOTE = ("requests[].raw_usage preserves the normalized usage dict captured by the backend, not "
+                   "the original provider wire event; warning text is replaced with warning_count.")
 
 
 def _nonneg(value):
@@ -96,10 +94,14 @@ def _rows(kept, gaps):
         if not isinstance(usage, dict):
             continue
         counters, problems = _counters(usage)
-        row = {'step': rec.get('step'), 'attempt': rec.get('attempt'), 'status': rec.get('status'),
+        status = rec.get('status')
+        if not isinstance(status, str):
+            status = 'unknown'
+            gaps.append({'kind': 'invalid_status', 'note': 'non-string call status grouped as unknown'})
+        row = {'step': rec.get('step'), 'attempt': rec.get('attempt'), 'status': status,
                'backend': rec.get('backend'), 'model': rec.get('model'), 'started': rec.get('started'),
                'counters': counters, 'raw_usage': _raw_usage(usage),
-               'scope': 'provider_turn_aggregate' if AGGREGATE_KEY in usage else 'single_request'}
+               'scope': 'provider_turn_aggregate' if AGGREGATE_KEY in usage else 'backend_call'}
         if rec.get('stopped'):
             row['stopped'] = rec['stopped']
         if rec.get('status') not in PAID:
@@ -161,7 +163,7 @@ def _active_context(kept):
         if isinstance(rec.get('usage'), dict):
             candidates.update(rec['usage'])
         for key, value in candidates.items():
-            if CONTEXT_KEY.search(str(key)) and _nonneg(value) is not None:
+            if str(key).lower() in CONTEXT_KEYS and _nonneg(value) is not None:
                 estimates.append({'step': rec.get('step'), 'attempt': rec.get('attempt'), 'source': key,
                                   'value': value, 'started': rec.get('started')})
     if not estimates:
@@ -177,8 +179,14 @@ def _active_context(kept):
 
 
 def _compactions(kept, requests):
-    events = [rec for rec in kept if isinstance(rec, dict) and
-              any(COMPACT_KEY.search(str(k)) for k in list(rec) + list(rec.get('usage') or {}))]
+    events = []
+    for rec in kept:
+        fields = dict(rec)
+        if isinstance(rec.get('usage'), dict):
+            fields.update(rec['usage'])
+        if any(str(k).lower() in COMPACT_KEYS and
+               (v is True or (_nonneg(v) is not None and v > 0)) for k, v in fields.items()):
+            events.append(rec)
     if not events:
         return {'count': 0, 'requests_between': None,
                 'note': 'no record in this trace marks a compaction; 0 means none was observed, not that none '
@@ -189,7 +197,7 @@ def _compactions(kept, requests):
 
 def _tool_artifacts(trace):
     """(bytes, count) of the trace's steps/*.raw.txt artifacts, or (None, 0) without a trace: these files hold
-    bytes of tool output, which are outside every token count."""
+    raw backend output. Artifact bytes are measured separately from token counters."""
     if not trace:
         return None, 0
     try:
@@ -249,28 +257,29 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
     }
     any_aggregate = any(row['scope'] == 'provider_turn_aggregate' for row in rows)
     if any_aggregate:
-        exclusions.append('usage marked provider_turn_aggregate already includes every child call its provider '
-                          'made inside the turn; such child usage is never added again (nonoverlapping scopes)')
+        gaps.append({'kind': 'aggregate_attribution_unknown',
+                     'note': 'aggregate model subtotals are not added again; separately recorded child overlap '
+                             'and the underlying provider request count are unavailable'})
     amplification = {
-        'input_per_request': round(uncached / whole['requests'], 1) if whole.get('requests') else None,
-        'cumulative_input_per_accepted_call': uncached if final_state in ACCEPTED else None,
-        'tool_result_bytes': artifact_bytes,
+        'uncached_input_per_usage_record': round(uncached / whole['requests'], 1) if whole.get('requests') else None,
+        'uncached_input_at_completed_state': uncached if final_state in ACCEPTED else None,
+        'raw_artifact_bytes': artifact_bytes,
         'raw_artifacts': artifact_count,
-        'repeated_unchanged_reads': {'signatures': len({b.get('signature') for b in blockers}),
+        'repeated_failure_outputs': {'signatures': len({b.get('signature') for b in blockers}),
                                      'repeat_events': sum(max(0, b.get('count', 1) - 1) for b in blockers),
-                                     'note': 'signatures hash the failure output (and any unchanged-file hint the '
-                                             'record carries); unchanged-file evidence is not recorded on its own'},
+                                     'note': 'signatures hash failure output only; identical output does not establish '
+                                             'unchanged files or repeated file reads'},
         'blockers': [dict(b) for b in blockers],
         'compactions': _compactions(kept, whole.get('requests') or 0),
-        'notes': ['cumulative_input_per_accepted_call is null unless the final state is an accepted outcome',
-                  'tool_result_bytes counts artifact bytes, not tokens; they are outside every token count'],
+        'notes': ['uncached_input_at_completed_state is null unless the final state is an accepted outcome',
+                  'raw_artifact_bytes counts captured backend output, not all tool results; bytes are outside every token count'],
     }
-    stopped = sum(1 for row in rows if row.get('stopped'))
+    stopped = sum(1 for rec in kept if rec.get('stopped'))
     outcome = {
         'final_state': final_state,
         'calls_completed': (summary.get('calls', 0) - summary.get('unfinished_calls', 0))
                            if summary.get('calls') is not None else sum(1 for r in paid_rows),
-        'calls_failed': sum(1 for row in rows if row['status'] in FAILED),
+        'calls_failed': sum(1 for rec in kept if rec.get('status') in FAILED),
         'stopped_calls': stopped,
         'elapsed_seconds': summary.get('elapsed_s'),
         'cost_usd': cost_usd,
@@ -292,15 +301,19 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
     exclusions += ['the task report is a private artifact and is never sent to a model',
                    'tool-result artifacts hold bytes, not tokens; they are outside every token count',
                    'subscription token usage is not a monetary invoice']
-    notes += ['every unknown is null with a note, never zero',
+    notes += ['ledger totals sum known counters only; missing categories are coverage gaps, not measured zero',
               'identifiers for experiment, job, thread and parent are not recorded by this harness and stay '
               'unknown',
               'provider-reported usage is the only source for every token category here']
+    try:
+        user = getpass.getuser() or None
+    except (OSError, KeyError):
+        user = None
     return {
         'schema_version': SCHEMA_VERSION,
         'identifiers': {'task_id': task_id, 'started': started,
                         'hostname': socket.gethostname() or None,
-                        'user': getpass.getuser() if getpass.getuser() else None},
+                        'user': user},
         'consumption': consumed,
         'active_context': _active_context(kept),
         'amplification': amplification,

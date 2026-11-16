@@ -191,6 +191,14 @@ class GoldenTest(unittest.TestCase):
 
 
 class FeedbackBoundTest(unittest.TestCase):
+    def test_json_feedback_accounts_for_escaping_and_structural_overhead(self):
+        feedback = {'protocol_error': '\"\\\n' * 1000}
+        bounded, report = workflow.bound_feedback(feedback, 100, text_protocol=False)
+        actual = len(json.dumps(bounded, ensure_ascii=False).encode())
+        self.assertEqual(report['total_after'], actual)
+        self.assertEqual(report['unreduced'], actual - 100)
+        self.assertEqual(bounded, feedback)  # a protocol error remains required evidence
+
     def test_under_the_cap_the_feedback_copy_is_unchanged_and_reported(self):
         bounded, report = workflow.bound_feedback(GOLD_FEEDBACK, 10 ** 9)
         self.assertEqual(bounded, GOLD_FEEDBACK)
@@ -276,30 +284,29 @@ class MaterialBoundTest(unittest.TestCase):
         self.assertIn('check:gate', report['components'])
         self.assertGreater(report['components']['file:big.py'], 8000)
 
-    def test_over_the_cap_diffs_stay_unchanged_files_yield_with_their_exact_path(self):
-        with tempfile.TemporaryDirectory() as d:
-            Path(d, 'candidate').mkdir()
-            for name, text in (('big.py', 'def f():\n    return 2\n' + 'z\n' * 4000), ('other.py', 'other = 1\n')):
-                Path(d, 'candidate', name).write_text(text)
-            Path(d, 'check-1.out').write_text('the full log\n')
-            material = workflow.review_material(self.spec(), self.files(), 'r', self.observed(),
-                                                cap=3000, artifacts=d)
-            self.assertIn('=== a.py (diff from the initial file) ===\n--- a/a.py', material)  # a required diff
-            self.assertIn('-y = 2\n+y = 3\n', material)
-            self.assertIn('=== big.py (after the change; full text at ' + d + '/candidate/big.py)\n', material)
-            self.assertNotIn('z\n' * 10, material)  # the dump itself is gone
-            self.assertIn('AssertionError: exact failure', material)  # the exact failure line stays
-            self.assertIn('(full log at ' + d + '/check-1.out)', material)  # the full log is cited
-            self.assertIn('z\n' * 4000, (Path(d, 'candidate') / 'big.py').read_text())  # and recoverable
-            self.assertIn('=== dep.py (after the change) ===\ndep = 1\n', material)  # named by the failing check
-            self.assertIn('=== other.py (after the change; full text at ' + d + '/candidate/other.py)\n', material)
+    def test_overflow_preserves_rewrites_new_files_dependencies_and_logs(self):
+        spec, files, observed = self.spec(), self.files(), self.observed()
+        spec['files']['new.py'] = ''
+        files['new.py'] = 'new evidence\n' * 200
+        observed[0]['stdout'] = 'start\n' + 'noise\n' * 300 + 'IMPORTANT MIDDLE ERROR\n' + 'noise\n' * 300
+        parts, report = workflow._material_parts(spec, files, 'r', observed, cap=3000)
+        material = '\n\n'.join(text for _, text, _ in parts)
+        for name, text in files.items():
+            self.assertIn(text, material, name)
+        for text in spec['fixtures'].values():
+            self.assertIn(text, material)
+        self.assertIn('IMPORTANT MIDDLE ERROR', material)
+        self.assertIn('-y = 2\n+y = 3\n', material)
+        self.assertEqual(report['dropped'], {})
+        self.assertEqual(report['unreduced'], len(material.encode()) - 3000)
 
-    def test_a_vanished_artifact_gets_an_explicit_missing_marker_with_its_path(self):
-        with tempfile.TemporaryDirectory() as d:  # no check-1.out, no candidate/: the logs and files are gone
+    def test_missing_artifacts_do_not_remove_inline_evidence(self):
+        with tempfile.TemporaryDirectory() as d:
             material = workflow.review_material(self.spec(), self.files(), 'r', self.observed(),
                                                 cap=3000, artifacts=d)
-            self.assertIn(f'(full log missing; it was at {d}/check-1.out)', material)
-            self.assertIn(f'full text missing; it was at {d}/candidate/big.py)', material)
+            self.assertIn(self.files()['big.py'], material)
+            self.assertIn(self.observed()[0]['stderr'], material)
+            self.assertNotIn('full text missing', material)
 
     def test_bounding_is_deterministic(self):
         with tempfile.TemporaryDirectory() as d:

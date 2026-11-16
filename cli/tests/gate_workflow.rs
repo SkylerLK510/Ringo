@@ -1785,7 +1785,7 @@ fn normalize(v: &mut Value, from: &str, to: &str) {
     match v {
         Value::Object(m) => {
             for (k, x) in m.iter_mut() {
-                if ["seconds", "elapsed_s", "started", "updated", "pid", "output_tokens_per_second"].contains(&k.as_str()) && x.is_number() {
+                if ["seconds", "elapsed_s", "elapsed_seconds", "started", "updated", "pid", "output_tokens_per_second"].contains(&k.as_str()) && x.is_number() {
                     *x = json!("<n>");
                 } else if k == "message_sha256" {
                     *x = json!("<sha of a message the calls already compare, timing included>");
@@ -1798,7 +1798,7 @@ fn normalize(v: &mut Value, from: &str, to: &str) {
         Value::String(t) => {
             // a JSON-protocol writer message carries the check results, timing included
             static SECONDS: std::sync::LazyLock<regex::Regex> =
-                std::sync::LazyLock::new(|| regex::Regex::new(r#""(seconds|elapsed_s|output_tokens_per_second)": [0-9.e+-]+"#).unwrap());
+                std::sync::LazyLock::new(|| regex::Regex::new(r#""(seconds|elapsed_s|elapsed_seconds|output_tokens_per_second)": [0-9.e+-]+"#).unwrap());
             *t = SECONDS.replace_all(&t.replace(from, to), "\"$1\": \"<n>\"").into_owned();
         }
         _ => {}
@@ -1820,9 +1820,24 @@ fn tree(dir: &Path, from: &str, to: &str) -> Vec<(String, String)> {
                 continue;
             }
             let text = String::from_utf8_lossy(&std::fs::read(&p).unwrap()).into_owned();
-            let text = if rel.ends_with(".json") || rel.ends_with(".jsonl") {
+            let text = if rel.ends_with(".json") {
+                match serde_json::from_str::<Value>(&text) {
+                    Ok(mut v) => {
+                        if rel.ends_with("task-report.json") {
+                            // Python and Rust run in separate output directories. The
+                            // report identifies that directory by its basename.
+                            let task_id = v.pointer_mut("/identifiers/task_id").unwrap();
+                            assert_eq!(task_id.as_str(), p.parent().unwrap().file_name().unwrap().to_str());
+                            *task_id = json!("<output directory>");
+                        }
+                        normalize(&mut v, from, to);
+                        pyjson::dumps(&v)
+                    }
+                    Err(_) => text.replace(from, to),
+                }
+            } else if rel.ends_with(".jsonl") {
                 text.lines()
-                    .map(|line| match serde_json::from_str::<Value>(line).or_else(|_| serde_json::from_str::<Value>(&text)) {
+                    .map(|line| match serde_json::from_str::<Value>(line) {
                         Ok(mut v) => {
                             normalize(&mut v, from, to);
                             pyjson::dumps(&v)
