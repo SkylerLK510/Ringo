@@ -600,18 +600,20 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
                 reply, usage = call_fn(spec_b, system, message, soft, **({'watch': watch} if watch else {}))
             except harness.AdmissionRefused as exc:
                 accounting.refuse_reservation()
-                accounting.record({**record, 'status': 'admission_refused', 'error': str(exc)})
+                accounting.record({**record, 'status': 'admission_refused', 'error': str(exc),
+                                   'seconds': round(time.monotonic() - t0, 6)})
                 raise
             except BaseException as exc:
                 stopped = harness.stop_reason(exc, watch)
                 accounting.record({**record, 'status': 'error', 'usage': getattr(exc, 'usage', None),
                                    'error': f'{type(exc).__name__}: {exc}',
+                                   'seconds': round(time.monotonic() - t0, 6),
                                    **({'stopped': stopped} if stopped else {})},
                                   raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
                 if stopped == 'person' and attempt == 1:
                     continue
                 raise
-            seconds = round(time.monotonic() - t0, 3)
+            seconds = round(time.monotonic() - t0, 6)
             accounting.record({**record, 'status': 'ok', 'usage': usage, 'seconds': seconds}, reply)
             accounting.finish(kind, seconds, usage)
             return reply
