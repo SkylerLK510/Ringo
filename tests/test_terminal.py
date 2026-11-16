@@ -111,7 +111,7 @@ class TerminalTest(unittest.TestCase):
                 mock.patch('sys.stderr', new_callable=io.StringIO) as err:
             code = workflow.main(['--spec', 'fixture.json', '--out', '/tmp/fixture'])
         self.assertEqual(code, 130)
-        self.assertIn('interrupted; report: /tmp/fixture/report.json', err.getvalue())
+        self.assertIn(f'interrupted; report: {Path("/tmp/fixture") / "report.json"}', err.getvalue())
 
     def test_redirected_output_is_quiet_by_default_and_summary_stays_json(self):
         stream, run = io.StringIO(), harness.Run()
