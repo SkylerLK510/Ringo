@@ -3730,10 +3730,11 @@ mod tests {
         let mut s = record_session();
         let agent = Agent::from_name("codex").unwrap();
         fs::write(s.repo.join("large.txt"), "old\n").unwrap();
-        let index = s.dir.join("record-test.index");
-        let before = s.snapshot(&index).unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let before = git(&s.repo, &["write-tree"]).unwrap();
         fs::write(s.repo.join("large.txt"), format!("{}\nEND-OF-DIFF\n", "🌍".repeat(30_000))).unwrap();
-        let after = s.snapshot(&index).unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let after = git(&s.repo, &["write-tree"]).unwrap();
         let id = record_turn(&mut s, "keep this exact constraint");
         s.jobs[id - 1].before = Some(before);
         s.jobs[id - 1].after = Some(after);
