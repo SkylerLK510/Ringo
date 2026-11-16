@@ -3685,6 +3685,9 @@ mod tests {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!("ringo-record-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
         fs::create_dir_all(&path).unwrap();
+        // Exercise record diffs in a normal project repository; the outside-project undo store has a separate
+        // Windows extended-path constraint that is unrelated to record sizing.
+        git(&path, &["init", "-q"]).unwrap();
         Session::new(&path).unwrap()
     }
 
