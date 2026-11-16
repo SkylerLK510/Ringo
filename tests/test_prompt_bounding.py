@@ -415,9 +415,11 @@ class HandoffFidelityTest(unittest.TestCase):
         replies = [code('basic', 'return 0'), code('token', 'return 2*x')]
         reviews = ['What this change does: x.\n\nNo defects found.']
 
-        def steady(root, messages):  # check tracebacks name the temp dir; that path is not part of the prompt
+        def steady(root, messages):  # Ignore temporary paths in check tracebacks when comparing prompts.
             run = str(Path(root, 'run'))
-            return [re.sub(r'"seconds": [0-9.]+', '"seconds": 0', m).replace(run, '<run>') for m in messages]
+            encoded_run = json.dumps(run)[1:-1]  # Windows paths also occur inside JSON strings.
+            return [re.sub(r'"seconds": [0-9.]+', '"seconds": 0', m)
+                    .replace(encoded_run, '<run>').replace(run, '<run>') for m in messages]
         with tempfile.TemporaryDirectory() as d:
             first = Work(Path(d), replies, reviews)
             messages_one = steady(d, [message for _, message in first.seen])
