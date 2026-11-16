@@ -577,6 +577,20 @@ fn normalise_temp(s: &str, prefix: &str) -> String {
     out
 }
 
+/// Normalize only measured wall time and derived rate; deterministic rates have their own unit coverage.
+fn normalise_throughput(v: &mut Value) {
+    match v {
+        Value::Object(m) => for (k, x) in m {
+            if ["elapsed_s", "output_tokens_per_second"].contains(&k.as_str()) && x.is_number() {
+                assert!(x.as_f64().is_some_and(|n| n.is_finite() && n >= 0.0));
+                *x = json!(format!("<{k}>"));
+            } else { normalise_throughput(x); }
+        },
+        Value::Array(a) => a.iter_mut().for_each(normalise_throughput),
+        _ => {}
+    }
+}
+
 /// state.json text with pid, started and updated replaced, after checking their types.
 fn normalise_state(text: &str) -> String {
     let mut state: Map<String, Value> = parse_line(text.trim_end()).as_object().unwrap().clone();
@@ -588,11 +602,12 @@ fn normalise_state(text: &str) -> String {
     }
     state.insert("pid".into(), json!("<pid>"));
     assert!(text.ends_with('\n') && !text.trim_end().contains('\n'), "one line: {text:?}");
-    pyjson::dumps_compact(&Value::Object(state))
+    { let mut v = Value::Object(state); normalise_throughput(&mut v); pyjson::dumps_compact(&v) }
 }
 
 fn normalise_script(line: &str) -> String {
     let mut v = parse_line(line);
+    normalise_throughput(&mut v);
     normalise_files(&mut v["files"]);
     for step in v["steps"].as_array_mut().unwrap() {
         if let Some(text) = step["state"].as_str() {
@@ -1299,6 +1314,7 @@ fn rust_watch(case: &Value, sink: &Arc<Mutex<String>>) -> String {
 
 fn normalise_watch(line: &str) -> String {
     let mut v = parse_line(line);
+    normalise_throughput(&mut v);
     normalise_files(&mut v["files"]);
     if let Some(m) = v["incident"].as_object_mut()
         && let Some(after) = m.get("decided_after_s") {
@@ -1894,6 +1910,14 @@ fn normalise_timeouts(s: &str) -> String {
 
 fn normalise_plan(line: &str, parallel: bool) -> String {
     let mut v = parse_line(line);
+    normalise_throughput(&mut v);
+    if let Some(trace) = v["trace"].as_array_mut() {
+        for line in trace {
+            let mut record = parse_line(line.as_str().expect("trace record"));
+            normalise_throughput(&mut record);
+            *line = json!(pyjson::dumps(&record));
+        }
+    }
     if let Some(m) = v["incidents"].as_object_mut() {
         for (name, text) in m.iter_mut() {
             if !name.ends_with(".json") {
@@ -2402,7 +2426,7 @@ fn sigint_kills_the_call_and_marks_the_run_interrupted_as_python_does() {
     let (py_code, py) = interrupted_run(true, &base);
     let (rs_code, rs) = interrupted_run(false, &base);
     assert_eq!(rs_code, Some(130), "the native runtime exits 130 after Ctrl-C");
-    assert_eq!(py_code, None, "Python ends by SIGINT itself");
+    assert_eq!(py_code, Some(130), "Python preserves the interrupted summary and exits 130");
     let (py, rs) = (pyjson::dumps(&py), pyjson::dumps(&rs));
     assert_eq!(py.replace(&base.join("py").to_string_lossy().to_string(), "<dir>"), rs.replace(&base.join("rs").to_string_lossy().to_string(), "<dir>"));
     assert!(rs.contains("KeyboardInterrupt: ") && rs.contains("\"status\": \"interrupted\""), "{rs}");

@@ -1632,6 +1632,9 @@ fn main_arguments_and_help_match_python() {
         vec!["-h=x"],
         vec!["--help=x"],
         vec!["--spec"],
+        vec!["--progress", "sometimes"],
+        vec!["--summary-format", "yaml"],
+        vec!["--progress", "always", "--summary-format", "text", "--spec", &missing, "--out", "o"],
         vec!["--spec", "a"],
         vec!["--out", "o"],
         vec!["--spec", "--out", "o"],
@@ -1782,7 +1785,7 @@ fn normalize(v: &mut Value, from: &str, to: &str) {
     match v {
         Value::Object(m) => {
             for (k, x) in m.iter_mut() {
-                if ["seconds", "elapsed_s", "started", "updated", "pid"].contains(&k.as_str()) && x.is_number() {
+                if ["seconds", "elapsed_s", "started", "updated", "pid", "output_tokens_per_second"].contains(&k.as_str()) && x.is_number() {
                     *x = json!("<n>");
                 } else if k == "message_sha256" {
                     *x = json!("<sha of a message the calls already compare, timing included>");
@@ -1795,7 +1798,7 @@ fn normalize(v: &mut Value, from: &str, to: &str) {
         Value::String(t) => {
             // a JSON-protocol writer message carries the check results, timing included
             static SECONDS: std::sync::LazyLock<regex::Regex> =
-                std::sync::LazyLock::new(|| regex::Regex::new(r#""(seconds|elapsed_s)": [0-9.e+-]+"#).unwrap());
+                std::sync::LazyLock::new(|| regex::Regex::new(r#""(seconds|elapsed_s|output_tokens_per_second)": [0-9.e+-]+"#).unwrap());
             *t = SECONDS.replace_all(&t.replace(from, to), "\"$1\": \"<n>\"").into_owned();
         }
         _ => {}
@@ -2049,7 +2052,7 @@ fn work_interrupted_by_sigint_matches_python() {
         std::thread::sleep(std::time::Duration::from_millis(3500)); // past the check child's write
         assert!(!out.join("round-1/candidate/late").exists(), "{arm}: the check's child outlived the interrupt");
         let stderr = String::from_utf8_lossy(&done.stderr).into_owned();
-        assert!(stderr.trim_end().ends_with("KeyboardInterrupt"), "{arm}: {stderr}");
+        assert!(stderr.contains("ringo work: interrupted; report:"), "{arm}: {stderr}");
         outcomes.push((out, done.status));
     }
     use std::os::unix::process::ExitStatusExt;

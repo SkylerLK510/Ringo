@@ -17,7 +17,7 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 use crate::rt::harness::{self, Backend};
-use crate::rt::{backends, pipelines, py, pyjson, Error, Exc, Result};
+use crate::rt::{backends, pipelines, py, pyjson, terminal, Error, Exc, Result};
 use serde_json::{Map, Number, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -1960,6 +1960,8 @@ impl Work<'_> {
         };
         let spec_b = role_backend(&harness::backend(str_of(backend_spec)?)?, opts)?;
         let kind = label.split('-').next().unwrap_or(label);
+        let system_sha = harness::sha(system);
+        let message_sha = harness::sha(message);
         for attempt in 1..=2 {
             interruption()?;
             let left = HNum::Float(self.remaining()); // read once, so the limit is never below the soft limit
@@ -1974,8 +1976,8 @@ impl Work<'_> {
             record.insert("attempt".into(), Value::from(attempt));
             record.insert("backend".into(), Value::String(spec_b.name.clone()));
             harness::asked(&mut record, &spec_b.argv, None);
-            record.insert("system_sha256".into(), Value::String(harness::sha(system)));
-            record.insert("message_sha256".into(), Value::String(harness::sha(message)));
+            record.insert("system_sha256".into(), Value::String(system_sha.clone()));
+            record.insert("message_sha256".into(), Value::String(message_sha.clone()));
             let mut watch: Option<std::sync::Arc<harness::Watch>> = None;
             if harness::accepts_watch(&self.call_fn) {
                 let (run, b, probe_label, f) =
@@ -2006,7 +2008,7 @@ impl Work<'_> {
             match self.call_fn.call(&spec_b, system, message, soft, None, watched) {
                 Err(e) if e.is(Exc::Admission) => {
                     self.accounting.refuse_reservation()?;
-                    let rec = with(vec![("status", "admission_refused".into()), ("error", Value::String(e.msg.clone()))]);
+                    let rec = with(vec![("status", "admission_refused".into()), ("error", Value::String(e.msg.clone())), ("seconds", float(py::round(t0.elapsed().as_secs_f64(), 6)))]);
                     self.accounting.record(&rec, None, None)?;
                     return Err(e);
                 }
@@ -2016,6 +2018,7 @@ impl Work<'_> {
                         ("status", "error".into()),
                         ("usage", harness::attr(&e, "usage").cloned().unwrap_or(Value::Null)),
                         ("error", Value::String(format!("{}: {}", e.type_name(), e.msg))),
+                        ("seconds", float(py::round(t0.elapsed().as_secs_f64(), 6))),
                     ]);
                     if let Some(s) = stopped {
                         rec.insert("stopped".into(), Value::String(s.into()));
@@ -2030,7 +2033,7 @@ impl Work<'_> {
                 }
                 Ok((reply, usage)) => {
                     let usage = usage.unwrap_or(Value::Null);
-                    let seconds = py::round(t0.elapsed().as_secs_f64(), 3);
+                    let seconds = py::round(t0.elapsed().as_secs_f64(), 6);
                     let rec = with(vec![("status", "ok".into()), ("usage", usage.clone()), ("seconds", float(seconds))]);
                     self.accounting.record(&rec, Some(&reply), None)?;
                     self.accounting.finish(kind, HNum::Float(seconds), Some(&usage))?;
@@ -2310,6 +2313,10 @@ fn json_loads(text: &str) -> Result<Value> {
 /// the identity rt::select chose for this binary (Python's run computes releases.identity(HERE)). Returns the
 /// report; ValueError and OSError before the run starts (an invalid spec or folder) propagate.
 pub fn run(spec_path: &Path, out: &Path, call_fn: Option<&CallFn>, implementation: &Value) -> Result<Value> {
+    run_with_progress(spec_path, out, call_fn, implementation, "auto")
+}
+
+pub fn run_with_progress(spec_path: &Path, out: &Path, call_fn: Option<&CallFn>, implementation: &Value, progress: &str) -> Result<Value> {
     let call_fn = call_fn.cloned().unwrap_or_else(CallFn::real);
     let started = std::time::Instant::now();
     let here = py::realpath(&crate::ringo_home())?;
@@ -2398,7 +2405,9 @@ pub fn run(spec_path: &Path, out: &Path, call_fn: Option<&CallFn>, implementatio
     };
     // Ctrl-C from here on ends the run 'interrupted', with its report and state, the running check or call killed
     backends::install_interrupt();
+    let progress = terminal::Guard::new(&work.accounting, progress);
     let result = work.work().and_then(|()| interruption());
+    drop(progress);
     let mut raised = None;
     match result {
         Ok(()) => {}
@@ -2422,8 +2431,9 @@ pub fn run(spec_path: &Path, out: &Path, call_fn: Option<&CallFn>, implementatio
     }
     // finally: the report, the shortcomings and the state, however the run ended
     work.report.insert("rounds".into(), Value::Array(std::mem::take(&mut work.rounds).into_iter().map(Value::Object).collect()));
-    work.report.insert("usage".into(), Value::Object(work.accounting.summary()));
-    work.report.insert("elapsed_s".into(), float(started.elapsed().as_nanos() as f64 / 1_000_000_000.0));
+    let elapsed = started.elapsed().as_secs_f64();
+    work.report.insert("elapsed_s".into(), float(elapsed));
+    work.report.insert("usage".into(), Value::Object(work.accounting.summary_elapsed(elapsed)));
     let report = Value::Object(std::mem::take(&mut work.report));
     write_json(&work.out.join("report.json"), &report)?;
     let shortcomings = obj(vec![
@@ -3116,6 +3126,8 @@ fn format_usage(t: &Theme, width: i64) -> String {
         format!("[{}-h{}]", t.summary_short_option, t.reset),
         format!("{}--spec {}SPEC{}", t.summary_long_option, t.summary_label, t.reset),
         format!("{}--out {}OUT{}", t.summary_long_option, t.summary_label, t.reset),
+        format!("[{}--progress {}{{auto,always,never}}{}]", t.summary_long_option, t.summary_label, t.reset),
+        format!("[{}--summary-format {}{{auto,text,json}}{}]", t.summary_long_option, t.summary_label, t.reset),
     ];
     let mut usage = std::iter::once(PROG.to_string()).chain(parts.iter().cloned()).collect::<Vec<_>>().join(" ");
     let text_width = width;
@@ -3178,7 +3190,7 @@ fn format_help(t: &Theme, width: i64) -> String {
     help.push_str("\n\n");
     // the options section, indented by 2; positional arguments: none, so no section
     let max_help_position = 24.min((width - 20).max(4));
-    let actions: [(String, String, &str); 3] = [
+    let actions: [(String, String, &str); 5] = [
         (
             format!("{}-h{}, {}--help{}", t.short_option, t.reset, t.long_option, t.reset),
             "-h, --help".into(),
@@ -3190,6 +3202,8 @@ fn format_help(t: &Theme, width: i64) -> String {
             "--out OUT".into(),
             "new or empty folder outside the Ringo checkout (mode 0700)",
         ),
+        (format!("{}--progress{} {}{{auto,always,never}}{}", t.long_option, t.reset, t.label, t.reset), "--progress {auto,always,never}".into(), ""),
+        (format!("{}--summary-format{} {}{{auto,text,json}}{}", t.long_option, t.reset, t.label, t.reset), "--summary-format {auto,text,json}".into(), ""),
     ];
     let action_max_length = actions.iter().map(|a| a.1.len() as i64 + 2).max().expect("actions");
     let help_position = (action_max_length + 2).min(max_help_position);
@@ -3197,6 +3211,7 @@ fn format_help(t: &Theme, width: i64) -> String {
     let action_width = help_position - 2 - 2;
     let mut items = String::new();
     for (colored, plain, text) in &actions {
+        if text.is_empty() { items.push_str(&format!("  {colored}\n")); continue; }
         let (header, indent_first) = if plain.len() as i64 <= action_width {
             let padded = format!("  {plain:<w$}  ", w = action_width.max(0) as usize);
             (padded.replacen(plain.as_str(), colored, 1), 0)
@@ -3222,7 +3237,7 @@ fn format_help(t: &Theme, width: i64) -> String {
 /// The parsed command line: help asked for, or the two paths.
 enum Args {
     Help,
-    Paths { spec: String, out: String },
+    Paths { spec: String, out: String, progress: String, summary_format: String },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3230,15 +3245,19 @@ enum Act {
     Help,
     Spec,
     Out,
+    Progress,
+    Summary,
 }
 
-const OPTIONS: [(&str, Act); 4] = [("-h", Act::Help), ("--help", Act::Help), ("--spec", Act::Spec), ("--out", Act::Out)];
+const OPTIONS: [(&str, Act); 6] = [("-h", Act::Help), ("--help", Act::Help), ("--spec", Act::Spec), ("--out", Act::Out), ("--progress", Act::Progress), ("--summary-format", Act::Summary)];
 
 fn action_name(a: Act) -> &'static str {
     match a {
         Act::Help => "-h/--help",
         Act::Spec => "--spec",
         Act::Out => "--out",
+        Act::Progress => "--progress",
+        Act::Summary => "--summary-format",
     }
 }
 
@@ -3328,6 +3347,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
         }
     }
     let (mut spec, mut out) = (None, None);
+    let (mut progress, mut summary_format) = ("auto".to_string(), "auto".to_string());
     let mut extras: Vec<String> = Vec::new();
     let max_option = tuples.keys().copied().max();
     let mut start = 0;
@@ -3412,6 +3432,14 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
                 Act::Help => return Ok(Args::Help),
                 Act::Spec => spec = values.into_iter().next(),
                 Act::Out => out = values.into_iter().next(),
+                Act::Progress | Act::Summary => {
+                    let value = values.into_iter().next().expect("argument");
+                    let choices = if a == Act::Progress { ["auto", "always", "never"] } else { ["auto", "text", "json"] };
+                    if !choices.contains(&value.as_str()) {
+                        return Err(argument_error(Some(a), format!("invalid choice: {} (choose from {})", py::repr(&value), choices.iter().map(|c| py::repr(c)).collect::<Vec<_>>().join(", "))));
+                    }
+                    if a == Act::Progress { progress = value; } else { summary_format = value; }
+                }
             }
         }
         start = stop;
@@ -3424,7 +3452,7 @@ fn parse_args(argv: &[String]) -> std::result::Result<Args, String> {
     if !extras.is_empty() {
         return Err(format!("unrecognized arguments: {}", extras.join(" ")));
     }
-    Ok(Args::Paths { spec: spec.expect("required"), out: out.expect("required") })
+    Ok(Args::Paths { spec: spec.expect("required"), out: out.expect("required"), progress, summary_format })
 }
 
 /// `ringo.py work --spec SPEC --out OUT`: run the workflow and print its outcome as one JSON line; 0 when ready
@@ -3437,7 +3465,7 @@ pub fn main_with(argv: &[String], console: Console, call_fn: Option<&CallFn>, im
             let _ = console.out.write_all(format_help(theme, width).as_bytes());
             return 0;
         }
-        Ok(Args::Paths { spec, out }) => (spec, out),
+        Ok(Args::Paths { spec, out, progress, summary_format }) => (spec, out, progress, summary_format),
         Err(message) => {
             let usage = format_usage(theme, width);
             let _ = console.err.write_all(format!("{}\n", usage.trim_matches('\n')).as_bytes());
@@ -3445,15 +3473,14 @@ pub fn main_with(argv: &[String], console: Console, call_fn: Option<&CallFn>, im
             return 2;
         }
     };
-    let report = match run(Path::new(&args.0), Path::new(&args.1), call_fn, implementation) {
+    let report = match run_with_progress(Path::new(&args.0), Path::new(&args.1), call_fn, implementation, &args.2) {
         Ok(report) => report,
         Err(e) if e.is(Exc::Value) || e.is(Exc::Os) => {
             let _ = console.err.write_all(format!("ringo work: {}\n", e.msg).as_bytes());
             return 2;
         }
         Err(e) if e.is(Exc::KeyboardInterrupt) => {
-            // the report and state already say interrupted; Python's traceback ends with this line
-            let _ = console.err.write_all(b"KeyboardInterrupt\n");
+            let _ = console.err.write_all(format!("ringo work: interrupted; report: {}\n", Path::new(&args.1).join("report.json").display()).as_bytes());
             return 130;
         }
         Err(e) => {
@@ -3462,6 +3489,9 @@ pub fn main_with(argv: &[String], console: Console, call_fn: Option<&CallFn>, im
             return 1;
         }
     };
+    if let Some(usage) = report["usage"].as_object() {
+        let _ = console.err.write_all(format!("{}\n", terminal::summary_text(usage, &args.3)).as_bytes());
+    }
     match outcome(&report, Path::new(&args.1)) {
         Ok(o) => {
             let _ = console.out.write_all(format!("{}\n", pyjson::dumps(&o)).as_bytes());
