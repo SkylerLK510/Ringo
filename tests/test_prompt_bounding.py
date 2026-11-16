@@ -415,11 +415,12 @@ class HandoffFidelityTest(unittest.TestCase):
         replies = [code('basic', 'return 0'), code('token', 'return 2*x')]
         reviews = ['What this change does: x.\n\nNo defects found.']
 
-        def steady(root, messages):  # Ignore temporary paths in check tracebacks when comparing prompts.
-            run = str(Path(root, 'run'))
-            encoded_run = json.dumps(run)[1:-1]  # Windows paths also occur inside JSON strings.
+        def steady(root, messages):
+            # Normalize only the generated basename. Windows subprocess tracebacks can resolve the
+            # parent path differently (e.g. an 8.3 alias), and JSON also escapes its separators.
+            temp_name = Path(root).name
             return [re.sub(r'"seconds": [0-9.]+', '"seconds": 0', m)
-                    .replace(encoded_run, '<run>').replace(run, '<run>') for m in messages]
+                    .replace(temp_name, '<temp>') for m in messages]
         with tempfile.TemporaryDirectory() as d:
             first = Work(Path(d), replies, reviews)
             messages_one = steady(d, [message for _, message in first.seen])
