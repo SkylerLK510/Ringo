@@ -41,6 +41,49 @@ effect is in the [improvement log](IMPROVEMENT-LOG.md). The remaining cost of a
 Council round is Ringo's own evidence, sent whole to each judge; `work` now runs the Council only when a task
 opts in, and makes one review call by default.
 
+## Long conversations
+
+The shell's default handoff threshold remains 64,000 reported context tokens.
+Between turns it starts a fresh native conversation only when the inline record
+is estimated to be at most half the previous context. This does not interrupt or
+bound a long agent turn already in progress.
+
+Within a running turn, Codex now receives
+`model_auto_compact_token_limit=64000`; Claude receives
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000`, its minimum supported window. Previously
+both defaults were 200,000. Claude subtracts output reserve and compaction
+headroom from its window, so the two settings are not identical trigger points.
+These native controls summarize history as the agent works, including history
+being re-read from cache. They apply to new and resumed conversations. Explicit
+Codex config or a Claude window environment variable takes precedence; native
+settings disabling compaction are not overridden. agy's compaction remains under
+its own control.
+
+The threshold applies to context size, not the accumulated cache-read counter.
+Compaction cannot erase tokens already consumed or cap total task usage. It also
+has its own token and latency cost, and a large tool result can overshoot the
+threshold before the next native compaction boundary. Ringo keeps provider usage
+totals across compactions and clears stale context sizes when compaction completes
+so a later handoff does not discard the native summary based on its old size.
+These defaults reduce the context allowed to accumulate; savings and task quality
+still require matched task measurements.
+
+The inline **record body** has a hard 60,000 UTF-8 byte budget shared by turns,
+file lists, diffs, cut notices, restart separators and saved-record pointers.
+The current owner message, handoff envelope, standing instructions and native
+agent overhead are outside that text budget. Bytes are not provider tokens.
+Older material is omitted first; the full record is kept outside the project for
+recovery. Inline changed-file lists show at most 20 names and the omitted count.
+A record already supplied whole inline gets no redundant file pointer. A cut
+record points at the full file with instructions to recover only needed details
+(agy receives the pointer only in read mode).
+
+These bounds add no inference calls. Offline regressions cover 200-turn
+histories, large file lists and failure messages, Unicode diffs and 25 repeated
+restart carries. They establish bounded prompt text and recovery availability,
+not equivalent task quality or savings against standalone agents. Recovering
+omitted evidence can still consume tokens; include those reads in comparisons.
+
 ## Optimization objective
 
 The current user objective is for Ringo plus its agent to consume fewer total

@@ -548,7 +548,7 @@ fn agent_commands_are_pinned() {
                 "-c", "model_provider=\"openai\"", "-c", "features.default_mode_request_user_input=false",
                 "-c", "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false",
                 "-c", "features.plugins=false", "-c", "features.apps=false", "-c", "features.image_generation=false",
-                "-c", "features.goals=false", "-c", "model_auto_compact_token_limit=200000"].map(String::from).to_vec();
+                "-c", "features.goals=false", "-c", "model_auto_compact_token_limit=64000"].map(String::from).to_vec();
     let mut codex_turn = |write: bool| -> (Vec<String>, String, String) {
         let (argv, _) = turn(agent("codex"), write, &codex);
         let thread = threads(&codex).pop().unwrap().to_string();
@@ -637,11 +637,11 @@ fn codex_is_told_it_is_in_ringo_and_compact_keeps_claudes_commands() {
     assert!(!argv(&mut s, "/compact").lines().any(|a| a == "--disable-slash-commands"), "/compact is a command");
 }
 
-/// Every Claude turn runs with a 200k auto-compact window, so a long conversation is compacted by Claude itself
+/// Every Claude turn runs with a 100k auto-compact window, so a long conversation is compacted by Claude itself
 /// instead of growing toward the 1M window; the owner's own rules file, when there is one, goes in ahead of the
 /// project's instructions.
 #[test]
-fn claude_turns_compact_at_200k_and_carry_the_owners_rules() {
+fn claude_turns_compact_at_100k_and_carry_the_owners_rules() {
     let r = repo("compact-rules");
     fs::write(r.join("AGENTS.md"), "Project rule.\n").unwrap();
     let claude = fake(&root(), "claude-rules", "#!/bin/sh\nprintf '%s' \"$CLAUDE_CODE_AUTO_COMPACT_WINDOW\" > \"$0.window\"\n\
@@ -658,8 +658,9 @@ fn claude_turns_compact_at_200k_and_carry_the_owners_rules() {
          fs::read_to_string(claude.with_extension("appended")).unwrap_or_default())
     };
     // an owner who sets the window keeps it
-    let window = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW").unwrap_or_else(|_| "200000".into());
-    assert_eq!(run(&mut s), (window, "Project rule.\n".to_string()), "no rules file: as before");
+    let window = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW").unwrap_or_else(|_| "100000".into());
+    assert_eq!(run(&mut s), (window.clone(), "Project rule.\n".to_string()), "new turn");
+    assert_eq!(run(&mut s), (window, "Project rule.\n".to_string()), "resumed turn keeps the window");
     fs::write(s.rules_path(), "My rule.\n\n").unwrap();
     assert_eq!(run(&mut s).1, "My rule.\n\nProject rule.\n", "the owner's rules first, then the project's");
     fs::remove_file(r.join("AGENTS.md")).unwrap();
@@ -1759,7 +1760,7 @@ fn the_record_names_the_files_a_turn_edited_where_git_cannot_see_them() {
 }
 
 #[test]
-fn codex_compacts_where_claude_does_unless_the_owner_set_it() {
+fn codex_compacts_at_64k_on_new_and_resumed_turns_unless_the_owner_set_it() {
     let r = repo("codex-compact");
     let codex = fake(&root(), "codex-compact", &codex_ok());
     let mut s = session(&r, agent("codex"), &codex);
@@ -1767,11 +1768,13 @@ fn codex_compacts_where_claude_does_unless_the_owner_set_it() {
     fs::create_dir_all(&home).unwrap();
     s.codex_home = home.clone();
     let args = |s: &mut Session| {
-        s.forget();
         said(s, "codex", "go");
         fs::read_to_string(codex.with_extension("argv")).unwrap()
     };
-    assert!(args(&mut s).lines().any(|l| l == "model_auto_compact_token_limit=200000"));
+    assert!(args(&mut s).lines().any(|l| l == "model_auto_compact_token_limit=64000"));
+    assert_eq!(threads(&codex).last().unwrap()["method"], "thread/start");
+    assert!(args(&mut s).lines().any(|l| l == "model_auto_compact_token_limit=64000"));
+    assert_eq!(threads(&codex).last().unwrap()["method"], "thread/resume");
     fs::write(home.join("config.toml"), "model = \"x\"\nmodel_auto_compact_token_limit = 350000\n").unwrap();
     assert!(!args(&mut s).contains("model_auto_compact_token_limit"), "the owner's own limit stands");
 }
@@ -1983,6 +1986,24 @@ echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
     said(&mut s, "claude", "next");
     let (told, resumed) = claude_heard(&claude);
     assert!(!resumed && told.starts_with("Ringo's record of this conversation so far"), "{told}");
+}
+
+#[test]
+fn codex_keeps_its_compacted_summary_when_no_later_call_reports_context() {
+    let r = repo("codex-compacted");
+    let events = r#"
+echo '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"inputTokens":70000,"cachedInputTokens":60000,"outputTokens":5},"last":{"inputTokens":70000,"outputTokens":5}}}}'
+echo '{"method":"item/completed","params":{"item":{"type":"contextCompaction"}}}'
+echo '{"method":"item/completed","params":{"item":{"type":"agentMessage","text":"done"}}}'
+echo '{"method":"turn/completed","params":{"turn":{"status":"completed"}}}'
+"#;
+    let codex = fake(&root(), "codex-compacted", &codex_script("", events));
+    let mut s = session(&r, agent("codex"), &codex);
+    said(&mut s, "codex", "go");
+    assert_eq!(s.job(1).unwrap().tokens, Tokens { input: 10_000, cache_read: 60_000, cache_write: 0, output: 5 });
+    said(&mut s, "codex", "continue");
+    assert_eq!(threads(&codex).last().unwrap()["method"], "thread/resume");
+    assert_eq!(turn_text(&codex), "continue", "the old pre-compaction size must not discard the native summary");
 }
 
 fn usage_rows(state: &Path) -> Vec<serde_json::Value> {
@@ -2254,8 +2275,8 @@ fn an_agent_of_the_owners_own_carries_its_instructions_into_every_turn() {
 /// agy hears what the others did as any agent does. An edits turn (ask mode here) is not pointed at the whole
 /// record and gains no folder. A read turn gains the job's folder (--add-dir, measured with agy 1.5.8), and is
 /// pointed at the whole record only when the record it was handed was cut: an uncut record is already everything,
-/// and agy opens what it is pointed at, so the pointer there would only spend tokens reading it again. Codex, which
-/// can always open it, is pointed there in both.
+/// and agy opens what it is pointed at, so the pointer there would only spend tokens reading it again. The same
+/// no-repeat rule applies to Codex and Claude: a complete inline record needs no pointer.
 #[test]
 fn agy_is_sent_to_the_whole_record_only_where_it_can_open_it() {
     let r = repo("agy-record");
@@ -2275,7 +2296,7 @@ fn agy_is_sent_to_the_whole_record_only_where_it_can_open_it() {
     assert!(!fs::read_to_string(format!("{}.argv", agy.display())).unwrap().contains("--add-dir"),
             "an edits turn gains no folder: its write_file(*) rule would reach Ringo's own state folder");
     let heard = turn_text(&codex);
-    assert!(heard.contains("agy: fine by me") && heard.contains("The whole record, uncut, is in") && heard.contains("record.md"), "{heard}");
+    assert!(heard.contains("agy: fine by me") && !heard.contains("record.md"), "a complete record needs no second read: {heard}");
 
     // read mode: --add-dir makes the job's folder part of agy's workspace, and the pointer is given only when the
     // record it was handed was cut — with this small a conversation the record is whole, so pointing at the file

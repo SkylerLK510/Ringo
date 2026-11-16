@@ -43,8 +43,9 @@ add a dark mode switch to the settings page
 - A long conversation costs more with every call, because the agent reads all of it again each time. Once it passes
   64,000 tokens, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
   reply, the steps taken, the files changed and the change itself. No extra call writes it, and the turn's log says
-  when it happens. Claude and Codex also shrink a conversation by themselves once it passes 200,000 tokens within
-  one turn; `/compact` makes Claude do that at once.
+  when it happens. Within one turn, Codex also compacts at a 64,000-token context threshold; Claude uses its
+  minimum 100,000-token window, minus its own output reserve and compaction headroom. Your explicit native
+  overrides take precedence. `/compact` makes Claude compact at once.
 - To give every Claude turn your own rules (how you push, what never to do), write them in `rules.md` in Ringo's
   state folder (`~/.local/share/ringo/rules.md`). Keep it short: every line is read on every call.
 

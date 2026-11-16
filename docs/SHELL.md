@@ -729,10 +729,12 @@ added. Codex reads your `~/.codex/AGENTS.md` itself.
 A follow-up re-sends the conversation so far, so it costs a first turn plus that history, and within a turn every
 call re-reads everything before it. On a subscription login Claude runs Opus with a 1M window, where Claude Code
 compacts a conversation only near 967k tokens: one long turn started in a home folder read 3.9M tokens in all, its
-last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000`, the window Claude Code
-compacts at on a 200k model, and Claude compacts by itself when a conversation passes it, mid-turn as on resuming.
+last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000`, its minimum supported
+window. Claude subtracts output reserve and compaction headroom and compacts by itself, mid-turn as on resuming.
 Codex compacts near its own 475k window (one long turn here read 2.9M tokens, its calls still growing past 137k), so
-it runs with `-c model_auto_compact_token_limit=200000` too, unless your `config.toml` sets the key. A compaction
+it runs with `-c model_auto_compact_token_limit=64000`, unless your `config.toml` sets the key. Previously both
+defaults were 200,000. These are context thresholds, including cached history, rather than limits on accumulated
+token usage; large tool results can overshoot them until the next native compaction boundary. A compaction
 takes a minute or more (82 s for 171k tokens, measured), and the turn's row says "compacting the conversation" meanwhile.
 Compaction keeps the system prompt (with the files appended above) and re-reads the five files last changed; the
 rest of the history becomes Claude's summary. Set the variable yourself to choose another window (100000 to
@@ -742,8 +744,8 @@ use it.)
 
 agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
 sandbox. Its startup event lists them, and no setting Ringo can pass removes them. Nor does Ringo set where agy
-compacts its conversation: in 24 real agy turns (2026-11-14) its calls grew past the 200,000 tokens where Claude's
-and Codex's compact (the largest read 256k), and fell back sharply only once (256k to 15k, within one turn).
+compacts its conversation: in 24 real agy turns (2026-11-14) its calls grew past the former 200,000-token defaults
+for Claude and Codex (the largest read 256k), and fell back sharply only once (256k to 15k, within one turn).
 
 Whatever the agent, a running turn's own count is told as it goes and warned about: each model call's usage is
 read as it lands (Claude per message, Codex per thread update, agy per step — Codex's and agy's were unparsed

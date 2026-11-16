@@ -511,7 +511,12 @@ impl Parser {
             ("item/completed", "webSearch") => notes.push(Note::Step(format!("search {}", short(s(item, "query"), 120)))),
             ("item/completed", "collabAgentToolCall") => notes.extend(self.codex_subagents(item)),
             ("item/started", "contextCompaction") => notes.push(activity("compacting the conversation".into())),
-            ("item/completed", "contextCompaction") => notes.push(Note::Log("compacted the conversation".into())),
+            ("item/completed", "contextCompaction") => {
+                notes.push(Note::Log("compacted the conversation".into()));
+                // As with Claude's compact_boundary, the previous size no longer describes the conversation.
+                // Keep the native summary on the next turn if no later call reports its new size.
+                notes.push(Note::Context(0));
+            }
             ("turn/plan/updated", _) => {
                 let plan = p.get("plan").and_then(Value::as_array).cloned().unwrap_or_default();
                 let finished = plan.iter().filter(|step| s(step, "status") == "completed").count();
@@ -1399,6 +1404,27 @@ mod tests {
         assert_eq!(live, [Tokens { input: 50_000, cache_read: 100_000, cache_write: 0, output: 500 },
                           Tokens { input: 80_000, cache_read: 200_000, cache_write: 0, output: 1_000 }],
                    "the thread's total as each update lands (the shell takes a resumed thread's earlier turns off)");
+    }
+
+    #[test]
+    fn codex_compactions_reset_context_without_resetting_consumption() {
+        let usage = |input, cached, output, last| json!({"method": "thread/tokenUsage/updated", "params": {
+            "tokenUsage": {"total": {"inputTokens": input, "cachedInputTokens": cached, "outputTokens": output},
+                           "last": {"inputTokens": last, "outputTokens": 10}}
+        }}).to_string();
+        let compact = json!({"method": "item/completed", "params": {"item": {"type": "contextCompaction"}}}).to_string();
+        let events = [usage(65_000, 60_000, 10, 65_000), compact.clone(),
+                      usage(73_000, 62_000, 20, 8_000), usage(140_000, 124_000, 30, 67_000), compact,
+                      usage(148_000, 126_000, 40, 8_000),
+                      json!({"method": "item/completed", "params": {"item": {
+                          "type": "agentMessage", "text": "done"}}}).to_string(),
+                      json!({"method": "turn/completed", "params": {"turn": {"status": "completed"}}}).to_string()];
+        let (p, notes) = run(Style::Codex, &events.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(p.finish(), Ok(()));
+        let context: Vec<u64> = notes.iter().filter_map(|n| match n { Note::Context(n) => Some(*n), _ => None }).collect();
+        assert_eq!(context, [65_010, 0, 8_010, 67_010, 0, 8_010]);
+        assert!(notes.contains(&Note::Tokens(Tokens { input: 22_000, cache_read: 126_000, cache_write: 0, output: 40 })),
+                "compaction reduces future context; already-consumed cached input is still counted");
     }
 
     #[test]
