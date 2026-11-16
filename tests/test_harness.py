@@ -1,4 +1,5 @@
 """Offline checks of harness.py and pipelines.py: fake backends only, no model calls."""
+import hashlib
 import io
 import json
 import os
@@ -418,7 +419,11 @@ class RunTest(unittest.TestCase):
             rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
             self.assertEqual([r['status'] for r in rows], ['started', 'error'])
             raw = Path(d, 't', 'steps', f"{rows[1]['step']}.1.raw.txt")
-            self.assertEqual(raw.stat().st_size, harness.RAW_LIMIT)
+            self.assertEqual(raw.stat().st_size, 1_500_000)  # the whole output, not a cap
+            excerpt = rows[1]['raw_excerpt']
+            self.assertEqual(excerpt['total_bytes'], raw.stat().st_size)
+            self.assertEqual(excerpt['omitted_bytes'], 500_000)  # the head stops at RAW_LIMIT; the artifact has all
+            self.assertEqual(excerpt['sha256'], hashlib.sha256(b'R' * 1_500_000).hexdigest())
 
     def test_an_input_refused_as_too_large_is_not_sent_again(self):
         calls = []

@@ -14,7 +14,7 @@ import time
 from latency import canonical, read_json, sha
 
 HERE = Path(__file__).resolve().parent
-RUNTIME = ('ringo.py', 'harness.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
+RUNTIME = ('ringo.py', 'harness.py', 'taskreport.py', 'backends.py', 'pipelines.py', 'context.py', 'findings.py',
            'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py', 'research.py')
 # Files that joined the runtime after releases already existed. New bundles always include them; a bundle staged
 # before one joined still verifies without it, since that bundle has no feature that runs it.
