@@ -15,7 +15,7 @@ use super::py::{self, Num};
 use super::{pyjson, Error, Exc, Result};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
-use super::pipelines;
+use super::{pipelines, terminal};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -305,13 +305,16 @@ pub fn claude_usage(reply: &Map<String, Value>) -> Map<String, Value> {
     };
     let mut out = Map::new();
     if count("input_tokens").is_some() || count("output_tokens").is_some() {
-        out.insert("input".into(), tokens("input_tokens"));
         out.insert("cache_write".into(), tokens("cache_creation_input_tokens"));
         out.insert("cache_read".into(), tokens("cache_read_input_tokens"));
-        out.insert("output".into(), tokens("output_tokens"));
     }
     out.insert("cost_usd".into(), reply.get("total_cost_usd").cloned().unwrap_or(Value::Null));
     out.insert("models".into(), Value::Array(models));
+    if count("input_tokens").is_some() || count("output_tokens").is_some() {
+        for (field, key) in [("input", "input_tokens"), ("output", "output_tokens")] {
+            if let Some(n) = count(key) { out.insert(field.into(), n.clone()); }
+        }
+    }
     out
 }
 
@@ -543,6 +546,7 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
     let mut tok = [0i128; 4]; // TOKEN_KEYS order
     let mut reasoning: Option<i128> = None; // the part of `output` spent on reasoning, when Codex reports it
     let (mut messages, mut completed, mut measured) = (Vec::<String>::new(), 0usize, 0usize);
+    let (mut measured_input, mut measured_output) = (false, false);
     let mut reasons: Vec<String> = Vec::new();
     let mut items: Vec<(String, u64)> = Vec::new();
     let mut warnings: Vec<Value> = Vec::new();
@@ -568,6 +572,8 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
             if ["input_tokens", "output_tokens"].iter().any(|k| nonneg_int(reported.get(*k)).is_some()) {
                 measured += 1;
             }
+            measured_input |= nonneg_int(reported.get("input_tokens")).is_some();
+            measured_output |= nonneg_int(reported.get("output_tokens")).is_some();
             let tokens = |key: &str| nonneg_int(reported.get(key)).unwrap_or(0);
             let cached = tokens("cached_input_tokens").min(tokens("input_tokens"));
             for (k, add) in [
@@ -633,6 +639,10 @@ pub fn codex_reply(output: &str, name: &str, tools: &[String]) -> Result<(String
     }
     usage.insert("items".into(), Value::Object(items.iter().map(|(k, n)| (k.clone(), Value::from(*n))).collect()));
     usage.insert("warnings".into(), Value::Array(warnings));
+    if measured > 0 {
+        if !measured_output { usage.shift_remove("output"); }
+        if !measured_input { usage.shift_remove("input"); usage.shift_remove("cache_read"); }
+    }
     if !reasons.is_empty() {
         let mut unique: Vec<&str> = Vec::new();
         for r in &reasons {
@@ -819,6 +829,7 @@ pub struct Finished {
 
 struct Totals {
     calls: i64,
+    completed: i64,
     cost: f64,
     unpriced: i64,
     untokened: i64,
@@ -840,6 +851,8 @@ pub struct Run {
     pub max_cost: Option<Num>,
     pub unpriced_call_usd: Option<Num>,
     pub started: f64,
+    pub clock_started: Instant,
+    progress: Mutex<Option<Arc<terminal::Progress>>>,
     totals: Mutex<Totals>,
 }
 
@@ -874,8 +887,11 @@ impl Run {
             max_cost: max_cost.and_then(Num::from_value),
             unpriced_call_usd: unpriced_call_usd.and_then(Num::from_value),
             started: now(),
+            clock_started: Instant::now(),
+            progress: Mutex::new(None),
             totals: Mutex::new(Totals {
                 calls: 0,
+                completed: 0,
                 cost: 0.0,
                 unpriced: 0,
                 untokened: 0,
@@ -929,6 +945,10 @@ impl Run {
     /// usage, or usage without token fields, counts under untokened_calls, as an unknown price counts under
     /// unpriced_calls. As in Python, a failure part way leaves the totals it already changed.
     pub fn record(&self, rec: &Map<String, Value>, reply: Option<&str>, raw: Option<&str>) -> Result<()> {
+        let mut rec = rec.clone();
+        if rec.contains_key("seconds") {
+            rec.insert("output_tokens_per_second".into(), terminal::rate(rec.get("usage"), rec.get("seconds")));
+        }
         let mut t = lock(&self.totals);
         let usage = rec.get("usage");
         let fields = match usage {
@@ -947,6 +967,7 @@ impl Run {
             t.reasoning = Some(py_add(t.reasoning.unwrap_or(Num::Int(0)), x, "+=")?);
         }
         if matches!(rec.get("status"), Some(Value::String(s)) if PAID_STATUSES.contains(&s.as_str())) {
+            t.completed += 1;
             if !matches!(usage, Some(Value::Object(m)) if TOKEN_KEYS.iter().all(|k| m.contains_key(*k))) {
                 t.untokened += 1;
             }
@@ -958,6 +979,7 @@ impl Run {
                 },
             }
         }
+        if let Some(progress) = lock(&self.progress).as_ref() { progress.update(&rec); }
         let Some(trace) = &self.trace else { return Ok(()) };
         let path = py::join(trace, "trace.jsonl");
         let mut f = fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| py::path_error(&e, &path))?;
@@ -1030,7 +1052,7 @@ impl Run {
         state.insert("started".into(), pyjson::float_value(py::round(self.started, 3)));
         state.insert("updated".into(), pyjson::float_value(py::round(now(), 3)));
         state.insert("last".into(), t.last.clone());
-        state.extend(summary_of(t));
+        state.extend(summary_of(t, self.clock_started.elapsed().as_secs_f64()));
         for (k, v) in extra {
             if !v.is_null() {
                 state.insert((*k).to_string(), v.clone());
@@ -1040,11 +1062,19 @@ impl Run {
     }
 
     pub fn summary(&self) -> Map<String, Value> {
-        summary_of(&lock(&self.totals))
+        self.summary_elapsed(self.clock_started.elapsed().as_secs_f64())
+    }
+
+    pub fn summary_elapsed(&self, seconds: f64) -> Map<String, Value> {
+        summary_of(&lock(&self.totals), seconds)
+    }
+
+    pub fn set_progress(&self, progress: Option<Arc<terminal::Progress>>) {
+        *lock(&self.progress) = progress;
     }
 }
 
-fn summary_of(t: &Totals) -> Map<String, Value> {
+fn summary_of(t: &Totals, elapsed: f64) -> Map<String, Value> {
     let mut m = Map::new();
     m.insert("calls".into(), Value::from(t.calls));
     m.insert("cost_usd".into(), pyjson::float_value(py::round(t.cost, 6)));
@@ -1058,6 +1088,11 @@ fn summary_of(t: &Totals) -> Map<String, Value> {
     if let Some(n) = t.reasoning {
         m.insert("reasoning_output".into(), n.to_value());
     }
+    m.insert("unfinished_calls".into(), Value::from((t.calls - t.completed).max(0)));
+    m.insert("elapsed_s".into(), pyjson::float_value(elapsed));
+    let known = t.calls > 0 && t.completed == t.calls && t.untokened == 0;
+    let rate = if known { terminal::rate(Some(&Value::Object(m.clone())), Some(&pyjson::float_value(elapsed))) } else { Value::Null };
+    m.insert("output_tokens_per_second".into(), rate);
     m
 }
 
@@ -1651,6 +1686,8 @@ impl Plan<'_> {
     fn attempts(&self, label: &str, p: &Value, message: &str) -> Result<String> {
         let mut last: Option<Error> = None; // the earlier attempt's error, reported if the retry cannot start
         let pass_id = py::value_str(p.get("id").unwrap_or(&Value::Null));
+        let system_sha = sha(&self.system);
+        let message_sha = sha(message);
         for attempt in [1i64, 2] {
             let reserved = if self.stop.is_set() {
                 Err(budget_exceeded("run stopped after another pass failed"))
@@ -1673,8 +1710,8 @@ impl Plan<'_> {
             rec.insert("pass".into(), p.get("id").cloned().unwrap_or(Value::Null));
             rec.insert("backend".into(), Value::String(backend.name.clone()));
             asked(&mut rec, &backend.argv, p.get("model"));
-            rec.insert("system_sha256".into(), Value::String(sha(&self.system)));
-            rec.insert("message_sha256".into(), Value::String(sha(message)));
+            rec.insert("system_sha256".into(), Value::String(system_sha.clone()));
+            rec.insert("message_sha256".into(), Value::String(message_sha.clone()));
             rec.insert("started".into(), pyjson::float_value(now()));
             let (mut soft, mut limit) = (self.timeout_s, limit_for(self.timeout_s));
             if let Some(left) = self.left {
@@ -1694,7 +1731,7 @@ impl Plan<'_> {
             }
             self.run.record(&with(&rec, &[("status", "started".into())]), None, None)?;
             let t0 = Instant::now();
-            let seconds = || pyjson::float_value(py::round(t0.elapsed().as_secs_f64(), 3));
+            let seconds = || pyjson::float_value(py::round(t0.elapsed().as_secs_f64(), 6));
             let model = p.get("model").and_then(Value::as_str);
             let as_watch = watch.clone().map(|w| w as Arc<dyn backends::Watch>);
             let (text, usage) = match self.call_fn.call(&backend, &self.system, message, soft, model, as_watch) {
@@ -1940,6 +1977,8 @@ pub struct Args {
     pub unpriced_call_usd: Option<f64>,
     pub timeout: Num,
     pub max_calls: Option<String>,
+    pub progress: String,
+    pub summary_format: String,
     /// Set by task from findings_pr (Python's `args.findings_pr`).
     pub findings_pr: Map<String, Value>,
 }
@@ -2123,29 +2162,34 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
     };
     let run = run.expect("set by the setup");
     let summary_of = |extra: &[&Map<String, Value>]| -> Map<String, Value> {
-        let mut m = run.summary();
+        let mut m = run.summary_elapsed(started.elapsed().as_secs_f64());
         for part in extra {
             m.extend((*part).clone());
         }
         m
     };
     // the whole task so far, its own work around the calls included
-    let elapsed = || pyjson::float_value(started.elapsed().as_nanos() as f64 / 1e9);
     backends::install_interrupt();
+    let display = terminal::Guard::new(&run, &args.progress);
     let ran = run_plan(&plan, &material, &b, &run, &CallFn::real(), args.timeout, None, c.as_ref(), None);
+    drop(display);
     let ran = match ran {
         Ok(_) if backends::interrupted() => Err(backends::keyboard_interrupt()),
         other => other,
     };
     let (text, stats) = match ran {
         Ok(parts) => parts,
-        Err(exc) if reported(&exc) => {
-            print_stderr(&format!("harness: {kind} failed: {}", exc.msg));
+        Err(exc) if reported(&exc) || exc.is(Exc::KeyboardInterrupt) => {
+            let interrupted = exc.is(Exc::KeyboardInterrupt);
+            print_stderr(&if interrupted { format!("harness: {kind} interrupted") } else { format!("harness: {kind} failed: {}", exc.msg) });
             let mut summary = summary_of(&[&names]);
-            summary.insert("elapsed_s".into(), elapsed());
-            print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
-            let _ = run.state("failed", &[("error", Value::String(py::head(&described(&exc), 500).into()))]);
-            return 2;
+            summary.insert("status".into(), if interrupted { "interrupted" } else { "error" }.into());
+            if let Some(trace) = &run.trace {
+                let _ = py::write_file(&py::join(trace, "summary.json"), pyjson::dumps_indent(&Value::Object(summary.clone()), 1).as_bytes());
+            }
+            print_stderr(&terminal::summary_text(&summary, &args.summary_format));
+            let _ = run.state(if interrupted { "interrupted" } else { "failed" }, &[("error", Value::String(py::head(&described(&exc), 500).into()))]);
+            return if interrupted { 130 } else { 2 };
         }
         Err(exc) => {
             let _ = run.state("interrupted", &[]);
@@ -2154,14 +2198,14 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
     };
     let stats = stats.as_object().cloned().unwrap_or_default();
     let mut summary = summary_of(&[&stats, &names]);
-    summary.insert("elapsed_s".into(), elapsed()); // replaced below once the findings are written; kept if writing them fails
+    summary.extend(run.summary_elapsed(started.elapsed().as_secs_f64())); // replaced below once the findings are written; kept if writing them fails
     let written = (|| -> Result<()> {
         if given(&args.findings_json).is_some() {
             summary.extend(write_findings(args, &text, &run)?);
             if summary.get("findings_unshaped") == Some(&Value::Bool(true)) {
                 print_stderr("harness: the review has no numbered finding and no \"No defects found\" line, so the findings file is empty");
             }
-            summary.insert("elapsed_s".into(), elapsed());
+            summary.extend(run.summary_elapsed(started.elapsed().as_secs_f64()));
         }
         if let Some(trace) = &run.trace {
             py::write_file(&py::join(trace, "result.md"), format!("{text}\n").as_bytes())?;
@@ -2178,13 +2222,13 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
             return uncaught(&exc, Some(&run));
         }
         print_stdout(&text);
-        summary.insert("elapsed_s".into(), elapsed()); // the export that failed took its time too
+        summary.extend(run.summary_elapsed(started.elapsed().as_secs_f64())); // the export that failed took its time too
         print_stderr(&format!("harness: {kind} cannot write the result: {}", exc.msg));
-        print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
+        print_stderr(&terminal::summary_text(&summary, &args.summary_format));
         let _ = run.state("failed", &[("error", Value::String(py::head(&format!("cannot write the result: {}", exc.msg), 500).into()))]);
         return 2;
     }
-    print_stderr(&format!("harness: {}", pyjson::dumps(&Value::Object(summary))));
+    print_stderr(&terminal::summary_text(&summary, &args.summary_format));
     if let Some(trace) = &run.trace {
         let result = match given(&args.out) {
             Some(out) => pstr(&py::realpath(Path::new(out)).unwrap_or_else(|_| PathBuf::from(out))),
@@ -2227,6 +2271,8 @@ enum Kind {
     Str,
     Int,
     Float,
+    Progress,
+    Summary,
 }
 
 struct Opt {
@@ -2279,6 +2325,8 @@ fn options(command: &str) -> Vec<Opt> {
             TIMEOUT_S.py_str(),
             HARD_FLOOR_S.py_str()
         ))),
+        opt(&["--progress"], "progress", Kind::Progress, s("stderr progress: animate in a terminal, or log steps with always")),
+        opt(&["--summary-format"], "summary_format", Kind::Summary, s("stderr summary: text in a terminal and JSON when redirected")),
         opt(&["--max-calls"], "max_calls", Kind::Str, None),
     ]);
     out
@@ -2414,10 +2462,17 @@ fn collapse(text: &str) -> String {
     text.split(|c: char| c.is_ascii_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" ")
 }
 
+fn choices(kind: Kind) -> &'static [&'static str] {
+    match kind { Kind::Progress => &["auto", "always", "never"], Kind::Summary => &["auto", "text", "json"], _ => &[] }
+}
+fn metavar(o: &Opt) -> String {
+    if choices(o.kind).is_empty() { o.dest.to_uppercase() } else { format!("{{{}}}", choices(o.kind).join(",")) }
+}
+
 fn opt_usage(o: &Opt) -> String {
     let part = match o.kind {
         Kind::Flag => o.flags[0].to_string(),
-        _ => format!("{} {}", o.flags[0], o.dest.to_uppercase()),
+        _ => format!("{} {}", o.flags[0], metavar(o)),
     };
     if o.required { part } else { format!("[{part}]") }
 }
@@ -2425,7 +2480,7 @@ fn opt_usage(o: &Opt) -> String {
 fn invocation(o: &Opt) -> String {
     match o.kind {
         Kind::Flag => o.flags.join(", "),
-        _ => format!("{} {}", o.flags.join(", "), o.dest.to_uppercase()),
+        _ => format!("{} {}", o.flags.join(", "), metavar(o)),
     }
 }
 
@@ -2626,6 +2681,10 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
                     Kind::Float if py::float(&value).is_err() => return Err(bad("float")),
                     _ => {}
                 }
+                let options = choices(o.kind);
+                if !options.is_empty() && !options.contains(&value.as_str()) {
+                    return Err(parser_error(usage(), &sub, &format!("argument {name}: invalid choice: {} (choose from {})", py::repr(&value), options.iter().map(|s| py::repr(s)).collect::<Vec<_>>().join(", "))));
+                }
                 values.insert(o.dest, value);
             }
         }
@@ -2658,6 +2717,8 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
         unpriced_call_usd: get("unpriced_call_usd").and_then(|v| py::float(&v).ok()),
         timeout: get("timeout").and_then(|v| py::float(&v).ok()).map_or(TIMEOUT_S, Num::Float),
         max_calls: get("max_calls"),
+        progress: get("progress").unwrap_or_else(|| "auto".into()),
+        summary_format: get("summary_format").unwrap_or_else(|| "auto".into()),
         findings_pr: Map::new(),
         command,
     })
