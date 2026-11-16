@@ -156,8 +156,7 @@ The [contributor guide](CONTRIBUTING.md#repository-map) explains where a change 
 
 ## CLI usability and readability research
 
-See [the CLI usability and readability research](docs/RESEARCH-CLI-USABILITY.md)
-(also mirrored in [research/cli-usability.md](research/cli-usability.md)) for
+See [the CLI usability and readability research](docs/RESEARCH-CLI-USABILITY.md) for
 industry standards (POSIX, GNU, [clig.dev](https://clig.dev/), Heroku), command
 hierarchies (`noun verb`), stream discipline (`stdout` data vs `stderr` diagnostics),
 readability microcopy (the 3-part What/Why/Fix error model), visual hierarchy,
