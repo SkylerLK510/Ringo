@@ -133,23 +133,23 @@ class CallTest(unittest.TestCase):
         with self.assertRaises(harness.BudgetExceeded):
             run.reserve()
 
-    def test_claude_tokens_are_known_when_the_reply_counts_its_input_or_output(self):
+    def test_claude_keeps_each_reported_count_and_marks_missing_counts_unknown(self):
         zero = dict.fromkeys(harness.TOKEN_KEYS, 0)
         full = {'input_tokens': 3, 'cache_creation_input_tokens': 7, 'cache_read_input_tokens': 90, 'output_tokens': 4}
         cases = [(full, {'input': 3, 'cache_write': 7, 'cache_read': 90, 'output': 4}),
                  ({'input_tokens': 0, 'output_tokens': 0}, zero),  # reported zeros are counts, not a missing report
-                 ({'input_tokens': 5, 'output_tokens': 'bad', 'cache_read_input_tokens': 1.5}, {**zero, 'input': 5}),
-                 ({'input_tokens': True, 'output_tokens': 9, 'cache_creation_input_tokens': -1}, {**zero, 'output': 9}),
+                 ({'input_tokens': 5, 'output_tokens': 'bad', 'cache_read_input_tokens': 1.5}, {'input': 5, 'cache_write': 0, 'cache_read': 0}),
+                 ({'input_tokens': True, 'output_tokens': 9, 'cache_creation_input_tokens': -1}, {'cache_write': 0, 'cache_read': 0, 'output': 9}),
                  # neither count is a non-negative int (a bool or a float is not one): unknown, so no token fields
                  ({'input_tokens': True, 'output_tokens': 4.0, 'cache_read_input_tokens': 50}, {}),
                  ({}, {}), (None, {}), ([1], {})]
         for reported, tokens in cases:
             with self.subTest(reported=reported):
                 usage = harness.claude_usage({'usage': reported, 'total_cost_usd': 0.02})
-                self.assertEqual(list(usage.items()), [*tokens.items(), ('cost_usd', 0.02), ('models', [])])
+                self.assertEqual(usage, {**tokens, 'cost_usd': 0.02, 'models': []})
                 run = harness.Run()
                 run.record({'status': 'ok', 'usage': usage})
-                self.assertEqual(run.summary()['untokened_calls'], 0 if tokens else 1)
+                self.assertEqual(run.summary()['untokened_calls'], 0 if all(k in tokens for k in harness.TOKEN_KEYS) else 1)
 
     def test_explicit_admission_refusal_is_not_charged_by_review_or_design(self):
         for kind in ('review', 'design'):
