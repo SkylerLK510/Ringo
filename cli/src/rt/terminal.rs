@@ -120,7 +120,7 @@ impl Progress {
                 }
             };
             #[cfg(not(unix))]
-            let width = 80;
+            let width: usize = 80;
             write_raw(&format!(
                 "\r\x1b[K{}",
                 line.chars()
