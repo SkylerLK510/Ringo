@@ -3,6 +3,7 @@
 //! the IDE drive a `Session` and render its jobs.
 
 pub mod evidence;
+pub mod gateway;
 pub mod parse;
 pub mod rt;
 pub mod task;

@@ -9,6 +9,7 @@ use crate::evidence::{EvidenceError, EvidenceStatus, EvidenceStore, Registration
 use crate::task::{Decision, DecisionStatus, OwnerText, RepositoryBinding, Task};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
@@ -172,6 +173,10 @@ struct AssignmentRecord {
     manifest: AssignmentManifest,
     state: TaskState,
     text: String,
+    /// Every evidence ID this assignment and its acknowledged base chain told the agent about. Older records have
+    /// none and are read by walking their chain; new records answer a scoped read in one lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    grant: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -229,16 +234,13 @@ impl AssignmentStore {
         if agent.is_empty() || agent.len() > 128 {
             return Err(AssignmentError::Io("an assignment agent name must be 1-128 bytes".into()));
         }
-        let state = self.state(task)?;
+        let (state, staged) = self.state(task)?;
         let baseline = match native_thread {
             Some(thread) => self.load_baseline(task, agent, thread)?,
             None => None,
         };
         let kind = if baseline.is_some() { AssignmentKind::Delta } else { AssignmentKind::Full };
         let required = required(&state, baseline.as_ref().map(|(_, record)| &record.state), kind);
-        if kind == AssignmentKind::Delta && required == RequiredState::default() {
-            return Ok(None);
-        }
         let base_id = baseline.as_ref().map(|(cursor, _)| cursor.assignment_id.clone());
         let base_revision = baseline.as_ref().map(|(_, record)| record.manifest.task_revision);
         let identity = serde_json::json!({
@@ -316,10 +318,39 @@ impl AssignmentStore {
         let text = render(&manifest);
         manifest.assignment_bytes = text.len();
         debug_assert_eq!(render(&manifest).len(), text.len());
+        // A delta that tells nothing new is not sent. An undelivered claim that now fits under a larger budget does
+        // make one: the loop above included it, so the check looks at what was actually included rather than at the
+        // required fields alone. A claim that still does not fit is not repeated as an unchanged omission notice.
+        if kind == AssignmentKind::Delta
+            && manifest.required == RequiredState::default()
+            && manifest.claims.is_empty()
+        {
+            return Ok(None);
+        }
+        // Only now, past every budget check, does an evidence ID become discoverable. A preparation that failed
+        // above leaves at most a reusable content-addressed cache: no assignment, no cursor, no evidence grant.
+        self.evidence.publish(task, &staged)?;
+        // The cumulative grant this assignment and its acknowledged chain have told this agent about. Persisting it
+        // keeps a long-lived thread's scoped reads one record deep instead of an unbounded manifest walk.
+        let mut grant: BTreeSet<String> = BTreeSet::new();
+        collect_evidence(&manifest, &mut grant);
+        if let Some((_, base)) = &baseline {
+            match &base.grant {
+                Some(ids) => grant.extend(ids.iter().cloned()),
+                // A record written before cumulative grants existed: walk its chain once, within the reader's bound.
+                None => {
+                    if let Some(base_id) = &manifest.base_assignment_id
+                        && let Some(old) = self.allowed_evidence(task, base_id)?
+                    {
+                        grant.extend(old);
+                    }
+                }
+            }
+        }
         let prepared = PreparedAssignment { manifest: manifest.clone(), text: text.clone() };
         self.persist(&AssignmentRecord {
             schema_version: ASSIGNMENT_SCHEMA_VERSION, repository: self.repository.clone(), task_id: task.id.clone(),
-            manifest, state, text,
+            manifest, state, text, grant: Some(grant.into_iter().collect()),
         })?;
         Ok(Some(prepared))
     }
@@ -378,14 +409,69 @@ impl AssignmentStore {
         Ok(())
     }
 
-    fn state(&self, task: &Task) -> Result<TaskState> {
-        let registrations = self.evidence.register_task(task)?;
+    /// The evidence IDs an assignment could have told its agent about: its own manifest plus every assignment it
+    /// builds on. A read tool that is given an assignment ID can hold the caller to exactly this set, so an
+    /// unchanged artifact from an earlier assignment stays readable while evidence that was never delivered to that
+    /// agent does not become one. `None` means no such assignment; a broken chain is an error, never a wider grant.
+    pub fn allowed_evidence(&self, task: &Task, assignment_id: &str) -> Result<Option<BTreeSet<String>>> {
+        self.check_task(task)?;
+        if !well_formed_id(assignment_id, "a-")
+            || fs::symlink_metadata(self.assignment_path(&task.id, assignment_id)?).is_err()
+        {
+            return Ok(None);
+        }
+        let top = self.load_assignment(task, assignment_id)?;
+        if let Some(grant) = top.grant {
+            return Ok(Some(grant.into_iter().collect()));
+        }
+        // A record written before cumulative grants existed: walk its chain, with a cycle and depth guard.
+        let mut allowed = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        let mut next = Some(assignment_id.to_string());
+        while let Some(id) = next {
+            if !seen.insert(id.clone()) {
+                return Err(AssignmentError::Corrupt("the assignment chain contains a cycle".into()));
+            }
+            if seen.len() > 64 {
+                return Err(AssignmentError::Corrupt("the assignment chain is longer than 64 assignments".into()));
+            }
+            let record = self.load_assignment(task, &id)?;
+            // A newer record in the legacy chain already carries the cumulative grant: it subsumes the rest.
+            if let Some(grant) = record.grant { allowed.extend(grant); break; }
+            if let Some(artifacts) = &record.manifest.required.artifacts {
+                let registrations = match artifacts {
+                    Section::Complete(registrations) => registrations.as_slice(),
+                    Section::Changes { added, removed } => {
+                        // A removed artifact's snapshot is still readable by its ID; both sides of a change were
+                        // part of what this assignment told its agent.
+                        for registration in removed {
+                            if let Some(id) = &registration.evidence_id { allowed.insert(id.clone()); }
+                        }
+                        added.as_slice()
+                    }
+                };
+                for registration in registrations {
+                    if let Some(id) = &registration.evidence_id { allowed.insert(id.clone()); }
+                }
+            }
+            for claim in &record.manifest.claims {
+                allowed.insert(claim.evidence_id.clone());
+            }
+            next = record.manifest.base_assignment_id;
+        }
+        Ok(Some(allowed))
+    }
+
+    fn state(&self, task: &Task) -> Result<(TaskState, Vec<Registration>)> {
+        // Staged, not published: the immutable bytes and records may be cached, but no evidence identity is
+        // discoverable until the whole assignment has passed its budget check.
+        let registrations = self.evidence.stage_task(task)?;
         let mut claims = Vec::new();
         for job in &task.jobs {
             let origin = format!("job:{}:reply.md", job.id);
             let Some(registration) = registrations.iter().find(|r| r.origin == origin && r.status == EvidenceStatus::Ready) else { continue };
             let (Some(id), Some(expected), Some(size)) = (&registration.evidence_id, &registration.digest, registration.bytes) else { continue };
-            let mut file = self.evidence.snapshot(task, id)?;
+            let mut file = self.evidence.staged_snapshot(task, id)?;
             let mut bytes = Vec::new();
             Read::by_ref(&mut file).take(MAX_SNAPSHOT_BYTES + 1).read_to_end(&mut bytes)
                 .map_err(|e| AssignmentError::Io(format!("an evidence snapshot could not be read: {e}")))?;
@@ -402,14 +488,14 @@ impl AssignmentStore {
                 evidence_id: id.clone(), digest, text,
             });
         }
-        Ok(TaskState {
+        Ok((TaskState {
             objective: task.objective.clone(), constraints: task.constraints.clone(),
             accepted_decisions: task.decisions.iter().filter(|d| d.status == DecisionStatus::Accepted).cloned().collect(),
-            next_action: task.next_action.clone(), artifacts: registrations, unresolved_issues: task.unresolved_issues.clone(),
+            next_action: task.next_action.clone(), artifacts: registrations.clone(), unresolved_issues: task.unresolved_issues.clone(),
             claims,
             proposed_decision_bytes: task.decisions.iter().filter(|d| d.status == DecisionStatus::Proposed)
                 .map(|d| d.text.len() + d.author.len()).sum(),
-        })
+        }, registrations))
     }
 
     fn check_task(&self, task: &Task) -> Result<()> {
@@ -484,7 +570,12 @@ impl AssignmentStore {
         let bytes = serde_json::to_vec_pretty(record).map_err(|e| AssignmentError::Io(e.to_string()))?;
         if path.exists() {
             let old: AssignmentRecord = read_json(&path)?;
-            if old != *record {
+            // The grant is derived bookkeeping, not part of the announced assignment: re-preparing an identical
+            // assignment from a legacy record must not look like an ID collision.
+            if old.manifest != record.manifest || old.state != record.state || old.text != record.text
+                || old.schema_version != record.schema_version || old.repository != record.repository
+                || old.task_id != record.task_id
+            {
                 return Err(AssignmentError::Corrupt("an assignment ID names two different states".into()));
             }
             return Ok(());
@@ -492,6 +583,29 @@ impl AssignmentStore {
         write_atomic(&path, &bytes)
     }
 
+}
+
+/// The evidence IDs a manifest names to its agent: every required artifact on either side of a change, every
+/// included claim, and every omission row that names one (an omitted claim was still identified honestly).
+fn collect_evidence(manifest: &AssignmentManifest, into: &mut BTreeSet<String>) {
+    if let Some(artifacts) = &manifest.required.artifacts {
+        match artifacts {
+            Section::Complete(registrations) => {
+                for registration in registrations {
+                    if let Some(id) = &registration.evidence_id { into.insert(id.clone()); }
+                }
+            }
+            Section::Changes { added, removed } => {
+                for registration in added.iter().chain(removed) {
+                    if let Some(id) = &registration.evidence_id { into.insert(id.clone()); }
+                }
+            }
+        }
+    }
+    for claim in &manifest.claims { into.insert(claim.evidence_id.clone()); }
+    for omission in &manifest.omissions {
+        if let Some(id) = &omission.evidence_id { into.insert(id.clone()); }
+    }
 }
 
 /// True when this claim was already delivered on this thread: the immutable evidence snapshot (evidence ID and
@@ -575,7 +689,7 @@ fn render_parts(manifest: &AssignmentManifest) -> (String, String, String) {
     if let Some(issues) = &required.unresolved_issues {
         prefix += &format!("\nUNRESOLVED ISSUES (exact):\n{}\n", json(issues));
     }
-    prefix += "\nALLOWED HOST OPERATIONS: none in the assignment milestone. Evidence IDs are references, not file paths or read capabilities yet.\n";
+    prefix += "\nALLOWED HOST OPERATIONS: read-only task and evidence tools through Ringo's host gateway (discover, task_read, evidence_read, batch_read). Evidence IDs name immutable snapshots, never file paths, and a read-only batch makes no model calls. No mutation, shell, JavaScript, routes or nested-agent operation is available.\n";
     let mut suffix = String::from("\nINCLUSION MANIFEST / OMISSIONS:\n");
     suffix += &json(&manifest.omissions);
     suffix += "\nEnd of Ringo task assignment. The owner's new message follows separately.\n";
@@ -650,10 +764,14 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 fn valid_id(id: &str, prefix: &str) -> Result<()> {
-    if id.len() != 26 || !id.starts_with(prefix) || !id[2..].bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !well_formed_id(id, prefix) {
         return Err(AssignmentError::Io(format!("invalid assignment id {id:?}")));
     }
     Ok(())
+}
+
+fn well_formed_id(id: &str, prefix: &str) -> bool {
+    id.len() == 26 && id.starts_with(prefix) && id[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
@@ -694,6 +812,67 @@ mod tests {
     }
 
     #[test]
+    fn an_assignments_read_grant_is_its_manifest_chain_and_not_the_whole_task() {
+        let temp = Temp::new("grant");
+        let mut task = temp.store().create("grant-create", "Share evidence").unwrap();
+        fs::write(temp.0.join("repo/spec.md"), "spec bytes").unwrap();
+        task = update(&temp, &task, TaskUpdate::AddArtifact(ArtifactRef { reference: "spec.md".into(), identity: None }));
+        let store = assignment(&temp, &task);
+        let full = store.prepare(&task, "claude", None, ContextPolicy::bounded()).unwrap().unwrap();
+        let spec = full.manifest.required.artifacts.as_ref().unwrap();
+        let spec_id = match spec { Section::Complete(rs) => rs[0].evidence_id.clone().unwrap(), _ => panic!("a full assignment lists every artifact") };
+        let allowed = store.allowed_evidence(&task, &full.manifest.assignment_id).unwrap().unwrap();
+        assert!(allowed.contains(&spec_id) && allowed.len() == 1, "{allowed:?}");
+        // A delta builds on the acknowledged assignment: its unchanged artifact stays readable.
+        store.acknowledge(&task, "claude", "thread-1", &full.manifest.assignment_id).unwrap();
+        task = update(&temp, &task, TaskUpdate::AddConstraint("Keep the scope.".into()));
+        let delta = store.prepare(&task, "claude", Some("thread-1"), ContextPolicy::bounded()).unwrap().unwrap();
+        assert_eq!(delta.manifest.kind, AssignmentKind::Delta);
+        let allowed = store.allowed_evidence(&task, &delta.manifest.assignment_id).unwrap().unwrap();
+        assert!(allowed.contains(&spec_id), "the base assignment's evidence is still readable: {allowed:?}");
+        // Evidence registered only after the assignment is not part of its grant.
+        fs::write(temp.0.join("repo/later.md"), "later bytes").unwrap();
+        task = update(&temp, &task, TaskUpdate::AddArtifact(ArtifactRef { reference: "later.md".into(), identity: None }));
+        let later = store.prepare(&task, "claude", None, ContextPolicy::bounded()).unwrap().unwrap();
+        let later_id = match later.manifest.required.artifacts.as_ref().unwrap() {
+            Section::Complete(rs) => rs.iter().find(|r| r.reference == "later.md").unwrap().evidence_id.clone().unwrap(),
+            _ => panic!("a full assignment lists every artifact"),
+        };
+        assert!(!store.allowed_evidence(&task, &full.manifest.assignment_id).unwrap().unwrap().contains(&later_id));
+        assert!(store.allowed_evidence(&task, &later.manifest.assignment_id).unwrap().unwrap().contains(&later_id));
+        // An unknown or malformed assignment id grants nothing rather than the whole task.
+        assert!(store.allowed_evidence(&task, "a-000000000000000000000000").unwrap().is_none());
+        assert!(store.allowed_evidence(&task, "spec.md").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_long_thread_keeps_the_evidence_its_chain_was_told_about() {
+        // Preparation keeps extending a thread's delta chain; the reader must not start refusing a valid chain at
+        // an arbitrary depth. The persisted cumulative grant keeps a scoped read one record deep.
+        let temp = Temp::new("long-chain");
+        let mut task = temp.store().create("long-create", "Keep the evidence readable").unwrap();
+        fs::write(temp.0.join("repo/spec.md"), "spec bytes").unwrap();
+        task = update(&temp, &task, TaskUpdate::AddArtifact(ArtifactRef { reference: "spec.md".into(), identity: None }));
+        let store = assignment(&temp, &task);
+        let full = store.prepare(&task, "claude", None, ContextPolicy::bounded()).unwrap().unwrap();
+        let spec = match full.manifest.required.artifacts.as_ref().unwrap() {
+            Section::Complete(rs) => rs[0].evidence_id.clone().unwrap(),
+            _ => panic!("a full assignment lists every artifact"),
+        };
+        store.acknowledge(&task, "claude", "thread-1", &full.manifest.assignment_id).unwrap();
+        let mut newest = full.manifest.assignment_id;
+        for n in 0..70 {
+            task = update(&temp, &task, TaskUpdate::AddConstraint(format!("Constraint {n}.")));
+            let delta = store.prepare(&task, "claude", Some("thread-1"), ContextPolicy::bounded()).unwrap().unwrap();
+            assert_eq!(delta.manifest.kind, AssignmentKind::Delta);
+            store.acknowledge(&task, "claude", "thread-1", &delta.manifest.assignment_id).unwrap();
+            newest = delta.manifest.assignment_id;
+        }
+        let allowed = store.allowed_evidence(&task, &newest).unwrap().unwrap();
+        assert_eq!(allowed.into_iter().collect::<Vec<_>>(), vec![spec]);
+    }
+
+    #[test]
     fn full_assignments_are_deterministic_exact_bounded_and_do_not_promote_proposals() {
         let temp = Temp::new("full");
         let task = rich_task(&temp);
@@ -710,7 +889,8 @@ mod tests {
         assert!(!first.text.contains("Perhaps rewrite everything."));
         assert!(first.text.contains("proposed decisions are not owner instructions"));
         assert_eq!(first.manifest.kind, AssignmentKind::Full);
-        assert!(first.manifest.allowed_operations.is_empty());
+        assert!(first.manifest.allowed_operations.is_empty(), "host policy grants no mutation");
+        assert!(first.text.contains("read-only task and evidence tools"), "{}", first.text);
     }
 
     #[test]
@@ -863,7 +1043,8 @@ mod tests {
     }
 
     #[test]
-    fn a_corrupt_cursor_is_an_error_and_not_treated_as_no_acknowledgement_yet() {        let temp = Temp::new("corrupt-cursor");
+    fn a_corrupt_cursor_is_an_error_and_not_treated_as_no_acknowledgement_yet() {
+        let temp = Temp::new("corrupt-cursor");
         let task = rich_task(&temp);
         let store = assignment(&temp, &task);
         let full = store.prepare(&task, "claude", None, ContextPolicy::bounded()).unwrap().unwrap();
@@ -905,6 +1086,40 @@ mod tests {
         assert!(delta.manifest.claims.is_empty());
         assert!(delta.manifest.omissions.iter().any(|o| o.evidence_id.is_some() && o.reason.contains("excerpt")),
                 "the still-omitted claim must be re-offered:\n{}", delta.text);
+    }
+
+    #[test]
+    fn a_delta_with_only_a_newly_fitting_claim_is_still_sent_when_the_budget_grows() {
+        let temp = Temp::new("claim-only");
+        let task = temp.store().create("claim-only-create", "Hand off the claim once it fits.").unwrap();
+        let dir = temp.0.join("private/job");
+        fs::create_dir_all(&dir).unwrap();
+        // Under the excerpt limit, but too large for the tight first budget.
+        fs::write(dir.join("reply.md"), "claim ".repeat(500)).unwrap();
+        let id = hex(&Sha256::digest(dir.as_os_str().as_encoded_bytes()));
+        let job = JobRef {
+            id, shell_id: 1, agent: "claude".into(), write: false, directory: dir.clone(), status_at_attach: "done".into(),
+            base: None, before: None, after: None,
+            evidence: ["reply.md"].map(|name| ArtifactRef {
+                reference: dir.join(name).to_string_lossy().into_owned(), identity: None,
+            }).into_iter().collect(),
+        };
+        let task = temp.store().attach(&task.id, task.revision, "attach", job).unwrap();
+        let store = assignment(&temp, &task);
+        let full = store.prepare(&task, "claude", None, ContextPolicy { budget_bytes: 2_500 }).unwrap().unwrap();
+        assert!(full.manifest.claims.is_empty(), "the tight budget must leave the claim out:\n{}", full.text);
+        store.acknowledge(&task, "claude", "thread", &full.manifest.assignment_id).unwrap();
+        // Nothing in the task changed; only the budget grew. The undelivered claim now fits, so a claim-only delta
+        // must be sent rather than suppressed as an unchanged required state.
+        let delta = store.prepare(&task, "claude", Some("thread"), ContextPolicy::bounded()).unwrap()
+            .expect("a claim that now fits makes a delta even with unchanged required state");
+        assert_eq!(delta.manifest.kind, AssignmentKind::Delta);
+        assert_eq!(delta.manifest.required, RequiredState::default());
+        assert_eq!(delta.manifest.claims.len(), 1);
+        assert!(delta.text.contains("claim claim"));
+        store.acknowledge(&task, "claude", "thread", &delta.manifest.assignment_id).unwrap();
+        // Now the claim was delivered: with the same budget and no task change, nothing is sent again.
+        assert!(store.prepare(&task, "claude", Some("thread"), ContextPolicy::bounded()).unwrap().is_none());
     }
 
     #[test]

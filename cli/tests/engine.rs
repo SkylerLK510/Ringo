@@ -2,7 +2,7 @@
 #![cfg(unix)]
 
 use ringo_cli::{kept, parse::Tokens, Agent, Decision, Kept, Mode, Session, Status};
-use ringo_cli::task::{DecisionStatus, JobRef, TaskUpdate};
+use ringo_cli::task::{ArtifactRef, DecisionStatus, JobRef, TaskUpdate};
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -1707,6 +1707,38 @@ fn task_assignments_cross_agents_and_restart_with_immutable_evidence_and_native_
 }
 
 #[test]
+fn unchanged_cumulative_usage_does_not_acknowledge_an_undelivered_delta() {
+    let r = repo("task-stale-usage");
+    let working = fake(&root(), "codex-stale-usage-working", &codex_ok());
+    // A resumed thread that reports the same total as before, does no model work and fails.
+    let idle = fake(&root(), "codex-stale-usage-idle", &codex_script("", r#"echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","tokenUsage":{"total":{"inputTokens":10,"cachedInputTokens":4,"outputTokens":2}}}}'
+echo '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"status":"failed","error":{"message":"no model work"}}}}'"#));
+    let state = root().join("task-stale-usage-state");
+    let mut s = Session::with_state_home(&r, &state, &state).unwrap();
+    s.programs.insert(agent("codex"), working.clone());
+    s.codex_home = root().join("codex-home-stale-usage");
+    let store = s.task_store().unwrap();
+    let task = store.create("stale-create", "Keep the pending delta.").unwrap();
+    s.select_task(&task.id).unwrap();
+    said(&mut s, "codex", "begin the task");
+    assert!(turn_text(&working).starts_with("RINGO TASK ASSIGNMENT\nKind: full"));
+
+    // A fresh owner change is pending when the resumed turn repeats its earlier cumulative total and fails.
+    let _task = store.update(&task.id, task.revision, "stale-constraint",
+                              TaskUpdate::AddConstraint("Still pending.".into())).unwrap();
+    s.programs.insert(agent("codex"), idle.clone());
+    let failed = s.launch_agent(agent("codex"), false, "do no work").unwrap();
+    assert_eq!(wait(&mut s, failed), Status::Failed("codex: no model work".into()));
+
+    // The cursor did not advance: the next turn is still a delta carrying the change the failed turn never received.
+    s.programs.insert(agent("codex"), working.clone());
+    said(&mut s, "codex", "retry the task");
+    let delta = turn_text(&working);
+    assert!(delta.starts_with("RINGO TASK ASSIGNMENT\nKind: delta"), "{delta}");
+    assert!(delta.contains("Still pending."), "the undelivered change was lost:\n{delta}");
+}
+
+#[test]
 fn a_restarted_shell_cannot_acknowledge_from_a_provider_total_it_never_observed() {
     // The crash window: the provider thread advanced after the shell's last keep, so the restored watermark lags
     // the thread. A resumed turn that only repeats that historical total and fails did no work here: its first
@@ -1751,7 +1783,9 @@ echo '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"status":"fa
 fn a_task_update_that_cannot_start_stays_pending_and_required_overflow_makes_no_provider_request() {
     let r = repo("task-pending");
     let claude = fake(&root(), "claude-task-pending", CLAUDE_TALKS);
-    let mut s = session(&r, agent("claude"), &claude);
+    let state = root().join("task-pending-state");
+    let mut s = Session::with_state_home(&r, &state, &state).unwrap();
+    s.programs.insert(agent("claude"), claude.clone());
     let store = s.task_store().unwrap();
     let mut task = store.create("pending-create", "Preserve pending updates.").unwrap();
     task = store.update(&task.id, task.revision, "initial-constraint", TaskUpdate::AddConstraint("Keep auth.".into())).unwrap();
@@ -1773,6 +1807,9 @@ fn a_task_update_that_cannot_start_stays_pending_and_required_overflow_makes_no_
     assert!(!delta.contains("Keep auth."), "the unchanged constraint was repeated: {delta}");
 
     let huge = store.create("overflow-create", &"🌍".repeat(9_000)).unwrap();
+    fs::write(r.join("huge-note.md"), "a readable artifact").unwrap();
+    let huge = store.update(&huge.id, huge.revision, "huge-artifact",
+                            TaskUpdate::AddArtifact(ArtifactRef { reference: "huge-note.md".into(), identity: None })).unwrap();
     s.select_task(&huge.id).unwrap();
     let missing = fake(&root(), "claude-overflow-runs", CLAUDE_TALKS);
     // Remove its observation files to prove that the required overflow returns before spawning this otherwise valid fake.
@@ -1782,6 +1819,113 @@ fn a_task_update_that_cannot_start_stays_pending_and_required_overflow_makes_no_
     let error = s.launch_agent(agent("claude"), false, "this cannot make a model call").unwrap_err();
     assert!(error.contains("required task state needs") && error.contains("nothing was sent or truncated"), "{error}");
     assert!(!PathBuf::from(format!("{}.stdin", missing.display())).exists());
+    // A refused preparation publishes no evidence identity and no assignment, even though it could read the artifact.
+    let evidence = ringo_cli::evidence::EvidenceStore::new(&state, &huge.repository).unwrap();
+    assert!(evidence.registered(&huge).unwrap().is_empty(), "a refused preparation must not publish evidence");
+    // The staged bytes may exist, but even a caller that knows the staged ID gets no read through the gateway.
+    let staged_id = evidence.stage_task(&huge).unwrap().pop().unwrap().evidence_id.unwrap();
+    let gateway = ringo_cli::gateway::Gateway::new(&state, &huge.repository).unwrap();
+    let response = gateway.dispatch(&serde_json::json!({
+        "protocol": 1, "request_id": "staged", "op": "evidence_read",
+        "params": { "task_id": huge.id, "evidence_id": staged_id }}));
+    assert_eq!(response["ok"], serde_json::json!(false), "{response}");
+    assert_eq!(response["error"]["code"], serde_json::json!("unknown_evidence"), "{response}");
+}
+
+#[test]
+fn a_read_only_batch_serves_the_same_evidence_across_agents_and_a_restart_without_a_model_call() {
+    let r = repo("task-gateway");
+    let (codex, claude) = (fake(&root(), "codex-task-gateway", &codex_ok()),
+                           fake(&root(), "claude-task-gateway", CLAUDE_TALKS));
+    let state = root().join("task-gateway-state");
+    let open = || {
+        let mut s = Session::with_state_home(&r, &state, &state).unwrap();
+        s.programs.insert(agent("codex"), codex.clone());
+        s.programs.insert(agent("claude"), claude.clone());
+        s.codex_home = root().join("codex-home-gateway");
+        s
+    };
+    let mut s = open();
+    let store = s.task_store().unwrap();
+    let mut task = store.create("gateway-create", "Share bounded evidence.").unwrap();
+    fs::write(r.join("spec.md"), "the spec").unwrap();
+    task = store.update(&task.id, task.revision, "gateway-artifact",
+                        TaskUpdate::AddArtifact(ArtifactRef { reference: "spec.md".into(), identity: None })).unwrap();
+    task = store.update(&task.id, task.revision, "gateway-constraint",
+                        TaskUpdate::AddConstraint("Never send a raw path.".into())).unwrap();
+    s.select_task(&task.id).unwrap();
+    let claude_job = said(&mut s, "claude", "read the spec first");
+    task = store.attach(&task.id, task.revision, "gateway-attach", JobRef::from_job(s.job(claude_job).unwrap()).unwrap()).unwrap();
+    said(&mut s, "codex", "take over");
+    let handoff = turn_text(&codex);
+    assert!(handoff.starts_with("RINGO TASK ASSIGNMENT\nKind: full"), "{handoff}");
+    // Both the artifact and the attributed reply are named by opaque, task-scoped evidence IDs.
+    let evidence = ringo_cli::evidence::EvidenceStore::new(&state, &task.repository).unwrap();
+    let registered = evidence.registered(&task).unwrap();
+    let spec = registered.iter().find(|r| r.origin == ringo_cli::evidence::artifact_origin("spec.md"))
+        .and_then(|r| r.evidence_id.clone()).expect("the artifact is registered");
+    let reply = registered.iter().find(|r| r.origin.starts_with("job:") && r.origin.ends_with(":reply.md"))
+        .and_then(|r| r.evidence_id.clone()).expect("the attached reply is registered");
+    assert!(handoff.contains(&spec) && handoff.contains(&reply), "the handoff names both ids:\n{handoff}");
+
+    let runs_before = fs::read_to_string(format!("{}.args", codex.display())).unwrap_or_default().lines().count();
+    // A host transport, not a model: one read-only batch over the CLI adapter.
+    let discovery = tools(&state, &r, &serde_json::json!({
+        "protocol": 1, "request_id": "discover", "op": "discover", "params": {},
+    }));
+    assert_eq!(discovery["ok"], serde_json::json!(true), "{discovery}");
+    assert_eq!(discovery["result"]["tools"].as_array().unwrap().len(), 4);
+    let batch = tools(&state, &r, &serde_json::json!({
+        "protocol": 1, "request_id": "batch", "op": "batch_read", "params": { "steps": [
+            { "tool": "task_read", "params": { "task_id": task.id } },
+            { "tool": "evidence_read", "params": { "task_id": task.id, "evidence_id": spec } },
+            { "tool": "evidence_read", "params": { "task_id": task.id, "evidence_id": reply, "max_bytes": 64 } },
+        ] },
+    }));
+    assert_eq!(batch["ok"], serde_json::json!(true), "{batch}");
+    assert_eq!(batch["task_revision"], serde_json::json!(task.revision));
+    assert_eq!(batch["result"]["complete"], serde_json::json!(true), "{batch}");
+    let results = batch["result"]["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["result"]["revision"], serde_json::json!(task.revision));
+    assert_eq!(results[1]["result"]["content"], serde_json::json!("the spec"));
+    assert_eq!(results[2]["result"]["content"], serde_json::json!("done"));
+    // A structured refusal is a response, not a crash or a model call.
+    let refusal = tools(&state, &r, &serde_json::json!({
+        "protocol": 1, "request_id": "missing", "op": "task_read", "params": { "task_id": "t-000000000000000000000000" },
+    }));
+    assert_eq!(refusal["ok"], serde_json::json!(false));
+    assert_eq!(refusal["error"]["code"], serde_json::json!("unknown_task"));
+    assert_eq!(fs::read_to_string(format!("{}.args", codex.display())).unwrap_or_default().lines().count(),
+               runs_before, "a read-only batch makes no model call");
+
+    // Restart the shell; a fresh gateway process still resolves the same task revision and evidence bytes.
+    let kept = s.keep(None).unwrap();
+    drop(s);
+    let mut resumed = open();
+    resumed.go_on(&kept).unwrap();
+    assert_eq!(resumed.selected_task().unwrap().unwrap().id, task.id);
+    let after = tools(&state, &r, &serde_json::json!({
+        "protocol": 1, "request_id": "after-restart", "op": "evidence_read",
+        "params": { "task_id": task.id, "evidence_id": spec, "task_revision": task.revision },
+    }));
+    assert_eq!(after["ok"], serde_json::json!(true), "{after}");
+    assert_eq!(after["result"]["content"], serde_json::json!("the spec"));
+    assert_eq!(after["task_revision"], serde_json::json!(task.revision));
+}
+
+/// Run one gateway request through the `ringo tools` adapter: a separate process, no model, no mutation.
+fn tools(state: &Path, repo: &Path, request: &serde_json::Value) -> serde_json::Value {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ringo"))
+        .args(["tools", "--repo", repo.to_str().unwrap(), "--state", state.to_str().unwrap()])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
+        .spawn().expect("ringo tools starts");
+    child.stdin.as_mut().unwrap().write_all(request.to_string().as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "ringo tools failed: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).expect("the adapter writes one JSON response")
 }
 
 #[test]

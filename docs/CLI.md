@@ -16,6 +16,7 @@ backends, accounting and evaluation tools. For interactive use, start with the
 | `research` | Answers a brief from web sources that Ringo checks itself |
 | `wait DIR` | Waits for a background run to finish and prints its state |
 | `release` | Manages approved, versioned releases of Ringo itself |
+| `tools` | Serves one read-only task/evidence JSON request on stdin (see [shared tasks and evidence](SHARED-TASK-TOOLS.md)) |
 | `ringo` (the shell) | A full-screen session for working with several agents and running Ringo's pipelines |
 
 Run the commands with `python3 ringo.py COMMAND`, or with the `ringo` binary (`cargo install --locked --path cli`), which

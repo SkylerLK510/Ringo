@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const EVIDENCE_SCHEMA_VERSION: u32 = 1;
 /// Registration is deliberately bounded. Larger sources remain available to the owner through the original job, but
@@ -100,6 +101,15 @@ impl EvidenceStore {
     /// Register all currently named task artifacts and attached job outputs in stable task order. A source that
     /// disappeared after a successful registration keeps its previous immutable registration.
     pub fn register_task(&self, task: &Task) -> Result<Vec<Registration>> {
+        let staged = self.stage_task(task)?;
+        self.publish(task, &staged)?;
+        Ok(staged)
+    }
+
+    /// The first half of `register_task`: write the immutable bytes and records, but publish no latest pointer, so
+    /// no evidence identity is handed out yet. A preparation that then fails its budget check leaves the cache it
+    /// may reuse but grants nothing and changes no discoverable evidence.
+    pub fn stage_task(&self, task: &Task) -> Result<Vec<Registration>> {
         if task.repository != self.repository {
             return Err(EvidenceError::WrongTask(task.id.clone()));
         }
@@ -108,7 +118,7 @@ impl EvidenceStore {
         for artifact in &task.artifacts {
             let origin = artifact_origin(&artifact.reference);
             out.push(self.register_source(task, origin, artifact.reference.clone(), artifact.identity.clone(),
-                                          &task.repository.path, Path::new(&artifact.reference), false));
+                                          &task.repository.path, Path::new(&artifact.reference), false, false));
         }
         for job in &task.jobs {
             for (index, artifact) in job.evidence.iter().enumerate() {
@@ -128,14 +138,62 @@ impl EvidenceStore {
                     continue;
                 }
                 out.push(self.register_source(task, format!("job:{}:{name}", job.id), format!("job:{}/{name}", job.id),
-                                              artifact.identity.clone(), &job.directory, Path::new(name), true));
+                                              artifact.identity.clone(), &job.directory, Path::new(name), true, false));
             }
         }
         Ok(out)
     }
+
+    /// Publish the latest pointer for each ready staged registration. This is the only step that makes an evidence
+    /// ID discoverable; it is separate so a failed preparation never publishes one.
+    pub fn publish(&self, task: &Task, registrations: &[Registration]) -> Result<()> {
+        if task.repository != self.repository {
+            return Err(EvidenceError::WrongTask(task.id.clone()));
+        }
+        for registration in registrations {
+            let (Some(id), EvidenceStatus::Ready) = (&registration.evidence_id, &registration.status) else { continue };
+            let record = self.load_record(&task.id, id)?;
+            if record.origin != registration.origin {
+                return Err(EvidenceError::Corrupt("a staged registration does not name its origin".into()));
+            }
+            // The per-ID marker is what makes direct lookup possible; the latest pointer is only discovery. A
+            // staged record without a marker stays unknown even to a caller that can derive its ID.
+            self.publish_id(&task.id, id)?;
+            self.record_latest(&record)?;
+        }
+        Ok(())
+    }
+
+    fn publish_id(&self, task_id: &str, evidence_id: &str) -> Result<()> {
+        valid_id(evidence_id, "e-")?;
+        let dir = self.dir.join(task_id).join("published");
+        private_dir(&dir)?;
+        let path = dir.join(evidence_id);
+        if fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            return Err(EvidenceError::Corrupt("an evidence publication marker is a symlink and was left untouched".into()));
+        }
+        if !path.exists() {
+            write_new(&path, b"published")?;
+        }
+        Ok(())
+    }
+
+    /// A publication marker makes an ID readable directly, including after its origin is superseded. It is checked
+    /// without following anything: a marker that is not a regular private file publishes nothing.
+    fn is_published(&self, task_id: &str, evidence_id: &str) -> bool {
+        if valid_id(evidence_id, "e-").is_err() {
+            return false;
+        }
+        let path = self.dir.join(task_id).join("published").join(evidence_id);
+        fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+    }
     /// Metadata for an issued ID, scoped again at lookup. The snapshot path is never part of the public registration.
+    /// A record that was staged by a preparation but never published is not issued: it reads as unknown here.
     pub fn registration(&self, task: &Task, evidence_id: &str) -> Result<Registration> {
         let record = self.load_record(&task.id, evidence_id)?;
+        if !self.is_published(&task.id, evidence_id) {
+            return Err(EvidenceError::NotFound(evidence_id.into()));
+        }
         if record.task_id != task.id || record.repository != self.repository || task.repository != self.repository {
             return Err(EvidenceError::WrongTask(evidence_id.into()));
         }
@@ -151,8 +209,83 @@ impl EvidenceStore {
         })
     }
 
+    /// Every currently latest registration of this task, read-only: this registers nothing. Superseded snapshots
+    /// stay readable by their own IDs but are not listed here. A pointer that cannot be trusted is reported as
+    /// unavailable, never skipped or followed somewhere else.
+    pub fn registered(&self, task: &Task) -> Result<Vec<Registration>> {
+        if task.repository != self.repository {
+            return Err(EvidenceError::WrongTask(task.id.clone()));
+        }
+        let latest = self.dir.join(&task.id).join("latest");
+        match fs::symlink_metadata(&latest) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(EvidenceError::Corrupt("the latest evidence folder is a symlink and was not followed".into()))
+            }
+            Ok(meta) if !meta.is_dir() => {
+                return Err(EvidenceError::Corrupt("the latest evidence path is not a folder".into()))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(EvidenceError::Io(e.to_string())),
+        }
+        let entries = fs::read_dir(&latest).map_err(|e| EvidenceError::Io(e.to_string()))?;
+        let mut names: Vec<_> = entries.filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let pointer = latest.join(&name);
+            let label = format!("latest:{}", name.to_string_lossy());
+            if fs::symlink_metadata(&pointer).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                out.push(unavailable(String::new(), label, None,
+                                     "the latest evidence pointer is a symlink and was not followed"));
+                continue;
+            }
+            let id = match fs::read_to_string(&pointer) {
+                Ok(id) => id,
+                Err(e) => {
+                    out.push(unavailable(String::new(), label, None,
+                                         &format!("the latest evidence pointer is unreadable: {e}")));
+                    continue;
+                }
+            };
+            let id = id.trim();
+            match self.load_record(&task.id, id) {
+                // A record must resolve inside this task and repository, exactly as a direct lookup requires.
+                Ok(record) if record.task_id == task.id && record.repository == self.repository
+                    && self.is_published(&task.id, id) => out.push(Registration {
+                    origin: record.origin, reference: format!("evidence:{id}"), declared_identity: None,
+                    evidence_id: Some(record.id), digest: Some(record.digest), bytes: Some(record.bytes),
+                    status: EvidenceStatus::Ready, detail: None,
+                }),
+                Ok(record) if record.task_id == task.id && record.repository == self.repository => {
+                    out.push(unavailable(String::new(), format!("evidence:{id}"), None,
+                        "the latest evidence pointer names a record that was never published"))
+                }
+                Ok(_) => out.push(unavailable(String::new(), format!("evidence:{id}"), None,
+                    "the latest evidence pointer names a record outside this task's scope")),
+                Err(e) => out.push(unavailable(String::new(), format!("evidence:{id}"), None,
+                    &format!("the latest evidence pointer is unreadable and was left untouched: {e}"))),
+            }
+        }
+        Ok(out)
+    }
+
     /// Open the immutable snapshot for a future bounded reader. This resolves no live source and grants no path access.
     pub(crate) fn snapshot(&self, task: &Task, evidence_id: &str) -> Result<fs::File> {
+        if !self.is_published(&task.id, evidence_id) {
+            return Err(EvidenceError::NotFound(evidence_id.into()));
+        }
+        self.open_snapshot(task, evidence_id)
+    }
+
+    /// Open a staged snapshot for the preparing assignment itself, before publication. Only the preparation path
+    /// uses this to measure its claims; every issued read goes through `snapshot`, which requires the marker.
+    pub(crate) fn staged_snapshot(&self, task: &Task, evidence_id: &str) -> Result<fs::File> {
+        self.open_snapshot(task, evidence_id)
+    }
+
+    fn open_snapshot(&self, task: &Task, evidence_id: &str) -> Result<fs::File> {
         let record = self.load_record(&task.id, evidence_id)?;
         open_regular_beneath(&self.dir.join(&task.id).join("blobs"), Path::new(&record.snapshot))
             .map_err(|e| EvidenceError::Io(format!("the evidence snapshot could not be opened: {e}")))
@@ -169,6 +302,7 @@ impl EvidenceStore {
             .map_err(|e| EvidenceError::Corrupt(format!("evidence metadata is corrupt and was left untouched: {e}")))?;
         if record.schema_version != EVIDENCE_SCHEMA_VERSION || record.id != evidence_id || record.task_id != task_id
             || record.repository != self.repository || !valid_digest(&record.digest)
+            || record.bytes > MAX_SNAPSHOT_BYTES
             || record.snapshot != format!("{}.bin", &record.digest[7..]) {
             return Err(EvidenceError::Corrupt("evidence metadata failed its scope or identity check".into()));
         }
@@ -180,9 +314,9 @@ impl EvidenceStore {
     /// be reached without following symlinks — a redirected job root is refused, never read at its destination.
     fn register_source(
         &self, task: &Task, origin: String, display: String, declared: Option<String>,
-        root: &Path, relative: &Path, job: bool,
+        root: &Path, relative: &Path, job: bool, publish: bool,
     ) -> Registration {
-        match self.register_one(task, &origin, display.clone(), declared.clone(), root, relative, job) {
+        match self.register_one(task, &origin, display.clone(), declared.clone(), root, relative, job, publish) {
             Ok(mut registration) => {
                 registration.reference = display;
                 registration.declared_identity = declared;
@@ -198,9 +332,10 @@ impl EvidenceStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_one(
         &self, task: &Task, origin: &str, display: String, declared: Option<String>, root: &Path, relative: &Path,
-        job: bool,
+        job: bool, publish: bool,
     ) -> Result<Registration> {
         if relative.as_os_str().is_empty() {
             return Err(EvidenceError::NotFound(display));
@@ -230,7 +365,7 @@ impl EvidenceStore {
             repository: self.repository.clone(), origin: origin.into(),
             snapshot: format!("{}.bin", &digest[7..]), digest: digest.clone(), bytes: bytes.len() as u64,
         };
-        self.persist(&record, &bytes)?;
+        self.persist(&record, &bytes, publish)?;
         Ok(Registration {
             origin: origin.into(), reference: display, declared_identity: declared, evidence_id: Some(id),
             digest: Some(digest), bytes: Some(record.bytes), status: EvidenceStatus::Ready, detail: None,
@@ -244,6 +379,9 @@ impl EvidenceStore {
         if record.origin != origin {
             return Err(EvidenceError::Corrupt("the latest evidence pointer does not name its origin".into()));
         }
+        if !self.is_published(&task.id, &record.id) {
+            return Err(EvidenceError::Corrupt("the latest evidence pointer names a record that was never published".into()));
+        }
         if declared.as_deref().is_some_and(valid_digest) && declared.as_deref() != Some(record.digest.as_str()) {
             return Ok(unavailable(origin.into(), display, declared, "the only snapshot does not match the declared identity"));
         }
@@ -254,7 +392,7 @@ impl EvidenceStore {
         })
     }
 
-    fn persist(&self, record: &EvidenceRecord, bytes: &[u8]) -> Result<()> {
+    fn persist(&self, record: &EvidenceRecord, bytes: &[u8], publish: bool) -> Result<()> {
         let task = self.dir.join(&record.task_id);
         let blobs = task.join("blobs");
         let records = task.join("records");
@@ -279,7 +417,10 @@ impl EvidenceStore {
             let encoded = serde_json::to_vec_pretty(record).map_err(|e| EvidenceError::Invalid(e.to_string()))?;
             write_new(&path, &encoded)?;
         }
-        self.record_latest(record)
+        if publish {
+            self.record_latest(record)?;
+        }
+        Ok(())
     }
 
     /// A missing live source reuses the latest registration for its origin. The pointer is derived state: its bytes
@@ -315,7 +456,7 @@ fn unavailable(origin: String, reference: String, declared: Option<String>, why:
     }
 }
 
-fn valid_digest(identity: &str) -> bool {
+pub(crate) fn valid_digest(identity: &str) -> bool {
     identity.len() == 71 && identity.starts_with("sha256:") && identity[7..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
@@ -337,7 +478,11 @@ fn private_dir(path: &Path) -> Result<()> {
 }
 
 fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
-    let part = path.with_extension(format!("part-{}", std::process::id()));
+    // A unique temporary name per write: two threads in this process staging the same content must not share a
+    // pathname, or one's failed create could delete the other's in-progress file. Only the invocation that created
+    // the temporary file cleans it up.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let part = path.with_extension(format!("part-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -345,20 +490,29 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    let mut file = match options.open(&part) {
+        Ok(file) => file,
+        Err(e) => {
+            // This invocation created nothing, so there is nothing of ours to remove. A content-addressed blob may
+            // have won a concurrent race; never replace it, its digest is checked on read.
+            if path.is_file() {
+                return Ok(());
+            }
+            return Err(EvidenceError::Io(format!("{}: {e}", path.display())));
+        }
+    };
     let result = (|| -> std::io::Result<()> {
-        let mut file = options.open(&part)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&part, path)
     })();
     if let Err(e) = result {
+        let _ = fs::remove_file(&part);
         // A content-addressed blob may have won a concurrent race. Never replace it; its digest will be checked on read.
         if path.is_file() {
-            let _ = fs::remove_file(&part);
             return Ok(());
         }
-        let _ = fs::remove_file(&part);
         return Err(EvidenceError::Io(format!("{}: {e}", path.display())));
     }
     Ok(())
@@ -388,7 +542,7 @@ fn open_regular_beneath_strict(root: &Path, relative: &Path) -> std::io::Result<
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
     // SAFETY: the path is NUL-terminated and live for the call; returned descriptors are owned below.
-    let fd = unsafe { libc::open(b"/\0".as_ptr().cast(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    let fd = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -596,7 +750,8 @@ mod tests {
         assert_eq!(reply.status, EvidenceStatus::Unavailable, "a redirected job root must not be read: {reply:?}");
         assert!(reply.evidence_id.is_none());
         assert!(reply.detail.as_deref().unwrap_or_default().contains("symlink"), "detail was: {:?}", reply.detail);
-        // The unrelated content was never registered under the job's origin.        assert!(registrations.iter().all(|r| r.status != EvidenceStatus::Ready));
+        // The unrelated content was never registered under the job's origin.
+        assert!(registrations.iter().all(|r| r.status != EvidenceStatus::Ready));
     }
 
     #[test]
@@ -620,6 +775,56 @@ mod tests {
         assert_eq!(again[0].origin, artifact_origin("second.txt"));
         assert_eq!(again[0].evidence_id, second.evidence_id);
         assert_ne!(again[0].evidence_id, first.evidence_id);
+    }
+
+    #[test]
+    fn a_staged_evidence_id_stays_unreadable_until_its_preparation_publishes() {
+        let temp = Temp::new("staged");
+        let made = temp.task();
+        fs::write(temp.0.join("repo/note.txt"), "staged bytes").unwrap();
+        let made = add_artifact(&temp, &made, "note.txt", None);
+        let store = evidence(&temp, &made);
+        let staged = store.stage_task(&made).unwrap().pop().unwrap();
+        assert_eq!(staged.status, EvidenceStatus::Ready);
+        let id = staged.evidence_id.clone().unwrap();
+        // The bytes are cached, but an id is published only by a preparation that passed its budget check. A caller
+        // that can derive the id (it hashes the origin) learns nothing from the staging alone.
+        assert!(matches!(store.registration(&made, &id), Err(EvidenceError::NotFound(_))));
+        assert!(matches!(store.snapshot(&made, &id), Err(EvidenceError::NotFound(_))));
+        assert!(store.registered(&made).unwrap().is_empty());
+        store.publish(&made, &[staged]).unwrap();
+        assert_eq!(store.registration(&made, &id).unwrap().evidence_id.as_deref(), Some(id.as_str()));
+        let registered = store.registered(&made).unwrap();
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].evidence_id.as_deref(), Some(id.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_redirected_or_unreadable_latest_pointer_is_reported_not_followed() {
+        use std::os::unix::fs::symlink;
+        let temp = Temp::new("pointer");
+        let made = temp.task();
+        fs::write(temp.0.join("repo/first.txt"), "first bytes").unwrap();
+        fs::write(temp.0.join("repo/second.txt"), "second bytes").unwrap();
+        let made = add_artifact(&temp, &made, "first.txt", None);
+        let made = add_artifact(&temp, &made, "second.txt", None);
+        let registered = evidence(&temp, &made).register_task(&made).unwrap();
+        let first_id = registered[0].evidence_id.clone().unwrap();
+        let latest = evidence(&temp, &made).dir.join(&made.id).join("latest");
+        let mut pointers: Vec<_> = fs::read_dir(&latest).unwrap().map(|e| e.unwrap().path()).collect();
+        pointers.sort();
+        assert_eq!(pointers.len(), 2);
+        // One pointer is redirected, the other no longer names a record. Neither is followed or fatal.
+        fs::remove_file(&pointers[0]).unwrap();
+        symlink(temp.0.join("elsewhere.txt"), &pointers[0]).unwrap();
+        fs::write(&pointers[1], "not an evidence id").unwrap();
+        let listed = evidence(&temp, &made).registered(&made).unwrap();
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.iter().all(|r| r.status == EvidenceStatus::Unavailable && r.evidence_id.is_none()));
+        // The genuine snapshot stays readable by its own id.
+        let still = evidence(&temp, &made).registration(&made, &first_id).unwrap();
+        assert_eq!(still.evidence_id.as_deref(), Some(first_id.as_str()));
     }
 
     #[cfg(unix)]
@@ -653,5 +858,30 @@ mod tests {
         std::os::unix::fs::symlink("/", temp.0.join("repo/root-link")).unwrap();
         assert!(evidence(&temp, &valid).registration(&other, &id).is_err());
         assert!(evidence(&temp, &valid).registration(&valid, "e-../../../etc").is_err());
+    }
+
+    #[test]
+    fn concurrent_registration_of_identical_content_does_not_delete_each_others_temp_files() {
+        // Two threads staging the same content must not share a temporary pathname: with a per-process name, one
+        // thread's failed create could delete the other's in-progress file. Unique names plus self-owned cleanup
+        // make every registration succeed and leave the immutable blob intact.
+        let temp = Temp::new("concurrent");
+        let made = temp.task();
+        fs::write(temp.0.join("repo/note.txt"), "shared bytes").unwrap();
+        let made = add_artifact(&temp, &made, "note.txt", None);
+        let store = evidence(&temp, &made);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8).map(|_| scope.spawn(|| store.register_task(&made))).collect();
+            for handle in handles {
+                let regs = handle.join().unwrap().unwrap();
+                assert_eq!(regs[0].status, EvidenceStatus::Ready);
+                assert!(regs[0].evidence_id.is_some());
+            }
+        });
+        // The blob is still readable and its bytes are intact.
+        let id = store.registered(&made).unwrap().pop().unwrap().evidence_id.unwrap();
+        let mut content = String::new();
+        store.snapshot(&made, &id).unwrap().read_to_string(&mut content).unwrap();
+        assert_eq!(content, "shared bytes");
     }
 }

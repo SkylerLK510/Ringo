@@ -9,6 +9,7 @@ mod updates;
 
 use std::ffi::OsString;
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
@@ -22,6 +23,9 @@ ringo: Ringo's shell and harness.
                             (with release state, ringo.py decides which runtime runs it)
   ringo research ...        Ringo's research role (the Python runtime runs it)
   ringo wait|release ...    the same as python3 ringo.py wait|release ...
+  ringo tools [--repo PATH] [--state DIR]
+                            one read-only task/evidence request on stdin, its JSON response on stdout
+                            (no model call, shell, mutation or network)
 
 Prompts and plans come from RINGO_HOME (default: the checkout ringo was built from).
 ";
@@ -30,7 +34,7 @@ fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     // Shell agents can request bounded reviews/designs; pipeline models cannot launch more pipelines.
     let command = args.first().and_then(|a| a.to_str());
-    let allowed = command == Some("ask-server") ||
+    let allowed = command == Some("ask-server") || command == Some("tools") ||
         (std::env::var_os("RINGO_PIPELINE_CHILD").is_none() && matches!(command, Some("review" | "design" | "wait")));
     if std::env::var_os("RINGO_CHILD").is_some() && !allowed {
         eprintln!("ringo: refusing recursive execution (RINGO_CHILD); shell agents may use review, design or wait");
@@ -79,7 +83,89 @@ fn main() -> ExitCode {
             }
         }
         Some("review" | "design" | "work") => pipeline(args),
+        Some("tools") => tools(&args[1..]),
         _ => harness(args),
+    }
+}
+
+/// `ringo tools [--repo PATH] [--state DIR]`: one read-only gateway request on stdin, one JSON response on stdout.
+/// This is a transport for agents, not a pipeline: it starts no model, shell or nested Ringo run and mutates no task.
+/// A structured refusal still exits 0; a host reads the response's `ok`, as the protocol says.
+fn tools(args: &[OsString]) -> ExitCode {
+    use ringo_cli::gateway::{Gateway, MAX_REQUEST_BYTES};
+    use std::io::Read;
+
+    let (mut repo, mut state) = (None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.to_str() {
+            Some("--repo") => match rest.next() {
+                Some(value) => repo = Some(PathBuf::from(value)),
+                None => return tools_usage("--repo needs a path"),
+            },
+            Some("--state") => match rest.next() {
+                Some(value) => state = Some(PathBuf::from(value)),
+                None => return tools_usage("--state needs a path"),
+            },
+            Some("-h" | "--help") => {
+                print!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other => return tools_usage(&format!("unknown argument {other:?}")),
+        }
+    }
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(e) => return tools_usage(&format!("the current folder cannot be read: {e}")),
+    };
+    let (path, git) = task_binding(repo.as_deref().unwrap_or(&cwd));
+    let state = state.unwrap_or_else(ringo_cli::state_root);
+    let binding = ringo_cli::task::RepositoryBinding { path, git };
+    let gateway = match Gateway::new(&state, &binding) {
+        Ok(gateway) => gateway,
+        Err(why) => {
+            eprintln!("ringo tools: {why}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut bytes = Vec::new();
+    // Bound the read itself: an oversized request is refused by the gateway, never buffered without limit.
+    if let Err(e) = std::io::stdin().lock().take(MAX_REQUEST_BYTES as u64 + 1).read_to_end(&mut bytes) {
+        eprintln!("ringo tools: the request could not be read: {e}");
+        return ExitCode::from(2);
+    }
+    match serde_json::to_string(&gateway.dispatch_bytes(&bytes)) {
+        Ok(text) => {
+            println!("{text}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("ringo tools: the response could not be written: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn tools_usage(why: &str) -> ExitCode {
+    eprintln!("ringo tools: {why}\n");
+    eprint!("{USAGE}");
+    ExitCode::from(2)
+}
+
+/// The repository a shell session in `cwd` would bind tasks to: the enclosing git project, unless that project holds
+/// the owner's home folder (a dotfiles checkout), else the folder itself.
+fn task_binding(cwd: &Path) -> (PathBuf, bool) {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from).unwrap_or_default();
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    let top = Command::new("git").arg("-C").arg(cwd).args(["rev-parse", "--show-toplevel"]).output().ok()
+        .filter(|out| out.status.success())
+        .map(|out| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))
+        .filter(|top| home.as_os_str().is_empty() || !home.starts_with(top))
+        .map(|top| std::fs::canonicalize(&top).unwrap_or(top));
+    match top {
+        Some(top) => (top, true),
+        None => (std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()), false),
     }
 }
 

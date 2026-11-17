@@ -11,6 +11,7 @@ Start with a task you want to do. The references and research notes can wait unt
 | [Getting started](GETTING-STARTED.md) | Install the shell or Python CLI, sign in, and run an example |
 | [User guide](USER-GUIDE.md) | Everyday terminal use: agents, permissions, input, images, usage and undo |
 | [Shell reference](SHELL.md) | Commands, configuration, platform behavior and session handling |
+| [Shared tasks and evidence](SHARED-TASK-TOOLS.md) | Task assignments, cross-agent handoffs, immutable evidence and the read-only gateway |
 | [Pipeline reference](CLI.md) | Review, design, work, research, backends, time limits and accounting |
 | [Research](RESEARCH.md) | Source gathering, verification and report rules |
 | [Token usage](TOKEN-USAGE.md) | Which tokens are counted and how unknown usage is represented |
