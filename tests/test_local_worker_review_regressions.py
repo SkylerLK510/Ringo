@@ -170,9 +170,6 @@ class ReviewRegressions(unittest.TestCase):
 
     @unittest.skipUnless(SANDBOX_AVAILABLE, 'working Linux namespace containment required')
     def test_candidate_check_cannot_read_owner_files_or_connect_to_host(self):
-        import shutil
-        if not shutil.which('bwrap'):
-            self.skipTest('bubblewrap unavailable')
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             owner = root / 'owner-secret'
