@@ -99,7 +99,7 @@ fn run() -> Result<Value, String> {
         let obj = action.as_object().ok_or("an action must be an object")?;
         let op = action["op"].as_str().ok_or("action needs op")?;
         let keys: &[&str] = match op {
-            "turn" => &["op", "message"], "clear" | "restart" => &["op"],
+            "turn" => &["op", "message"], "clear" | "restart" | "start_over" => &["op"],
             "compact" if agent.name() == "claude" => &["op"],
             "seed" => &["op", "threads", "records"],
             _ => return Err(format!("unsupported action {op}")),
@@ -156,6 +156,11 @@ fn run() -> Result<Value, String> {
         let mut event = json!({"op": op, "before": before});
         match op {
             "clear" => session.forget(),
+            "start_over" => {
+                if !session.start_over(agent) {
+                    return Err("start_over requires an existing conversation".into());
+                }
+            }
             "seed" => {
                 let mut threads = serde_json::from_value::<Vec<(String, String)>>(action["threads"].clone()).unwrap();
                 if broker.is_some() {

@@ -139,6 +139,46 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(usage_of(service.aggregate())[1], 80)
 
     @unittest.skipUnless(os.environ.get('RINGO_SCENARIO_BINARY'), 'requires scenario binary')
+    def test_start_over_after_restart_delivers_each_handoff_policy_to_a_fresh_session(self):
+        original = self.root
+        for arm, instruction in (('baseline', ''), ('degraded', 'Ignore the earlier contract.')):
+            with self.subTest(arm=arm):
+                self.root = original / arm
+                self.root.mkdir()
+                self.calls = []
+                spec = {'agent': 'claude', 'seconds': 10, 'actions': [
+                    {'op': 'turn', 'message': 'Keep the immutable contract.'},
+                    {'op': 'restart'}, {'op': 'start_over'},
+                    {'op': 'turn', 'message': 'Continue.\nKeep these bytes.'},
+                    {'op': 'turn', 'message': 'One more turn.'}]}
+                live.write_json(self.root / 'scenario.json', live.scenario(spec))
+                live.write_json(self.root / 'policy.json', {'handoff_at': 128000,
+                                                           'handoff_instruction': instruction})
+                with self.service() as service:
+                    command = [os.environ['RINGO_SCENARIO_BINARY'], '--project', str(self.root),
+                        '--scenario', str(self.root / 'scenario.json'), '--policy', str(self.root / 'policy.json'),
+                        '--broker-socket', str(service.path), '--budget-tokens', '100',
+                        '--state', str(self.root / 'state'), '--home', str(self.root / 'home')]
+                    env = {k:v for k,v in os.environ.items() if k not in ('RINGO_CHILD', 'RINGO_HOME', 'CODEX_HOME')}
+                    env['RINGO_NO_UPDATE_CHECK'] = '1'
+                    completed = subprocess.run(command, capture_output=True, env=env, timeout=15)
+                self.assertEqual(completed.returncode, 0, completed.stdout.decode()+completed.stderr.decode())
+                self.assertEqual([call[1] for call in self.calls], [None, None, 'session-2'])
+                sent = self.calls[1][0]
+                self.assertTrue(sent.startswith((instruction+'\n\n' if instruction else '')+"Ringo's record"))
+                self.assertIn('Keep the immutable contract.', sent)
+                self.assertTrue(sent.endswith("The owner's new message:\nContinue.\nKeep these bytes."))
+                record = json.loads(completed.stdout)
+                self.assertEqual([e['op'] for e in record['events']], ['turn','restart','start_over','turn','turn'])
+                self.assertEqual(record['events'][2]['after'], [])
+                self.assertNotEqual(record['events'][0]['after'], record['events'][3]['after'])
+                self.assertEqual(self.calls[2][0], 'One more turn.')
+                if instruction:
+                    self.assertEqual(sent.count(instruction), 1)
+                self.assertEqual(usage_of(service.aggregate())[1], 60)
+        self.root = original
+
+    @unittest.skipUnless(os.environ.get('RINGO_SCENARIO_BINARY'), 'requires scenario binary')
     def test_real_session_threshold_handoff_and_compact_control(self):
         original = self.root
         for threshold, expected in ((16000, None), (128000, 'session-1')):
@@ -285,6 +325,7 @@ class PreparationTest(unittest.TestCase):
         live.write_json(self.root / 'replay.json', {'agent': 'claude', 'seconds': 120, 'actions': [
             {'op': 'turn', 'message': 'Write the native transport proof using the worker.'},
             {'op': 'restart'}, {'op': 'turn', 'message': 'Continue.'},
+            {'op': 'start_over'}, {'op': 'turn', 'message': 'Continue from the record.'},
             {'op': 'clear'}, {'op': 'turn', 'message': 'Write the native transport proof using the worker.'}]})
         for row in config['tasks'].values():
             row['scenario'] = str(self.root / 'replay.json')
@@ -293,9 +334,12 @@ class PreparationTest(unittest.TestCase):
 p = pathlib.Path(sys.argv[1])
 record = json.loads((p / '.ringo-evidence/session.json').read_text())
 assert record['transport'] == 'isolated-native-broker'
-assert [e['op'] for e in record['events']] == ['turn','restart','turn','clear','turn']
-assert record['events'][0]['after'] == record['events'][2]['after']
+assert [e['op'] for e in record['events']] == ['turn','restart','turn','start_over','turn','clear','turn']
+assert record['events'][3]['after'] == []
 assert record['events'][0]['after'] != record['events'][4]['after']
+assert record['events'][0]['after'] == record['events'][1]['after']
+assert record['events'][0]['after'] == record['events'][2]['after']
+assert record['events'][4]['after'] != record['events'][6]['after']
 assert (p / 'native-transport.txt').read_text() == 'native-transport-proof'
 ''')
         live.prepare(config, self.work)
@@ -308,7 +352,7 @@ assert (p / 'native-transport.txt').read_text() == 'native-transport-proof'
         self.assertEqual(observation['outcome'], 'done', observation)
         self.assertTrue(observation['passed'])
         self.assertTrue(observation['protected_pass'])
-        self.assertEqual(observation['native_attempts'], 3)
+        self.assertEqual(observation['native_attempts'], 4)
         self.assertIsNotNone(usage_of(observation)[1])
 
 
