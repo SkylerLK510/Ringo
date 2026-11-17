@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import tempfile
 import threading
@@ -49,6 +50,7 @@ class RunnerTests(unittest.TestCase):
         )
         return run(request), adapter
 
+    @unittest.skipUnless(os.name == "posix", "real checks require POSIX process cleanup")
     def test_all_configured_checks_run_and_must_pass(self):
         # A passing first check must not make a later configured check optional.
         assignment = make_assignment(checks=[passing_check("first"), passing_check("second")])
@@ -64,6 +66,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue((self.result_dir / result.candidate_ref).exists())
         self.assertTrue(result_path.exists())
 
+    @unittest.skipUnless(os.name == "posix", "real checks require POSIX process cleanup")
     def test_repair_failing_early_check_is_not_accepted(self):
         assignment = make_assignment(checks=[failing_check("first"), passing_check("second")])
         config = make_config()
@@ -77,6 +80,7 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(adapter.remaining, 0)
 
+    @unittest.skipUnless(os.name == "posix", "real checks require POSIX process cleanup")
     def test_at_most_two_suites_and_no_third_call(self):
         assignment = make_assignment(checks=[failing_check("first"), failing_check("second")])
         config = make_config()

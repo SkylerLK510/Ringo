@@ -198,10 +198,12 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
     cleanup: dict[str, Any] = {}
     status = "failed"
     phase = "candidate"
+    verified_on_time = False
 
     def finish() -> Result:
         final_status = status
-        if stop.stopped and final_status not in ("timeout", "unavailable"):
+        if (stop.stopped and final_status not in ("timeout", "unavailable")
+                and not (final_status == _TERMINAL_SUCCESS and verified_on_time)):
             final_status = "timeout"
         return Result(
             schema_version=RESULT_SCHEMA_VERSION,
@@ -315,6 +317,7 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
                 status = "failed"
                 candidate = None
                 break
+            verified_on_time = not stop.stopped
             status = _TERMINAL_SUCCESS
             break
 
@@ -336,6 +339,7 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
                     checks.append(check_result)
                     if output_path is not None:
                         cleanup.setdefault("check_logs", []).append(output_path.name)
+                verified_on_time = not stop.stopped
         except WorkspaceError as exc:
             errors.append(str(exc)[:MAX_ERROR_CHARS])
             status = "failed"

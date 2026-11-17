@@ -59,7 +59,7 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(result.status, 'timeout')
             spawn.assert_not_called()
 
-    @unittest.skipUnless(os.name == 'posix', 'POSIX groups')
+    @unittest.skipUnless(sys.platform == 'linux' and Path('/proc/self/stat').exists(), 'Linux procfs liveness')
     def test_successful_check_kills_background_descendant(self):
         with tempfile.TemporaryDirectory() as temp:
             pidfile = Path(temp) / 'child.pid'
@@ -110,3 +110,43 @@ class ReviewRegressions(unittest.TestCase):
                     workspace.__enter__()
                 self.assertLessEqual(git.call_args.kwargs['timeout'], .1)
             self.assertFalse(list((root / 'private').iterdir()))
+
+    def test_check_setup_expiry_never_spawns(self):
+        spec = CheckSpec.from_dict({'id':'check', 'argv':[sys.executable, '-c', 'pass'], 'timeout_s':1})
+        with tempfile.TemporaryDirectory() as temp:
+            deadline = mock.Mock()
+            deadline.expired.side_effect = [False, True]
+            with mock.patch('local_worker.checks.subprocess.Popen') as spawn:
+                result, _ = run_check(spec, Path(temp), Path(temp), deadline, make_config())
+            self.assertEqual(result.status, 'timeout')
+            spawn.assert_not_called()
+
+    def test_nonposix_checks_refuse_without_spawn(self):
+        spec = CheckSpec.from_dict({'id':'check', 'argv':[sys.executable, '-c', 'pass'], 'timeout_s':1})
+        with mock.patch('local_worker.checks.os.name', 'nt'), mock.patch('local_worker.checks.subprocess.Popen') as spawn:
+            result, _ = run_check(spec, None, None, Deadline(5), make_config())
+        self.assertEqual(result.status, 'unavailable')
+        spawn.assert_not_called()
+
+    def test_allowed_cleanup_does_not_expire_verified_candidate(self):
+        from local_worker.adapters import ScriptedAdapter
+        from local_worker.runner import RunRequest, run
+        from local_worker.schemas import CheckResult
+        from local_worker.workspace import SnapshotWorkspace
+        from local_worker_support import make_assignment, candidate_json
+        clock = [0.0]
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assignment = make_assignment()
+            config = make_config()
+            class CleanupWorkspace(SnapshotWorkspace):
+                def __exit__(self, *args):
+                    clock[0] = config.job_deadline_s + 0.01
+                    super().__exit__(*args)
+            request = RunRequest(assignment, config, ScriptedAdapter([candidate_json(assignment=assignment)]),
+                                 lambda: CleanupWorkspace(assignment, config, root / 'private'),
+                                 OperationLedger(root / 'ledger'), 'cleanup-job', root / 'results')
+            passed = CheckResult(assignment.checks[0].id, 'passed', 0, 'digest', 0, '')
+            with mock.patch('local_worker.control.time.monotonic', side_effect=lambda: clock[0]), mock.patch('local_worker.runner.run_check', return_value=(passed, None)):
+                result, _ = run(request)
+            self.assertEqual(result.status, 'candidate_ready')

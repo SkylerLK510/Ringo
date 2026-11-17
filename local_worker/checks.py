@@ -115,6 +115,9 @@ def run_check(
     exit_code: int | None = None
     detail = ""
     try:
+        if deadline.expired():
+            return CheckResult(spec.id, "timeout", None, digest_bytes(b""), 0,
+                               "job deadline expired during check setup"), None
         proc = subprocess.Popen(list(spec.argv), **popen_kwargs)  # type: ignore[arg-type]
         readers = [
             threading.Thread(target=read, args=(proc.stdout,), daemon=True),

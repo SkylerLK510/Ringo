@@ -39,7 +39,9 @@ verified against the actual supported runtime. The mock HTTP tests prove client
 socket cleanup only. There is no configuration switch that certifies a runtime;
 adding a real certification workflow is a separate deliverable. `validate`,
 offline adapters and deterministic checks remain available. Process-tree cleanup
-for checks currently requires POSIX; other platforms fail closed.
+for checks currently requires POSIX; other platforms fail closed. A blocked live
+`run` exits 2 with a diagnostic on stderr, no JSON on stdout and no result artifact;
+this is an exception to the execution output contract below.
 
 ## Boundaries
 
