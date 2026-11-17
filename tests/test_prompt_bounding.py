@@ -499,10 +499,22 @@ class ReviewSafetyTest(unittest.TestCase):
         self.assertGreater(workflow.review_findings(text), 0)
         self.assertIn('Incomplete review batch', text)
 
-    def test_serialized_check_feedback_preserves_failure_line(self):
-        feedback = {'checks': [{'name': 'fixture', 'status': 'fail',
-                     'stdout': 'AssertionError: required failure\n' + 'x' * 12000, 'stderr': ''}]}
-        self.assertIn('AssertionError: required failure', workflow.render_feedback(feedback))
+    def test_unbounded_check_feedback_keeps_the_old_tail(self):
+        # with caps off the writer sees exactly what it saw before bounding existed: the log's last 6000 chars
+        out = 'AssertionError: required failure\n' + 'x' * 12000
+        feedback = {'checks': [{'name': 'fixture', 'status': 'fail', 'stdout': out, 'stderr': ''}]}
+        rendered = workflow.render_feedback(feedback)
+        self.assertIn(out[-6000:], rendered)
+        self.assertNotIn(out[-6001:], rendered)
+
+    def test_bounded_check_feedback_keeps_a_long_failure_line_whole(self):
+        # longer than the old 6000-char tail: bounded rendering must not re-trim what bound_feedback kept
+        line = 'AssertionError: ' + 'y' * 7000
+        feedback = {'checks': [{'name': 'fixture', 'status': 'fail', 'stdout': 'x' * 12000 + '\n' + line, 'stderr': ''}]}
+        reduced, _report = workflow.bound_feedback(feedback, 9000)
+        self.assertIn(line, workflow.render_feedback(reduced, bounded=True))
+        self.assertIn(line, workflow.text_message({'brief': 'b', 'fixtures': {}}, {}, reduced, bounded=True))
+        self.assertNotIn(line, workflow.render_feedback(reduced))
 
 
 class ContextOverflowTest(unittest.TestCase):

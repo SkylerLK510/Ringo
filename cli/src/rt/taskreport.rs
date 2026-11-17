@@ -83,7 +83,7 @@ fn num_eq(a: &Value, b: &Value) -> bool {
 /// event line must not be counted twice; consumption itself is order-independent.
 fn dedupe(records: &[Value], gaps: &mut Vec<Value>) -> Vec<Value> {
     let mut kept: Vec<Value> = vec![];
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen: HashSet<String> = HashSet::new(); // fixed-size digests, not whole serialized records
     let mut duplicates = 0;
     let mut started: Vec<f64> = vec![];
     for rec in records {
@@ -93,7 +93,7 @@ fn dedupe(records: &[Value], gaps: &mut Vec<Value>) -> Vec<Value> {
         }
         let mut opts = crate::rt::pyjson::Opts::default();
         opts.sort_keys = true;
-        let identity = crate::rt::pyjson::dumps_with(rec, opts);
+        let identity = crate::rt::sha256_hex(crate::rt::pyjson::dumps_with(rec, opts).as_bytes());
         if !seen.insert(identity) {
             duplicates += 1;
             continue;
@@ -511,10 +511,16 @@ pub fn build(
         .iter()
         .filter(|rec| matches!(rec.get("status"), Some(Value::String(s)) if PAID.contains(&s.as_str())) && !has_tokens(rec))
         .count() as i64;
+    // the harness counts a paid call as untokened when any category is missing, so reconcile against that count
+    let incomplete_requests = kept
+        .iter()
+        .filter(|rec| matches!(rec.get("status"), Some(Value::String(s)) if PAID.contains(&s.as_str())))
+        .filter(|rec| !rec.get("usage").and_then(Value::as_object).is_some_and(|u| TOKEN_KEYS.iter().all(|k| u.get(*k).is_some_and(nonneg))))
+        .count() as i64;
     let untokened_summary = summary.get("untokened_calls").cloned().unwrap_or(Value::Null);
-    if !rows.is_empty() && !untokened_summary.is_null() && !num_eq(&untokened_summary, &Value::from(unknown_requests)) {
+    if !rows.is_empty() && !untokened_summary.is_null() && !num_eq(&untokened_summary, &Value::from(incomplete_requests)) {
         let mut g = gap("untokened_mismatch", "the run summary and the trace disagree about calls that reported no token counts");
-        insert(&mut g, "records", Value::from(unknown_requests));
+        insert(&mut g, "records", Value::from(incomplete_requests));
         insert(&mut g, "summary", untokened_summary.clone());
         gaps.push(g);
     }
@@ -542,7 +548,7 @@ pub fn build(
     consumed.insert("unknown_usage_requests".into(), Value::from(unknown_requests));
     consumed.insert(
         "untokened_calls".into(),
-        if summary.contains_key("untokened_calls") { untokened_summary.clone() } else { Value::from(unknown_requests) },
+        if summary.contains_key("untokened_calls") { untokened_summary.clone() } else { Value::from(incomplete_requests) },
     );
     if rows.iter().any(|r| r["scope"] == "provider_turn_aggregate") {
         gaps.push(gap("aggregate_attribution_unknown", "aggregate model subtotals are not added again; separately recorded child overlap and the underlying provider request count are unavailable"));
@@ -635,7 +641,7 @@ pub fn build(
     outcome.insert("admission_refusals".into(), summary.get("admission_refusals").cloned().unwrap_or(Value::Null));
     outcome.insert("incidents".into(), summary.get("incidents").cloned().unwrap_or(Value::Null));
     let mut outcome_notes = vec![
-        "cost_usd is the provider-reported price of priced calls only; subscription token usage is not a monetary invoice".to_string(),
+        "cost_usd is the accounted cost: provider-reported prices plus any configured unpriced-call fallback charges; subscription token usage is not a monetary invoice".to_string(),
         "acceptance checks and constraint retention are not recorded by this harness and stay unknown".to_string(),
         "a budget stop is an incomplete outcome; the caller decides the final state".to_string(),
     ];

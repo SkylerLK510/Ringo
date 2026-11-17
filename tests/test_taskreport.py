@@ -46,7 +46,8 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(whole, {'input': 310, 'cache_write': 0, 'cache_read': 50, 'output': 50,
                                  'total': 410, 'requests': 3})
         self.assertEqual(report['consumption']['unknown_usage_requests'], 1)
-        self.assertEqual(report['consumption']['untokened_calls'], 1)
+        # b, c and d each lack a valid counter, so the Run would have counted all three as untokened
+        self.assertEqual(report['consumption']['untokened_calls'], 3)
         by_status = report['consumption']['by_status']
         self.assertEqual(by_status['ok'], {'input': 300, 'cache_write': 0, 'cache_read': 50, 'output': 50,
                                            'total': 400, 'requests': 2})
@@ -100,6 +101,16 @@ class LedgerTest(unittest.TestCase):
         summary = {'calls': 1, 'untokened_calls': 2, 'unfinished_calls': 0}
         report = taskreport.build([ok(1, input=1)], summary=summary)
         self.assertIn('untokened_mismatch', [g['kind'] for g in report['coverage']['gaps']])
+
+    def test_partial_usage_agrees_with_the_run_s_untokened_count(self):
+        run = harness.Run(max_tokens=100)
+        run.reserve()
+        record = {'step': 's', 'attempt': 1, 'status': 'ok', 'usage': {'input': 5, 'output': 2}}
+        run.record(record)
+        summary = run.summary()
+        self.assertEqual(summary['untokened_calls'], 1)
+        report = taskreport.build([{**record, 'seq': 1}], summary=summary)
+        self.assertNotIn('untokened_mismatch', [g['kind'] for g in report['coverage']['gaps']])
 
     def test_no_records_with_spent_tokens_falls_back_to_the_run_summary_and_names_the_gap(self):
         summary = {'calls': 2, 'unfinished_calls': 0, 'input': 50, 'output': 5, 'cache_write': 0, 'cache_read': 0,
@@ -309,6 +320,33 @@ class TokenBudgetTest(unittest.TestCase):
                 self.assertEqual(run.tokens['input'], 0)
                 with self.assertRaises(harness.BudgetExceeded):
                     run.reserve()
+
+    def test_malformed_usage_is_unknown_and_does_not_raise(self):
+        run = harness.Run(max_tokens=100)
+        run.reserve()
+        run.record({'step': 's', 'attempt': 1, 'status': 'ok', 'usage': [1]})
+        self.assertEqual(run.summary()['untokened_calls'], 1)
+        with self.assertRaisesRegex(harness.BudgetExceeded, 'cannot be kept'):
+            run.reserve()
+
+    def test_usage_on_an_unsettled_record_does_not_count_toward_the_cap(self):
+        run = harness.Run(max_tokens=5)
+        run.reserve()
+        run.record({'step': 's', 'attempt': 1, 'status': 'started',
+                    'usage': {'input': 50, 'cache_write': 0, 'cache_read': 0, 'output': 50}})
+        self.assertEqual(sum(run.tokens.values()), 0)
+        run.reserve()
+
+    def test_an_invalid_claude_cache_count_stays_unknown_and_blocks_the_cap(self):
+        usage = harness.claude_usage({'usage': {'input_tokens': 1, 'output_tokens': 1,
+                                                'cache_read_input_tokens': -3}, 'total_cost_usd': 0.0})
+        self.assertNotIn('cache_read', usage)
+        self.assertEqual(usage['cache_write'], 0)  # absent is zero
+        run = harness.Run(max_tokens=100)
+        run.reserve()
+        run.record({'step': 's', 'attempt': 1, 'status': 'ok', 'usage': usage})
+        with self.assertRaisesRegex(harness.BudgetExceeded, 'cannot be kept'):
+            run.reserve()
 
     def test_the_cap_stops_admitting_calls_once_reached(self):
         run = harness.Run(max_tokens=100)

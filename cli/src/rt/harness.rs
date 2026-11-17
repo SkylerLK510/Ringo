@@ -316,8 +316,12 @@ pub fn claude_usage(reply: &Map<String, Value>) -> Map<String, Value> {
     };
     let mut out = Map::new();
     if count("input_tokens").is_some() || count("output_tokens").is_some() {
-        out.insert("cache_write".into(), tokens("cache_creation_input_tokens"));
-        out.insert("cache_read".into(), tokens("cache_read_input_tokens"));
+        // an absent cache count is zero; a present but invalid one stays unknown, so a token cap cannot pass it
+        for (field, key) in [("cache_write", "cache_creation_input_tokens"), ("cache_read", "cache_read_input_tokens")] {
+            if !u.contains_key(key) || count(key).is_some() {
+                out.insert(field.into(), tokens(key));
+            }
+        }
     }
     out.insert("cost_usd".into(), reply.get("total_cost_usd").cloned().unwrap_or(Value::Null));
     out.insert("models".into(), Value::Array(models));
@@ -1020,16 +1024,14 @@ impl Run {
             rec.insert("output_tokens_per_second".into(), terminal::rate(rec.get("usage"), rec.get("seconds")));
         }
         let mut t = lock(&self.totals);
-        let usage = rec.get("usage");
-        let fields = match usage {
-            Some(Value::Object(m)) => Some(m),
-            Some(v) if py::truthy(v) => {
-                return Err(Error::new(Exc::Attribute, format!("'{}' object has no attribute 'get'", py::type_name(v))));
-            }
+        let fields = match rec.get("usage") {
+            Some(Value::Object(m)) => Some(m), // malformed usage is unknown, never an error that loses the record
             _ => None,
         };
+        let paid = matches!(rec.get("status"), Some(Value::String(s)) if PAID_STATUSES.contains(&s.as_str()));
         for (i, k) in TOKEN_KEYS.iter().enumerate() {
-            if let Some(value) = fields.and_then(|m| nonneg_int(m.get(*k))) {
+            // only settled attempts count, as in the task report's ledger
+            if let Some(value) = fields.filter(|_| paid).and_then(|m| nonneg_int(m.get(*k))) {
                 t.tokens[i] = match t.tokens[i] {
                     Num::Int(old) => Num::Int(old.checked_add(value).ok_or_else(py::too_big)?),
                     other => Num::Float(other.as_f64() + value as f64),
@@ -1039,9 +1041,9 @@ impl Run {
         if let Some(x) = fields.and_then(|m| m.get("reasoning_output")).filter(|v| py::int_of(v).is_some()) {
             t.reasoning = Some(py_add(t.reasoning.unwrap_or(Num::Int(0)), x, "+=")?);
         }
-        if matches!(rec.get("status"), Some(Value::String(s)) if PAID_STATUSES.contains(&s.as_str())) {
+        if paid {
             t.completed += 1;
-            if !matches!(usage, Some(Value::Object(m)) if TOKEN_KEYS.iter().all(|k| m.contains_key(*k))) {
+            if !fields.is_some_and(|m| TOKEN_KEYS.iter().all(|k| nonneg_int(m.get(*k)).is_some())) {
                 t.untokened += 1;
             }
             match fields.and_then(|m| m.get("cost_usd")).and_then(valid_price) {
@@ -1216,9 +1218,17 @@ impl Run {
         if let Some(trace) = &self.trace {
             let path = py::join(trace, "trace.jsonl");
             if path.exists() {
-                let text = fs::read_to_string(&path).map_err(|e| py::path_error(&e, &path))?;
-                for line in py::splitlines(&text, false) {
-                    records.push(pyjson::loads(line).unwrap_or(Value::Null));
+                use std::io::BufRead;
+                // streamed: the trace can be large
+                let file = fs::File::open(&path).map_err(|e| py::path_error(&e, &path))?;
+                for line in std::io::BufReader::new(file).lines() {
+                    let line = line.map_err(|e| py::path_error(&e, &path))?;
+                    let mut rec = pyjson::loads(&line).unwrap_or(Value::Null);
+                    // the report never reads a failure's output, and its sha256 still tells records apart
+                    if let Some(Value::Object(excerpt)) = rec.as_object_mut().and_then(|m| m.get_mut("raw_excerpt")) {
+                        excerpt.remove("head");
+                    }
+                    records.push(rec);
                 }
             }
         }

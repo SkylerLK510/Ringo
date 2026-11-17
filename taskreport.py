@@ -8,6 +8,7 @@ unavailable attribution reported separately. Backend call records are not necess
 requests. Active context is reported only when an explicit estimate is captured.
 """
 import getpass
+import hashlib
 import json
 import re
 import socket
@@ -47,7 +48,7 @@ def _dedupe(records, gaps):
         if not isinstance(rec, dict):
             gaps.append({'kind': 'unparseable_trace_line', 'note': 'a trace line that is not a JSON object was skipped'})
             continue
-        identity = json.dumps(rec, sort_keys=True, default=str)
+        identity = hashlib.sha256(json.dumps(rec, sort_keys=True, default=str).encode('utf-8', 'surrogatepass')).digest()
         if identity in seen:
             duplicates += 1
             continue
@@ -235,8 +236,11 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
         return isinstance(usage, dict) and any(_nonneg(usage.get(k)) is not None for k in TOKEN_KEYS)
     # a paid record whose usage carries no token fields — or none at all — is an unknown, never a zero request
     unknown_requests = sum(1 for rec in kept if rec.get('status') in PAID and not _has_tokens(rec))
-    if rows and summary.get('untokened_calls') not in (None, unknown_requests):
-        gaps.append({'kind': 'untokened_mismatch', 'records': unknown_requests,
+    # the harness counts a paid call as untokened when any category is missing, so reconcile against that count
+    incomplete_requests = sum(1 for rec in kept if rec.get('status') in PAID and not (
+        isinstance(rec.get('usage'), dict) and all(_nonneg(rec['usage'].get(k)) is not None for k in TOKEN_KEYS)))
+    if rows and summary.get('untokened_calls') not in (None, incomplete_requests):
+        gaps.append({'kind': 'untokened_mismatch', 'records': incomplete_requests,
                      'summary': summary['untokened_calls'],
                      'note': 'the run summary and the trace disagree about calls that reported no token counts'})
     if unknown_inputs:
@@ -253,7 +257,7 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
         'normalization': {'note': NORMALIZATION_NOTE, 'raw_fields_kept': RAW_FIELDS_NOTE,
                           'accounting_scopes': SCOPE_NOTE},
         'unknown_usage_requests': unknown_requests,
-        'untokened_calls': summary.get('untokened_calls', unknown_requests),
+        'untokened_calls': summary.get('untokened_calls', incomplete_requests),
     }
     any_aggregate = any(row['scope'] == 'provider_turn_aggregate' for row in rows)
     if any_aggregate:
@@ -286,8 +290,8 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
         'unpriced_calls': summary.get('unpriced_calls'),
         'admission_refusals': summary.get('admission_refusals'),
         'incidents': summary.get('incidents'),
-        'notes': ['cost_usd is the provider-reported price of priced calls only; subscription token usage is '
-                  'not a monetary invoice',
+        'notes': ['cost_usd is the accounted cost: provider-reported prices plus any configured unpriced-call '
+                  'fallback charges; subscription token usage is not a monetary invoice',
                   'acceptance checks and constraint retention are not recorded by this harness and stay unknown',
                   'a budget stop is an incomplete outcome; the caller decides the final state'],
     }

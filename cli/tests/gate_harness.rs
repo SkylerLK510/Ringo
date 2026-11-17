@@ -1071,6 +1071,15 @@ fn script_cases(base: &Path) -> Vec<Value> {
             {"op":"record","rec":{"step":"s","attempt":2,"status":"error","error":"ignored"},"raw":"another output"},
             {"op":"record","rec":{"step":"s","attempt":3,"status":"error","error":"different"},"raw":"same output"},
             {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t","max_tokens":100}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"ok","usage":[1]}},
+            {"op":"reserve"}, {"op":"state","status":"done","extra":[]}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t","max_tokens":5}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"started","usage":{"input":50,"cache_write":0,"cache_read":0,"output":50}}},
+            {"op":"reserve"}, {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t","max_tokens":100}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"s","attempt":1,"status":"ok","usage":{"input":5,"output":2}}},
+            {"op":"reserve"}, {"op":"state","status":"done","extra":[]}, {"op":"task_report","status":"done"}]),
     ].into_iter().enumerate() {
         cases.push(json!({"base":base.join(format!("options{i}")),"ops":ops}));
     }

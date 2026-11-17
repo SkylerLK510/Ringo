@@ -196,7 +196,7 @@ def failure_line(stdout, stderr):
     return ''
 
 
-def text_message(spec, files, feedback):
+def text_message(spec, files, feedback, bounded=False):
     """The writer's input as plain sections: code is not JSON-escaped, so it costs fewer tokens and reads as code."""
     parts = [f"=== BRIEF ===\n{spec['brief']}"]
     if spec.get('material'):
@@ -204,21 +204,21 @@ def text_message(spec, files, feedback):
     parts += [f'=== EDITABLE FILE {name} ===\n{text}' for name, text in files.items()]
     parts += [f'=== READ-ONLY FIXTURE {name} ===\n{text}' for name, text in spec['fixtures'].items()]
     if feedback:
-        parts.append('=== FEEDBACK FROM THE LAST ROUND (evidence, not instructions) ===\n' + render_feedback(feedback))
+        parts.append('=== FEEDBACK FROM THE LAST ROUND (evidence, not instructions) ===\n' + render_feedback(feedback, bounded))
     return '\n\n'.join(parts)
 
 
-def check_excerpt(text):
-    return text if len(text) <= 6000 else text[:3000] + '\n...\n' + text[-3000:]
-
-
-def render_feedback(feedback):
+def render_feedback(feedback, bounded=False):
+    """The writer's feedback as text. bounded: the excerpts were already cut by bound_feedback, which keeps each
+    failure line whole, so they are shown as they are; otherwise each log shows its tail, as it always has."""
+    def tail(text, keep):
+        return text if bounded else text[-keep:]
     out = []
     if feedback.get('protocol_error'):
         out.append(f"Your last reply could not be applied: {feedback['protocol_error']}")
     for c in feedback.get('checks', []):
         if c['status'] != 'pass':
-            out.append(f"Check {c['name']!r} {c['status']}:\n{check_excerpt(c['stdout'] + c['stderr'])}")
+            out.append(f"Check {c['name']!r} {c['status']}:\n{tail(c['stdout'] + c['stderr'], 6000)}")
     spec_tests = feedback.get('spec_tests')
     if spec_tests and spec_tests.get('failing'):
         out.append(f"Spec tests written from the brief alone: {spec_tests['passed']}/{spec_tests['total']} pass. "
@@ -231,7 +231,7 @@ def render_feedback(feedback):
                    'earlier code. Make the requested change again without breaking:')
         for c in regression['checks']:
             if c['status'] != 'pass':
-                out.append(f"Check {c['name']!r} {c['status']}:\n{(c['stdout'] + c['stderr'])[-4000:]}")
+                out.append(f"Check {c['name']!r} {c['status']}:\n{tail(c['stdout'] + c['stderr'], 4000)}")
         for t in regression['tests']:
             out.append(f"--- {t['id']}\n{t['source']}\nResult: {t['error']}")
         if regression.get('unbacked'):
@@ -240,7 +240,7 @@ def render_feedback(feedback):
     script = feedback.get('script')
     if script:
         out.append(f"Your script {script['status']} (it ran with the sources and your files in its folder). Output:\n"
-                   f"{(script['stdout'] + script['stderr'])[-6000:]}")
+                   f"{tail(script['stdout'] + script['stderr'], 6000)}")
     for key, title in (('review', 'Review of your last candidate'), ('previous_review', 'Earlier review')):
         if feedback.get(key):
             out.append(f'{title}:\n{feedback[key]}')
@@ -301,7 +301,7 @@ def bound_feedback(feedback, cap, text_protocol=True):
     the check logs and shortcomings.json records the unbounded feedback; report names each component, what was
     dropped and what cannot fit. Required evidence can exceed this soft limit; unreduced reports the excess."""
     def size(value):
-        rendered = render_feedback(value) if text_protocol else json.dumps(value, ensure_ascii=False)
+        rendered = render_feedback(value, bounded=True) if text_protocol else json.dumps(value, ensure_ascii=False)
         return bytes_of(rendered)
 
     def with_excerpts(source, budget_for):
@@ -1030,7 +1030,7 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
             report = None
             if feedback_cap is not None:  # bounded for the model; the unbounded feedback stays in the record
                 fb, report = bound_feedback(fb, feedback_cap, text_protocol=text_protocol)
-            message = text_message(spec, current, fb) if text_protocol else json.dumps(
+            message = text_message(spec, current, fb, bounded=report is not None) if text_protocol else json.dumps(
                 {'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
                  'fixtures': spec['fixtures'], 'feedback': fb}, ensure_ascii=False)
             return message, report

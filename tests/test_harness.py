@@ -139,8 +139,9 @@ class CallTest(unittest.TestCase):
         full = {'input_tokens': 3, 'cache_creation_input_tokens': 7, 'cache_read_input_tokens': 90, 'output_tokens': 4}
         cases = [(full, {'input': 3, 'cache_write': 7, 'cache_read': 90, 'output': 4}),
                  ({'input_tokens': 0, 'output_tokens': 0}, zero),  # reported zeros are counts, not a missing report
-                 ({'input_tokens': 5, 'output_tokens': 'bad', 'cache_read_input_tokens': 1.5}, {'input': 5, 'cache_write': 0, 'cache_read': 0}),
-                 ({'input_tokens': True, 'output_tokens': 9, 'cache_creation_input_tokens': -1}, {'cache_write': 0, 'cache_read': 0, 'output': 9}),
+                 ({'input_tokens': 5, 'output_tokens': 'bad', 'cache_read_input_tokens': 1.5}, {'input': 5, 'cache_write': 0}),
+                 ({'input_tokens': True, 'output_tokens': 9, 'cache_creation_input_tokens': -1}, {'cache_read': 0, 'output': 9}),
+                 # an absent cache count is zero; a present but invalid one stays unknown
                  # neither count is a non-negative int (a bool or a float is not one): unknown, so no token fields
                  ({'input_tokens': True, 'output_tokens': 4.0, 'cache_read_input_tokens': 50}, {}),
                  ({}, {}), (None, {}), ([1], {})]

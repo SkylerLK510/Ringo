@@ -97,8 +97,11 @@ def claude_usage(reply):
     models = reply.get('modelUsage')
     if not any(type(u.get(k)) is int and u[k] >= 0 for k in ('input_tokens', 'output_tokens')):
         return {'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
-    usage = {'cache_write': tokens('cache_creation_input_tokens'), 'cache_read': tokens('cache_read_input_tokens'),
-             'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
+    usage = {}
+    for field, key in (('cache_write', 'cache_creation_input_tokens'), ('cache_read', 'cache_read_input_tokens')):
+        if key not in u or (type(u[key]) is int and u[key] >= 0):  # an absent cache count is zero
+            usage[field] = tokens(key)  # a present but invalid one stays unknown, so a token cap cannot pass it
+    usage.update(cost_usd=reply.get('total_cost_usd'), models=sorted(models) if isinstance(models, dict) else [])
     for field, key in (('input', 'input_tokens'), ('output', 'output_tokens')):
         if type(u.get(key)) is int and u[key] >= 0:
             usage[field] = u[key]
@@ -749,14 +752,15 @@ class Run:
             rec = dict(rec)
             if 'seconds' in rec:
                 rec['output_tokens_per_second'] = output_rate(rec.get('usage'), rec['seconds'])
-            usage = rec.get('usage')
-            for k in self.tokens:
-                value = usage.get(k) if isinstance(usage, dict) else None
+            usage = rec.get('usage') if isinstance(rec.get('usage'), dict) else None  # malformed usage is unknown
+            paid = rec.get('status') in PAID_STATUSES
+            for k in self.tokens:  # only settled attempts count, as in the task report's ledger
+                value = usage.get(k) if paid and usage else None
                 if type(value) is int and value >= 0:
                     self.tokens[k] += value
             if type((usage or {}).get('reasoning_output')) is int:
                 self.reasoning = (self.reasoning or 0) + usage['reasoning_output']
-            if rec.get('status') in PAID_STATUSES:
+            if paid:
                 self.completed += 1
                 if not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in TOKEN_KEYS):
                     self.untokened += 1
@@ -869,11 +873,17 @@ class Run:
         import taskreport  # deferred: only the run's end needs it, so a one-call launch pays nothing
         records = []
         if self.trace and (self.trace / 'trace.jsonl').exists():
-            for line in (self.trace / 'trace.jsonl').read_text(encoding='utf-8').splitlines():
-                try:
-                    records.append(json.loads(line))
-                except ValueError:
-                    records.append(None)
+            with open(self.trace / 'trace.jsonl', encoding='utf-8') as f:  # streamed: the trace can be large
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        records.append(None)
+                        continue
+                    if isinstance(rec, dict) and isinstance(rec.get('raw_excerpt'), dict):
+                        # the report never reads a failure's output, and its sha256 still tells records apart
+                        rec['raw_excerpt'] = {k: v for k, v in rec['raw_excerpt'].items() if k != 'head'}
+                    records.append(rec)
         return taskreport.build(records, summary=self.summary(), blockers=list(self.blockers),
                                 final_state=final_state, trace=self.trace, max_tokens=self.max_tokens,
                                 overshoot_calls=self.budget_overshoot_calls if self.max_tokens is not None else None,

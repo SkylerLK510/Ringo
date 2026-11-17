@@ -421,10 +421,7 @@ fn check_lines(out: &mut Vec<String>, checks: &Value, keep: usize) -> Result<()>
         if !matches!(status, Value::String(s) if s == "pass") {
             let name = c.get("name")?;
             let log = concat(c.get("stdout")?, c.get("stderr")?)?;
-            let excerpt = if keep == 6000 && log.chars().count() > keep {
-                format!("{}\n...\n{}", log.chars().take(3000).collect::<String>(), py::tail(&log, 3000))
-            } else { py::tail(&log, keep).to_string() };
-            out.push(format!("Check {} {}:\n{}", py::value_repr(name), py::value_str(status), excerpt));
+            out.push(format!("Check {} {}:\n{}", py::value_repr(name), py::value_str(status), py::tail(&log, keep)));
         }
     }
     Ok(())
