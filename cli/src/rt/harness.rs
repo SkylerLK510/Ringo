@@ -1104,6 +1104,8 @@ impl Run {
                 );
                 if failed {
                     if let Some(Value::Object(excerpt)) = rec.get_mut("raw_excerpt") {
+                        // nothing beyond the head is recoverable
+                        excerpt.insert("omission_note".into(), Value::String(ARTIFACT_ERROR.into()));
                         excerpt.insert("artifact_error".into(), Value::String(ARTIFACT_ERROR.into()));
                     }
                 }

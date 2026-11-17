@@ -807,8 +807,8 @@ class Run:
                                           'omission_note': 'the record keeps only the head; the artifact holds the '
                                                           'whole output, and its sha256 above proves it',
                                           'head': data[:excerpt].decode('utf-8', 'replace')}
-                    if saved is None:
-                        rec['raw_excerpt']['artifact_error'] = ARTIFACT_ERROR
+                    if saved is None:  # nothing beyond the head is recoverable
+                        rec['raw_excerpt'].update(omission_note=ARTIFACT_ERROR, artifact_error=ARTIFACT_ERROR)
                 with open(self.trace / 'trace.jsonl', 'a', encoding='utf-8') as f:
                     f.write(json.dumps(rec) + '\n')
                 self.last = {k: rec[k] for k in ('step', 'attempt', 'status') if k in rec}

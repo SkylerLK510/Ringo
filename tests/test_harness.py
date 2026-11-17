@@ -436,6 +436,7 @@ class RunTest(unittest.TestCase):
             excerpt = rows[0]['raw_excerpt']
             self.assertIsNone(excerpt['artifact'])
             self.assertEqual(excerpt['artifact_error'], harness.ARTIFACT_ERROR)
+            self.assertEqual(excerpt['omission_note'], harness.ARTIFACT_ERROR)  # no claim of a whole artifact
             self.assertEqual(excerpt['head'], 'whole output')
             self.assertEqual(list(Path(d, 't', 'steps').rglob('*.tmp')), [])
 
