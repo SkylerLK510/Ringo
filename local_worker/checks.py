@@ -64,6 +64,12 @@ def run_check(
     result carries a digest and a short status detail, never the raw bytes.
     """
     started = time.monotonic()
+    if deadline.expired():
+        return CheckResult(spec.id, "timeout", None, digest_bytes(b""), 0,
+                           "job deadline expired before the check started"), None
+    if os.name != "posix":
+        return CheckResult(spec.id, "unavailable", None, digest_bytes(b""), 0,
+                           "owned process-tree cleanup is supported only on POSIX"), None
     private_dir.mkdir(parents=True, exist_ok=True)
     output_path: Path | None = None
 
@@ -131,6 +137,9 @@ def run_check(
             if status == "passed" and exit_code != 0:
                 status = "failed"
                 detail = f"check exited with {exit_code}"
+        # A successful parent can leave background descendants holding pipes.
+        # The process group belongs to this check even after its leader exits.
+        _kill_process(proc)
         for thread in readers:
             thread.join(timeout=1.0)
     except (OSError, ValueError) as exc:

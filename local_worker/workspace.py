@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .candidate import Candidate
 from .config import Config
+from .control import Deadline
 from .schemas import Assignment, digest_bytes
 
 _CLEANUP_MESSAGE_LIMIT = 500
@@ -43,6 +44,7 @@ class Workspace(ABC):
         self.config = config
         self.root: Path | None = None
         self.cleanup_detail = ""
+        self.deadline: Deadline | None = None
 
     @abstractmethod
     def __enter__(self) -> Path:
@@ -150,14 +152,21 @@ class GitWorktreeWorkspace(Workspace):
     def __enter__(self) -> Path:
         assert self.root is not None
         revision = self.assignment.base_revision
+        remaining = self.deadline.remaining() if self.deadline else 30.0
+        if remaining <= 0:
+            self._cleanup()
+            raise WorkspaceError("job deadline expired before workspace setup")
         try:
             completed = self._git(
                 ["worktree", "add", "--detach", str(self.root), str(revision)],
-                timeout=30.0,
+                timeout=min(30.0, remaining),
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
+            self._added = True  # add may have registered the worktree before timing out
+            self._cleanup()
             raise WorkspaceError(f"git worktree add failed: {exc}") from exc
         if completed.returncode != 0:
+            self._cleanup()
             raise WorkspaceError(f"git worktree add failed: {completed.stderr.strip()[:_CLEANUP_MESSAGE_LIMIT]}")
         self._added = True
         try:

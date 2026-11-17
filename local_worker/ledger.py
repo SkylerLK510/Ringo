@@ -99,6 +99,31 @@ class OperationLedger:
         finally:
             os.close(fd)
 
+    @contextlib.contextmanager
+    def execution_lock(self, request_id: str):
+        path = self.ops_dir / (self._path(request_id).stem + ".lease")
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR, 0o600)
+        acquired = False
+        try:
+            try:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except (BlockingIOError, OSError):
+                pass  # fail closed: an uncertain owner is treated as active
+            yield acquired
+        finally:
+            if acquired:
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            os.close(fd)
+
     def claim(
         self, request_id: str, assignment_digest: str, config_fingerprint: str
     ) -> tuple[OperationRecord, bool]:
@@ -189,13 +214,16 @@ class OperationLedger:
                 except (OSError, json.JSONDecodeError, TypeError):
                     continue
                 if record.state == "running":
-                    changed.append(
-                        self._update_unlocked(
-                            record.operation_id,
-                            state="unknown",
-                            error="interrupted; outcome unresolved",
+                    with self.execution_lock(record.request_id) as abandoned:
+                        if not abandoned:
+                            continue
+                        changed.append(
+                            self._update_unlocked(
+                                record.operation_id,
+                                state="unknown",
+                                error="interrupted; outcome unresolved",
+                            )
                         )
-                    )
         return changed
 
     def private_dir(self, operation_id: str) -> Path:

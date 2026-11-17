@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from .adapters import UnsupportedPolicy, build_adapter
+from .adapters import InferenceUnavailable, UnsupportedPolicy, build_adapter
 from .config import Config, ConfigError, load_assignment_file
 from .ledger import OperationLedger, OperationConflict
 from .prompts import AssignmentTooLarge, build_prompt
@@ -130,7 +130,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.handler(args))
-    except (ConfigError, SchemaError, UnsupportedPolicy, ValueError, WorkspaceError, AssignmentTooLarge, OperationConflict, OSError) as exc:
+    except (InferenceUnavailable, ConfigError, SchemaError, UnsupportedPolicy, ValueError, WorkspaceError, AssignmentTooLarge, OperationConflict, OSError) as exc:
         print(f"ringo local-worker: {exc}", file=sys.stderr)
         return _EXIT_INPUT
     except KeyboardInterrupt:

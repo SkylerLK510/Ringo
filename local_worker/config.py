@@ -140,6 +140,9 @@ class Config:
         max_attempts = integer("max_attempts", 2, low=2, high=2)
         max_check_suites = integer("max_check_suites", 2, low=2, high=2)
         options = _dict(value.get("options", {}), "config.options")
+        reserved = {"num_ctx", "num_predict", "temperature", "seed"}
+        if reserved.intersection(options):
+            raise ConfigError("config.options cannot override validated generation settings")
         if len(options) > 32:
             raise ConfigError("config.options exceeds 32 entries")
 

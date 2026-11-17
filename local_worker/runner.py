@@ -125,6 +125,9 @@ def _persist(
 ) -> Path:
     """Write a result; only a freshly claimed operation may be finalized."""
     stem = f"{request.request_id}-{record.operation_id[-8:]}"
+    if not finalize:
+        from uuid import uuid4
+        stem += "-refusal-" + uuid4().hex
     result_path = request.result_dir / f"{stem}.result.json"
     _write_json(result_path, result.to_dict())
     if finalize:
@@ -140,6 +143,16 @@ def _persist(
 
 
 def run(request: RunRequest) -> tuple[Result, Path]:
+    # Hold a per-request OS lease throughout execution. Reconciliation cannot
+    # classify an active operation as interrupted; process death releases it.
+    with request.ledger.execution_lock(request.request_id) as owned:
+        if not owned:
+            from .ledger import OperationConflict
+            raise OperationConflict("operation is currently owned by another worker")
+        return _run(request, owned)
+
+
+def _run(request: RunRequest, owned: bool) -> tuple[Result, Path]:
     """Execute one assignment and return its result plus the result file path."""
     started = time.monotonic()
     request.result_dir.mkdir(parents=True, exist_ok=True)
@@ -154,7 +167,7 @@ def run(request: RunRequest) -> tuple[Result, Path]:
         if existing_path.exists():
             return Result.from_dict(json.loads(existing_path.read_text(encoding="utf-8"))), existing_path
 
-    if not created:
+    if not created or not owned:
         # A prior or concurrent run owns this request id. Never start inference
         # for it: with no retrievable result its outcome is unresolved until a
         # person reconciles the ledger.
@@ -188,7 +201,7 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
 
     def finish() -> Result:
         final_status = status
-        if stop.stopped and final_status not in (_TERMINAL_SUCCESS, "timeout", "unavailable"):
+        if stop.stopped and final_status not in ("timeout", "unavailable"):
             final_status = "timeout"
         return Result(
             schema_version=RESULT_SCHEMA_VERSION,
@@ -310,6 +323,7 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
         # accepted by passing only the check it happened to reach.
         suite: list[CheckResult] = []
         workspace = request.workspace_factory()
+        workspace.deadline = deadline
         try:
             with workspace as root:
                 if candidate.kind == "patch":

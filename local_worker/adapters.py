@@ -183,10 +183,11 @@ class OllamaHttpAdapter(InferenceAdapter):
             chunks: list[str] = []
             total = 0
             usage = InferenceUsage()
+            completed = False
             while True:
                 if stop.stopped:
                     raise InferenceCancelled("deadline or explicit stop fired during generation")
-                line = response.readline()
+                line = response.readline(self._config.max_stream_bytes - total + 1)
                 if not line:
                     break
                 total += len(line)
@@ -204,6 +205,7 @@ class OllamaHttpAdapter(InferenceAdapter):
                 if isinstance(piece, str):
                     chunks.append(piece)
                 if event.get("done") is True:
+                    completed = True
                     usage = InferenceUsage(
                         prompt_eval_count=_count(event.get("prompt_eval_count")),
                         prompt_eval_cached_count=_count(event.get("prompt_eval_cached_count")),
@@ -215,6 +217,8 @@ class OllamaHttpAdapter(InferenceAdapter):
                     break
             if stop.stopped:
                 raise InferenceCancelled("deadline fired before the stream completed")
+            if not completed:
+                raise InferenceUnavailable("stream ended without a terminal done event")
             return InferenceResult(
                 text="".join(chunks),
                 usage=usage,
@@ -302,7 +306,10 @@ class ScriptedAdapter(InferenceAdapter):
 def build_adapter(config: Config) -> InferenceAdapter:
     """Build the local adapter only. Cloud/auto are explicit refusals."""
     if config.policy == "local":
-        return OllamaHttpAdapter(config)
+        raise InferenceUnavailable(
+            "live local jobs are disabled: Ollama server-side cancellation has not "
+            "been certified; mock disconnect tests are not runtime certification"
+        )
     raise UnsupportedPolicy(
         f"policy {config.policy!r} is defined but not implemented; local-only is the default"
     )

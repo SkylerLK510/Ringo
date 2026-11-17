@@ -32,6 +32,15 @@ inference; a missing or mismatched digest fails closed.
 | `local_worker/runner.py` | Bounded two-attempt orchestration and result assembly |
 | `local_worker/cli.py` | `validate`, `run`, `reconcile` |
 
+## Live execution blocker
+
+`run` refuses live Ollama generation until server-side cancellation has been
+verified against the actual supported runtime. The mock HTTP tests prove client
+socket cleanup only. There is no configuration switch that certifies a runtime;
+adding a real certification workflow is a separate deliverable. `validate`,
+offline adapters and deterministic checks remain available. Process-tree cleanup
+for checks currently requires POSIX; other platforms fail closed.
+
 ## Boundaries
 
 - At most **two** local inference calls: one candidate, one repair with bounded
