@@ -13,8 +13,9 @@ observes the server-side disconnect; it is not a measurement of a live Ollama
 build. Exact tokenizer accounting is not available to this standalone module,
 so input size is checked with a one-token-per-byte upper bound (true for any
 tokenizer) and an oversized assignment is rejected rather than truncated. The
-configured model digest is verified against Ollama's local `/api/tags` before
-inference; a missing or mismatched digest fails closed.
+configured model digest is compared with Ollama's local `/api/tags` before
+each attempt; a missing or mismatched digest fails closed. This observes a mutable
+tag, so results report `digest_observed`, never verified generation weights.
 
 ## Layout
 
@@ -26,7 +27,7 @@ inference; a missing or mismatched digest fails closed.
 | `local_worker/control.py` | Monotonic deadline, cancellation flag, owned-socket shutdown guard |
 | `local_worker/adapters.py` | Ollama `/api/generate` NDJSON adapter; explicit refusal of cloud/auto |
 | `local_worker/prompts.py` | Bounded prompt assembly and context-budget rejection |
-| `local_worker/checks.py` | Host-configured argv checks, capped private output, process-group cleanup |
+| `local_worker/checks.py` | Linux bubblewrap checks, capped private output, process-group cleanup |
 | `local_worker/workspace.py` | Detached git worktree (or slice-only snapshot for fixtures) and candidate application |
 | `local_worker/ledger.py` | Durable operation records outside the checkout; conflict and restart handling |
 | `local_worker/runner.py` | Bounded two-attempt orchestration and result assembly |
@@ -39,7 +40,9 @@ verified against the actual supported runtime. The mock HTTP tests prove client
 socket cleanup only. There is no configuration switch that certifies a runtime;
 adding a real certification workflow is a separate deliverable. `validate`,
 offline adapters and deterministic checks remain available. Process-tree cleanup
-for checks currently requires POSIX; other platforms fail closed. A blocked live
+for checks requires Linux with bubblewrap and usable namespaces; other systems
+fail closed without a host execution fallback. Checks see system binaries and
+their disposable workspace, with no network, owner home, checkout or ledger. A blocked live
 `run` exits 2 with a diagnostic on stderr, no JSON on stdout and no result artifact;
 this is an exception to the execution output contract below.
 
@@ -69,7 +72,7 @@ constraints, base revision, allowed paths, identity-bound text slices and
 host-configured checks. It never carries a raw conversation transcript.
 
 The result carries: terminal status, phase, worker identity with digest
-verification, wall deadline and elapsed time, per-attempt operation
+observation, wall deadline and elapsed time, per-attempt operation
 IDs/fingerprints/usage,
 per-check status and output digest, changed paths, candidate digest and a
 candidate artifact reference, uncertainty flags, errors and cleanup summary.

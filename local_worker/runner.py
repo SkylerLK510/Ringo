@@ -8,6 +8,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from .durability import sync_directory, durable_mkdir
 from typing import Any, Callable
 
 from .adapters import InferenceAdapter, InferenceCancelled, InferenceUnavailable
@@ -44,7 +45,7 @@ class RunRequest:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(path.parent)
     data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     fd, temporary = tempfile.mkstemp(prefix=".result-", suffix=".tmp", dir=str(path.parent))
     try:
@@ -53,6 +54,7 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        sync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -234,8 +236,16 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
         errors.append(str(exc)[:MAX_ERROR_CHARS])
         return finish()
 
+    first_workspace = None
+    if request.assignment.checks:
+        try:
+            first_workspace = request.workspace_factory()
+        except WorkspaceError as exc:
+            errors.append(str(exc)[:MAX_ERROR_CHARS])
+            return finish()
     feedback: str | None = None
     for index in range(1, request.config.max_attempts + 1):
+        changed_files = ()
         if stop.stopped:
             status = "timeout"
             break
@@ -325,9 +335,10 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
         # first check never makes a later one optional, and a repair cannot be
         # accepted by passing only the check it happened to reach.
         suite: list[CheckResult] = []
-        workspace = request.workspace_factory()
-        workspace.deadline = deadline
+        changed_files = ()
         try:
+            workspace = first_workspace if index == 1 else request.workspace_factory()
+            workspace.deadline = deadline
             with workspace as root:
                 if candidate.kind == "patch":
                     changed_files = workspace.apply(candidate)

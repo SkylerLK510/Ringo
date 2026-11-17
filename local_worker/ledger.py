@@ -9,6 +9,7 @@ import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from .durability import sync_directory, durable_mkdir
 from typing import Any
 from uuid import uuid4
 
@@ -61,7 +62,7 @@ class OperationLedger:
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
         self.ops_dir = self.root / "ops"
-        self.ops_dir.mkdir(parents=True, exist_ok=True)
+        durable_mkdir(self.ops_dir)
 
     def _path(self, request_id: str) -> Path:
         safe = _token(request_id, "request_id")
@@ -240,6 +241,7 @@ class OperationLedger:
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary, path)
+            sync_directory(path.parent)
         except BaseException:
             try:
                 os.unlink(temporary)

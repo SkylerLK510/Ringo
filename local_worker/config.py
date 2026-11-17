@@ -183,7 +183,8 @@ class Config:
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Config":
-        data = Path(path).read_bytes()
+        with Path(path).open("rb") as handle:
+            data = handle.read(MAX_CONFIG_BYTES + 1)
         if len(data) > MAX_CONFIG_BYTES:
             raise ConfigError("config file is too large")
         try:
@@ -218,7 +219,8 @@ class Config:
 def load_assignment_file(path: str | Path) -> dict[str, Any]:
     from .schemas import MAX_ASSIGNMENT_BYTES
 
-    data = Path(path).read_bytes()
+    with Path(path).open("rb") as handle:
+        data = handle.read(MAX_ASSIGNMENT_BYTES + 1)
     if len(data) > MAX_ASSIGNMENT_BYTES:
         raise SchemaError("assignment file is too large")
     try:

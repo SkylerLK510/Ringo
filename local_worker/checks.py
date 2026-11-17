@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import signal
+import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -14,7 +16,7 @@ from .config import Config
 from .control import Deadline
 from .schemas import CheckResult, CheckSpec, digest_bytes
 
-_CAPTURE_ENV = ("PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT", "TEMP", "TMP")
+
 _MAX_DETAIL_CHARS = 500
 
 
@@ -32,10 +34,27 @@ def _safe_cwd(spec: CheckSpec, workspace_root: Path) -> Path:
     return target
 
 
-def _environment(spec: CheckSpec) -> dict[str, str]:
-    env = {key: os.environ[key] for key in _CAPTURE_ENV if key in os.environ}
-    env.update(spec.env)
-    return env
+def _sandbox_command(spec: CheckSpec, workspace_root: Path, cwd: Path) -> list[str]:
+    """Expose only system binaries and this disposable workspace to candidate code."""
+    bwrap = shutil.which('bwrap')
+    if sys.platform != 'linux' or bwrap is None:
+        raise CheckSetupError('checks require Linux bubblewrap containment; no host fallback')
+    command = [bwrap, '--unshare-all', '--die-with-parent', '--new-session',
+               '--cap-drop', 'ALL', '--clearenv', '--ro-bind', '/usr', '/usr']
+    for name in ('bin', 'sbin', 'lib', 'lib64'):
+        path = Path('/') / name
+        if path.is_symlink():
+            command += ['--symlink', os.readlink(path), str(path)]
+        elif path.exists():
+            command += ['--ro-bind', str(path), str(path)]
+    root = str(workspace_root.resolve())
+    command += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                '--bind', root, root, '--chdir', str(cwd),
+                '--setenv', 'PATH', '/usr/local/bin:/usr/bin:/bin',
+                '--setenv', 'HOME', '/tmp']
+    for key, value in spec.env.items():
+        command += ['--setenv', key, value]
+    return command + ['--', *spec.argv]
 
 
 def _kill_process(proc: subprocess.Popen[bytes]) -> None:
@@ -75,6 +94,7 @@ def run_check(
 
     try:
         cwd = _safe_cwd(spec, workspace_root)
+        command = _sandbox_command(spec, workspace_root, cwd)
     except CheckSetupError as exc:
         elapsed = int((time.monotonic() - started) * 1000)
         return CheckResult(spec.id, "unavailable", None, digest_bytes(b""), elapsed, str(exc)[:_MAX_DETAIL_CHARS]), None
@@ -103,7 +123,7 @@ def run_check(
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
-        "env": _environment(spec),
+        "env": {},
     }
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True
@@ -118,7 +138,7 @@ def run_check(
         if deadline.expired():
             return CheckResult(spec.id, "timeout", None, digest_bytes(b""), 0,
                                "job deadline expired during check setup"), None
-        proc = subprocess.Popen(list(spec.argv), **popen_kwargs)  # type: ignore[arg-type]
+        proc = subprocess.Popen(command, **popen_kwargs)  # type: ignore[arg-type]
         readers = [
             threading.Thread(target=read, args=(proc.stdout,), daemon=True),
             threading.Thread(target=read, args=(proc.stderr,), daemon=True),

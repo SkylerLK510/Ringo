@@ -131,7 +131,8 @@ class OllamaHttpTests(unittest.TestCase):
         with _Server(complete=True) as server:
             adapter = OllamaHttpAdapter(make_config(endpoint=server.endpoint))
             adapter.generate("prompt", StopControl(Deadline(5.0)))
-            self.assertTrue(adapter.describe()["digest_verified"])
+            self.assertTrue(adapter.describe()["digest_observed"])
+            self.assertFalse(adapter.describe()["digest_verified"])
 
     def test_mismatched_model_digest_refuses_without_generation(self):
         with _Server(complete=True, tags_digest="b" * 64) as server:

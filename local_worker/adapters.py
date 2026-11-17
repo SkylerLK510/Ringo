@@ -74,13 +74,14 @@ class OllamaHttpAdapter(InferenceAdapter):
         parsed = urlsplit(config.endpoint)
         self._host = parsed.hostname or "127.0.0.1"
         self._port = parsed.port or 11434
-        self._digest_verified = False
+        self._digest_observed = False
 
     def describe(self) -> dict[str, Any]:
         return {
             "adapter": "ollama-http",
             **self._config.worker_description(),
-            "digest_verified": self._digest_verified,
+            "digest_verified": False,
+            "digest_observed": self._digest_observed,
         }
 
     def verify_model_digest(self, stop: StopControl) -> None:
@@ -89,10 +90,11 @@ class OllamaHttpAdapter(InferenceAdapter):
         Ollama's documented /api/tags response reports each model's content
         digest. A tag can be repointed to different weights, so recording a
         digest in the config is not a pin unless the runtime agrees with it.
-        Verification succeeds once per adapter (one loaded model is assumed);
+        Observation is repeated before every attempt and is not an immutable pin;
         an absent, malformed or mismatched digest fails closed.
         """
-        if self._digest_verified or self._config.model_digest is None:
+        self._digest_observed = False
+        if self._config.model_digest is None:
             return
         timeout = max(0.1, min(5.0, stop.deadline.remaining()))
         conn = http.client.HTTPConnection(self._host, self._port, timeout=timeout)
@@ -132,7 +134,7 @@ class OllamaHttpAdapter(InferenceAdapter):
                     "configured model digest does not match the runtime model; "
                     "refusing to attribute output to unverified weights"
                 )
-            self._digest_verified = True
+            self._digest_observed = True
         except (OSError, http.client.HTTPException) as exc:
             if stop.stopped or (guard is not None and guard.triggered):
                 raise InferenceCancelled(f"model verification stopped: {exc}") from exc

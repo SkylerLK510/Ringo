@@ -2,6 +2,7 @@
 import json
 import os
 import subprocess
+import socket
 import sys
 import tempfile
 import time
@@ -150,3 +151,66 @@ class ReviewRegressions(unittest.TestCase):
             with mock.patch('local_worker.control.time.monotonic', side_effect=lambda: clock[0]), mock.patch('local_worker.runner.run_check', return_value=(passed, None)):
                 result, _ = run(request)
             self.assertEqual(result.status, 'candidate_ready')
+
+    def test_missing_containment_never_executes_on_host(self):
+        spec = CheckSpec.from_dict({'id': 'check', 'argv': [sys.executable, '-c', 'pass'], 'timeout_s': 1})
+        with tempfile.TemporaryDirectory() as temp, mock.patch('local_worker.checks.shutil.which', return_value=None), mock.patch('local_worker.checks.subprocess.Popen') as spawn:
+            result, _ = run_check(spec, Path(temp), Path(temp), Deadline(5), make_config())
+        self.assertEqual(result.status, 'unavailable')
+        spawn.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == 'linux', 'Linux namespace containment')
+    def test_candidate_check_cannot_read_owner_files_or_connect_to_host(self):
+        import shutil
+        if not shutil.which('bwrap'):
+            self.skipTest('bubblewrap unavailable')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            owner = root / 'owner-secret'
+            owner.write_text('private')
+            workspace = root / 'workspace'
+            workspace.mkdir()
+            host = socket.socket()
+            self.addCleanup(host.close)
+            host.bind(('127.0.0.1', 0))
+            host.listen()
+            script = ('from pathlib import Path; import socket; '
+                      f'assert not Path({str(owner)!r}).exists(); '
+                      f'assert socket.socket().connect_ex(("127.0.0.1", {host.getsockname()[1]})) != 0; '
+                      'Path("proof").write_text("contained")')
+            spec = CheckSpec.from_dict({'id': 'contained', 'argv': [sys.executable, '-c', script], 'timeout_s': 2})
+            result, _ = run_check(spec, workspace, root / 'private', Deadline(5), make_config())
+            self.assertEqual(result.status, 'passed', result.detail)
+            self.assertEqual((workspace / 'proof').read_text(), 'contained')
+            self.assertEqual(owner.read_text(), 'private')
+
+    def test_deep_json_finishes_as_malformed_instead_of_stranding_ledger(self):
+        from local_worker.adapters import ScriptedAdapter
+        from local_worker.runner import RunRequest, run
+        from local_worker_support import make_assignment, workspace_factory
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            assignment, config = make_assignment(), make_config()
+            ledger = OperationLedger(root / 'ledger')
+            adapter = ScriptedAdapter(['[' * 2000 + '0' + ']' * 2000])
+            request = RunRequest(assignment, config, adapter, workspace_factory(assignment, config, root / 'private'), ledger, 'deep-json', root / 'results')
+            result, _ = run(request)
+            self.assertEqual(result.status, 'malformed_candidate')
+            self.assertNotEqual(ledger.load('deep-json').state, 'running')
+            self.assertEqual(len(adapter.prompts), 1)
+
+    def test_invalid_workspace_is_rejected_before_inference_and_finalized(self):
+        from local_worker.adapters import ScriptedAdapter
+        from local_worker.runner import RunRequest, run
+        from local_worker.workspace import WorkspaceError
+        from local_worker_support import make_assignment
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            ledger = OperationLedger(root / 'ledger')
+            adapter = ScriptedAdapter([])
+            factory = mock.Mock(side_effect=WorkspaceError('missing base revision'))
+            request = RunRequest(make_assignment(), make_config(), adapter, factory, ledger, 'bad-workspace', root / 'results')
+            result, _ = run(request)
+            self.assertNotEqual(result.status, 'candidate_ready')
+            self.assertNotEqual(ledger.load('bad-workspace').state, 'running')
+            self.assertEqual(adapter.prompts, [])

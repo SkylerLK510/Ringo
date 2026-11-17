@@ -70,8 +70,8 @@ def strict_json_loads(text: str) -> Any:
 
     try:
         return json.loads(text, object_pairs_hook=pairs, parse_constant=constant)
-    except json.JSONDecodeError as exc:
-        raise SchemaError(f"invalid JSON: {exc.msg}") from exc
+    except (ValueError, RecursionError) as exc:
+        raise SchemaError(f"invalid JSON: {exc}") from exc
 
 
 def _dict(value: Any, name: str) -> dict[str, Any]:
