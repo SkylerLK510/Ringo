@@ -12,6 +12,7 @@ from local_worker.ledger import OperationConflict, OperationLedger
 from local_worker.runner import RunRequest, run
 
 from local_worker_support import (
+    SANDBOX_AVAILABLE,
     candidate_json,
     failing_check,
     make_assignment,
@@ -28,6 +29,7 @@ def _hang(prompt, stop):
     raise InferenceCancelled("hung request stopped")
 
 
+@unittest.skipUnless(SANDBOX_AVAILABLE, "working Linux bubblewrap and visible Python required")
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()

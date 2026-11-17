@@ -16,7 +16,7 @@ from local_worker.config import ConfigError
 from local_worker.control import Deadline, StopControl
 from local_worker.ledger import OperationLedger
 from local_worker.schemas import CheckSpec
-from local_worker_support import make_config
+from local_worker_support import make_config, SANDBOX_AVAILABLE
 
 
 class ReviewRegressions(unittest.TestCase):
@@ -60,24 +60,32 @@ class ReviewRegressions(unittest.TestCase):
             self.assertEqual(result.status, 'timeout')
             spawn.assert_not_called()
 
-    @unittest.skipUnless(sys.platform == 'linux' and Path('/proc/self/stat').exists(), 'Linux procfs liveness')
+    @unittest.skipUnless(SANDBOX_AVAILABLE, 'working Linux containment required')
     def test_successful_check_kills_background_descendant(self):
+        import fcntl
         with tempfile.TemporaryDirectory() as temp:
-            pidfile = Path(temp) / 'child.pid'
-            script = ('import subprocess,sys,pathlib; p=subprocess.Popen([sys.executable,"-c","import time; time.sleep(30)"]); '
-                      f'pathlib.Path({str(pidfile)!r}).write_text(str(p.pid))')
+            lockfile = Path(temp) / 'child.lock'
+            ready = Path(temp) / 'ready'
+            child = ('import fcntl,pathlib,time; '
+                     f'f=open({str(lockfile)!r},"w"); fcntl.flock(f,fcntl.LOCK_EX); '
+                     f'pathlib.Path({str(ready)!r}).touch(); time.sleep(30)')
+            script = ('import subprocess,sys,pathlib,time; '
+                      f'subprocess.Popen([sys.executable,"-c",{child!r}]); '
+                      f'p=pathlib.Path({str(ready)!r}); '
+                      'exec("while not p.exists(): time.sleep(.01)")')
             spec = CheckSpec.from_dict({'id':'check', 'argv':[sys.executable, '-c', script], 'timeout_s':2})
             result, _ = run_check(spec, Path(temp), Path(temp), Deadline(5), make_config())
             self.assertEqual(result.status, 'passed')
-            pid = int(pidfile.read_text())
-            for _ in range(100):
-                stat = Path(f'/proc/{pid}/stat')
-                if not stat.exists() or stat.read_text().split()[2] == 'Z':
-                    break
-                time.sleep(.01)
-            else:
-                os.kill(pid, 9)
-                self.fail('background process survived check cleanup')
+            self.assertTrue(ready.exists())
+            with lockfile.open('r') as lock:
+                for _ in range(100):
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        time.sleep(.01)
+                else:
+                    self.fail('background process retained its lock after check cleanup')
 
     def test_nonowner_result_cannot_overwrite_authoritative_result(self):
         from local_worker.runner import RunRequest, _empty_result, _persist
@@ -117,7 +125,8 @@ class ReviewRegressions(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             deadline = mock.Mock()
             deadline.expired.side_effect = [False, True]
-            with mock.patch('local_worker.checks.subprocess.Popen') as spawn:
+            with mock.patch('local_worker.checks.subprocess.Popen') as spawn, mock.patch(
+                    'local_worker.checks._sandbox_command', return_value=['sandbox']):
                 result, _ = run_check(spec, Path(temp), Path(temp), deadline, make_config())
             self.assertEqual(result.status, 'timeout')
             spawn.assert_not_called()
@@ -159,7 +168,7 @@ class ReviewRegressions(unittest.TestCase):
         self.assertEqual(result.status, 'unavailable')
         spawn.assert_not_called()
 
-    @unittest.skipUnless(sys.platform == 'linux', 'Linux namespace containment')
+    @unittest.skipUnless(SANDBOX_AVAILABLE, 'working Linux namespace containment required')
     def test_candidate_check_cannot_read_owner_files_or_connect_to_host(self):
         import shutil
         if not shutil.which('bwrap'):

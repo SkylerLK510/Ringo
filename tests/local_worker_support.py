@@ -101,3 +101,20 @@ def workspace_factory(assignment: Assignment, config: Config, root: Path):
         return SnapshotWorkspace(assignment, config, root)
 
     return factory
+
+
+def sandbox_available():
+    """Probe real containment, including interpreter visibility, for integration tests."""
+    import subprocess
+    from local_worker.checks import _sandbox_command, CheckSetupError
+    from local_worker.schemas import CheckSpec
+    try:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            spec = CheckSpec.from_dict({'id': 'probe', 'argv': [sys.executable, '-c', 'pass'], 'timeout_s': 2})
+            return subprocess.run(_sandbox_command(spec, root, root), capture_output=True,
+                                  timeout=3).returncode == 0
+    except (CheckSetupError, OSError, subprocess.TimeoutExpired):
+        return False
+
+SANDBOX_AVAILABLE = sandbox_available()

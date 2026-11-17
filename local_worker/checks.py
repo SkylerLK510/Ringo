@@ -36,10 +36,10 @@ def _safe_cwd(spec: CheckSpec, workspace_root: Path) -> Path:
 
 def _sandbox_command(spec: CheckSpec, workspace_root: Path, cwd: Path) -> list[str]:
     """Expose only system binaries and this disposable workspace to candidate code."""
-    bwrap = shutil.which('bwrap')
+    bwrap = shutil.which('bwrap', path='/usr/bin:/bin')
     if sys.platform != 'linux' or bwrap is None:
         raise CheckSetupError('checks require Linux bubblewrap containment; no host fallback')
-    command = [bwrap, '--unshare-all', '--die-with-parent', '--new-session',
+    command = [str(Path(bwrap).resolve()), '--unshare-all', '--die-with-parent', '--new-session',
                '--cap-drop', 'ALL', '--clearenv', '--ro-bind', '/usr', '/usr']
     for name in ('bin', 'sbin', 'lib', 'lib64'):
         path = Path('/') / name

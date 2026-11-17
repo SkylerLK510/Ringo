@@ -157,7 +157,7 @@ def run(request: RunRequest) -> tuple[Result, Path]:
 def _run(request: RunRequest, owned: bool) -> tuple[Result, Path]:
     """Execute one assignment and return its result plus the result file path."""
     started = time.monotonic()
-    request.result_dir.mkdir(parents=True, exist_ok=True)
+    durable_mkdir(request.result_dir)
     assignment_digest = request.assignment.digest()
     config_fingerprint = request.config.fingerprint()
     record, created = request.ledger.claim(
