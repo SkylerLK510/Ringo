@@ -32,6 +32,7 @@ pub const PROBE_TIMEOUT_S: Num = Num::Int(120);
 pub const STALL_FACTOR: i128 = 3;
 /// Bytes of a failed call's stdout kept in the trace.
 pub const RAW_LIMIT: usize = 1_000_000;
+pub const ARTIFACT_ERROR: &str = "the whole output could not be written; only the head in this record survives";
 pub const TOOL_ITEMS: [&str; 4] = ["command_execution", "mcp_tool_call", "web_search", "file_change"];
 /// Codex's own built-in MCP server offers resource listings that no flag disables; with a private CODEX_HOME they
 /// list nothing, so a call that returned an empty list told the model nothing and does not break a tool-free turn.
@@ -1079,12 +1080,19 @@ impl Run {
                 let attempt = py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?);
                 let target = py::join(&py::join(trace, "steps"), &format!("{step}.{attempt}.raw.txt"));
                 let temporary = target.with_extension("tmp");
-                py::write_file(&temporary, data)?;
-                fs::rename(&temporary, &target).map_err(|e| py::path_error(&e, &target))?;
+                // a failed artifact write must not lose the paid attempt's trace record
+                let saved = match py::write_file(&temporary, data).and_then(|_| fs::rename(&temporary, &target).map_err(|e| py::path_error(&e, &target))) {
+                    Ok(()) => Value::String(format!("steps/{step}.{attempt}.raw.txt")),
+                    Err(_) => {
+                        let _ = fs::remove_file(&temporary);
+                        Value::Null
+                    }
+                };
+                let failed = saved.is_null();
                 rec.insert(
                     "raw_excerpt".into(),
                     Value::Object(Map::from_iter([
-                        ("artifact", Value::String(format!("steps/{}.{}.raw.txt", py::value_str(rec.get("step").ok_or_else(|| key_error("step"))?), py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?)))),
+                        ("artifact", saved),
                         ("total_bytes", Value::from(data.len())),
                         ("excerpt_bytes", Value::from(excerpt)),
                         ("sha256", Value::String(crate::rt::sha256_hex(data))),
@@ -1094,6 +1102,11 @@ impl Run {
                         ("head", Value::String(String::from_utf8_lossy(&data[..excerpt]).into_owned())),
                     ].into_iter().map(|(k, v)| (k.into(), v)))),
                 );
+                if failed {
+                    if let Some(Value::Object(excerpt)) = rec.get_mut("raw_excerpt") {
+                        excerpt.insert("artifact_error".into(), Value::String(ARTIFACT_ERROR.into()));
+                    }
+                }
             }
             let path = py::join(trace, "trace.jsonl");
             let mut f = fs::OpenOptions::new().append(true).create(true).open(&path).map_err(|e| py::path_error(&e, &path))?;

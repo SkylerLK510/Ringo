@@ -1071,6 +1071,9 @@ fn script_cases(base: &Path) -> Vec<Value> {
             {"op":"record","rec":{"step":"s","attempt":2,"status":"error","error":"ignored"},"raw":"another output"},
             {"op":"record","rec":{"step":"s","attempt":3,"status":"error","error":"different"},"raw":"same output"},
             {"op":"task_report"}]),
+        json!([{"op":"new","trace":"t"}, {"op":"reserve"},
+            {"op":"record","rec":{"step":"missing/s","attempt":1,"status":"error","error":"e"},"raw":"whole output"},
+            {"op":"state","status":"done","extra":[]}, {"op":"task_report"}]),
         json!([{"op":"new","trace":"t","max_tokens":100}, {"op":"reserve"},
             {"op":"record","rec":{"step":"s","attempt":1,"status":"ok","usage":[1]}},
             {"op":"reserve"}, {"op":"state","status":"done","extra":[]}, {"op":"task_report"}]),
@@ -1275,7 +1278,7 @@ fn watch_cases(base: &Path) -> Vec<Value> {
         json!({"trace": false, "finished": [["review", 2, usage(1)]], "stdout": "turn.started"}),
         json!({"finished": [["review", 5.0, usage(10)], ["review", 6.0, usage(11)]], "elapsed": 40.25}),
         json!({"finished": [["review", 5.0, usage(9)], ["review", 6.0, usage(10)]], "soft_s": 0.3, "limit_s": 2.5, "elapsed": 18.05}),
-        json!({"finished": [["review", 3.0, json!({"input": 1234567, "cache_read": 1.5, "cache_write": 0, "output": 7654321})],
+        json!({"finished": [["review", 3.0, json!({"input": 1234567, "cache_read": 2, "cache_write": 0, "output": 7654321})],
                             ["review", 3, usage(10)]], "soft_s": 3.5, "limit_s": 1800.0, "elapsed": 9.0001}),
         json!({"finished": [["verdicts", 1.0, usage(10)]], "kind": "review", "label": "verdicts.batch-2", "attempt": 2}),
         json!({"finished": [["review", 5, usage(10)], ["review", 5.0, usage(10)], ["review", 4.9, null]], "elapsed": 15.0001}),
@@ -1586,6 +1589,7 @@ fn small_helpers_match_python() {
         r#"{"input": [1], "cache_write": 2, "cache_read": 3, "output": 4}"#, r#"{"output": 4, "input": 1, "cache_read": 3, "cache_write": 2, "x": 0}"#,
         r#"{"input": 0.1, "cache_write": 0.2, "cache_read": 0.3, "output": 1e16}"#, r#"{"input": 1e308, "cache_write": 1e308, "cache_read": -1e308, "output": 0}"#,
         r#"{"input": 123456789012345678901234567890, "cache_write": 1, "cache_read": 0.5, "output": 0}"#, r#"{"input": 1e400, "cache_write": 1, "cache_read": 1, "output": 1}"#,
+        r#"{"input": -1, "cache_write": 2, "cache_read": 3, "output": 4}"#, r#"{"input": 2.0, "cache_write": 2, "cache_read": 3, "output": 4}"#,
     ] {
         cases.push(json!(["total_tokens", [v(u)]]));
     }

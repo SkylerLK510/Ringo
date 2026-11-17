@@ -88,6 +88,9 @@ def valid_price(x):
     return x if ok else None
 
 
+ARTIFACT_ERROR = 'the whole output could not be written; only the head in this record survives'
+
+
 def claude_usage(reply):
     """Usage from a Claude CLI JSON reply; missing input/output counts stay unknown, the price stays."""
     u = reply.get('usage') if isinstance(reply.get('usage'), dict) else {}
@@ -646,7 +649,10 @@ def stop_reason(exc, watch):
 
 
 def total_tokens(usage):
-    return sum(usage[k] for k in TOKEN_KEYS) if isinstance(usage, dict) and all(k in usage for k in TOKEN_KEYS) else None
+    """The sum of a usage's four token counts, or None unless all four are non-negative ints."""
+    if isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in TOKEN_KEYS):
+        return sum(usage[k] for k in TOKEN_KEYS)
+    return None
 
 def write_state(folder, state):
     """Atomically replace folder/state.json: the small run state an agent waits on (`ringo.py wait`) and reads
@@ -784,15 +790,25 @@ class Run:
                     excerpt = min(len(data), RAW_LIMIT)
                     artifact = self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt"
                     temporary = artifact.with_suffix('.tmp')
-                    temporary.write_bytes(data)
-                    temporary.replace(artifact)
-                    rec['raw_excerpt'] = {'artifact': f"steps/{rec['step']}.{rec['attempt']}.raw.txt",
+                    saved = f"steps/{rec['step']}.{rec['attempt']}.raw.txt"
+                    try:  # a failed artifact write must not lose the paid attempt's trace record
+                        temporary.write_bytes(data)
+                        temporary.replace(artifact)
+                    except OSError:
+                        saved = None
+                        try:
+                            temporary.unlink()
+                        except OSError:
+                            pass
+                    rec['raw_excerpt'] = {'artifact': saved,
                                           'total_bytes': len(data), 'excerpt_bytes': excerpt,
                                           'sha256': hashlib.sha256(data).hexdigest(),
                                           'head_bytes': excerpt, 'omitted_bytes': len(data) - excerpt,
                                           'omission_note': 'the record keeps only the head; the artifact holds the '
                                                           'whole output, and its sha256 above proves it',
                                           'head': data[:excerpt].decode('utf-8', 'replace')}
+                    if saved is None:
+                        rec['raw_excerpt']['artifact_error'] = ARTIFACT_ERROR
                 with open(self.trace / 'trace.jsonl', 'a', encoding='utf-8') as f:
                     f.write(json.dumps(rec) + '\n')
                 self.last = {k: rec[k] for k in ('step', 'attempt', 'status') if k in rec}

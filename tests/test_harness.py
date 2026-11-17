@@ -426,6 +426,27 @@ class RunTest(unittest.TestCase):
             self.assertEqual(excerpt['omitted_bytes'], 500_000)  # the head stops at RAW_LIMIT; the artifact has all
             self.assertEqual(excerpt['sha256'], hashlib.sha256(b'R' * 1_500_000).hexdigest())
 
+    def test_a_failed_raw_artifact_write_still_records_the_attempt(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d, 't'))
+            run.reserve()
+            run.record({'step': 'missing/s', 'attempt': 1, 'status': 'error', 'error': 'e'}, raw='whole output')
+            rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            excerpt = rows[0]['raw_excerpt']
+            self.assertIsNone(excerpt['artifact'])
+            self.assertEqual(excerpt['artifact_error'], harness.ARTIFACT_ERROR)
+            self.assertEqual(excerpt['head'], 'whole output')
+            self.assertEqual(list(Path(d, 't', 'steps').rglob('*.tmp')), [])
+
+    def test_total_tokens_needs_four_non_negative_ints(self):
+        self.assertEqual(harness.total_tokens({'input': 1, 'cache_write': 2, 'cache_read': 3, 'output': 4}), 10)
+        for bad in ({'input': 1.5, 'cache_write': 2, 'cache_read': 3, 'output': 4},
+                    {'input': -1, 'cache_write': 2, 'cache_read': 3, 'output': 4},
+                    {'input': True, 'cache_write': 2, 'cache_read': 3, 'output': 4},
+                    {'input': 1, 'cache_write': 2, 'cache_read': 3}, None, [1]):
+            self.assertIsNone(harness.total_tokens(bad), bad)
+
     def test_an_input_refused_as_too_large_is_not_sent_again(self):
         calls = []
         def too_large(*args):
