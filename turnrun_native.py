@@ -23,6 +23,15 @@ from turnrun_isolation import DockerSandbox
 
 AUTHORITY = 'api.anthropic.com:443'
 FRAME_BYTES = 512 * 1024
+PROMPT_BYTES = 128 * 1024
+# Each downstream frame re-serializes the prompt with JSON escaping, so admit a
+# prompt only when its escaped form leaves room for the rest of the frame.
+PROMPT_FRAME_BYTES = FRAME_BYTES - 64 * 1024
+
+
+def prompt_fits(prompt):
+    return (isinstance(prompt, str) and len(prompt.encode()) <= PROMPT_BYTES
+            and len(json.dumps(prompt).encode()) <= PROMPT_FRAME_BYTES)
 CHUNK_BYTES = 16384
 USAGE_FIELDS = {'input': 'input_tokens', 'cache_write': 'cache_creation_input_tokens',
                 'cache_read': 'cache_read_input_tokens', 'output': 'output_tokens'}
@@ -213,14 +222,31 @@ def native_result(events, code, model, worker_required=True):
 
 class NativeBroker(DockerSandbox):
     """One disposable, network-disabled provider process, separate from worker and checker."""
+    BRIDGE = 'turnrun_native_bridge.py'
+    REPLAY_MODEL = 'claude-sonnet-4-6'
+    credential = staticmethod(oauth_token)
+    parse_result = staticmethod(native_result)
+    attempt_error = staticmethod(NativeAttemptError)
+    connect_provider = staticmethod(provider_socket)
+    save_error = staticmethod(save_native_error)
+
+    def validate_model(self, model):
+        if not isinstance(model, str) or not model.startswith('claude-') or len(model) > 128:
+            raise ValueError('pin a full Claude model name')
+
+    def validate_event(self, event, model):
+        if event.get('type') == 'system' and event.get('subtype') == 'init':
+            if event.get('tools') != ['mcp__trial__worker'] or event.get('model') != model:
+                raise NativeProfileError('native startup exposed unexpected tools or model')
+
     def probe(self):
         row = json.loads(self._call(['exec', self.id, 'python3', '-I',
-                         '/opt/ringo/turnrun_native_bridge.py', '--probe'], timeout=30, limit=8192))
+                         '/opt/ringo/'+self.BRIDGE, '--probe'], timeout=30, limit=8192))
         required = ('direct_network_denied', 'owner_home_absent', 'docker_socket_absent',
                     'managed_settings_absent', 'task_workspace_empty')
         if row.get('uid') != 65532 or any(row.get(key) is not True for key in required):
             raise ValueError('native process containment probe failed')
-        if row.get('bridge_sha256') != sha256_file(Path(__file__).parent / 'turnrun_native_bridge.py'):
+        if row.get('bridge_sha256') != sha256_file(Path(__file__).parent / self.BRIDGE):
             raise ValueError('native image bridge differs from the selected controller source')
         return {**row, 'image': self.image, 'provider_calls': 0, 'live_certified': False}
 
@@ -305,7 +331,7 @@ class NativeBroker(DockerSandbox):
         cannot select a live model/provider or turn a replay into inference.
         """
         result = self._run(prompt=prompt, instruction='Use only the provided worker.',
-                          model='claude-sonnet-4-6', token_file=None, endpoint=endpoint,
+                          model=self.REPLAY_MODEL, token_file=None, endpoint=endpoint,
                           token_cap=token_cap, seconds=seconds, max_turns=4, persistent=True,
                           resume=resume, on_event=on_event, error_file=error_file, offline=True)
         return {**result, 'synthetic': True, 'provider_calls': 0}
@@ -314,9 +340,8 @@ class NativeBroker(DockerSandbox):
              seconds, max_turns, error_file=None, persistent=False, resume=None, on_event=None, offline=False):
         if 'RINGO_CHILD' in os.environ and not offline:
             raise ValueError('live native execution refuses RINGO_CHILD; use a standalone session')
-        if not isinstance(model, str) or not model.startswith('claude-') or len(model) > 128:
-            raise ValueError('pin a full Claude model name')
-        if not isinstance(prompt, str) or len(prompt.encode()) > 128 * 1024:
+        self.validate_model(model)
+        if not prompt_fits(prompt):
             raise ValueError('prompt exceeds its limit')
         if not isinstance(instruction, str) or len(instruction.encode()) > 4096:
             raise ValueError('instruction exceeds its limit')
@@ -332,12 +357,12 @@ class NativeBroker(DockerSandbox):
                 or not re.fullmatch(r'[a-zA-Z0-9_-]{1,128}', resume)):
             raise ValueError('invalid native continuation request')
         self.probe()
-        credential = 'sk-ant-oat01-offline-placeholder' if offline else oauth_token(token_file)
+        credential = 'sk-ant-oat01-offline-placeholder' if offline else self.credential(token_file)
         request = {'prompt': prompt, 'instruction': instruction, 'model': model,
                    'oauth_token': credential, 'max_turns': max_turns}
         if persistent:
             request.update(persistent=True, resume=resume)
-        command = [self.docker, 'exec', '-i', self.id, 'python3', '-I', '/opt/ringo/turnrun_native_bridge.py']
+        command = [self.docker, 'exec', '-i', self.id, 'python3', '-I', '/opt/ringo/'+self.BRIDGE]
         if offline:
             command.append('--exercise-session')
         frames = queue.Queue(maxsize=16)
@@ -348,7 +373,7 @@ class NativeBroker(DockerSandbox):
             if error_file is not None:
                 if not private_error_saved:
                     try:
-                        private_error_saved = save_native_error(events, error_file, credential)
+                        private_error_saved = self.save_error(events, error_file, credential)
                     except (OSError, ValueError):
                         pass
                 result['diagnostics']['private_error_saved'] = private_error_saved
@@ -428,9 +453,7 @@ class NativeBroker(DockerSandbox):
                         if total > 8 * 1024 * 1024 or not isinstance(event, dict):
                             raise ValueError('native event limit exceeded')
                         events.append(event)
-                        if event.get('type') == 'system' and event.get('subtype') == 'init':
-                            if event.get('tools') != ['mcp__trial__worker'] or event.get('model') != model:
-                                raise NativeProfileError('native startup exposed unexpected tools or model')
+                        self.validate_event(event, model)
                         if on_event is not None:
                             on_event(event)
                     elif kind == 'mcp':
@@ -440,7 +463,7 @@ class NativeBroker(DockerSandbox):
                             raise ValueError('upstream traffic is forbidden in offline replay')
                         if type(key) is not int or key in opened or len(opened) >= 256 or len(tunnels) >= 8:
                             raise ValueError('native tunnel admission limit reached')
-                        conn = provider_socket(frame.get('authority'))
+                        conn = self.connect_provider(frame.get('authority'))
                         opened.add(key)
                         tunnels[key] = conn
                         send({'type': 'opened', 'id': key})
@@ -461,8 +484,10 @@ class NativeBroker(DockerSandbox):
                         break
                     else:
                         raise ValueError('native bridge failed; preserve the full token reservation')
-                proc.wait(timeout=max(0.1, deadline-time.monotonic()))
-                result = native_result(events, exit_code, model)
+                bridge_code = proc.wait(timeout=max(0.1, deadline-time.monotonic()))
+                if bridge_code != 0:
+                    raise NativeProfileError("native bridge exited unsuccessfully after its result frame")
+                result = self.parse_result(events, exit_code, model)
                 if result['outcome'] != 'done':
                     retain_error(result)
                 if sum(result['usage'][k] for k in ('input', 'cache_write', 'cache_read', 'output')) > token_cap:
@@ -471,7 +496,7 @@ class NativeBroker(DockerSandbox):
                 return result
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, NativeProfileError) else type(exc).__name__+' during native attempt'
-                failure = NativeAttemptError(reason, events, exit_code)
+                failure = self.attempt_error(reason, events, exit_code)
                 retain_error(failure.result)
                 raise failure from None
             finally:
@@ -493,13 +518,13 @@ class NativeBroker(DockerSandbox):
                         proc.kill()
                     proc.wait(timeout=10)
                 if cleanup_error:
-                    failure = NativeAttemptError('native container cleanup failed', events, exit_code)
+                    failure = self.attempt_error('native container cleanup failed', events, exit_code)
                     # A prior failure may already have saved this attempt's private error.
                     retain_error(failure.result)
                     raise failure
 
 
-def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, work):
+def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, work, profile='claude'):
     """One reserved standalone proof trial; not a campaign or Session certification."""
     if 'RINGO_CHILD' in os.environ:
         raise ValueError('native certification must run outside a Ringo child session')
@@ -509,10 +534,20 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
         raise ValueError('certification wall limit must be from 30 through 300 seconds')
     work = outside_repo(work, 'native certification evidence')
     # Fail before starting/reserving if authentication has not been provisioned.
-    oauth_token(token_file)
+    source_files = ('turnrun_native.py', 'turnrun_native_bridge.py', 'turnrun_broker.py', 'turnrun_isolation.py')
+    broker_class = NativeBroker
+    if profile == 'codex-luna-low':
+        from turnrun_codex import CodexBroker, PROCESS_SOURCES, MODEL, subscription_auth
+        if model != MODEL:
+            raise ValueError('Codex process proof model differs from the pinned profile')
+        broker_class, source_files = CodexBroker, PROCESS_SOURCES
+        subscription_auth(token_file)
+    elif profile == 'claude':
+        oauth_token(token_file)
+    else:
+        raise ValueError('unknown process proof profile')
     work.mkdir(parents=True, exist_ok=False, mode=0o700)
-    sources = {name: sha256_file(Path(__file__).parent / name) for name in
-               ('turnrun_native.py', 'turnrun_native_bridge.py', 'turnrun_broker.py', 'turnrun_isolation.py')}
+    sources = {name: sha256_file(Path(__file__).parent / name) for name in source_files}
     plan = {'image': image, 'worker_image': worker_image, 'model': model,
             'budget_tokens': budget_tokens, 'seconds': seconds, 'max_turns': 4, 'sources': sources,
             'authorization_source': 'explicit standalone CLI --budget-tokens',
@@ -527,6 +562,8 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
     report = {'process_profile_certified': False, 'live_campaign_certified': False,
               'provider_requests': None, 'known_tokens': None, 'reserved_tokens': budget_tokens,
               'image': image, 'worker_image': worker_image, 'model': model, 'sources': sources}
+    if profile != 'claude':
+        report['profile'] = profile
 
     def retain_result(result):
         counts, total = usage_of(result)
@@ -541,7 +578,7 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
     try:
         with DockerSandbox(worker_image, lifetime=seconds+60) as worker:
             with WorkerEndpoint(worker, lifetime=seconds+30) as endpoint:
-                with NativeBroker(image, lifetime=seconds+45) as broker:
+                with broker_class(image, lifetime=seconds+45) as broker:
                     try:
                         result = broker.run(prompt='Use the worker tool to write exactly '+nonce+
                             ' followed by a newline to /work/native-proof.txt. Then finish.',

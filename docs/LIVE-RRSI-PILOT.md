@@ -12,8 +12,9 @@ interface. Its static blocker list is not the live adapter's preflight result.
 
 The trusted host runs the pinned `scenariorun` binary with `--broker-socket`, mutually
 exclusive with the offline `--program`. This is an explicit evaluation transport,
-not a provider executable renamed to evade the offline runner's checks. Only the
-Claude adapter is supported. Normal shell startup never enables this transport.
+not a provider executable renamed to evade the offline runner's checks. Claude and
+the pinned [Codex subscription profile](CODEX-RRSI-BROKER.md) are supported.
+Normal shell startup never enables this transport.
 
 Session owns instruction policy, handoff thresholds, restart/clear, continuation
 IDs and event accounting. A client subprocess sends only the resulting text and
@@ -70,7 +71,12 @@ A private version-1 config contains exactly:
   grader examples contain only ordinary files/directories. Both grader examples
   must include the evidence files that the check expects.
 
-Scenarios use the existing actions, restricted to Claude. For seeded context-size
+For Codex, use version 2 with the additional `profile: codex-luna-low`,
+`model: gpt-6-luna`, a matching Codex image and a fresh Codex process proof.
+Codex scenarios set `agent: codex` and support turns, restart, clear, fresh starts
+and matching-agent seeds. Compact remains Claude-only.
+
+Claude scenarios use the existing actions. For seeded context-size
 experiments, `seed.threads` may contain `[["claude", "$current"]]`: the runner resolves
 it to the current observed native session. Literal invented IDs are refused.
 Context sizes and records remain evaluator-supplied and must be described as

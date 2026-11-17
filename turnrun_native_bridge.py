@@ -53,6 +53,7 @@ def arguments(model, mcp, instruction, turns, *, persistent=False, resume=None, 
 
 
 class Bridge:
+    authority = AUTHORITY
     def __init__(self):
         self.lock = threading.Lock()
         self.pending = {}
@@ -145,7 +146,7 @@ class Bridge:
                     self.close_connection = True
 
             def do_CONNECT(self):
-                if not proxy or self.path != AUTHORITY:
+                if not proxy or self.path != bridge.authority:
                     self.send_error(403)
                     return
                 key, replies = bridge.channel()
