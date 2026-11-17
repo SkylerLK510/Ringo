@@ -518,7 +518,7 @@ def _build(repo, base, head, pr_text, budget, objects):
     excess = len(result.encode()) - budget
     if excess > 0:  # the change itself (PR text, diff, changed files, README) is over budget: context blocks were
         # dropped first; the manifest says by how much instead of sending oversized material silently.
-        overflow = ('Over the budget by {} bytes: the change itself does not fit it, so no unchanged context '
-                    'could be added. A claim that rests on what is not shown is still a question.'.format(excess))
+        overflow = ('Over the budget by {} bytes before this notice: required material and its manifest do not fit. Additional context '
+                    'may have been omitted. A claim that rests on what is not shown is still a question.'.format(excess))
         return '\n'.join([required, *[a['block'] for a in added], manifest() + overflow + '\n'])
     return result

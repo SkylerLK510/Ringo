@@ -208,13 +208,17 @@ def text_message(spec, files, feedback):
     return '\n\n'.join(parts)
 
 
+def check_excerpt(text):
+    return text if len(text) <= 6000 else text[:3000] + '\n...\n' + text[-3000:]
+
+
 def render_feedback(feedback):
     out = []
     if feedback.get('protocol_error'):
         out.append(f"Your last reply could not be applied: {feedback['protocol_error']}")
     for c in feedback.get('checks', []):
         if c['status'] != 'pass':
-            out.append(f"Check {c['name']!r} {c['status']}:\n{(c['stdout'] + c['stderr'])[-6000:]}")
+            out.append(f"Check {c['name']!r} {c['status']}:\n{check_excerpt(c['stdout'] + c['stderr'])}")
     spec_tests = feedback.get('spec_tests')
     if spec_tests and spec_tests.get('failing'):
         out.append(f"Spec tests written from the brief alone: {spec_tests['passed']}/{spec_tests['total']} pass. "
@@ -505,7 +509,7 @@ def load_spec(path):
     spec = strict_json(Path(path).read_text(encoding='utf-8'))
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
                'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
-               'max_cost', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
+               'max_cost', 'max_tokens', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
                'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair', 'no_regression'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
@@ -575,6 +579,8 @@ def load_spec(path):
         if spec['protocol'] != 'text':
             raise ValueError('scripts need the text protocol')
         positive(scripts.setdefault('timeout_s', 60), 'scripts timeout_s')
+    if spec.get('max_tokens') is not None and (type(spec['max_tokens']) is not int or spec['max_tokens'] < 0):
+        raise ValueError('max_tokens must be a non-negative integer or None')
     if spec.get('max_cost') is not None and spec.get('unpriced_call_usd') is None:
         raise ValueError('max_cost needs unpriced_call_usd for attempts that report no cost')
     command = spec.get('council')
@@ -707,6 +713,8 @@ def merge_review_batches(replies):
     pre, bodies, sections = '', [], {}
     for reply in replies:
         head, found, secs = pipelines.findings('review', reply)
+        if not found and not pipelines.NO_DEFECTS.search(pipelines.unfenced(reply)[1]):
+            found = {1: '### 1. Incomplete review batch\n\n' + reply}
         pre = pre or '\n'.join(line for line in head.splitlines() if not pipelines.NO_DEFECTS.search(line)).strip()
         bodies += list(found.values())
         for key, lines in secs.items():
@@ -778,7 +786,7 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
     started = time.perf_counter_ns()
     spec = load_spec(spec_path)
     out = harness.outside_repo(out, 'workflow run')
-    accounting = harness.Run(out, max_cost=spec.get('max_cost'), unpriced_call_usd=spec.get('unpriced_call_usd'))
+    accounting = harness.Run(out, max_cost=spec.get('max_cost'), unpriced_call_usd=spec.get('unpriced_call_usd'), max_tokens=spec.get('max_tokens'))
     try:
         write_json(out / 'spec.json', spec)
         implementation = {**releases.identity(HERE), 'effective_quality_claim': None}
@@ -900,7 +908,8 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
             batches = review_batches(spec, files, rationale, observed, material_cap, artifacts=str(folder),
                                      extra=extra)
             texts = [harness.run_plan(plan, b['material'], backend, accounting, call_fn=bounded,
-                                      timeout_s=spec['timeout_s'], left=remaining)[0] for b in batches]
+                                      timeout_s=spec['timeout_s'], left=remaining,
+                                      namespace=f"review-batch-{b['batch']}")[0] for b in batches]
             return merge_review_batches(texts), {'limit': material_cap, 'components': report['components'],
                                                  'dropped': report['dropped'],
                                                  'batches': [{'batch': b['batch'], 'of': b['of'],

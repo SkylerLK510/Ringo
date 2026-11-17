@@ -1194,8 +1194,8 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
         // the change itself (PR text, diff, changed files, README) is over budget: context blocks were dropped
         // first; the manifest says by how much instead of sending oversized material silently. Mirrors context.py.
         let overflow = format!(
-            "Over the budget by {excess} bytes: the change itself does not fit it, so no unchanged context \
-             could be added. A claim that rests on what is not shown is still a question.");
+            "Over the budget by {excess} bytes before this notice: required material and its manifest do not fit. Additional context \
+             may have been omitted. A claim that rests on what is not shown is still a question.");
         let mut out = String::new();
         out.push_str(&required);
         for a in &added {

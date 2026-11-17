@@ -455,6 +455,13 @@ class HandoffFidelityTest(unittest.TestCase):
             self.assertGreater(len(batches), 1)
             review_systems = [s for s in seen if s.startswith('You review')]
             self.assertEqual(len(review_systems), len(batches))
+            rows = [json.loads(line) for line in Path(d, 'run', 'trace.jsonl').read_text().splitlines()]
+            review_rows = [row for row in rows if row.get('step', '').startswith('review-batch-') and row.get('status') == 'ok']
+            self.assertEqual(len(review_rows), len(batches))
+            self.assertEqual(len({row['step'] for row in review_rows}), len(batches))
+            for row in review_rows:
+                self.assertTrue(Path(d, 'run', 'steps', f"{row['step']}.{row['attempt']}.txt").is_file())
+
             covered = [name for b in batches for name in b['covers'] if name != 'brief']
             self.assertEqual(sorted(covered), sorted(set(covered)))
             self.assertEqual(set(covered) | {'brief'}, {'brief', 'diff:server.py', 'file:server.py',
@@ -486,6 +493,18 @@ def make_repo(d, big):
     return repo, base, head
 
 
+class ReviewSafetyTest(unittest.TestCase):
+    def test_unreadable_batch_cannot_become_a_clean_review(self):
+        text = workflow.merge_review_batches(['No defects found.', 'I could not complete this review.'])
+        self.assertGreater(workflow.review_findings(text), 0)
+        self.assertIn('Incomplete review batch', text)
+
+    def test_serialized_check_feedback_preserves_failure_line(self):
+        feedback = {'checks': [{'name': 'fixture', 'status': 'fail',
+                     'stdout': 'AssertionError: required failure\n' + 'x' * 12000, 'stderr': ''}]}
+        self.assertIn('AssertionError: required failure', workflow.render_feedback(feedback))
+
+
 class ContextOverflowTest(unittest.TestCase):
     def test_a_change_bigger_than_the_budget_keeps_everything_and_says_by_how_much(self):
         with tempfile.TemporaryDirectory() as d:
@@ -494,9 +513,9 @@ class ContextOverflowTest(unittest.TestCase):
             self.assertGreater(len(material.encode()), 1000)  # mandatory evidence is never truncated
             self.assertIn('=== change.diff ===', material)
             self.assertIn('+x = 2', material)
-            found = re.search(r'Over the budget by (\d+) bytes: the change itself does not fit it', material)
+            found = re.search(r'Over the budget by (\d+) bytes before this notice: required material and its manifest do not fit', material)
             self.assertIsNotNone(found, material[-400:])
-            self.assertGreater(int(found.group(1)), 0)
+            self.assertEqual(int(found.group(1)), len(material[:found.start()].encode()) - 1000)
             self.assertEqual(material.count('Over the budget by'), 1)
 
     def test_a_change_that_fits_says_nothing_about_overflow(self):

@@ -698,7 +698,7 @@ pub fn stop_reason(exc: &Error, watch: Option<&dyn backends::Watch>) -> Option<&
 /// The sum of a usage's four token counts, or None when it is not an object holding all four.
 pub fn total_tokens(usage: Option<&Value>) -> Result<Option<Num>> {
     match usage {
-        Some(Value::Object(m)) if TOKEN_KEYS.iter().all(|k| m.contains_key(*k)) => {
+        Some(Value::Object(m)) if TOKEN_KEYS.iter().all(|k| nonneg_int(m.get(*k)).is_some()) => {
             let values = TOKEN_KEYS.iter().map(|k| operand(&m[*k])).collect::<Result<Vec<_>>>()?;
             py_sum(&values).map(Some)
         }
@@ -1028,10 +1028,13 @@ impl Run {
             }
             _ => None,
         };
-        let zero = Value::from(0);
         for (i, k) in TOKEN_KEYS.iter().enumerate() {
-            let x = fields.and_then(|m| m.get(*k)).filter(|v| py::truthy(v)).unwrap_or(&zero);
-            t.tokens[i] = py_add(t.tokens[i], x, "+=")?;
+            if let Some(value) = fields.and_then(|m| nonneg_int(m.get(*k))) {
+                t.tokens[i] = match t.tokens[i] {
+                    Num::Int(old) => Num::Int(old.checked_add(value).ok_or_else(py::too_big)?),
+                    other => Num::Float(other.as_f64() + value as f64),
+                };
+            }
         }
         if let Some(x) = fields.and_then(|m| m.get("reasoning_output")).filter(|v| py::int_of(v).is_some()) {
             t.reasoning = Some(py_add(t.reasoning.unwrap_or(Num::Int(0)), x, "+=")?);
@@ -1048,7 +1051,7 @@ impl Run {
                     None => t.unpriced += 1,
                 },
             }
-            if t.max_tokens.is_some() && TOKEN_KEYS.iter().all(|k| fields.map(|m| m.contains_key(*k)).unwrap_or(false)) {
+            if t.max_tokens.is_some() {
                 let recorded = py_sum(&t.tokens.iter().cloned().map(Ok).collect::<Vec<Operand>>())?;
                 if matches!(recorded.py_cmp(t.max_tokens.clone().expect("checked above")), Some(Ordering::Greater)) {
                     let over = match (recorded, t.max_tokens.expect("checked above")) {
@@ -1070,6 +1073,12 @@ impl Run {
                 // the artifact keeps the whole output, the record a bounded head of it
                 let data = raw.as_bytes();
                 let excerpt = data.len().min(RAW_LIMIT);
+                let step = py::value_str(rec.get("step").ok_or_else(|| key_error("step"))?);
+                let attempt = py::value_str(rec.get("attempt").ok_or_else(|| key_error("attempt"))?);
+                let target = py::join(&py::join(trace, "steps"), &format!("{step}.{attempt}.raw.txt"));
+                let temporary = target.with_extension("tmp");
+                py::write_file(&temporary, data)?;
+                fs::rename(&temporary, &target).map_err(|e| py::path_error(&e, &target))?;
                 rec.insert(
                     "raw_excerpt".into(),
                     Value::Object(Map::from_iter([
@@ -1098,9 +1107,6 @@ impl Run {
                 let steps = py::join(trace, "steps");
                 if let Some(reply) = reply {
                     py::write_file(&py::join(&steps, &format!("{step}.{attempt}.txt")), reply.as_bytes())?;
-                }
-                if let Some(raw) = raw.filter(|r| !r.is_empty()) {
-                    py::write_file(&py::join(&steps, &format!("{step}.{attempt}.raw.txt")), raw.as_bytes())?;
                 }
             }
         }
@@ -1236,6 +1242,14 @@ impl Run {
         state.insert("updated".into(), pyjson::float_value(py::round(now(), 3)));
         state.insert("last".into(), t.last.clone());
         state.extend(summary_of(t, self.clock_started.elapsed().as_secs_f64()));
+        if let Some(cap) = t.max_tokens {
+            let recorded = py_sum(&t.tokens.iter().cloned().map(Ok).collect::<Vec<Operand>>())?;
+            state.insert("budget".into(), serde_json::json!({
+                "max_tokens": cap.to_value(), "recorded_tokens": recorded.to_value(),
+                "overshoot": t.budget_overshoot_calls,
+                "note": "a cap stops new calls only; it never kills a running call, and a budget stop is an incomplete outcome"
+            }));
+        }
         for (k, v) in extra {
             if !v.is_null() {
                 state.insert((*k).to_string(), v.clone());
@@ -2157,6 +2171,7 @@ pub struct Args {
     pub out: Option<String>,
     pub trace: Option<String>,
     pub max_cost: Option<f64>,
+    pub max_tokens: Option<i64>,
     pub unpriced_call_usd: Option<f64>,
     pub timeout: Num,
     pub max_calls: Option<String>,
@@ -2318,7 +2333,7 @@ pub fn task(args: &mut Args, kind: &str, identity: &Value) -> i32 {
             args.findings_pr = findings_pr(args)?;
         }
         let price = |v: Option<f64>| v.map(|f| if f.is_nan() { Value::String("nan".into()) } else { pyjson::float_value(f) });
-        let r = Arc::new(Run::new(given(&args.trace).map(Path::new), price(args.max_cost).as_ref(), price(args.unpriced_call_usd).as_ref())?);
+        let r = Arc::new(Run::new_with_options(given(&args.trace).map(Path::new), price(args.max_cost).as_ref(), price(args.unpriced_call_usd).as_ref(), args.max_tokens.map(Value::from).as_ref(), Some(&Value::from(3)))?);
         run = Some(Arc::clone(&r));
         if let Some(trace) = &r.trace {
             py::write_file(&py::join(trace, "material.txt"), material.as_bytes())?; // as sent, on every OS
@@ -2501,6 +2516,7 @@ fn options(command: &str) -> Vec<Opt> {
         opt(&["--pipeline"], "pipeline", Kind::Str, s("a plan JSON file (default: the built-in one-call plan)")),
         opt(&["--out"], "out", Kind::Str, s("write the result here instead of stdout")),
         opt(&["--trace"], "trace", Kind::Str, s("new/empty folder outside the repository for trace, replies and material (0700)")),
+        opt(&["--max-tokens"], "max_tokens", Kind::Int, s("stop new calls at this recorded token total; unknown usage blocks admission")),
         opt(&["--max-cost"], "max_cost", Kind::Float, s("stop starting calls once the cost reaches this many USD")),
         opt(&["--unpriced-call-usd"], "unpriced_call_usd", Kind::Float, s("fallback cost for any attempt reporting no price; required with --max-cost")),
         opt(&["--timeout"], "timeout", Kind::Float, Some(format!(
@@ -2896,6 +2912,7 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
         pipeline: get("pipeline"),
         out: get("out"),
         trace: get("trace"),
+        max_tokens: get("max_tokens").and_then(|v| py::int(&v)),
         max_cost: get("max_cost").and_then(|v| py::float(&v).ok()),
         unpriced_call_usd: get("unpriced_call_usd").and_then(|v| py::float(&v).ok()),
         timeout: get("timeout").and_then(|v| py::float(&v).ok()).map_or(TIMEOUT_S, Num::Float),

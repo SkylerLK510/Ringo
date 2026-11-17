@@ -290,6 +290,26 @@ class RunHookTest(unittest.TestCase):
 
 
 class TokenBudgetTest(unittest.TestCase):
+    def test_partial_usage_records_known_overshoot_and_running_budget(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d, 't'), max_tokens=100)
+            run.record({'step': 's', 'attempt': 1, 'status': 'ok', 'usage': {'input': 120}})
+            state = json.loads(Path(d, 't', 'state.json').read_text())
+            self.assertEqual(state['budget']['recorded_tokens'], 120)
+            self.assertEqual(state['budget']['overshoot'], 1)
+            with self.assertRaises(harness.BudgetExceeded):
+                run.reserve()
+
+    def test_invalid_counter_values_stay_unknown(self):
+        for bad in (None, True, -1, 1.5):
+            with self.subTest(bad=bad):
+                run = harness.Run(max_tokens=100)
+                run.record({'step': 's', 'attempt': 1, 'status': 'ok',
+                            'usage': {'input': bad, 'output': 1, 'cache_read': 0, 'cache_write': 0}})
+                self.assertEqual(run.tokens['input'], 0)
+                with self.assertRaises(harness.BudgetExceeded):
+                    run.reserve()
+
     def test_the_cap_stops_admitting_calls_once_reached(self):
         run = harness.Run(max_tokens=100)
         run.reserve()

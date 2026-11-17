@@ -751,12 +751,14 @@ class Run:
                 rec['output_tokens_per_second'] = output_rate(rec.get('usage'), rec['seconds'])
             usage = rec.get('usage')
             for k in self.tokens:
-                self.tokens[k] += (usage or {}).get(k) or 0
+                value = usage.get(k) if isinstance(usage, dict) else None
+                if type(value) is int and value >= 0:
+                    self.tokens[k] += value
             if type((usage or {}).get('reasoning_output')) is int:
                 self.reasoning = (self.reasoning or 0) + usage['reasoning_output']
             if rec.get('status') in PAID_STATUSES:
                 self.completed += 1
-                if not isinstance(usage, dict) or not all(k in usage for k in TOKEN_KEYS):
+                if not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in TOKEN_KEYS):
                     self.untokened += 1
                 price = valid_price((usage or {}).get('cost_usd'))
                 if price is not None:
@@ -765,7 +767,7 @@ class Run:
                     self.cost += self.unpriced_call_usd
                 else:
                     self.unpriced += 1
-                if self.max_tokens is not None and all(k in (usage or {}) for k in TOKEN_KEYS):
+                if self.max_tokens is not None:
                     recorded = sum(self.tokens.values())
                     if recorded > self.max_tokens:
                         rec['budget_overshoot_tokens'] = recorded - self.max_tokens
@@ -776,6 +778,10 @@ class Run:
                 if raw:  # the artifact keeps the whole output, the record a bounded head of it
                     data = raw.encode('utf-8', 'replace')
                     excerpt = min(len(data), RAW_LIMIT)
+                    artifact = self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt"
+                    temporary = artifact.with_suffix('.tmp')
+                    temporary.write_bytes(data)
+                    temporary.replace(artifact)
                     rec['raw_excerpt'] = {'artifact': f"steps/{rec['step']}.{rec['attempt']}.raw.txt",
                                           'total_bytes': len(data), 'excerpt_bytes': excerpt,
                                           'sha256': hashlib.sha256(data).hexdigest(),
@@ -786,11 +792,9 @@ class Run:
                 with open(self.trace / 'trace.jsonl', 'a', encoding='utf-8') as f:
                     f.write(json.dumps(rec) + '\n')
                 self.last = {k: rec[k] for k in ('step', 'attempt', 'status') if k in rec}
-                self._state('running')
+                self.state('running')
                 if reply is not None:
                     (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.txt").write_text(reply, encoding='utf-8')
-                if raw:
-                    (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt").write_bytes(data)
 
             if self.progress:
                 self.progress(rec)
@@ -952,7 +956,7 @@ def checker_pass(plan, checker_spec):
         raise ValueError('a checker backend needs a plan with a verdicts pass')
 
 
-def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_S, scope=None, checker_spec=None, left=None):
+def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_S, scope=None, checker_spec=None, left=None, namespace=None):
     """Run every pass of the plan, then assemble; returns (result text, stats). Each reply in the wrong shape is
     asked once more; a failed call is retried once; a command that cannot start stops the run. The number of calls
     is structural: one per pass (one per batch of findings for a batched checker, at most
@@ -982,7 +986,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
         if not first:
             gate.wait()
         try:
-            return attempts(label, p, message)
+            return attempts(f'{namespace}.{label}' if namespace else label, p, message)
         except BaseException as exc:
             with gate_lock:
                 if not failures:
@@ -1173,7 +1177,7 @@ def task(args, kind):
                     pass
         if getattr(args, 'findings_json', None):
             args.findings_pr = findings_pr(args)
-        run = Run(args.trace, args.max_cost, args.unpriced_call_usd)
+        run = Run(args.trace, args.max_cost, args.unpriced_call_usd, max_tokens=args.max_tokens)
         if run.trace:
             (run.trace / 'material.txt').write_text(material, encoding='utf-8', newline='')  # as sent, on every OS
             (run.trace / 'plan.json').write_text(json.dumps(plan, indent=1), encoding='utf-8')
@@ -1269,6 +1273,7 @@ def main(argv=None, *, prog='harness.py'):
         p.add_argument('--pipeline', help='a plan JSON file (default: the built-in one-call plan)')
         p.add_argument('--out', help='write the result here instead of stdout')
         p.add_argument('--trace', help='new/empty folder outside the repository for trace, replies and material (0700)')
+        p.add_argument('--max-tokens', type=int, help='stop new calls at this recorded token total; unknown usage blocks admission')
         p.add_argument('--max-cost', type=float, help='stop starting calls once the cost reaches this many USD')
         p.add_argument('--unpriced-call-usd', type=float,
                        help='fallback cost for any attempt reporting no price; required with --max-cost')

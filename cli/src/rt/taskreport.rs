@@ -498,7 +498,7 @@ pub fn build(
         let (ledger, _, _) = ledger(group)?;
         statuses.insert(name, ledger);
     }
-    let paid_rows = rows.iter().filter(|r| matches!(r["status"], Value::String(ref s) if PAID.contains(&s.as_str()))).count() as i64;
+    let paid_rows = kept.iter().filter(|r| matches!(r.get("status"), Some(Value::String(s)) if PAID.contains(&s.as_str()))).count() as i64;
 
     let has_tokens = |rec: &Value| -> bool {
         rec.get("usage")

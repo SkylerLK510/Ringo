@@ -421,7 +421,10 @@ fn check_lines(out: &mut Vec<String>, checks: &Value, keep: usize) -> Result<()>
         if !matches!(status, Value::String(s) if s == "pass") {
             let name = c.get("name")?;
             let log = concat(c.get("stdout")?, c.get("stderr")?)?;
-            out.push(format!("Check {} {}:\n{}", py::value_repr(name), py::value_str(status), py::tail(&log, keep)));
+            let excerpt = if keep == 6000 && log.chars().count() > keep {
+                format!("{}\n...\n{}", log.chars().take(3000).collect::<String>(), py::tail(&log, 3000))
+            } else { py::tail(&log, keep).to_string() };
+            out.push(format!("Check {} {}:\n{}", py::value_repr(name), py::value_str(status), excerpt));
         }
     }
     Ok(())
@@ -1119,9 +1122,9 @@ pub fn load_spec(path: &Path) -> Result<Value> {
 
 #[cfg(unix)]
 fn check_spec(spec: &mut Value, path: &str) -> Result<()> {
-    const ALLOWED: [&str; 26] = [
+    const ALLOWED: [&str; 27] = [
         "version", "brief", "material", "files", "fixtures", "checks", "council", "rubric", "writer", "judge",
-        "samples", "first_judges", "max_rounds", "max_seconds", "timeout_s", "max_cost", "unpriced_call_usd",
+        "samples", "first_judges", "max_rounds", "max_seconds", "timeout_s", "max_cost", "max_tokens", "unpriced_call_usd",
         "allow_tool_backends", "allow_execution", "roles", "protocol", "spec_tests", "candidates", "scripts",
         "protocol_repair", "no_regression",
     ];
@@ -1144,6 +1147,11 @@ fn check_spec(spec: &mut Value, path: &str) -> Result<()> {
     for key in required {
         if !m.get(*key).and_then(Value::as_str).is_some_and(|s| !py::strip(s).is_empty()) {
             return Err(Error::value(format!("{key} is required")));
+        }
+    }
+    if let Some(cap) = m.get("max_tokens").filter(|v| !v.is_null()) {
+        if !is_int(cap) || !py::int_of(cap).is_some_and(|n| n >= 0) {
+            return Err(Error::value("max_tokens must be a non-negative integer or None"));
         }
     }
     need(!m.get("material").is_none_or(Value::is_string), "material must be text")?;
@@ -2322,7 +2330,7 @@ pub fn run_with_progress(spec_path: &Path, out: &Path, call_fn: Option<&CallFn>,
     let here = py::realpath(&crate::ringo_home())?;
     let spec = load_spec(spec_path)?;
     let out = harness::outside_repo(out, "workflow run")?;
-    let accounting = std::sync::Arc::new(harness::Run::new(Some(&out), spec.get("max_cost"), spec.get("unpriced_call_usd"))?);
+    let accounting = std::sync::Arc::new(harness::Run::new_with_options(Some(&out), spec.get("max_cost"), spec.get("unpriced_call_usd"), spec.get("max_tokens"), Some(&Value::from(3)))?);
     let start = || -> Result<Value> {
         write_json(&out.join("spec.json"), &spec)?;
         let mut identity = items_of(implementation)?.clone();

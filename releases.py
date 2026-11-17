@@ -18,7 +18,7 @@ RUNTIME = ('ringo.py', 'harness.py', 'taskreport.py', 'backends.py', 'pipelines.
            'workflow.py', 'spec_runner.py', 'evaluate.py', 'improve.py', 'releases.py', 'latency.py', 'research.py')
 # Files that joined the runtime after releases already existed. New bundles always include them; a bundle staged
 # before one joined still verifies without it, since that bundle has no feature that runs it.
-LATER_RUNTIME = {'spec_runner.py', 'research.py'}
+LATER_RUNTIME = {'spec_runner.py', 'research.py', 'taskreport.py'}
 IDENT = re.compile(r'[0-9a-f]{64}')
 # A release may also carry the Rust runtime (the `ringo` binary built from cli/), with the differential gate report
 # that proved it sends the same requests as this Python runtime. Then review, design and work run the bundled binary.

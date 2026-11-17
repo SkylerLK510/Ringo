@@ -278,7 +278,7 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
     outcome = {
         'final_state': final_state,
         'calls_completed': (summary.get('calls', 0) - summary.get('unfinished_calls', 0))
-                           if summary.get('calls') is not None else sum(1 for r in paid_rows),
+                           if summary.get('calls') is not None else sum(1 for r in kept if r.get('status') in PAID),
         'calls_failed': sum(1 for rec in kept if rec.get('status') in FAILED),
         'stopped_calls': stopped,
         'elapsed_seconds': summary.get('elapsed_s'),
