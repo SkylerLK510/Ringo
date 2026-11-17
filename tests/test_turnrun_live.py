@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import turnrun_live as live
 from turnrun_campaign import demonstration_plan, digest
-from turnrun_native import NativeAttemptError
+from turnrun_native import NativeAttemptError, PROMPT_FRAME_BYTES, prompt_fits
 from turnrun_native_bridge import arguments
 from turnrun import ledger_entries, usage_of
 
@@ -60,8 +60,18 @@ class TransportTest(unittest.TestCase):
                 data += chunk
             return [json.loads(line) for line in data.splitlines()]
 
-    def test_worst_case_escaped_prompt_reaches_provider_once(self):
+    def test_prompt_too_large_once_escaped_refuses_before_provider(self):
+        # 128 KiB of control bytes escapes to ~786 KB, past the 512 KiB frame
+        # every downstream bridge re-sends it in.
         prompt = '\x00' * (128 * 1024)
+        with self.service() as service:
+            output = self.request(service, prompt)
+        self.assertTrue(output[-1].get('is_error'))
+        self.assertEqual(self.calls, [])
+
+    def test_escaped_prompt_that_fits_the_frame_reaches_provider_once(self):
+        prompt = '\x00' * (PROMPT_FRAME_BYTES // 6 - 1)
+        self.assertTrue(prompt_fits(prompt))
         with self.service() as service:
             output = self.request(service, prompt)
         self.assertFalse(output[-1].get('is_error', False))

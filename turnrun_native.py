@@ -23,6 +23,15 @@ from turnrun_isolation import DockerSandbox
 
 AUTHORITY = 'api.anthropic.com:443'
 FRAME_BYTES = 512 * 1024
+PROMPT_BYTES = 128 * 1024
+# Each downstream frame re-serializes the prompt with JSON escaping, so admit a
+# prompt only when its escaped form leaves room for the rest of the frame.
+PROMPT_FRAME_BYTES = FRAME_BYTES - 64 * 1024
+
+
+def prompt_fits(prompt):
+    return (isinstance(prompt, str) and len(prompt.encode()) <= PROMPT_BYTES
+            and len(json.dumps(prompt).encode()) <= PROMPT_FRAME_BYTES)
 CHUNK_BYTES = 16384
 USAGE_FIELDS = {'input': 'input_tokens', 'cache_write': 'cache_creation_input_tokens',
                 'cache_read': 'cache_read_input_tokens', 'output': 'output_tokens'}
@@ -332,7 +341,7 @@ class NativeBroker(DockerSandbox):
         if 'RINGO_CHILD' in os.environ and not offline:
             raise ValueError('live native execution refuses RINGO_CHILD; use a standalone session')
         self.validate_model(model)
-        if not isinstance(prompt, str) or len(prompt.encode()) > 128 * 1024:
+        if not prompt_fits(prompt):
             raise ValueError('prompt exceeds its limit')
         if not isinstance(instruction, str) or len(instruction.encode()) > 4096:
             raise ValueError('instruction exceeds its limit')

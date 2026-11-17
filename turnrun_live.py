@@ -22,7 +22,7 @@ from turnrun import CampaignLock, clean_env, ledger_append, outside_repo, sha256
 from turnrun_broker import WorkerEndpoint, unique_object, reject_constant
 from turnrun_campaign import Campaign, admission_schedule, digest, policy, validate_plan
 from turnrun_isolation import DockerSandbox, IMAGE, bundle
-from turnrun_native import NativeAttemptError, NativeBroker
+from turnrun_native import NativeAttemptError, NativeBroker, prompt_fits
 
 ROOT = Path(__file__).resolve().parent
 SOURCES = ('turnrun_live.py', 'turnrun_native.py', 'turnrun_native_bridge.py', 'turnrun_campaign.py',
@@ -149,7 +149,7 @@ class SessionTransport:
         if not isinstance(request, dict) or set(request) != {'prompt', 'resume'}:
             raise ValueError('invalid broker request fields')
         prompt, resume = request['prompt'], request['resume']
-        if not isinstance(prompt, str) or len(prompt.encode()) > 128*1024:
+        if not prompt_fits(prompt):
             raise ValueError('invalid broker prompt')
         if resume is not None and (not isinstance(resume, str) or resume not in self.sessions):
             raise ValueError('unobserved native continuation ID')
