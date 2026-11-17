@@ -10,6 +10,7 @@ pub mod harness;
 pub mod pipelines;
 pub mod py;
 pub mod pyjson;
+pub mod taskreport;
 pub mod terminal;
 pub mod wait;
 pub mod workflow;

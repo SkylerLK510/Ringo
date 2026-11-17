@@ -1,4 +1,5 @@
 """Offline checks of harness.py and pipelines.py: fake backends only, no model calls."""
+import hashlib
 import io
 import json
 import os
@@ -138,8 +139,9 @@ class CallTest(unittest.TestCase):
         full = {'input_tokens': 3, 'cache_creation_input_tokens': 7, 'cache_read_input_tokens': 90, 'output_tokens': 4}
         cases = [(full, {'input': 3, 'cache_write': 7, 'cache_read': 90, 'output': 4}),
                  ({'input_tokens': 0, 'output_tokens': 0}, zero),  # reported zeros are counts, not a missing report
-                 ({'input_tokens': 5, 'output_tokens': 'bad', 'cache_read_input_tokens': 1.5}, {'input': 5, 'cache_write': 0, 'cache_read': 0}),
-                 ({'input_tokens': True, 'output_tokens': 9, 'cache_creation_input_tokens': -1}, {'cache_write': 0, 'cache_read': 0, 'output': 9}),
+                 ({'input_tokens': 5, 'output_tokens': 'bad', 'cache_read_input_tokens': 1.5}, {'input': 5, 'cache_write': 0}),
+                 ({'input_tokens': True, 'output_tokens': 9, 'cache_creation_input_tokens': -1}, {'cache_read': 0, 'output': 9}),
+                 # an absent cache count is zero; a present but invalid one stays unknown
                  # neither count is a non-negative int (a bool or a float is not one): unknown, so no token fields
                  ({'input_tokens': True, 'output_tokens': 4.0, 'cache_read_input_tokens': 50}, {}),
                  ({}, {}), (None, {}), ([1], {})]
@@ -418,7 +420,33 @@ class RunTest(unittest.TestCase):
             rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
             self.assertEqual([r['status'] for r in rows], ['started', 'error'])
             raw = Path(d, 't', 'steps', f"{rows[1]['step']}.1.raw.txt")
-            self.assertEqual(raw.stat().st_size, harness.RAW_LIMIT)
+            self.assertEqual(raw.stat().st_size, 1_500_000)  # the whole output, not a cap
+            excerpt = rows[1]['raw_excerpt']
+            self.assertEqual(excerpt['total_bytes'], raw.stat().st_size)
+            self.assertEqual(excerpt['omitted_bytes'], 500_000)  # the head stops at RAW_LIMIT; the artifact has all
+            self.assertEqual(excerpt['sha256'], hashlib.sha256(b'R' * 1_500_000).hexdigest())
+
+    def test_a_failed_raw_artifact_write_still_records_the_attempt(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d, 't'))
+            run.reserve()
+            run.record({'step': 'missing/s', 'attempt': 1, 'status': 'error', 'error': 'e'}, raw='whole output')
+            rows = [json.loads(x) for x in Path(d, 't', 'trace.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            excerpt = rows[0]['raw_excerpt']
+            self.assertIsNone(excerpt['artifact'])
+            self.assertEqual(excerpt['artifact_error'], harness.ARTIFACT_ERROR)
+            self.assertEqual(excerpt['omission_note'], harness.ARTIFACT_ERROR)  # no claim of a whole artifact
+            self.assertEqual(excerpt['head'], 'whole output')
+            self.assertEqual(list(Path(d, 't', 'steps').rglob('*.tmp')), [])
+
+    def test_total_tokens_needs_four_non_negative_ints(self):
+        self.assertEqual(harness.total_tokens({'input': 1, 'cache_write': 2, 'cache_read': 3, 'output': 4}), 10)
+        for bad in ({'input': 1.5, 'cache_write': 2, 'cache_read': 3, 'output': 4},
+                    {'input': -1, 'cache_write': 2, 'cache_read': 3, 'output': 4},
+                    {'input': True, 'cache_write': 2, 'cache_read': 3, 'output': 4},
+                    {'input': 1, 'cache_write': 2, 'cache_read': 3}, None, [1]):
+            self.assertIsNone(harness.total_tokens(bad), bad)
 
     def test_an_input_refused_as_too_large_is_not_sent_again(self):
         calls = []

@@ -4,6 +4,7 @@
 
 pub mod parse;
 pub mod rt;
+pub mod task;
 
 pub mod images;
 pub mod turn_policy;
@@ -615,6 +616,10 @@ pub struct Session {
     pub codex_home: PathBuf,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
+    /// The explicitly selected persistent task, if any. Ordinary conversations leave this None.
+    pub selected_task: Option<String>,
+    /// Why a task named by a resumed conversation could not be selected; chat still resumes normally.
+    pub selected_task_error: Option<String>,
     pub max_jobs: usize,
     /// The backend Ringo pipelines use.
     pub backend: String,
@@ -945,7 +950,7 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 /// The agent child's environment: no API keys or endpoint overrides (subscription logins only), and RINGO_CHILD
-/// so an agent cannot start Ringo again.
+/// so an agent cannot start another shell; bounded reviews/designs remain available.
 fn agent_env(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let k = key.to_string_lossy();
@@ -1061,7 +1066,8 @@ impl Session {
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(), max_jobs: 3,
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(),
+                     selected_task: None, selected_task_error: None, max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
@@ -1082,6 +1088,27 @@ impl Session {
 
     pub fn job(&self, id: usize) -> Result<&Job, String> {
         self.jobs.get(id.wrapping_sub(1)).ok_or(format!("no job #{id}"))
+    }
+
+    /// The persistent task store for this exact repository. It is opened only for explicit task operations (or when a
+    /// resumed conversation names a task), so damaged task state never prevents ordinary chat.
+    pub fn task_store(&self) -> Result<task::TaskStore, String> {
+        task::TaskStore::new(&self.root, self.repo.clone(), self.git).map_err(|e| e.to_string())
+    }
+
+    pub fn select_task(&mut self, id: &str) -> Result<task::Task, String> {
+        let task = self.task_store()?.load(id).map_err(|e| e.to_string())?;
+        self.selected_task = Some(task.id.clone());
+        self.selected_task_error = None;
+        Ok(task)
+    }
+
+    pub fn selected_task(&self) -> Result<Option<task::Task>, String> {
+        self.selected_task.as_deref().map(|id| self.select_task_read(id)).transpose()
+    }
+
+    fn select_task_read(&self, id: &str) -> Result<task::Task, String> {
+        self.task_store()?.load(id).map_err(|e| e.to_string())
     }
 
     /// The program an agent runs: as set (tests point it at a fake), else its entry's (an agent added after the
@@ -1258,6 +1285,13 @@ impl Session {
         self.about = kept["about"].as_str().unwrap_or_default().to_string();
         self.separate = kept["separate"].as_bool().unwrap_or(false);
         self.reached_before = list_names(&kept["reached"]).filter_map(Agent::from_name).collect();
+        self.selected_task = None;
+        self.selected_task_error = None;
+        if let Some(id) = kept["task"].as_str() {
+            if let Err(why) = self.select_task(id) {
+                self.selected_task_error = Some(why);
+            }
+        }
         Some(kept)
     }
 
@@ -1276,7 +1310,8 @@ impl Session {
         usage.sort();
         let kept = serde_json::json!({"threads": self.threads(), "told": self.carry(), "records": self.carry_record(),
                                       "separate": self.separate, "reached": reached, "usage": usage,
-                                      "conversation": conversation, "folder": self.repo, "about": about, "saved": saved});
+                                      "conversation": conversation, "folder": self.repo, "about": about, "saved": saved,
+                                      "task": self.selected_task});
         let (path, part) = (self.dir.join(KEPT), self.dir.join(format!("{KEPT}.part")));
         // written whole, then renamed: a crash mid-write leaves the last one
         fs::write(&part, kept.to_string()).and_then(|_| fs::rename(&part, &path)).map_err(|e| format!("{}: {e}", path.display()))?;

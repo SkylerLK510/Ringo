@@ -114,3 +114,17 @@ Example: the preceding runtime publication's two native reviews reported
 269,849 uncached input + 17,920 cached input + 0 cache-write + 1,184 output =
 **288,953 tokens**. That is reported usage, not a new benchmark score or an
 estimate of the outer agent's entire session consumption.
+
+## Optional admission limit and reporting
+
+`review` and `design` accept `--max-tokens N`; `work` specs accept `"max_tokens": N`.
+The nonnegative integer limits admission using recorded input, cache-read, cache-write
+and output counters across all attempts. In-flight calls may exceed the limit; their
+known overshoot is reported. Missing or invalid counters block subsequent calls under
+a token limit. This is an admission limit, not a provider-side generation cap.
+
+Private traces retain full failed output and bounded ledger excerpts. `task-report.json`
+derives usage and coverage from that ledger, including paid attempts with unknown usage.
+Python library callers can opt into feedback/material byte caps and coverage-tracked
+review batches; those prompt-bounding options are not exposed by the native CLI yet.
+Byte counts do not establish token savings or quality improvements.

@@ -60,7 +60,7 @@ HARD_FLOOR_S = 900  # the limiter never stops a call sooner than this, however s
 PROBE_MESSAGE = 'Reply with the single word OK.'
 PROBE_TIMEOUT_S = 120
 STALL_FACTOR = 3  # past this multiple of the slowest finished comparable call, a running call looks stalled
-RAW_LIMIT = 1_000_000  # bytes of a failed call's stdout kept in the trace
+RAW_LIMIT = 1_000_000  # bytes of a failed call's stdout kept inline in a record; the artifact keeps the whole output
 
 
 class BudgetExceeded(Exception):
@@ -88,6 +88,9 @@ def valid_price(x):
     return x if ok else None
 
 
+ARTIFACT_ERROR = 'the whole output could not be written; only the head in this record survives'
+
+
 def claude_usage(reply):
     """Usage from a Claude CLI JSON reply; missing input/output counts stay unknown, the price stays."""
     u = reply.get('usage') if isinstance(reply.get('usage'), dict) else {}
@@ -97,8 +100,11 @@ def claude_usage(reply):
     models = reply.get('modelUsage')
     if not any(type(u.get(k)) is int and u[k] >= 0 for k in ('input_tokens', 'output_tokens')):
         return {'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
-    usage = {'cache_write': tokens('cache_creation_input_tokens'), 'cache_read': tokens('cache_read_input_tokens'),
-             'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
+    usage = {}
+    for field, key in (('cache_write', 'cache_creation_input_tokens'), ('cache_read', 'cache_read_input_tokens')):
+        if key not in u or (type(u[key]) is int and u[key] >= 0):  # an absent cache count is zero
+            usage[field] = tokens(key)  # a present but invalid one stays unknown, so a token cap cannot pass it
+    usage.update(cost_usd=reply.get('total_cost_usd'), models=sorted(models) if isinstance(models, dict) else [])
     for field, key in (('input', 'input_tokens'), ('output', 'output_tokens')):
         if type(u.get(key)) is int and u[key] >= 0:
             usage[field] = u[key]
@@ -643,7 +649,10 @@ def stop_reason(exc, watch):
 
 
 def total_tokens(usage):
-    return sum(usage[k] for k in TOKEN_KEYS) if isinstance(usage, dict) and all(k in usage for k in TOKEN_KEYS) else None
+    """The sum of a usage's four token counts, or None unless all four are non-negative ints."""
+    if isinstance(usage, dict) and all(type(usage.get(k)) is int and usage[k] >= 0 for k in TOKEN_KEYS):
+        return sum(usage[k] for k in TOKEN_KEYS)
+    return None
 
 def write_state(folder, state):
     """Atomically replace folder/state.json: the small run state an agent waits on (`ringo.py wait`) and reads
@@ -666,14 +675,26 @@ class Run:
     counts calls but never caps them: the plan's structure (passes, batches, one retry, one repair) or the
     workflow's rounds and samples decide how many calls a task needs, so a cap could only cut a task short."""
 
-    def __init__(self, trace_dir=None, max_cost=None, unpriced_call_usd=None):
-        """unpriced_call_usd: a declared cost per call for backends that report none (None: unknown)."""
+    def __init__(self, trace_dir=None, max_cost=None, unpriced_call_usd=None, max_tokens=None, blocker_threshold=3):
+        """unpriced_call_usd: a declared cost per call for backends that report none (None: unknown).
+        max_tokens: a whole-task token cap over every recorded call (None: off, today's behavior exactly). It
+        stops ADMITTING new calls; it never kills a call that is already running — an in-flight call that
+        pushes past the cap is recorded as overshoot and counted. blocker_threshold: after this many failures
+        with an identical signature, each further one is flagged as a repeated blocker (None: off)."""
         for label, value in (('max_cost', max_cost), ('unpriced_call_usd', unpriced_call_usd)):
             if value is not None and valid_price(value) is None:
                 raise ValueError(f'{label} must be a finite, non-negative number')
+        if max_tokens is not None and (type(max_tokens) is not int or max_tokens < 0):
+            raise ValueError('max_tokens must be a non-negative integer or None')
+        if blocker_threshold is not None and (type(blocker_threshold) is not int or blocker_threshold < 1):
+            raise ValueError('blocker_threshold must be a positive integer or None')
         self.trace = Path(trace_dir) if trace_dir else None
-        self.max_cost, self.unpriced_call_usd = max_cost, unpriced_call_usd
+        self.max_cost, self.unpriced_call_usd, self.max_tokens = max_cost, unpriced_call_usd, max_tokens
+        self.blocker_threshold = blocker_threshold
         self.calls, self.cost, self.unpriced, self.untokened = 0, 0.0, 0, 0
+        self.budget_overshoot_calls = 0
+        self.blockers = []  # one compact entry per repeated-failure signature past the threshold
+        self._blocker_counts = {}
         self.clock_started, self.completed, self.progress = time.monotonic(), 0, None
         self.admission_refusals, self.incidents = 0, 0
         self.tokens = dict.fromkeys(TOKEN_KEYS, 0)
@@ -697,14 +718,23 @@ class Run:
         self.state('running')
 
     def reserve(self):
-        """Count a call about to start, or raise BudgetExceeded under a cost cap. A cost cap needs every earlier
-        call's cost: once one is unknown (a backend that reports none, a failed call) the cap cannot be kept, so no
-        call starts. The cap stops new calls; calls under a cost cap run one at a time."""
+        """Count a call about to start, or raise BudgetExceeded under a cap. A cost cap needs every earlier
+        call's cost: once one is unknown (a backend that reports none, a failed call) the cap cannot be kept, so
+        no call starts. The token cap is the same at the task's scope: it sums every recorded call's tokens
+        (delegation, repair and review included), and once a paid call reported no token counts the cap cannot
+        be kept either. Caps stop new calls only: a call that is already running is never killed, and one that
+        overshoots the token cap is recorded as overshoot."""
         with self.lock:
             if self.max_cost is not None and self.unpriced:
                 raise BudgetExceeded(f'the cost of {self.unpriced} calls is unknown, so the ${self.max_cost} cap cannot be kept')
             if self.max_cost is not None and self.cost >= self.max_cost:
                 raise BudgetExceeded(f'cost cap reached (${self.cost:.4f} of ${self.max_cost:.4f})')
+            recorded = sum(self.tokens.values())
+            if self.max_tokens is not None and self.untokened:
+                raise BudgetExceeded(f'{self.untokened} calls reported no token counts, so the '
+                                     f'{self.max_tokens:,}-token cap cannot be kept')
+            if self.max_tokens is not None and recorded >= self.max_tokens:
+                raise BudgetExceeded(f'token cap reached ({recorded:,} of {self.max_tokens:,} tokens)')
             self.calls += 1
 
     def refuse_reservation(self):
@@ -716,22 +746,29 @@ class Run:
             self.admission_refusals += 1
 
     def record(self, rec, reply=None, raw=None):
-        """Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, kept (first
-        RAW_LIMIT bytes) so the failure can be diagnosed. Token sums stay ints: a paid attempt that reported no
-        usage, or usage without token fields, counts under untokened_calls, as an unknown price counts under
-        unpriced_calls."""
+        """Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, written whole
+        to the step's .raw.txt artifact (a private 0700 folder) while the record keeps only a bounded excerpt of
+        it — head first, with the total size, the full output's sha256 and the artifact path, so evidence past
+        the excerpt stays recoverable. Token sums stay ints: a paid attempt that reported no usage, or usage
+        without token fields, counts under untokened_calls, as an unknown price counts under unpriced_calls. A
+        failure whose signature repeats past blocker_threshold is flagged in the record and kept in self.blockers
+        (measurement only: it changes no prompt); a paid call that pushes recorded tokens past max_tokens is
+        tagged with its overshoot."""
         with self.lock:
             rec = dict(rec)
             if 'seconds' in rec:
                 rec['output_tokens_per_second'] = output_rate(rec.get('usage'), rec['seconds'])
-            usage = rec.get('usage')
-            for k in self.tokens:
-                self.tokens[k] += (usage or {}).get(k) or 0
+            usage = rec.get('usage') if isinstance(rec.get('usage'), dict) else None  # malformed usage is unknown
+            paid = rec.get('status') in PAID_STATUSES
+            for k in self.tokens:  # only settled attempts count, as in the task report's ledger
+                value = usage.get(k) if paid and usage else None
+                if type(value) is int and value >= 0:
+                    self.tokens[k] += value
             if type((usage or {}).get('reasoning_output')) is int:
                 self.reasoning = (self.reasoning or 0) + usage['reasoning_output']
-            if rec.get('status') in PAID_STATUSES:
+            if paid:
                 self.completed += 1
-                if not isinstance(usage, dict) or not all(k in usage for k in TOKEN_KEYS):
+                if not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in TOKEN_KEYS):
                     self.untokened += 1
                 price = valid_price((usage or {}).get('cost_usd'))
                 if price is not None:
@@ -740,19 +777,67 @@ class Run:
                     self.cost += self.unpriced_call_usd
                 else:
                     self.unpriced += 1
+                if self.max_tokens is not None:
+                    recorded = sum(self.tokens.values())
+                    if recorded > self.max_tokens:
+                        rec['budget_overshoot_tokens'] = recorded - self.max_tokens
+                        self.budget_overshoot_calls += 1
+            if self.blocker_threshold is not None and rec.get('status') in ('error', 'fatal'):
+                self._blocker(rec, raw)
             if self.trace:
+                if raw:  # the artifact keeps the whole output, the record a bounded head of it
+                    data = raw.encode('utf-8', 'replace')
+                    excerpt = min(len(data), RAW_LIMIT)
+                    artifact = self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt"
+                    temporary = artifact.with_suffix('.tmp')
+                    saved = f"steps/{rec['step']}.{rec['attempt']}.raw.txt"
+                    try:  # a failed artifact write must not lose the paid attempt's trace record
+                        temporary.write_bytes(data)
+                        temporary.replace(artifact)
+                    except OSError:
+                        saved = None
+                        try:
+                            temporary.unlink()
+                        except OSError:
+                            pass
+                    rec['raw_excerpt'] = {'artifact': saved,
+                                          'total_bytes': len(data), 'excerpt_bytes': excerpt,
+                                          'sha256': hashlib.sha256(data).hexdigest(),
+                                          'head_bytes': excerpt, 'omitted_bytes': len(data) - excerpt,
+                                          'omission_note': 'the record keeps only the head; the artifact holds the '
+                                                          'whole output, and its sha256 above proves it',
+                                          'head': data[:excerpt].decode('utf-8', 'replace')}
+                    if saved is None:  # nothing beyond the head is recoverable
+                        rec['raw_excerpt'].update(omission_note=ARTIFACT_ERROR, artifact_error=ARTIFACT_ERROR)
                 with open(self.trace / 'trace.jsonl', 'a', encoding='utf-8') as f:
                     f.write(json.dumps(rec) + '\n')
                 self.last = {k: rec[k] for k in ('step', 'attempt', 'status') if k in rec}
-                self._state('running')
+                self.state('running')
                 if reply is not None:
                     (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.txt").write_text(reply, encoding='utf-8')
-                if raw:
-                    (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt").write_bytes(
-                        raw.encode('utf-8', 'replace')[:RAW_LIMIT])
 
             if self.progress:
                 self.progress(rec)
+
+    def _blocker(self, rec, raw):
+        """Repeated identical failures get one signature (status plus a hash of the raw output, or of the error
+        when no output was captured); past blocker_threshold the record is flagged and a compact checkpoint is
+        kept for the task report. Detection only: no prompt or feedback text is changed."""
+        data = raw.encode('utf-8', 'replace') if raw else (rec.get('error') or '').encode('utf-8', 'replace')
+        signature = f"{rec.get('status')}:{hashlib.sha256(data).hexdigest()}"
+        count = self._blocker_counts.get(signature, 0) + 1
+        self._blocker_counts[signature] = count
+        if count < self.blocker_threshold:
+            return
+        rec['blocker_repeat'] = count
+        entry = {'signature': signature, 'count': count, 'step': rec.get('step'), 'attempt': rec.get('attempt'),
+                 'sha256': hashlib.sha256(data).hexdigest(), 'total_bytes': len(data), 'at': rec.get('started')}
+        for i, previous in enumerate(self.blockers):
+            if previous['signature'] == signature:
+                self.blockers[i] = entry
+                break
+        else:
+            self.blockers.append(entry)
 
     def finish(self, kind, seconds, usage):
         with self.lock:
@@ -782,9 +867,55 @@ class Run:
             return self.incident_dir
 
     def state(self, status, **extra):
-        """Write state.json with status ('running', 'done', 'failed' or a work report status) and artifact paths."""
+        """Write state.json with status ('running', 'done', 'failed' or a work report status) and artifact paths.
+        When the run leaves 'running' it also writes the read-only whole-task report as a private artifact
+        (<trace>/task-report.json): measurement only, never sent to a model."""
         with self.lock:
-            self._state(status, **extra)
+            report = None
+            if status != 'running' and self.trace:
+                report = self._write_task_report(final_state=status)
+            budget = None
+            if self.max_tokens is not None:  # the whole-task cap: recorded tokens, and how many calls overshot
+                budget = {'max_tokens': self.max_tokens, 'recorded_tokens': sum(self.tokens.values()),
+                          'overshoot': self.budget_overshoot_calls,
+                          'note': 'a cap stops new calls only; it never kills a running call, and a budget stop '
+                                  'is an incomplete outcome'}
+            self._state(status, **({'budget': budget} if budget else {}),
+                        **({'task_report': report} if report else {}), **extra)
+
+    def task_report(self, final_state='unknown'):
+        """The whole-task report dict (taskreport.build), derived read-only from trace.jsonl and this run's own
+        counters. A run without a trace reports the gap instead of inventing records."""
+        import taskreport  # deferred: only the run's end needs it, so a one-call launch pays nothing
+        records = []
+        if self.trace and (self.trace / 'trace.jsonl').exists():
+            with open(self.trace / 'trace.jsonl', encoding='utf-8') as f:  # streamed: the trace can be large
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        records.append(None)
+                        continue
+                    if isinstance(rec, dict) and isinstance(rec.get('raw_excerpt'), dict):
+                        # the report never reads a failure's output, and its sha256 still tells records apart
+                        rec['raw_excerpt'] = {k: v for k, v in rec['raw_excerpt'].items() if k != 'head'}
+                    records.append(rec)
+        return taskreport.build(records, summary=self.summary(), blockers=list(self.blockers),
+                                final_state=final_state, trace=self.trace, max_tokens=self.max_tokens,
+                                overshoot_calls=self.budget_overshoot_calls if self.max_tokens is not None else None,
+                                cost_usd=round(self.cost, 6) if not self.unpriced else None,
+                                task_id=self.trace.name if self.trace else None,
+                                started=round(self.started, 3) if self.trace else None)
+
+    def _write_task_report(self, final_state):
+        """Write <trace>/task-report.json; recoverable reporting errors return None."""
+        try:
+            (self.trace / 'task-report.json').write_text(
+                json.dumps(self.task_report(final_state), indent=1) + '\n', encoding='utf-8')
+            return 'task-report.json'
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as exc:
+            print(f'ringo: task report could not be written: {exc}', file=sys.stderr)
+            return None
 
     def _state(self, status, **extra):
         if self.trace:
@@ -851,7 +982,7 @@ def checker_pass(plan, checker_spec):
         raise ValueError('a checker backend needs a plan with a verdicts pass')
 
 
-def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_S, scope=None, checker_spec=None, left=None):
+def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_S, scope=None, checker_spec=None, left=None, namespace=None):
     """Run every pass of the plan, then assemble; returns (result text, stats). Each reply in the wrong shape is
     asked once more; a failed call is retried once; a command that cannot start stops the run. The number of calls
     is structural: one per pass (one per batch of findings for a batched checker, at most
@@ -881,7 +1012,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
         if not first:
             gate.wait()
         try:
-            return attempts(label, p, message)
+            return attempts(f'{namespace}.{label}' if namespace else label, p, message)
         except BaseException as exc:
             with gate_lock:
                 if not failures:
@@ -1072,7 +1203,7 @@ def task(args, kind):
                     pass
         if getattr(args, 'findings_json', None):
             args.findings_pr = findings_pr(args)
-        run = Run(args.trace, args.max_cost, args.unpriced_call_usd)
+        run = Run(args.trace, args.max_cost, args.unpriced_call_usd, max_tokens=args.max_tokens)
         if run.trace:
             (run.trace / 'material.txt').write_text(material, encoding='utf-8', newline='')  # as sent, on every OS
             (run.trace / 'plan.json').write_text(json.dumps(plan, indent=1), encoding='utf-8')
@@ -1168,6 +1299,7 @@ def main(argv=None, *, prog='harness.py'):
         p.add_argument('--pipeline', help='a plan JSON file (default: the built-in one-call plan)')
         p.add_argument('--out', help='write the result here instead of stdout')
         p.add_argument('--trace', help='new/empty folder outside the repository for trace, replies and material (0700)')
+        p.add_argument('--max-tokens', type=int, help='stop new calls at this recorded token total; unknown usage blocks admission')
         p.add_argument('--max-cost', type=float, help='stop starting calls once the cost reaches this many USD')
         p.add_argument('--unpriced-call-usd', type=float,
                        help='fallback cost for any attempt reporting no price; required with --max-cost')

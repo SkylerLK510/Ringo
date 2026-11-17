@@ -1188,5 +1188,25 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
         // the list itself overflows
         skipped = vec![format!("{} unchanged file(s) that reference the change", skipped.len())];
     }
-    Ok(material(&added, &skipped, &unreadable))
+    let result = material(&added, &skipped, &unreadable);
+    let excess = result.len() as i64 - budget;
+    if excess > 0 {
+        // the change itself (PR text, diff, changed files, README) is over budget: context blocks were dropped
+        // first; the manifest says by how much instead of sending oversized material silently. Mirrors context.py.
+        let overflow = format!(
+            "Over the budget by {excess} bytes before this notice: required material and its manifest do not fit. Additional context \
+             may have been omitted. A claim that rests on what is not shown is still a question.");
+        let mut out = String::new();
+        out.push_str(&required);
+        for a in &added {
+            out.push('\n');
+            out.push_str(&a.block);
+        }
+        out.push('\n');
+        out.push_str(&manifest(&added, &skipped, &unreadable));
+        out.push_str(&overflow);
+        out.push('\n');
+        return Ok(out);
+    }
+    Ok(result)
 }

@@ -283,8 +283,8 @@ How it works:
   argument.
 - **agy** can be asked and cannot ask: Ringo gives it no ask tool (its `mcp(*)` permission, auto mode's edits turns
   only, opens the owner's own MCP servers).
-- Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
-  through, and it starts nothing.
+- Shell agents (`RINGO_CHILD=1`) may run `review`, `design` and `wait`, as well as their ask server.
+  Pipeline models also receive `RINGO_PIPELINE_CHILD=1` and cannot launch another pipeline.
 
 Checked live, one run each (Claude Code 2.1.322, codex-cli 0.167.0; `cargo run --example ask`, and the last through
 the shell in a pty):
@@ -413,6 +413,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
 | `/research TOPIC` | Ringo's research role: one live web search call, every quoted source fetched and its quote checked in code, one write call that cites only verified evidence ([details](RESEARCH-ROLE.md)). Measured once at about 68,000 tokens, most of them search results |
 | `/work SPEC.json` | Ringo's checked work loop on a task spec |
+| `/task ...` | a persistent owner task, kept in Ringo's private state outside the repository: `/task` lists this repository's tasks; `/task create OBJECTIVE` makes and selects one; `/task inspect [ID]` shows it concisely; `/task select ID` selects it and the conversation remembers it; `/task resume [ID]` puts its next action in the input without starting an agent; `/task attach #N` records an agent job's durable answer and evidence references; `/task update` changes the objective, next action, constraints, decisions, issues and artifact references. Each update writes only if the revision it read is still current, so two shells cannot silently overwrite each other |
 | `@codex TASK` | talk to Codex from now on: this turn and later plain lines go to it, in this folder (`@codex` alone switches without a turn) |
 | `@codex! TASK` | Codex in its own copy of the folder (a git worktree of it as it is now, uncommitted changes included); nothing reaches your files until `/apply` |
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once, each in its own copy, to compare |
@@ -1005,7 +1006,10 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   since), with `git apply --3way`. A conflict leaves your files and the job untouched.
 - **Stopping:** `/kill` stops the job's whole process group. A Ringo pipeline is interrupted first, so Python's own
   cleanup ends its model calls, which run in sessions of their own.
-- **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
+- **Bounded nesting:** shell agents may request `review`, `design` and `wait`. Python and native pipeline
+  backends set `RINGO_PIPELINE_CHILD=1`; both entrypoints refuse further pipeline launches from those models.
+  Shell agents cannot launch another shell, `work`, research or release management. Reviews retain their plan
+  bounds (one call by default, at most two with a retry, plus the existing soft-limit probe when applicable).
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.
 - **Limits:** three jobs at a time, and one turn of each agent's at a time in your folder; a line for an agent

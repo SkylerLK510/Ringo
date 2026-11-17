@@ -2,6 +2,7 @@
 #![cfg(unix)]
 
 use ringo_cli::{kept, parse::Tokens, Agent, Decision, Kept, Mode, Session, Status};
+use ringo_cli::task::JobRef;
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -1606,6 +1607,38 @@ fn a_conversation_kept_after_each_turn_goes_on_after_a_crash() {
     let mut after = open();
     after.go_on(&alone.keep(None).unwrap()).unwrap();
     assert!(after.separate && !again.separate);
+}
+
+#[test]
+fn a_task_attaches_a_finished_agent_job_and_survives_resume() {
+    let r = repo("task-attach");
+    let claude = fake(&root(), "claude-task", CLAUDE_TALKS);
+    let state = root().join("task-attach-state");
+    let open = || {
+        let mut s = Session::with_state_home(&r, &state, &state).unwrap();
+        s.programs.insert(agent("claude"), claude.clone());
+        s
+    };
+    let mut s = open();
+    let id = said(&mut s, "claude", "fix it");
+    let store = s.task_store().unwrap();
+    let made = store.create("task-create", "Ship the task engine").unwrap();
+    s.select_task(&made.id).unwrap();
+    let job = JobRef::from_job(s.job(id).unwrap()).unwrap();
+    assert_eq!((job.shell_id, job.agent.as_str(), job.write), (id, "claude", false));
+    assert!(job.evidence.iter().any(|e| e.reference.ends_with("reply.md")));
+    let attached = store.attach(&made.id, made.revision, "task-attach-1", job.clone()).unwrap();
+    assert_eq!((attached.revision, attached.jobs.len()), (2, 1));
+    let path = s.keep(None).unwrap();
+    drop(s);
+
+    // The job's shell number and folder are not restored with the conversation, but its durable reference is.
+    let mut next = open();
+    next.go_on(&path).unwrap();
+    let task = next.selected_task().unwrap().unwrap();
+    assert_eq!(task.jobs, vec![job]);
+    assert!(task.concise_view().contains("completion does not accept the task"));
+    assert!(next.selected_task_error.is_none());
 }
 
 #[test]

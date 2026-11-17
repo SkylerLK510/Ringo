@@ -28,10 +28,12 @@ Prompts and plans come from RINGO_HOME (default: the checkout ringo was built fr
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    // Ringo does not start inside a turn it launched. The one thing such a turn runs of Ringo is its own ask server,
-    // which starts nothing: it writes the ask into the turn's folder and waits for the shell to answer (`serve_asks`).
-    if std::env::var_os("RINGO_CHILD").is_some() && args.first().and_then(|a| a.to_str()) != Some("ask-server") {
-        eprintln!("ringo: refusing to start inside an agent that ringo launched (RINGO_CHILD is set)");
+    // Shell agents can request bounded reviews/designs; pipeline models cannot launch more pipelines.
+    let command = args.first().and_then(|a| a.to_str());
+    let allowed = command == Some("ask-server") ||
+        (std::env::var_os("RINGO_PIPELINE_CHILD").is_none() && matches!(command, Some("review" | "design" | "wait")));
+    if std::env::var_os("RINGO_CHILD").is_some() && !allowed {
+        eprintln!("ringo: refusing recursive execution (RINGO_CHILD); shell agents may use review, design or wait");
         return ExitCode::from(2);
     }
     match args.first().and_then(|a| a.to_str()) {

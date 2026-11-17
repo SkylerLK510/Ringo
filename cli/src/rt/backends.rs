@@ -781,12 +781,12 @@ static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 pub fn install_interrupt() {
     #[cfg(unix)]
     {
-        extern "C" fn on_sigint(_: libc::c_int) {
+        extern "C" fn on_sigint(signum: libc::c_int) {
             if INTERRUPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // SAFETY: signal and raise are async-signal-safe.
                 unsafe {
-                    libc::signal(libc::SIGINT, libc::SIG_DFL);
-                    libc::raise(libc::SIGINT);
+                    libc::signal(signum, libc::SIG_DFL);
+                    libc::raise(signum);
                 }
             }
         }
@@ -798,6 +798,7 @@ pub fn install_interrupt() {
             action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         }
         INSTALLED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -1012,6 +1013,9 @@ pub fn run_isolated(argv: &[String], prompt: &str, timeout_s: f64, kw: Isolated)
     {
         // ceiling: stdout is read whole; a command that floods it fills disk and memory
         let mut env: Env = std::env::vars_os().filter(|(k, _)| k != "TYPESAFE_API_KEY").collect();
+        env.retain(|(k, _)| k != "RINGO_CHILD" && k != "RINGO_PIPELINE_CHILD");
+        env.push(("RINGO_CHILD".into(), "1".into()));
+        env.push(("RINGO_PIPELINE_CHILD".into(), "1".into()));
         if kw.subscription_auth {
             env.retain(|(k, _)| !scrubbed(k));
         }

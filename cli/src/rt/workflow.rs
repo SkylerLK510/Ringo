@@ -1119,9 +1119,9 @@ pub fn load_spec(path: &Path) -> Result<Value> {
 
 #[cfg(unix)]
 fn check_spec(spec: &mut Value, path: &str) -> Result<()> {
-    const ALLOWED: [&str; 26] = [
+    const ALLOWED: [&str; 27] = [
         "version", "brief", "material", "files", "fixtures", "checks", "council", "rubric", "writer", "judge",
-        "samples", "first_judges", "max_rounds", "max_seconds", "timeout_s", "max_cost", "unpriced_call_usd",
+        "samples", "first_judges", "max_rounds", "max_seconds", "timeout_s", "max_cost", "max_tokens", "unpriced_call_usd",
         "allow_tool_backends", "allow_execution", "roles", "protocol", "spec_tests", "candidates", "scripts",
         "protocol_repair", "no_regression",
     ];
@@ -1144,6 +1144,11 @@ fn check_spec(spec: &mut Value, path: &str) -> Result<()> {
     for key in required {
         if !m.get(*key).and_then(Value::as_str).is_some_and(|s| !py::strip(s).is_empty()) {
             return Err(Error::value(format!("{key} is required")));
+        }
+    }
+    if let Some(cap) = m.get("max_tokens").filter(|v| !v.is_null()) {
+        if !is_int(cap) || !py::int_of(cap).is_some_and(|n| n >= 0) {
+            return Err(Error::value("max_tokens must be a non-negative integer or None"));
         }
     }
     need(!m.get("material").is_none_or(Value::is_string), "material must be text")?;
@@ -2322,7 +2327,7 @@ pub fn run_with_progress(spec_path: &Path, out: &Path, call_fn: Option<&CallFn>,
     let here = py::realpath(&crate::ringo_home())?;
     let spec = load_spec(spec_path)?;
     let out = harness::outside_repo(out, "workflow run")?;
-    let accounting = std::sync::Arc::new(harness::Run::new(Some(&out), spec.get("max_cost"), spec.get("unpriced_call_usd"))?);
+    let accounting = std::sync::Arc::new(harness::Run::new_with_options(Some(&out), spec.get("max_cost"), spec.get("unpriced_call_usd"), spec.get("max_tokens"), Some(&Value::from(3)))?);
     let start = || -> Result<Value> {
         write_json(&out.join("spec.json"), &spec)?;
         let mut identity = items_of(implementation)?.clone();
