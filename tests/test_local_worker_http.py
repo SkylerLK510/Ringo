@@ -4,13 +4,33 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from local_worker.adapters import InferenceCancelled, OllamaHttpAdapter
+from local_worker.adapters import InferenceCancelled, InferenceUnavailable, OllamaHttpAdapter
 from local_worker.control import Deadline, StopControl
 
-from local_worker_support import make_config
+from local_worker_support import MODEL_DIGEST, make_config
 
 
 class _OllamaHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path != "/api/tags":
+            self.send_error(404)
+            return
+        payload = {
+            "models": [
+                {
+                    "name": "qwen3.5:4b-q4_k_m",
+                    "model": "qwen3.5:4b-q4_k_m",
+                    "digest": self.server.tags_digest,  # type: ignore[attr-defined]
+                }
+            ]
+        }
+        raw = json.dumps(payload).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         self.rfile.read(length)
@@ -49,7 +69,8 @@ class _OllamaHandler(BaseHTTPRequestHandler):
 
 
 class _Server:
-    def __init__(self, *, complete: bool = False):
+    def __init__(self, *, complete: bool = False, tags_digest: str | None = None):
+        self.tags_digest = tags_digest or MODEL_DIGEST.removeprefix("sha256:")
         self.started = threading.Event()
         self.disconnected = threading.Event()
         self.stopped = threading.Event()
@@ -66,6 +87,7 @@ class _Server:
         self.httpd.stopped = self.stopped  # type: ignore[attr-defined]
         self.httpd.release = self.release  # type: ignore[attr-defined]
         self.httpd.complete = complete  # type: ignore[attr-defined]
+        self.httpd.tags_digest = self.tags_digest  # type: ignore[attr-defined]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
     def __enter__(self):
@@ -104,3 +126,17 @@ class OllamaHttpTests(unittest.TestCase):
             self.assertEqual(result.usage.prompt_eval_count, 12)
             self.assertEqual(result.usage.prompt_eval_cached_count, 3)
             self.assertEqual(result.usage.eval_count, 4)
+
+    def test_model_digest_is_verified_before_generation(self):
+        with _Server(complete=True) as server:
+            adapter = OllamaHttpAdapter(make_config(endpoint=server.endpoint))
+            adapter.generate("prompt", StopControl(Deadline(5.0)))
+            self.assertTrue(adapter.describe()["digest_verified"])
+
+    def test_mismatched_model_digest_refuses_without_generation(self):
+        with _Server(complete=True, tags_digest="b" * 64) as server:
+            adapter = OllamaHttpAdapter(make_config(endpoint=server.endpoint))
+            with self.assertRaises(InferenceUnavailable):
+                adapter.generate("prompt", StopControl(Deadline(5.0)))
+            self.assertFalse(server.started.is_set(), "/api/generate ran despite a digest mismatch")
+            self.assertFalse(adapter.describe()["digest_verified"])

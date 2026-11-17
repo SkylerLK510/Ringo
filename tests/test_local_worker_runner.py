@@ -49,28 +49,42 @@ class RunnerTests(unittest.TestCase):
         )
         return run(request), adapter
 
-    def test_two_attempts_and_two_check_suites_max(self):
-        assignment = make_assignment(checks=[failing_check("first"), passing_check("second")])
+    def test_all_configured_checks_run_and_must_pass(self):
+        # A passing first check must not make a later configured check optional.
+        assignment = make_assignment(checks=[passing_check("first"), passing_check("second")])
         config = make_config()
-        script = [candidate_json(assignment=assignment), candidate_json(assignment=assignment)]
-        (result, result_path), adapter = self._run(assignment, config, script)
+        (result, result_path), adapter = self._run(
+            assignment, config, [candidate_json(assignment=assignment)]
+        )
         self.assertEqual(result.status, "candidate_ready")
-        self.assertEqual(len(adapter.prompts), 2)
-        self.assertEqual(len(result.check_results), 2)
+        self.assertEqual(len(adapter.prompts), 1)
         self.assertEqual([item.check_id for item in result.check_results], ["first", "second"])
         self.assertEqual(result.attempts[0].status, "completed")
         self.assertIsNotNone(result.candidate_ref)
         self.assertTrue((self.result_dir / result.candidate_ref).exists())
         self.assertTrue(result_path.exists())
 
-    def test_no_third_call_when_both_checks_fail(self):
+    def test_repair_failing_early_check_is_not_accepted(self):
+        assignment = make_assignment(checks=[failing_check("first"), passing_check("second")])
+        config = make_config()
+        script = [candidate_json(assignment=assignment)] * 2
+        (result, _), adapter = self._run(assignment, config, script)
+        self.assertEqual(result.status, "check_failed")
+        self.assertEqual(len(adapter.prompts), 2)
+        self.assertEqual(
+            [item.check_id for item in result.check_results],
+            ["first", "second", "first", "second"],
+        )
+        self.assertEqual(adapter.remaining, 0)
+
+    def test_at_most_two_suites_and_no_third_call(self):
         assignment = make_assignment(checks=[failing_check("first"), failing_check("second")])
         config = make_config()
         script = [candidate_json(assignment=assignment)] * 3
         (result, _), adapter = self._run(assignment, config, script)
         self.assertEqual(result.status, "check_failed")
         self.assertEqual(len(adapter.prompts), 2)
-        self.assertEqual(len(result.check_results), 2)
+        self.assertEqual(len(result.check_results), 4)
         self.assertEqual(adapter.remaining, 1)
 
     def test_deadline_consumes_attempt_and_stops_further_calls(self):
@@ -80,7 +94,50 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "timeout")
         self.assertEqual(len(adapter.prompts), 1)
         self.assertEqual(adapter.cancelled, 1)
+
+    def test_invalid_candidate_shape_writes_a_terminal_result(self):
+        assignment = make_assignment(checks=[passing_check()])
+        config = make_config()
+        (result, result_path), adapter = self._run(assignment, config, ["[]"])
+        self.assertEqual(result.status, "malformed_candidate")
+        self.assertTrue(result.errors[0].startswith("invalid_shape"))
+        self.assertTrue(result_path.exists())
         self.assertEqual(len(adapter.prompts), 1)
+
+    def test_existing_running_operation_is_not_executed_again(self):
+        assignment = make_assignment(checks=[passing_check()])
+        config = make_config()
+        # Claim without finalizing: simulates an interrupted run.
+        self.ledger.begin("job-1", assignment.digest(), config.fingerprint())
+        (result, result_path), adapter = self._run(
+            assignment, config, [candidate_json(assignment=assignment)]
+        )
+        self.assertEqual(result.status, "unavailable")
+        self.assertEqual(result.phase, "reconcile")
+        self.assertEqual(adapter.prompts, [])
+        self.assertEqual(adapter.remaining, 1)
+        self.assertTrue(result_path.exists())
+        # The existing running record was not overwritten by this refusal.
+        self.assertEqual(self.ledger.find(result.operation_id).state, "running")
+
+    def test_concurrent_claims_are_exclusive(self):
+        digest = "sha256:" + "1" * 64
+        fingerprint = "sha256:" + "2" * 64
+        outcomes = []
+        barrier = threading.Barrier(4)
+
+        def worker():
+            barrier.wait()
+            outcomes.append(self.ledger.claim("race", digest, fingerprint))
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5.0)
+        self.assertEqual(len(outcomes), 4)
+        self.assertEqual(sum(1 for _, created in outcomes if created), 1)
+        self.assertEqual(len({record.operation_id for record, _ in outcomes}), 1)
 
     def test_cloud_policy_is_refused_without_a_call(self):
         with self.assertRaises(UnsupportedPolicy):

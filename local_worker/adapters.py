@@ -56,7 +56,7 @@ class InferenceAdapter(ABC):
 
     @abstractmethod
     def describe(self) -> dict[str, Any]:
-        """Return pinned worker identity for the result provenance."""
+        """Return worker identity and digest-verification status for provenance."""
 
 
 class OllamaHttpAdapter(InferenceAdapter):
@@ -74,13 +74,80 @@ class OllamaHttpAdapter(InferenceAdapter):
         parsed = urlsplit(config.endpoint)
         self._host = parsed.hostname or "127.0.0.1"
         self._port = parsed.port or 11434
+        self._digest_verified = False
 
     def describe(self) -> dict[str, Any]:
-        return {"adapter": "ollama-http", **self._config.worker_description()}
+        return {
+            "adapter": "ollama-http",
+            **self._config.worker_description(),
+            "digest_verified": self._digest_verified,
+        }
+
+    def verify_model_digest(self, stop: StopControl) -> None:
+        """Confirm the configured digest against the local runtime before inference.
+
+        Ollama's documented /api/tags response reports each model's content
+        digest. A tag can be repointed to different weights, so recording a
+        digest in the config is not a pin unless the runtime agrees with it.
+        Verification succeeds once per adapter (one loaded model is assumed);
+        an absent, malformed or mismatched digest fails closed.
+        """
+        if self._digest_verified or self._config.model_digest is None:
+            return
+        timeout = max(0.1, min(5.0, stop.deadline.remaining()))
+        conn = http.client.HTTPConnection(self._host, self._port, timeout=timeout)
+        guard: SocketGuard | None = None
+        try:
+            conn.connect()
+            owned = conn.sock
+            if owned is None:
+                raise InferenceUnavailable("no owned HTTP socket to verify the model")
+            guard = SocketGuard(owned, stop)
+            guard.start()
+            conn.request("GET", "/api/tags")
+            response = conn.getresponse()
+            if response.status != 200:
+                response.read(min(4_096, self._config.max_stream_bytes))
+                raise InferenceUnavailable(f"Ollama /api/tags returned HTTP {response.status}")
+            raw = response.read(min(1_048_576, self._config.max_stream_bytes))
+            if stop.stopped or guard.triggered:
+                raise InferenceCancelled("model verification stopped by the deadline")
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise InferenceUnavailable(f"invalid /api/tags response: {exc}") from exc
+            reported: str | None = None
+            if isinstance(payload, dict) and isinstance(payload.get("models"), list):
+                for entry in payload["models"]:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("name") == self._config.model or entry.get("model") == self._config.model:
+                        candidate = entry.get("digest")
+                        reported = candidate if isinstance(candidate, str) else None
+                        break
+            expected = self._config.model_digest.lower().removeprefix("sha256:")
+            actual = reported.lower().removeprefix("sha256:") if reported is not None else None
+            if actual != expected:
+                raise InferenceUnavailable(
+                    "configured model digest does not match the runtime model; "
+                    "refusing to attribute output to unverified weights"
+                )
+            self._digest_verified = True
+        except (OSError, http.client.HTTPException) as exc:
+            if stop.stopped or (guard is not None and guard.triggered):
+                raise InferenceCancelled(f"model verification stopped: {exc}") from exc
+            raise InferenceUnavailable(f"model verification failed: {exc}") from exc
+        finally:
+            if guard is not None:
+                guard.finish()
+            conn.close()
 
     def generate(self, prompt: str, stop: StopControl) -> InferenceResult:
         if stop.stopped:
             raise InferenceCancelled("deadline expired before the call started")
+        self.verify_model_digest(stop)
+        if stop.stopped:
+            raise InferenceCancelled("deadline expired before generation started")
         request: dict[str, Any] = {
             "model": self._config.model,
             "prompt": prompt,
@@ -192,7 +259,13 @@ class ScriptedAdapter(InferenceAdapter):
         return len(self._script)
 
     def describe(self) -> dict[str, Any]:
-        return {"adapter": self._name, "model": "fake", "pinned": True, "policy": "local"}
+        return {
+            "adapter": self._name,
+            "model": "fake",
+            "policy": "local",
+            "digest_configured": True,
+            "digest_verified": True,
+        }
 
     def generate(self, prompt: str, stop: StopControl) -> InferenceResult:
         if stop.stopped:

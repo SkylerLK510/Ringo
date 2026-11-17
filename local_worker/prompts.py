@@ -20,17 +20,24 @@ class AssignmentTooLarge(Exception):
     """The assignment cannot fit the configured context with a conservative bound."""
 
 
+# No tokenizer can use fewer than one input byte per token, so one token per byte
+# is a true upper bound for any model. A small allowance covers rendering the
+# single user turn (role delimiters) on top of the literal prompt bytes.
+TEMPLATE_TOKEN_OVERHEAD = 32
+
+
 def validate_prompt_size(prompt: str, config: Config) -> None:
     """Reject oversized input instead of silently truncating owner constraints.
 
-    Three UTF-8 bytes per token is a deliberately conservative proxy: an exact
-    count needs the selected model's tokenizer, which is not available to this
-    standalone worker. The bound is exposed in the result provenance.
+    Budgeting one token per UTF-8 byte is conservative for every tokenizer: an
+    exact count needs the selected model's tokenizer, which this standalone
+    worker cannot assume. An oversized assignment is rejected, never truncated.
     """
-    estimated_prompt_tokens = (len(prompt.encode("utf-8")) + 2) // 3
+    prompt_bytes = len(prompt.encode("utf-8"))
+    estimated_prompt_tokens = prompt_bytes + TEMPLATE_TOKEN_OVERHEAD
     if estimated_prompt_tokens + config.max_output_tokens > config.context_tokens:
         raise AssignmentTooLarge(
-            f"assignment needs about {estimated_prompt_tokens} prompt tokens plus "
+            f"assignment needs at most {estimated_prompt_tokens} prompt tokens plus "
             f"{config.max_output_tokens} output tokens, exceeding the "
             f"{config.context_tokens}-token context budget"
         )

@@ -11,8 +11,10 @@ started and no live benchmark or model comparison was performed. The reported
 cancellation proof comes from a deliberately hung loopback HTTP request that
 observes the server-side disconnect; it is not a measurement of a live Ollama
 build. Exact tokenizer accounting is not available to this standalone module,
-so input size is checked with a conservative byte-per-token bound and an
-oversized assignment is rejected rather than truncated.
+so input size is checked with a one-token-per-byte upper bound (true for any
+tokenizer) and an oversized assignment is rejected rather than truncated. The
+configured model digest is verified against Ollama's local `/api/tags` before
+inference; a missing or mismatched digest fails closed.
 
 ## Layout
 
@@ -35,10 +37,11 @@ oversized assignment is rejected rather than truncated.
 - At most **two** local inference calls: one candidate, one repair with bounded
   check/validation feedback. A malformed candidate is **not** silently repaired
   by a hidden parsing call. A timeout consumes its attempt.
-- At most **one configured check suite per parsed candidate**, at most **two**
-  suites per job. Check argv comes from the assignment, never from the model;
-  no shell is used. Raw output goes to a private diagnostics directory, never
-  into the result.
+- All configured checks run as **one suite per parsed candidate**, at most
+  **two** suites per job (one per attempt). A candidate is ready only when every
+  check in its suite passes. Check argv comes from the assignment, never from
+  the model; no shell is used. Raw output goes to a private diagnostics
+  directory, never into the result.
 - One 180-second wall deadline covers inference and checks, with a short
   separately bounded cleanup allowance. The HTTP adapter shuts down only the
   socket it owns when the deadline fires; it never kills a shared daemon.
@@ -54,8 +57,9 @@ NaN/Infinity are rejected. The assignment carries: IDs, objective, owner
 constraints, base revision, allowed paths, identity-bound text slices and
 host-configured checks. It never carries a raw conversation transcript.
 
-The result carries: terminal status, phase, pinned worker description, wall
-deadline and elapsed time, per-attempt operation IDs/fingerprints/usage,
+The result carries: terminal status, phase, worker identity with digest
+verification, wall deadline and elapsed time, per-attempt operation
+IDs/fingerprints/usage,
 per-check status and output digest, changed paths, candidate digest and a
 candidate artifact reference, uncertainty flags, errors and cleanup summary.
 A `candidate_ready` result still needs a person or the later gateway to accept
@@ -72,7 +76,7 @@ setup; setup itself requires separate owner authorization.
   "policy": "local",
   "endpoint": "http://127.0.0.1:11434",
   "model": "qwen3.5:4b-q4_k_m",
-  "model_digest": "sha256:<exact digest from ollama show>",
+  "model_digest": "sha256:<exact digest from ollama list / GET /api/tags>",
   "runtime_version": "<verified ollama version>",
   "quantization": "<verified quantization>",
   "context_tokens": 4096,

@@ -99,7 +99,14 @@ class SnapshotWorkspace(Workspace):
             target = _safe_target(root, item.path)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(item.content.encode("utf-8"))
-        self.verify_preimages()
+        try:
+            self.verify_preimages()
+        except BaseException:
+            # __exit__ is not called when __enter__ raises.
+            self._temp.cleanup()
+            self._temp = None
+            self.root = None
+            raise
         return root
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
@@ -153,10 +160,17 @@ class GitWorktreeWorkspace(Workspace):
         if completed.returncode != 0:
             raise WorkspaceError(f"git worktree add failed: {completed.stderr.strip()[:_CLEANUP_MESSAGE_LIMIT]}")
         self._added = True
-        self.verify_preimages()
+        try:
+            self.verify_preimages()
+        except BaseException:
+            # Python does not call __exit__ when __enter__ raises; clean the
+            # freshly registered worktree here so repeated bad assignments do
+            # not accumulate checkout copies.
+            self._cleanup()
+            raise
         return self.root
 
-    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+    def _cleanup(self) -> None:
         if self._added and self.root is not None:
             try:
                 completed = self._git(
@@ -171,3 +185,6 @@ class GitWorktreeWorkspace(Workspace):
             shutil.rmtree(self.root, ignore_errors=True)
         self._added = False
         self.root = None
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        self._cleanup()

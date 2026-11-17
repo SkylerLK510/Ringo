@@ -75,19 +75,21 @@ def run_check(
 
     capture_cap = min(65_536, config.max_stream_bytes)
     captured: list[bytes] = []
-    lengths = [0, 0]
+    captured_total = 0
+    capture_lock = threading.Lock()
 
-    def read(stream: object, index: int) -> None:
+    def read(stream: object) -> None:
+        nonlocal captured_total
         assert stream is not None
         while True:
             chunk = stream.read(4_096)  # type: ignore[attr-defined]
             if not chunk:
                 break
-            remaining = capture_cap - lengths[0]
-            if remaining > 0:
-                captured.append(chunk[:remaining])
-                lengths[0] += min(len(chunk), remaining)
-            lengths[index] += len(chunk)
+            with capture_lock:
+                remaining = capture_cap - captured_total
+                if remaining > 0:
+                    captured.append(chunk[:remaining])
+                    captured_total += min(len(chunk), remaining)
         stream.close()  # type: ignore[attr-defined]
 
     popen_kwargs: dict[str, object] = {
@@ -109,8 +111,8 @@ def run_check(
     try:
         proc = subprocess.Popen(list(spec.argv), **popen_kwargs)  # type: ignore[arg-type]
         readers = [
-            threading.Thread(target=read, args=(proc.stdout, 1), daemon=True),
-            threading.Thread(target=read, args=(proc.stderr, 2), daemon=True),
+            threading.Thread(target=read, args=(proc.stdout,), daemon=True),
+            threading.Thread(target=read, args=(proc.stderr,), daemon=True),
         ]
         for thread in readers:
             thread.start()

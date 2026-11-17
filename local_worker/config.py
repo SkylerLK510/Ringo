@@ -203,7 +203,7 @@ class Config:
             "model_digest": self.model_digest,
             "runtime_version": self.runtime_version,
             "quantization": self.quantization,
-            "pinned": self.model_digest is not None,
+            "digest_configured": self.model_digest is not None,
             "context_tokens": self.context_tokens,
             "max_output_tokens": self.max_output_tokens,
             "temperature": self.temperature,

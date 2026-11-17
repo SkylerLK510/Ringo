@@ -67,7 +67,12 @@ class Candidate:
 
 
 def parse_candidate(raw_text: str, assignment: Assignment, config: Config) -> Candidate:
-    """Parse one model response. No second model call is made to repair output."""
+    """Parse one model response. No second model call is made to repair output.
+
+    Every failure in a model-produced response becomes CandidateError so the
+    runner writes a terminal job result; a validator's SchemaError must never
+    escape and be mistaken for bad caller input.
+    """
     encoded = raw_text.encode("utf-8")
     if len(encoded) > config.max_candidate_bytes:
         raise CandidateError("oversized_candidate", "model output exceeds the byte limit")
@@ -75,6 +80,13 @@ def parse_candidate(raw_text: str, assignment: Assignment, config: Config) -> Ca
         raw = strict_json_loads(raw_text)
     except SchemaError as exc:
         raise CandidateError("malformed_json", f"output is not valid JSON: {exc}") from exc
+    try:
+        return _validated_candidate(raw, assignment, config)
+    except SchemaError as exc:
+        raise CandidateError("invalid_shape", str(exc)) from exc
+
+
+def _validated_candidate(raw: Any, assignment: Assignment, config: Config) -> Candidate:
     value = _dict(raw, "candidate")
     _exact_keys(
         value,

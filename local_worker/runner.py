@@ -15,7 +15,7 @@ from .candidate import Candidate, CandidateError, parse_candidate
 from .checks import run_check
 from .config import Config
 from .control import Deadline, StopControl
-from .ledger import OperationLedger
+from .ledger import OperationLedger, OperationRecord
 from .prompts import AssignmentTooLarge, build_prompt
 from .schemas import (
     MAX_ERRORS,
@@ -120,42 +120,56 @@ def _empty_result(
     )
 
 
+def _persist(
+    request: RunRequest, record: OperationRecord, result: Result, *, finalize: bool
+) -> Path:
+    """Write a result; only a freshly claimed operation may be finalized."""
+    stem = f"{request.request_id}-{record.operation_id[-8:]}"
+    result_path = request.result_dir / f"{stem}.result.json"
+    _write_json(result_path, result.to_dict())
+    if finalize:
+        request.ledger.update(
+            record.operation_id,
+            state=result.status,
+            attempts=len(result.attempts),
+            result_ref=result_path.name,
+            error=result.errors[0] if result.errors else None,
+            finished_at=time.time(),
+        )
+    return result_path
+
+
 def run(request: RunRequest) -> tuple[Result, Path]:
     """Execute one assignment and return its result plus the result file path."""
     started = time.monotonic()
     request.result_dir.mkdir(parents=True, exist_ok=True)
     assignment_digest = request.assignment.digest()
     config_fingerprint = request.config.fingerprint()
-    record = request.ledger.begin(request.request_id, assignment_digest, config_fingerprint)
+    record, created = request.ledger.claim(
+        request.request_id, assignment_digest, config_fingerprint
+    )
 
     if record.result_ref:
         existing_path = request.result_dir / record.result_ref
         if existing_path.exists():
             return Result.from_dict(json.loads(existing_path.read_text(encoding="utf-8"))), existing_path
-    if record.state == "unknown":
+
+    if not created:
+        # A prior or concurrent run owns this request id. Never start inference
+        # for it: with no retrievable result its outcome is unresolved until a
+        # person reconciles the ledger.
         result = _empty_result(
             request=request,
             operation_id=record.operation_id,
             status="unavailable",
             phase="reconcile",
-            errors=("operation state is unknown after interruption; reconcile before retrying",),
+            errors=("operation already exists without a retrievable result; reconcile before retrying",),
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
-    else:
-        result = _run_job(request, record.operation_id, started)
+        return result, _persist(request, record, result, finalize=False)
 
-    stem = f"{request.request_id}-{record.operation_id[-8:]}"
-    result_path = request.result_dir / f"{stem}.result.json"
-    _write_json(result_path, result.to_dict())
-    request.ledger.update(
-        record.operation_id,
-        state=result.status,
-        attempts=len(result.attempts),
-        result_ref=result_path.name,
-        error=result.errors[0] if result.errors else None,
-        finished_at=time.time(),
-    )
-    return result, result_path
+    result = _run_job(request, record.operation_id, started)
+    return result, _persist(request, record, result, finalize=True)
 
 
 def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
@@ -291,18 +305,23 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
             status = _TERMINAL_SUCCESS
             break
 
-        spec = request.assignment.checks[(index - 1) % len(request.assignment.checks)]
+        # The whole configured suite runs for every parsed candidate. A passing
+        # first check never makes a later one optional, and a repair cannot be
+        # accepted by passing only the check it happened to reach.
+        suite: list[CheckResult] = []
         workspace = request.workspace_factory()
         try:
             with workspace as root:
                 if candidate.kind == "patch":
                     changed_files = workspace.apply(candidate)
-                check_result, output_path = run_check(
-                    spec, root, private_dir, deadline, request.config
-                )
-            checks.append(check_result)
-            if output_path is not None:
-                cleanup.setdefault("check_logs", []).append(output_path.name)
+                for spec in request.assignment.checks:
+                    check_result, output_path = run_check(
+                        spec, root, private_dir, deadline, request.config
+                    )
+                    suite.append(check_result)
+                    checks.append(check_result)
+                    if output_path is not None:
+                        cleanup.setdefault("check_logs", []).append(output_path.name)
         except WorkspaceError as exc:
             errors.append(str(exc)[:MAX_ERROR_CHARS])
             status = "failed"
@@ -310,10 +329,12 @@ def _run_job(request: RunRequest, operation_id: str, started: float) -> Result:
             break
         cleanup["workspace"] = workspace.cleanup_detail or "ok"
 
-        if check_result.status == "passed":
+        failed = [item for item in suite if item.status != "passed"]
+        if not failed:
             status = _TERMINAL_SUCCESS
             break
-        errors.append(f"check {spec.id}: {check_result.status}: {check_result.detail}"[:MAX_ERROR_CHARS])
+        for item in failed:
+            errors.append(f"check {item.check_id}: {item.status}: {item.detail}"[:MAX_ERROR_CHARS])
         status = "check_failed"
         if index < request.config.max_attempts and not stop.stopped:
             feedback = _feedback(errors, checks)
