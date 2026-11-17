@@ -32,4 +32,5 @@ Reply with one JSON object and nothing else (no prose, no code fence):
 ]}
 - "paragraph" and "bullet" blocks cite 1 to 8 packet ids in "evidence"; "heading" and "gap" blocks cite none.
 - Text is plain: no URLs, links, HTML, citation numbers or packet ids. Ringo adds numbered citations from "evidence".
-- Start with a one-paragraph answer, then the supporting points. Aim for 150 to 600 words, at most 60 blocks.
+- If no verified quote supports a direct answer, return a gap block as the first and only block.
+- Otherwise start with a one-paragraph answer, then the supporting points. Aim for 150 to 600 words, at most 60 blocks.

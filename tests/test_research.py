@@ -328,7 +328,9 @@ class ParseTest(unittest.TestCase):
     def test_gap_only_answer_renders_without_inventing_citations(self):
         blocks = research.parse_blocks(json.dumps({'blocks': [
             {'type': 'gap', 'text': 'Current status cannot be established.'}]}), {'E1'})
-        text, cited = research.render(blocks, {'packets': [], 'works': [], 'records': []}, 2)
+        text, cited = research.render(blocks, {'packets': [], 'works': [], 'records': [
+            {'source': 1, 'level': 'verified', 'claims': [{'evidence': 'E1', 'level': 'verified'}]}]}, 2)
+        self.assertIn('Verified but not cited: E1', text)
         self.assertEqual(cited, [])
         self.assertIn('Not covered by the verified sources', text)
         self.assertNotIn('[1]', text)
@@ -454,7 +456,7 @@ class VerifierTest(Fixture):
     def test_grouped_quote_keeps_its_own_date_provenance(self):
         self.page('/first', html(QUOTE, 'Enough extra text to make this a useful source.'))
         result = self.verify(self.source('/first'))
-        packet = {**result['packets'][0], 'id': 'E2', 'url': self.url('/other'),
+        packet = {**result['packets'][0], 'id': 'E2', 'source': 2, 'url': self.url('/first'),
                   'published': '2000-01-02', 'modified': '2026-11-16',
                   'search_reported_date': '2099-01-01'}
         text = '\n'.join(research.source_entry('1', result['works'][0], [packet]))

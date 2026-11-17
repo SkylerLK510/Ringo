@@ -1304,7 +1304,7 @@ def source_entry(label, group, packets):
         where = f' (on {link(p["url"])})' if p['url'] != head['final_url'] else ''
         flag = ' (matched ignoring case: check the wording)' if p['match'] == 'case-insensitive' else ''
         lines.append(f'  - {p["id"]}{where}: “{md(p["quote"])}”{flag}')
-        if p['url'] != head['final_url']:
+        if p.get('source') != head.get('source'):
             dates = []
             for key, name in (('published', 'Published'), ('modified', 'Updated')):
                 if p.get(key):
@@ -1323,11 +1323,11 @@ def source_entry(label, group, packets):
     return lines + ['']
 
 
-def unused_lines(records, cited=frozenset()):
+def unused_lines(records, cited=None):
     """What was not used as evidence: uncited verified quotes, sources that could not be checked, dropped ones."""
     lines = []
-    uncited = [c for r in records for c in r['claims'] if c.get('evidence') and c['evidence'] not in cited]
-    if cited and uncited:
+    uncited = [c for r in records for c in r['claims'] if c.get('evidence') and c['evidence'] not in (cited or ())]
+    if cited is not None and uncited:
         lines.append(f'- Verified but not cited: {", ".join(c["evidence"] for c in uncited)}.')
     for r in records:
         if r['level'] == 'verified':
