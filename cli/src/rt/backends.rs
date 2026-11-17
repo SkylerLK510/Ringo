@@ -781,12 +781,12 @@ static INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 pub fn install_interrupt() {
     #[cfg(unix)]
     {
-        extern "C" fn on_sigint(_: libc::c_int) {
+        extern "C" fn on_sigint(signum: libc::c_int) {
             if INTERRUPTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // SAFETY: signal and raise are async-signal-safe.
                 unsafe {
-                    libc::signal(libc::SIGINT, libc::SIG_DFL);
-                    libc::raise(libc::SIGINT);
+                    libc::signal(signum, libc::SIG_DFL);
+                    libc::raise(signum);
                 }
             }
         }
@@ -798,6 +798,7 @@ pub fn install_interrupt() {
             action.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut action.sa_mask);
             libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+            libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         }
         INSTALLED.store(true, std::sync::atomic::Ordering::SeqCst);
     }

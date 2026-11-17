@@ -66,6 +66,30 @@ class RunStateTest(unittest.TestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(state(self.root / 't')['calls'], 1)
 
+    @unittest.skipUnless(os.name == 'posix', 'Unix process-group cancellation')
+    def test_terminating_a_shell_review_cleans_up_its_model_process(self):
+        import signal
+        pidfile = self.root / 'model.pid'
+        material = self.root / 'material.txt'
+        material.write_text('fixture')
+        child = f'import os, pathlib, time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)'
+        env = {**os.environ, 'RINGO_CHILD': '1'}
+        env.pop('RINGO_PIPELINE_CHILD', None)
+        proc = subprocess.Popen([sys.executable, str(Path(ringo.__file__).resolve()), 'review',
+                                 '--input', str(material), '--backend', shlex.join([sys.executable, '-c', child]),
+                                 '--trace', str(self.root / 'cancel')], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        deadline = time.monotonic() + 10
+        while not pidfile.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(pidfile.exists(), 'model started')
+        pid = int(pidfile.read_text())
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_a_failed_review_says_failed_with_its_error(self):
         code, _ = self.review('import sys; sys.exit(3)')
         self.assertEqual(code, 2)

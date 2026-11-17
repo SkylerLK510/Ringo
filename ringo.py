@@ -84,6 +84,13 @@ def main(argv=None):
             os.environ.get('RINGO_PIPELINE_CHILD') or argv[:1] not in (['review'], ['design'], ['wait'])):
         print('ringo: refusing recursive execution (RINGO_CHILD); shell agents may use review, design or wait', file=sys.stderr)
         return 2
+    if os.environ.get('RINGO_CHILD') and argv[:1] in (['review'], ['design']):
+        # The shell stops agent process groups with TERM. Unwind the backend's finally cleanup,
+        # including model subprocesses in separate sessions, just as Ctrl-C does.
+        import signal
+        def stopped(signum, frame):
+            raise KeyboardInterrupt
+        signal.signal(signal.SIGTERM, stopped)
     if argv[:1] == ['wait']:
         return wait(argv[1:])
     import releases
