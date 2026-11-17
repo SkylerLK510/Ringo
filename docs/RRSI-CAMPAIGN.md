@@ -91,6 +91,13 @@ never candidate-editable fields. The output records the action sequence, continu
 per-turn usage, restart state hash, scenario/policy/program/binary hashes. Test stand-ins inspect
 actual provider requests to verify the exact new message and transmitted history.
 
+`start_over` calls the production `Session::start_over` for the scenario agent and refuses when
+there is no conversation. Place it after `restart` to preserve the real kept record while making
+the next turn start a fresh native conversation from that record. An ordinary `restart` continues
+to preserve the conversation identity. `clear` discards history and cannot test a record handoff.
+Forced starts exercise `handoff_instruction`, independently of `handoff_at`; they do not measure
+threshold selection or long-context savings. Declare only policy fields the panel actually tests.
+
 ```sh
 cli/target/debug/scenariorun --project FIXTURE --scenario PRIVATE_SCENARIO.json \
   --program TRUSTED_FAKE_PROVIDER --state PRIVATE_STATE --home EMPTY_PRIVATE_HOME \
