@@ -1012,6 +1012,9 @@ pub fn run_isolated(argv: &[String], prompt: &str, timeout_s: f64, kw: Isolated)
     {
         // ceiling: stdout is read whole; a command that floods it fills disk and memory
         let mut env: Env = std::env::vars_os().filter(|(k, _)| k != "TYPESAFE_API_KEY").collect();
+        env.retain(|(k, _)| k != "RINGO_CHILD" && k != "RINGO_PIPELINE_CHILD");
+        env.push(("RINGO_CHILD".into(), "1".into()));
+        env.push(("RINGO_PIPELINE_CHILD".into(), "1".into()));
         if kw.subscription_auth {
             env.retain(|(k, _)| !scrubbed(k));
         }

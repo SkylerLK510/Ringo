@@ -283,8 +283,8 @@ How it works:
   argument.
 - **agy** can be asked and cannot ask: Ringo gives it no ask tool (its `mcp(*)` permission, auto mode's edits turns
   only, opens the owner's own MCP servers).
-- Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
-  through, and it starts nothing.
+- Shell agents (`RINGO_CHILD=1`) may run `review`, `design` and `wait`, as well as their ask server.
+  Pipeline models also receive `RINGO_PIPELINE_CHILD=1` and cannot launch another pipeline.
 
 Checked live, one run each (Claude Code 2.1.322, codex-cli 0.167.0; `cargo run --example ask`, and the last through
 the shell in a pty):
@@ -1006,7 +1006,10 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   since), with `git apply --3way`. A conflict leaves your files and the job untouched.
 - **Stopping:** `/kill` stops the job's whole process group. A Ringo pipeline is interrupted first, so Python's own
   cleanup ends its model calls, which run in sessions of their own.
-- **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
+- **Bounded nesting:** shell agents may request `review`, `design` and `wait`. Python and native pipeline
+  backends set `RINGO_PIPELINE_CHILD=1`; both entrypoints refuse further pipeline launches from those models.
+  Shell agents cannot launch another shell, `work`, research or release management. Reviews retain their plan
+  bounds (one call by default, at most two with a retry, plus the existing soft-limit probe when applicable).
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.
 - **Limits:** three jobs at a time, and one turn of each agent's at a time in your folder; a line for an agent

@@ -78,10 +78,12 @@ def wait(argv):
 
 def main(argv=None):
     import os
-    if os.environ.get('RINGO_CHILD'):  # set by the ringo shell for the agents it launches
-        print('ringo: refusing to start inside an agent that ringo launched (RINGO_CHILD is set)', file=sys.stderr)
-        return 2
     argv = list(sys.argv[1:] if argv is None else argv)
+    # Interactive shell agents may request bounded reviews/designs; pipeline models may never recurse.
+    if os.environ.get('RINGO_CHILD') and (
+            os.environ.get('RINGO_PIPELINE_CHILD') or argv[:1] not in (['review'], ['design'], ['wait'])):
+        print('ringo: refusing recursive execution (RINGO_CHILD); shell agents may use review, design or wait', file=sys.stderr)
+        return 2
     if argv[:1] == ['wait']:
         return wait(argv[1:])
     import releases

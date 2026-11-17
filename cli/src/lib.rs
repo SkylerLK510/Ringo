@@ -950,7 +950,7 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 /// The agent child's environment: no API keys or endpoint overrides (subscription logins only), and RINGO_CHILD
-/// so an agent cannot start Ringo again.
+/// so an agent cannot start another shell; bounded reviews/designs remain available.
 fn agent_env(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let k = key.to_string_lossy();
