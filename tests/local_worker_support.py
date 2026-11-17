@@ -110,9 +110,13 @@ def sandbox_available():
     import os
     bwrap = shutil.which('bwrap', path='/usr/bin:/bin')
     if sys.platform != 'linux' or not bwrap:
+        if os.environ.get('RINGO_REQUIRE_WORKER_SANDBOX') == '1':
+            raise RuntimeError('required Linux bubblewrap is unavailable')
         return False
     # Production exposes system installations only, not arbitrary virtualenvs.
     if not Path(sys.executable).resolve().is_relative_to('/usr'):
+        if os.environ.get('RINGO_REQUIRE_WORKER_SANDBOX') == '1':
+            raise RuntimeError('required sandbox system interpreter is unavailable')
         return False
     try:
         supported = subprocess.run([bwrap, '--unshare-all', '--ro-bind', '/', '/',
