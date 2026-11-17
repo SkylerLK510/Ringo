@@ -75,7 +75,7 @@ def scenario(value):
             raise ValueError('invalid scenario action')
         op = action.get('op')
         fields = {'turn': {'op', 'message'}, 'compact': {'op'}, 'clear': {'op'},
-                  'restart': {'op'}, 'seed': {'op', 'threads', 'records'}}.get(op)
+                  'restart': {'op'}, 'start_over': {'op'}, 'seed': {'op', 'threads', 'records'}}.get(op)
         if fields is None or set(action) != fields:
             raise ValueError('unknown scenario action or fields')
         if op == 'turn' and (not isinstance(action['message'], str) or len(action['message'].encode()) > 65536):
