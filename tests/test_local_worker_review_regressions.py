@@ -117,9 +117,11 @@ class ReviewRegressions(unittest.TestCase):
             with mock.patch.object(workspace, '_git', return_value=failure) as git:
                 with self.assertRaises(WorkspaceError):
                     workspace.__enter__()
-                self.assertLessEqual(git.call_args.kwargs['timeout'], .1)
+                self.assertGreater(git.call_args.kwargs['timeout'], 0)
+                self.assertLessEqual(git.call_args.kwargs['timeout'], .1 + 1e-9)
             self.assertFalse(list((root / 'private').iterdir()))
 
+    @unittest.skipUnless(os.name == "posix", "POSIX check setup path")
     def test_check_setup_expiry_never_spawns(self):
         spec = CheckSpec.from_dict({'id':'check', 'argv':[sys.executable, '-c', 'pass'], 'timeout_s':1})
         with tempfile.TemporaryDirectory() as temp:

@@ -28,7 +28,8 @@ class GitWorktreeWorkspaceTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         _git(self.repo, "init", "-q")
-        (self.repo / "notes.txt").write_text("repo content\n", encoding="utf-8")
+        _git(self.repo, "config", "core.autocrlf", "false")
+        (self.repo / "notes.txt").write_bytes(b"repo content\n")
         _git(self.repo, "add", "notes.txt")
         _git(
             self.repo, "-c", "user.name=Test", "-c", "user.email=test@example.com",
