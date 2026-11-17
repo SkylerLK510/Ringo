@@ -475,7 +475,9 @@ class NativeBroker(DockerSandbox):
                         break
                     else:
                         raise ValueError('native bridge failed; preserve the full token reservation')
-                proc.wait(timeout=max(0.1, deadline-time.monotonic()))
+                bridge_code = proc.wait(timeout=max(0.1, deadline-time.monotonic()))
+                if bridge_code != 0:
+                    raise NativeProfileError("native bridge exited unsuccessfully after its result frame")
                 result = self.parse_result(events, exit_code, model)
                 if result['outcome'] != 'done':
                     retain_error(result)

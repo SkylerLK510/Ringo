@@ -17,10 +17,11 @@ from turnrun_live import SessionTransport, scenario, write_json
 
 def events(sid='thread-1', inputs=30, cached=10, output=10):
     return [{'id': 2, 'result': {'thread': {'id': sid}, 'model': MODEL, 'modelProvider': 'openai', 'reasoningEffort': 'low'}},
-        {'method': 'item/completed', 'params': {'threadId': sid, 'item': {'type': 'agentMessage', 'text': 'done'}}},
-        {'method': 'thread/tokenUsage/updated', 'params': {'threadId': sid, 'tokenUsage': {'total': {
+        {'id': 3, 'result': {'turn': {'id': 'turn-current'}}},
+        {'method': 'item/completed', 'params': {'threadId': sid, 'turnId': 'turn-current', 'item': {'type': 'agentMessage', 'text': 'done'}}},
+        {'method': 'thread/tokenUsage/updated', 'params': {'threadId': sid, 'turnId': 'turn-current', 'tokenUsage': {'total': {
             'inputTokens': inputs, 'cachedInputTokens': cached, 'outputTokens': output}}}},
-        {'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'status': 'completed'}}}]
+        {'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': 'turn-current', 'status': 'completed'}}}]
 
 
 class CodexProfileTests(unittest.TestCase):
@@ -71,6 +72,30 @@ class CodexProfileTests(unittest.TestCase):
         self.assertEqual(sum(interrupted.result['usage'][k] for k in ('input','cache_read','cache_write','output')),40)
         decreased = retained_usage(events(inputs=1, cached=0), dict(input=20,cache_read=10,cache_write=0,output=10))
         self.assertFalse(decreased['counted'])
+
+    def test_stale_turn_usage_and_completion_cannot_complete_current_turn(self):
+        for field in ('usage', 'completion', 'reply'):
+            rows = events()
+            if field == 'usage':
+                rows[-2]['params']['turnId'] = 'previous-turn'
+            elif field == 'completion':
+                rows[-1]['params']['turn']['id'] = 'previous-turn'
+            else:
+                rows[2]['params']['turnId'] = 'previous-turn'
+            self.assertEqual(self.broker().parse_result(rows, 0, MODEL)['outcome'], 'failed')
+
+    def test_public_replay_remembers_cumulative_baseline(self):
+        broker = self.broker()
+        def replay(parent, **kwargs):
+            rows = events(inputs=60, cached=25, output=15) if kwargs.get('resume') else events()
+            for row in rows:
+                kwargs['on_event'](row)
+            return broker.parse_result(rows, 0, MODEL)
+        with patch('turnrun_native.NativeBroker.replay', replay):
+            first = broker.replay(prompt='x', endpoint=None, token_cap=100, seconds=1)
+            second = broker.replay(prompt='y', endpoint=None, token_cap=100, seconds=1, resume='thread-1')
+        self.assertEqual(usage_of(first)[1], 40)
+        self.assertEqual(usage_of(second)[1], 35)
 
     def test_pinned_model_tools_network_and_environment(self):
         broker = self.broker()

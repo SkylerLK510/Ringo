@@ -62,15 +62,23 @@ def session_id(events):
     return threads[0] if len(threads) == 1 else None
 
 
+def turn_id(events):
+    turns = [e.get('result', {}).get('turn', {}).get('id') for e in events if e.get('id') == 3]
+    return turns[0] if len(turns) == 1 and isinstance(turns[0], str) and turns[0] else None
+
+
 def retained_usage(events, previous=None):
     previous = previous or dict(input=0, cache_write=0, cache_read=0, output=0)
     sid = session_id(events)
+    tid = turn_id(events)
     reports = [e.get('params', {}).get('tokenUsage', {}).get('total') for e in events
-               if e.get('method') == 'thread/tokenUsage/updated' and e.get('params', {}).get('threadId') == sid]
+               if e.get('method') == 'thread/tokenUsage/updated' and e.get('params', {}).get('threadId') == sid
+               and tid is not None and e.get('params', {}).get('turnId') == tid]
     completions = [e for e in events if e.get('method') == 'turn/completed']
     observed, valid = [], bool(reports) and len(completions) == 1
     if len(completions) == 1:
-        valid &= completions[0].get('params', {}).get('threadId') == sid
+        valid &= (completions[0].get('params', {}).get('threadId') == sid
+                  and tid is not None and completions[0].get('params', {}).get('turn', {}).get('id') == tid)
     for counts in reports:
         if not isinstance(counts, dict):
             valid = False
@@ -156,6 +164,7 @@ class CodexBroker(NativeBroker):
         replies = [e.get('params', {}).get('item', {}).get('text') for e in events
                    if e.get('method') == 'item/completed'
                    and e.get('params', {}).get('threadId') == sid
+                   and turn_id(events) is not None and e.get('params', {}).get('turnId') == turn_id(events)
                    and e.get('params', {}).get('item', {}).get('type') == 'agentMessage']
         failed |= not replies or not isinstance(replies[-1], str) or not replies[-1].strip()
         result = {'outcome': 'done' if not failed and usage['counted'] else 'failed',
@@ -187,13 +196,16 @@ class CodexBroker(NativeBroker):
         self._remember(result, events)
         return result
 
-    def exercise_session(self, endpoint, request, *, token_cap=100000, seconds=45, on_event=None, error_file=None):
+    def replay(self, *, on_event=None, **kwargs):
         events = []
         def emit(event):
             events.append(event)
             if on_event is not None:
                 on_event(event)
-        result = super().replay(endpoint=endpoint, prompt=request['prompt'], resume=request.get('resume'),
-                                token_cap=token_cap, seconds=seconds, on_event=emit, error_file=error_file)
+        result = super().replay(on_event=emit, **kwargs)
         self._remember(result, events)
         return result
+
+    def exercise_session(self, endpoint, request, *, token_cap=100000, seconds=45, on_event=None, error_file=None):
+        return self.replay(endpoint=endpoint, prompt=request['prompt'], resume=request.get('resume'),
+                           token_cap=token_cap, seconds=seconds, on_event=on_event, error_file=error_file)

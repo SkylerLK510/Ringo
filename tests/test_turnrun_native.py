@@ -260,6 +260,29 @@ class NativeProfileTest(unittest.TestCase):
             with self.subTest(sample=sample), self.assertRaises(ValueError):
                 native_result(sample, 0, MODEL)
 
+    def test_bridge_failure_after_success_frame_preserves_usage_and_stops_session(self):
+        from unittest.mock import MagicMock
+        broker = object.__new__(NativeBroker)
+        broker.id, broker.docker, broker.lifetime, broker.stopped = 'native', 'docker', 120, False
+        endpoint = SimpleNamespace(worker=SimpleNamespace(id='worker'), failed=False, server=True)
+        frames = [{'type': 'event', 'event': event} for event in events()]
+        frames.append({'type': 'exit', 'code': 0})
+        proc = MagicMock()
+        proc.stdin = io.BytesIO()
+        proc.stdout = io.BytesIO(b''.join(json.dumps(frame).encode() + b'\n' for frame in frames))
+        proc.wait.return_value, proc.poll.return_value = 1, 1
+        proc.__enter__.return_value = proc
+        with patch.object(broker, 'probe'), patch.object(broker, '_call') as cleanup, \
+             patch('turnrun_native.subprocess.Popen', return_value=proc):
+            with self.assertRaisesRegex(NativeAttemptError, 'bridge exited unsuccessfully') as caught:
+                broker._run(prompt='fixture', instruction='', model=MODEL, token_file=None,
+                            endpoint=endpoint, token_cap=1000, seconds=30, max_turns=4,
+                            offline=True, persistent=True)
+        self.assertTrue(broker.stopped)
+        cleanup.assert_called_once()
+        self.assertEqual(caught.exception.result['usage']['input'], 10)
+        self.assertEqual(caught.exception.result['usage']['output'], 40)
+
     def test_environment_has_no_inherited_keys_routing_or_owner_configuration(self):
         with patch.dict(os.environ, {'ANTHROPIC_API_KEY': 'private', 'HOME': '/owner',
                                      'ANTHROPIC_BASE_URL': 'https://evil.test', 'AWS_SECRET_ACCESS_KEY': 'private'}):
