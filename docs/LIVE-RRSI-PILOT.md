@@ -79,6 +79,19 @@ sent exactly, without policy text; it must satisfy the same pinned-model and
 complete-usage gates. Offline control-command tests do not establish live compact
 compatibility. The initial private pilot uses seeded handoff/restart, not compact.
 
+For an explicit fresh conversation after restart, use `turn`, `restart`, `start_over`, `turn`.
+This invokes the normal Session record builder and sends no native resume ID on the last turn;
+it does not alter ordinary restart behavior. Inspect actual broker requests with deterministic
+stand-ins before authorizing controls: verify the earlier user contract, exact latest message,
+fresh conversation and selected handoff instruction at the intended turn. Raw prompt hashes can
+differ just because private record paths differ and cannot establish treatment delivery.
+
+Such a panel can cover `handoff_instruction`; forcing a fresh start cannot establish sensitivity
+to `handoff_at`. Keep the newest message from repeating the earlier contract, and keep decisive
+requirements in the inline record: an isolated worker cannot read a host record-file pointer.
+Route checks establish delivery only. Baseline competence and treatment sensitivity still require
+the live controls gate. An all-pass baseline and degraded arm does not authorize search.
+
 ```sh
 python3 turnrun_live.py prepare --config PRIVATE_CONFIG.json --work NEW_PRIVATE_DIR
 python3 turnrun_live.py certify-panel --work PRIVATE_DIR

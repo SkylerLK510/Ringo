@@ -55,6 +55,41 @@ class RunStateTest(unittest.TestCase):
         self.assertEqual((s['status'], s['calls'], s['result']), ('done', 1, str((self.root / 'R.md').resolve())))
         self.assertTrue(Path(s['summary']).is_file())
 
+    def test_shell_review_makes_one_call_and_its_reviewer_cannot_recurse(self):
+        bootstrap = str(Path(ringo.__file__).resolve())
+        child = (f'import subprocess, sys; sys.stdin.read(); '
+                 f'p = subprocess.run([sys.executable, {bootstrap!r}, "review", "--help"], capture_output=True); '
+                 f'assert p.returncode == 2, p; assert b"RINGO_CHILD" in p.stderr; print({REVIEW!r})')
+        with mock.patch.dict(os.environ, {'RINGO_CHILD': '1'}):
+            os.environ.pop('RINGO_PIPELINE_CHILD', None)
+            code, err = self.review(child)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(state(self.root / 't')['calls'], 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'Unix process-group cancellation')
+    def test_terminating_a_shell_review_cleans_up_its_model_process(self):
+        import signal
+        pidfile = self.root / 'model.pid'
+        material = self.root / 'material.txt'
+        material.write_text('fixture')
+        child = f'import os, pathlib, time; pathlib.Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(60)'
+        env = {**os.environ, 'RINGO_CHILD': '1'}
+        env.pop('RINGO_PIPELINE_CHILD', None)
+        proc = subprocess.Popen([sys.executable, str(Path(ringo.__file__).resolve()), 'review',
+                                 '--input', str(material), '--backend', shlex.join([sys.executable, '-c', child]),
+                                 '--trace', str(self.root / 'cancel')], env=env,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: proc.kill() if proc.poll() is None else None)
+        deadline = time.monotonic() + 10
+        while not pidfile.exists() and proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(pidfile.exists(), 'model started')
+        pid = int(pidfile.read_text())
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
     def test_a_failed_review_says_failed_with_its_error(self):
         code, _ = self.review('import sys; sys.exit(3)')
         self.assertEqual(code, 2)
@@ -181,6 +216,27 @@ if __name__ == '__main__':
 class ChildGuardTest(unittest.TestCase):
     def test_refuses_inside_an_agent_ringo_launched(self):
         err = io.StringIO()
-        with mock.patch.dict(os.environ, {'RINGO_CHILD': '1'}), contextlib.redirect_stderr(err):
+        with mock.patch.dict(os.environ, {'RINGO_CHILD': '1', 'RINGO_PIPELINE_CHILD': '1'}), contextlib.redirect_stderr(err):
             self.assertEqual(ringo.main(['wait', '/nonexistent']), 2)
         self.assertIn('RINGO_CHILD', err.getvalue())
+
+    def test_shell_child_can_wait_but_cannot_launch_work(self):
+        with mock.patch.dict(os.environ, {'RINGO_CHILD': '1'}):
+            with mock.patch.dict(os.environ):
+                os.environ.pop('RINGO_PIPELINE_CHILD', None)
+                with mock.patch.object(ringo, 'wait', return_value=0) as wait:
+                    self.assertEqual(ringo.main(['wait', '/fixture']), 0)
+                    wait.assert_called_once_with(['/fixture'])
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(ringo.main(['work', '/fixture']), 2)
+
+    def test_shell_review_dispatches_once_and_pipeline_review_dispatches_zero_times(self):
+        with mock.patch.dict(os.environ, {'RINGO_CHILD': '1'}), mock.patch('releases.dispatch', return_value=0) as dispatch:
+            os.environ.pop('RINGO_PIPELINE_CHILD', None)
+            self.assertEqual(ringo.main(['review', '--help']), 0)
+            dispatch.assert_called_once_with(['review', '--help'])
+            dispatch.reset_mock()
+            os.environ['RINGO_PIPELINE_CHILD'] = '1'
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(ringo.main(['review', '--help']), 2)
+            dispatch.assert_not_called()

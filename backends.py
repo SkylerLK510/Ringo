@@ -660,6 +660,7 @@ def child_env(subscription_auth=False):
     """The environment a backend command gets: the caller's without the TypeSafe key; with subscription_auth also
     without every *API_KEY variable and the endpoint and token overrides, so the CLI's own login is used."""
     env = {k: v for k, v in os.environ.items() if k != 'TYPESAFE_API_KEY'}
+    env.update(RINGO_CHILD='1', RINGO_PIPELINE_CHILD='1')
     if subscription_auth:
         env = {k: v for k, v in env.items() if not k.endswith('API_KEY') and k not in {
             'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ACCESS_TOKEN', 'ANTHROPIC_AUTH_TOKEN',

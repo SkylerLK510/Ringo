@@ -243,6 +243,32 @@ Using two agents at once also uses both plans at once: `/usage` shows how much e
 
 Copies need a git project.
 
+## Keep a task
+
+A task outlives the conversation: its objective, constraints, decisions, next action, artifacts, unresolved issues,
+and the agent jobs attached to it. Ringo keeps it in its private state, outside the repository, and binds it to this
+repository, so another folder cannot select it. Ordinary chat never reads or writes a task, so a damaged task file
+cannot stop a conversation.
+
+| Command | What it does |
+|---|---|
+| `/task` | list this repository's tasks, newest first |
+| `/task create OBJECTIVE` | make a task and select it |
+| `/task inspect [ID]` | show the selected task, or `ID`, concisely |
+| `/task select ID` | select a task; the conversation remembers it |
+| `/task resume [ID]` | put its next action (or objective) in the input; no agent starts |
+| `/task attach #N` | attach job N's durable answer and evidence references |
+| `/task update objective TEXT` | change the objective |
+| `/task update next TEXT` | set the next action |
+| `/task update constraint add TEXT`, `constraint remove N` | add or remove a constraint |
+| `/task update decision accept TEXT`, `decision propose TEXT`, `decision remove N` | record an owner decision |
+| `/task update issue add TEXT`, `issue remove N` | record or clear an unresolved issue |
+| `/task update artifact add REF [IDENTITY]`, `artifact remove N` | store an artifact reference |
+
+Each update is read at one revision and written only if that revision is still current, so two shells cannot silently
+overwrite each other; repeating a request is safe. `/task resume` only prepares the input: Enter sends it through the
+same agent conversation as ordinary chat, and no agent is started by the command itself.
+
 ## Run Ringo's pipelines
 
 These run the models as workers, with checks Ringo runs itself, and one review:

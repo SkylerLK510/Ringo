@@ -126,3 +126,6 @@ it neither searches nor changes workflow policy.
 Generic engineering skills may supply useful starting guidance. Their suitability
 for this research workload must be measured; no external framework is adopted by
 this requirements document.
+
+For CLI usability, readability, terminal layout and stream contracts, see
+the [CLI usability research](RESEARCH-CLI-USABILITY.md).

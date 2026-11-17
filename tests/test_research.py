@@ -317,13 +317,23 @@ class ParseTest(unittest.TestCase):
                'evidence id in text': blocks({**para, 'text': 'Three retries (E1).'}),
                'heading with evidence': blocks({'type': 'heading', 'text': 'H', 'evidence': ['E1']}),
                'paragraph without evidence': blocks({'type': 'paragraph', 'text': 'x'}),
-               'no evidence anywhere': blocks({'type': 'gap', 'text': 'x'}), 'unknown type': blocks({**para, 'type': 'quote'}),
+               'headings only': blocks({'type': 'heading', 'text': 'x'}), 'unknown type': blocks({**para, 'type': 'quote'}),
                'extra key': blocks({**para, 'url': 'u'}), 'extra top key': json.dumps({**ok, 'title': 't'}),
                'duplicate ids': blocks({**para, 'evidence': ['E1', 'E1']}), 'no blocks': blocks(),
                'repeated key': '{"blocks": [], "blocks": []}'}
         for name, text in bad.items():
             with self.subTest(name=name), self.assertRaises(research.Rejected):
                 research.parse_blocks(text, {'E1'})
+
+    def test_gap_only_answer_renders_without_inventing_citations(self):
+        blocks = research.parse_blocks(json.dumps({'blocks': [
+            {'type': 'gap', 'text': 'Current status cannot be established.'}]}), {'E1'})
+        text, cited = research.render(blocks, {'packets': [], 'works': [], 'records': [
+            {'source': 1, 'level': 'verified', 'claims': [{'evidence': 'E1', 'level': 'verified'}]}]}, 2)
+        self.assertIn('Verified but not cited: E1', text)
+        self.assertEqual(cited, [])
+        self.assertIn('Not covered by the verified sources', text)
+        self.assertNotIn('[1]', text)
 
     def test_normalisation_is_conservative_and_maps_back_to_the_page(self):
         self.assertEqual(research.norm('\u201cIt\u2019s\u201d \u2014 a\u00a0b\n\tc\u2026\u00ad'), '"It\'s" - a b c...')
@@ -412,6 +422,55 @@ class VerifierTest(Fixture):
         self.assertEqual([p['id'] for p in result['packets']], ['E1'])
         self.assertEqual(result['packets'][0]['quote'], QUOTE)
         self.assertEqual(self.server.log[0]['headers']['host'], f'site.test:{self.port}')
+
+    def test_search_dates_do_not_become_fetched_publication_dates(self):
+        self.page('/undated', html(QUOTE, 'Text that makes the page long enough to count.'))
+        source = self.source('/undated')
+        source['published'] = '2099-01-01'
+        result = self.verify(source)
+        packet = result['packets'][0]
+        self.assertIsNone(packet['published'])
+        self.assertIsNone(packet['modified'])
+        self.assertEqual(packet['search_reported_date'], '2099-01-01')
+        self.assertEqual(packet['retrieved'], result['records'][0]['retrieved'])
+        entry = '\n'.join(research.evidence_lines(result))
+        self.assertIn('2099-01-01 (search call; not verified on page)', entry)
+
+    def test_publication_update_and_search_dates_keep_their_provenance(self):
+        self.page('/dated', html(QUOTE, 'Text that makes the page long enough to count.', head=
+                                '<meta property="article:published_time" content="2001-02-03">'
+                                '<meta property="article:modified_time" content="2026-11-15">'))
+        source = self.source('/dated')
+        source['published'] = '2099-01-01'
+        result = self.verify(source)
+        packet = result['packets'][0]
+        self.assertEqual((packet['published'], packet['modified'], packet['search_reported_date']),
+                         ('2001-02-03', '2026-11-15', '2099-01-01'))
+        entry = '\n'.join(research.evidence_lines(result))
+        self.assertIn('dated 2001-02-03 (page metadata)', entry)
+        self.assertIn('Updated 2026-11-15 (page metadata)', entry)
+        self.assertNotIn('dated 2099', entry)
+        # Historical primary evidence stays usable; date metadata never changes quote verification.
+        self.assertEqual(packet['quote'], QUOTE)
+
+    def test_grouped_quote_keeps_its_own_date_provenance(self):
+        self.page('/first', html(QUOTE, 'Enough extra text to make this a useful source.'))
+        result = self.verify(self.source('/first'))
+        packet = {**result['packets'][0], 'id': 'E2', 'source': 2, 'url': self.url('/first'),
+                  'published': '2000-01-02', 'modified': '2026-11-16',
+                  'search_reported_date': '2099-01-01'}
+        text = '\n'.join(research.source_entry('1', result['works'][0], [packet]))
+        self.assertIn('Published 2000-01-02 (page metadata)', text)
+        self.assertIn('Updated 2026-11-16 (page metadata)', text)
+        self.assertIn('Search-reported 2099-01-01 (unverified)', text)
+        self.assertIn('Retrieved ' + packet['retrieved'], text)
+
+    def test_unknown_dates_are_not_replaced_with_the_retrieval_date(self):
+        self.page('/plain', QUOTE + '\n\nText that makes the page long enough to count.', ctype='text/plain')
+        packet = self.verify(self.source('/plain'))['packets'][0]
+        for field in ('published', 'modified', 'search_reported_date'):
+            self.assertIsNone(packet[field])
+        self.assertRegex(packet['retrieved'], r'^\d{4}-\d\d-\d\dT')
 
     def test_typography_and_whitespace_are_normalised(self):
         self.page('/t', html('The \u201cretry\u201d rule \u2014 clients<br>retry\u00a0at <em>most</em> three\n times; '
@@ -675,7 +734,9 @@ class PipelineTest(Fixture):
         return [self.source('/spec', cid='a'), self.source('/blog', cid='b', quote='Clients may retry forever, the blog claims.')]
 
     def test_a_report_takes_two_calls_and_cites_only_verified_evidence(self):
-        out = self.research(self.good(), self.answer('E1'))
+        sources = self.good()
+        sources[0]['published'] = '2099-01-01'
+        out = self.research(sources, self.answer('E1'))
         self.assertEqual((out.code, out.summary['outcome'], out.summary['calls']), (0, 'report', 2), out.stderr)
         self.assertEqual([c['search'] for c in out.calls], [True, False])
         self.assertEqual(out.calls[0]['argv'][:2], ['--search', 'exec'])
@@ -683,13 +744,23 @@ class PipelineTest(Fixture):
         self.assertIn(QUOTE, write_prompt)
         self.assertNotIn('retry forever', write_prompt)  # the dropped source never reaches the writer
         self.assertIn('BEGIN EVIDENCE', write_prompt)
+        packets = json.loads((out.trace / 'evidence.json').read_text())
+        self.assertIn(json.dumps(packets, indent=1, ensure_ascii=False), write_prompt)
+        self.assertIsNone(packets[0]['published'])
+        self.assertEqual(packets[0]['search_reported_date'], '2099-01-01')
+        self.assertEqual(packets[0]['retrieved'], json.loads(
+            (out.trace / 'verification.json').read_text())['records'][0]['retrieved'])
+        for call in out.calls:
+            self.assertRegex(call['stdin'], r'Today is \d{4}-\d\d-\d\d \(UTC\)')
         report = out.report
         self.assertIn('The protocol caps client retries at three. [1]', report)
         self.assertIn(f'**[1]** Retry rules (title as the search call gave it). <{self.url("/spec")}>', report)
         self.assertIn(f'E1: “{QUOTE}”', report)
         self.assertIn('Retrieved ', report)
+        self.assertIn('2099-01-01 (search call; not verified on page)', report)
         self.assertIn('S2 ' + self.url('/blog') + ': dropped', report)  # an unverified address is never a link
         self.assertIn('What “verified” means', report)
+        self.assertIn('not independent checks of freshness', report)
         self.assertEqual((out.state['status'], out.state['outcome'], out.state['calls']), ('done', 'report', 2))
         self.assertEqual((out.summary['verified'], out.summary['dropped'], out.summary['cited'], out.summary['searches']),
                          (1, 1, 1, 1))

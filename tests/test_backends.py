@@ -15,6 +15,12 @@ from tests.support import NO_SYMLINKS, POSIX_MODES, SYMLINKS, python_cli
 
 
 class BackendRuntimeTest(unittest.TestCase):
+    def test_pipeline_child_is_marked_even_from_a_standalone_or_shell_parent(self):
+        for parent in ({}, {'RINGO_CHILD': '1'}):
+            with mock.patch.dict(os.environ, parent, clear=True):
+                env = backends.child_env()
+                self.assertEqual((env['RINGO_CHILD'], env['RINGO_PIPELINE_CHILD']), ('1', '1'))
+
     def test_subprocess_receives_stdin_in_empty_directory_without_typesafe_key(self):
         code = ('import json, os, sys; print(json.dumps({"input":sys.stdin.read(), '
                 '"entries":os.listdir(), "key":os.environ.get("TYPESAFE_API_KEY")}))')
