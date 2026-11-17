@@ -189,6 +189,24 @@ class CodexBridge(Bridge):
             fake.shutdown()
 
 
+# Codex 0.169.0 forwards a dynamic tool's structure but strips validation
+# keywords such as maxLength, minimum and maximum. The offline replay compares
+# only what Codex forwards, so real structural drift is still refused.
+FORWARDED_SCHEMA_KEYS = ('type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'description')
+
+
+def forwarded_schema(schema):
+    if not isinstance(schema, dict):
+        return schema
+    kept = {k: schema[k] for k in FORWARDED_SCHEMA_KEYS if k in schema}
+    if isinstance(kept.get('properties'), dict):
+        kept['properties'] = {k: forwarded_schema(v) for k, v in kept['properties'].items()}
+    for key in ('items', 'additionalProperties'):
+        if isinstance(kept.get(key), dict):
+            kept[key] = forwarded_schema(kept[key])
+    return kept
+
+
 def fake_provider():
     """Network-disabled local protocol fixture, with no credentials or inference."""
     class Replay(http.server.BaseHTTPRequestHandler):
@@ -218,7 +236,7 @@ def fake_provider():
                 else:
                     names.append(tool.get('name'))
                     schemas.append(tool.get('parameters'))
-            if (names != ['worker'] or schemas != [self.server.worker_schema]
+            if (names != ['worker'] or schemas != [forwarded_schema(self.server.worker_schema)]
                     or body.get('model') != MODEL or body.get('reasoning', {}).get('effort') != 'low'):
                 self.server.rejected = True
                 data = json.dumps({'error': {'message': 'Offline profile rejected tools '+json.dumps(names)

@@ -143,8 +143,17 @@ class CodexProfileTests(unittest.TestCase):
 
     def test_replay_rejects_worker_schema_drift(self):
         import http.client
-        schema = {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}
-        for actual, status in ((schema, 200), ({'type': 'object'}, 400)):
+        schema = {'type': 'object', 'properties': {'command': {'type': 'string', 'maxLength': 8},
+                  'seconds': {'type': 'integer', 'minimum': 1, 'maximum': 300}},
+                  'required': ['command', 'seconds'], 'additionalProperties': False}
+        # Codex 0.169.0 strips validation bounds but must keep the structure.
+        stripped = {'type': 'object', 'properties': {'command': {'type': 'string'}, 'seconds': {'type': 'integer'}},
+                    'required': ['command', 'seconds'], 'additionalProperties': False}
+        retyped = json.loads(json.dumps(stripped)); retyped['properties']['seconds']['type'] = 'string'
+        optional = {**stripped, 'required': ['command']}
+        open_ended = {k: v for k, v in stripped.items() if k != 'additionalProperties'}
+        for actual, status in ((stripped, 200), ({'type': 'object'}, 400), (retyped, 400),
+                               (optional, 400), (open_ended, 400)):
             server = fake_provider()
             self.addCleanup(server.server_close)
             self.addCleanup(server.shutdown)
