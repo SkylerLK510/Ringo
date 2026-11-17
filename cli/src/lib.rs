@@ -4,6 +4,7 @@
 
 pub mod parse;
 pub mod rt;
+pub mod task;
 
 pub mod images;
 pub mod turn_policy;
@@ -24,16 +25,20 @@ const LOG_LINES: usize = 2000; // per job in memory; the full stream is on disk
 /// Past this many tokens in an agent's window, its next turn starts fresh from Ringo's record of the conversation
 /// instead of re-reading all of it at every call (see `Session::handoff`).
 pub const HANDOFF_AT: u64 = 64_000;
-/// How much of Ringo's record goes into a turn, in characters (about four a token): the turns, newest first, then
-/// the change they made.
-const RECORD_CHARS: usize = 60_000;
+/// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
+/// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
+const RECORD_BYTES: usize = 60_000;
 /// How much of one step's text a record keeps (`Session::record`): the head says what ran; the step's whole text is
 /// in the job's events file either way.
 const STEP_CHARS: usize = 160;
 /// What a shell keeps in its folder for a later one to go on from (`Session::keep`, `ringo --resume`).
 pub const KEPT: &str = "resume.json";
-/// Where an agent's conversation compacts itself mid-turn, in tokens: Claude's and Codex's (see `launch_agent`).
-const COMPACT_AT: u64 = 200_000;
+/// Native compaction during a running turn, independent of the between-turn record handoff. These control the
+/// context re-read by each call, including cached input, not cumulative token consumption or a hard size cap.
+const CODEX_COMPACT_AT: u64 = 64_000;
+/// Claude Code clamps its auto-compact window to at least 100k; its output reserve and compaction headroom are
+/// subtracted from this window. Passing Codex's 64k here would not produce a 64k window.
+const CLAUDE_COMPACT_WINDOW: u64 = 100_000;
 /// A running turn is warned in its log when its tokens so far pass `LIVE_WARN_AT`, then at each doubling (400k, 800k,
 /// …), with `/kill N` named: the owner decides (no turn is stopped behind the owner's back). Doubling, not every
 /// 200k: a turn's sum is mostly cache reads (each model call re-reads the conversation; 95% of the shell's ledger)
@@ -611,6 +616,10 @@ pub struct Session {
     pub codex_home: PathBuf,
     pub dir: PathBuf,
     pub jobs: Vec<Job>,
+    /// The explicitly selected persistent task, if any. Ordinary conversations leave this None.
+    pub selected_task: Option<String>,
+    /// Why a task named by a resumed conversation could not be selected; chat still resumes normally.
+    pub selected_task_error: Option<String>,
     pub max_jobs: usize,
     /// The backend Ringo pipelines use.
     pub backend: String,
@@ -720,9 +729,28 @@ fn newest(record: &str, room: usize) -> String {
     if record.len() <= room {
         return record.to_string();
     }
-    let at = (record.len() - room..record.len()).find(|&i| record.is_char_boundary(i)).unwrap_or(record.len());
+    let marker = "(the earliest turns before the restart are cut)\n";
+    if room < marker.len() {
+        return String::new();
+    }
+    let at = (record.len() - (room - marker.len())..record.len())
+        .find(|&i| record.is_char_boundary(i)).unwrap_or(record.len());
     let kept = record[at..].split_once('\n').map_or("", |(_, rest)| rest);
-    format!("(the earliest turns before the restart are cut)\n{kept}")
+    format!("{marker}{kept}")
+}
+
+/// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
+fn record_head(text: &str, room: usize) -> String {
+    if text.len() <= room {
+        return text.to_string();
+    }
+    let marker = "… (cut; the whole is in the record)";
+    if room < marker.len() {
+        return String::new();
+    }
+    let mut at = room - marker.len();
+    while !text.is_char_boundary(at) { at -= 1; }
+    format!("{}{marker}", &text[..at])
 }
 
 /// Files as Ringo's record names them: the first 20, then how many more.
@@ -922,7 +950,7 @@ fn resolved(path: &Path) -> PathBuf {
 }
 
 /// The agent child's environment: no API keys or endpoint overrides (subscription logins only), and RINGO_CHILD
-/// so an agent cannot start Ringo again.
+/// so an agent cannot start another shell; bounded reviews/designs remain available.
 fn agent_env(cmd: &mut Command) {
     for (key, _) in std::env::vars_os() {
         let k = key.to_string_lossy();
@@ -1038,7 +1066,8 @@ impl Session {
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
-        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(), max_jobs: 3,
+        Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(),
+                     selected_task: None, selected_task_error: None, max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
@@ -1059,6 +1088,27 @@ impl Session {
 
     pub fn job(&self, id: usize) -> Result<&Job, String> {
         self.jobs.get(id.wrapping_sub(1)).ok_or(format!("no job #{id}"))
+    }
+
+    /// The persistent task store for this exact repository. It is opened only for explicit task operations (or when a
+    /// resumed conversation names a task), so damaged task state never prevents ordinary chat.
+    pub fn task_store(&self) -> Result<task::TaskStore, String> {
+        task::TaskStore::new(&self.root, self.repo.clone(), self.git).map_err(|e| e.to_string())
+    }
+
+    pub fn select_task(&mut self, id: &str) -> Result<task::Task, String> {
+        let task = self.task_store()?.load(id).map_err(|e| e.to_string())?;
+        self.selected_task = Some(task.id.clone());
+        self.selected_task_error = None;
+        Ok(task)
+    }
+
+    pub fn selected_task(&self) -> Result<Option<task::Task>, String> {
+        self.selected_task.as_deref().map(|id| self.select_task_read(id)).transpose()
+    }
+
+    fn select_task_read(&self, id: &str) -> Result<task::Task, String> {
+        self.task_store()?.load(id).map_err(|e| e.to_string())
     }
 
     /// The program an agent runs: as set (tests point it at a fake), else its entry's (an agent added after the
@@ -1162,7 +1212,9 @@ impl Session {
             // agent that never took a turn in between. The newest stay, as in a fresh start's record.
             // ceiling: the turns cut here are in no file the next shell is pointed to.
             let told = self.told.get(&agent).map_or(String::new(), |before| {
-                format!("{}\n", newest(before.trim_end(), RECORD_CHARS.saturating_sub(record.len())))
+                let room = RECORD_BYTES.saturating_sub(record.len() + 1);
+                let older = newest(before.trim_end(), room);
+                if older.is_empty() { older } else { format!("{older}\n") }
             });
             (!turns.is_empty() || !told.is_empty()).then(|| (agent.name().to_string(), told + &record))
         }).collect()
@@ -1179,7 +1231,10 @@ impl Session {
             let file = self.dir.join(format!("record-{}.md", agent.name()));
             let record = match record.is_empty() || fs::write(&file, whole).is_err() {
                 true => record,
-                false => format!("{record}\n(these turns uncut: {})", file.display()),
+                false => {
+                    let pointer = format!("\n(these turns uncut: {})", file.display());
+                    format!("{}{pointer}", newest(&record, RECORD_BYTES.saturating_sub(pointer.len())))
+                }
             };
             (fills > 0 || !record.is_empty()).then(|| (agent.name().to_string(), fills, record))
         }).collect()
@@ -1230,6 +1285,13 @@ impl Session {
         self.about = kept["about"].as_str().unwrap_or_default().to_string();
         self.separate = kept["separate"].as_bool().unwrap_or(false);
         self.reached_before = list_names(&kept["reached"]).filter_map(Agent::from_name).collect();
+        self.selected_task = None;
+        self.selected_task_error = None;
+        if let Some(id) = kept["task"].as_str() {
+            if let Err(why) = self.select_task(id) {
+                self.selected_task_error = Some(why);
+            }
+        }
         Some(kept)
     }
 
@@ -1248,7 +1310,8 @@ impl Session {
         usage.sort();
         let kept = serde_json::json!({"threads": self.threads(), "told": self.carry(), "records": self.carry_record(),
                                       "separate": self.separate, "reached": reached, "usage": usage,
-                                      "conversation": conversation, "folder": self.repo, "about": about, "saved": saved});
+                                      "conversation": conversation, "folder": self.repo, "about": about, "saved": saved,
+                                      "task": self.selected_task});
         let (path, part) = (self.dir.join(KEPT), self.dir.join(format!("{KEPT}.part")));
         // written whole, then renamed: a crash mid-write leaves the last one
         fs::write(&part, kept.to_string()).and_then(|_| fs::rename(&part, &path)).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -1544,15 +1607,14 @@ impl Session {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
-            // A read agy follows the pointer now: its turn's --add-dir made this job's folder part of its workspace
-            // (measured with agy 1.5.8) — but only when the record it was handed was cut. Pointed at the file while
-            // the inline record is already whole, agy reads it anyway, and that is the 82.5k-token turn of 11/10
-            // again (measured culture: the pointer costs tokens only where it buys the cut turns back). An edits
-            // turn is given no pointer and no folder; after a read turn of the same conversation it keeps the folder
-            // that turn was given — agy retains --add-dir grants in the conversation (measured, probe 25).
-            let whole_at = match agent.spec().adapter {
-                Adapter::Agy if self.mode != Mode::Read || whole.trim_end() == record.trim_end() => String::new(),
-                _ => format!(" The whole record, uncut, is in {}.", self.jobs[id - 1].dir.join("record.md").display()),
+            // A complete inline record needs no second read. A cut one keeps a recovery path; agy can only open
+            // that path in read mode, where --add-dir grants the job folder (never in an edits turn).
+            let whole_at = if whole.trim_end() == record.trim_end()
+                || (agent.spec().adapter == Adapter::Agy && self.mode != Mode::Read) {
+                String::new()
+            } else {
+                format!(" The whole record, uncut, is in {}. Read only the parts needed to recover a missing \
+                         constraint or detail.", self.jobs[id - 1].dir.join("record.md").display())
             };
             let mut text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
                                 and can be wrong; the files here are the truth).{whole_at}\n\n{}\n\n", record.trim_end());
@@ -1609,16 +1671,18 @@ impl Session {
     fn fresh_record(&self, agent: Agent, turns: &[&Job]) -> (String, String) {
         let (record, whole) = self.record(turns);
         let Some(before) = self.carried(agent) else { return (record, whole) };
-        let join = |a: &str, b: &str| match b.is_empty() {
-            true => a.trim_end().to_string(),
-            false => format!("{}\n\n(Ringo restarted here; the turns since are numbered from #1 again)\n\n{b}", a.trim_end()),
+        let separator = "\n\n(Ringo restarted here; the turns since are numbered from #1 again)\n\n";
+        let join = |a: &str, b: &str| match (a.is_empty(), b.is_empty()) {
+            (true, _) => b.to_string(),
+            (_, true) => a.trim_end().to_string(),
+            _ => format!("{}{separator}{b}", a.trim_end()),
         };
-        (join(&newest(before, RECORD_CHARS.saturating_sub(record.len())), &record), join(before, &whole))
+        (join(&newest(before, RECORD_BYTES.saturating_sub(record.len() + separator.len())), &record), join(before, &whole))
     }
 
     /// Ringo's record of `turns`, oldest first, and the same uncut: each turn's message from the owner, word for
     /// word; the agent's reply (the newest whole, older ones' first paragraph); its failed steps and its last ones;
-    /// the files it changed; then the change the turns made, as a diff. Newest first into RECORD_CHARS; an older turn
+    /// the files it changed; then the change the turns made, as a diff. Newest first into RECORD_BYTES; an older turn
     /// past it is left to the whole record.
     fn record(&self, turns: &[&Job]) -> (String, String) {
         let cut = |text: &str, n: usize| match text.char_indices().nth(n) {
@@ -1688,7 +1752,8 @@ impl Session {
                 part += &format!("steps ({} in all): {}\n", j.steps.len(), steps.join(" | "));
             }
             if !j.changed.is_empty() {
-                part += &format!("changed: {}{}\n", j.changed.join(", "), if j.undone { " (taken back with /undo)" } else { "" });
+                let names = if full { j.changed.join(", ") } else { files(&j.changed.iter().cloned().collect()) };
+                part += &format!("changed: {names}{}\n", if j.undone { " (taken back with /undo)" } else { "" });
             } else if !j.touched.is_empty() {
                 // nothing git saw as its own: no snapshot of the folder (no /undo here: the home folder, a large one),
                 // or another turn at work here at the same time ran commands; the files it said it edited
@@ -1700,11 +1765,16 @@ impl Session {
         let mut used = 0;
         for (i, j) in turns.iter().enumerate().rev() {
             let part = render(j, i + 1 == turns.len() || j.talk || j.asked_by.is_some(), false);
-            if used + part.len() > RECORD_CHARS && !kept.is_empty() {
-                kept.push(format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1));
+            // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
+            // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
+            let part = record_head(&part, RECORD_BYTES - 128);
+            if used + part.len() + usize::from(!kept.is_empty()) > RECORD_BYTES - 128 && !kept.is_empty() {
+                let omitted = format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1);
+                used += omitted.len() + 1;
+                kept.push(omitted);
                 break;
             }
-            used += part.len();
+            used += part.len() + usize::from(!kept.is_empty());
             kept.push(part);
         }
         kept.reverse();
@@ -1720,9 +1790,13 @@ impl Session {
             let mut args = vec!["diff", first, last, "--"];
             args.extend(&files);
             if let Ok(diff) = run_git(self.folder(), &args).map(|d| String::from_utf8_lossy(&d).into_owned()) {
-                let room = RECORD_CHARS.saturating_sub(used).clamp(2_000, 16_000);
-                kept.push(format!("The change these turns made, as git shows it:\n{}", cut(&diff, room)));
-                whole.push(format!("The change these turns made, as git shows it:\n{diff}"));
+                let label = "The change these turns made, as git shows it:\n";
+                let room = RECORD_BYTES.saturating_sub(used + label.len() + 1).min(16_000);
+                let shown = record_head(&diff, room);
+                if !shown.is_empty() {
+                    kept.push(format!("{label}{shown}"));
+                }
+                whole.push(format!("{label}{diff}"));
             }
         }
         (kept.join("\n"), whole.join("\n"))
@@ -1935,11 +2009,11 @@ impl Session {
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
                 }
-                // Where Claude's turns compact (COMPACT_AT): Codex's own limit is near its 475k window, so one long
-                // turn here read 2.9M tokens with its calls still growing past 137k each (codex-cli 0.166.0). An owner
-                // whose config.toml sets the limit keeps their own.
+                // Compact within long turns too: between-turn handoffs cannot stop one autonomous turn from
+                // repeatedly re-reading a large history. Native compaction preserves the running task and handles
+                // tool boundaries itself; the owner's config.toml can still choose another threshold.
                 if !self.codex_sets("model_auto_compact_token_limit") {
-                    cmd.args(["-c", &format!("model_auto_compact_token_limit={COMPACT_AT}")]);
+                    cmd.args(["-c", &format!("model_auto_compact_token_limit={CODEX_COMPACT_AT}")]);
                 }
                 let mut thread = serde_json::json!({"cwd": cwd, "sandbox": sandbox,
                                                     "approvalPolicy": if auto { "on-request" } else { "never" }});
@@ -2097,13 +2171,11 @@ impl Session {
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["--effort", effort]);
                 }
-                // A subscription login runs Opus with a 1M window, where Claude Code compacts a conversation only near
-                // 967k: every call re-reads all of it, so one long turn here read 3.9M tokens with its last calls at
-                // 140k each. A 200k window is where Claude Code compacts on a 200k model, by itself, mid-turn as well
-                // as on resuming; the system prompt (with the files appended below) stays, and it re-reads the five
-                // files last changed. An owner who sets the variable keeps their own.
+                // Use Claude Code's minimum supported window, on new and resumed turns. Its native compaction
+                // summarizes history mid-turn while keeping the system prompt and task. An owner who sets the
+                // variable keeps their own; native controls that disable auto-compaction are left alone too.
                 if std::env::var_os("CLAUDE_CODE_AUTO_COMPACT_WINDOW").is_none() {
-                    cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", COMPACT_AT.to_string());
+                    cmd.env("CLAUDE_CODE_AUTO_COMPACT_WINDOW", CLAUDE_COMPACT_WINDOW.to_string());
                 }
                 if let Some(session) = &resume {
                     cmd.args(["--resume", session]);
@@ -3635,13 +3707,96 @@ mod tests {
 
     #[test]
     fn a_carried_record_keeps_its_newest_whole_lines() {
-        let record = "#1 · the owner to claude: é\nclaude: done\n#2 · the owner to codex: ü\ncodex: done\n";
+        let record = format!("{}\n#1 · the owner to claude: é\nclaude: done\n#2 · the owner to codex: ü\ncodex: done\n", "old ".repeat(50));
+        let record = record.as_str();
         assert_eq!(newest(record, record.len()), record, "it fits");
-        assert_eq!(newest(record, 31), "(the earliest turns before the restart are cut)\ncodex: done\n");
+        let marker = "(the earliest turns before the restart are cut)\n";
+        assert_eq!(newest(record, marker.len() + 31), format!("{marker}codex: done\n"));
         // a cut inside a two-byte letter moves past it instead of splitting it
         let at = record.find('ü').unwrap() + 1;
-        assert!(newest(record, record.len() - at).ends_with("codex: done\n"));
-        assert_eq!(newest(record, 0), "(the earliest turns before the restart are cut)\n");
+        assert!(newest(record, marker.len() + record.len() - at).ends_with("codex: done\n"));
+        assert_eq!(newest(record, 0), "");
+        for room in 0..record.len() {
+            assert!(newest(record, room).len() <= room, "room {room}");
+            assert!(record_head(record, room).len() <= room, "room {room}");
+        }
+    }
+
+    /// Construct histories directly: no agents or providers, including when generating hundreds of turns.
+    fn record_session() -> Session {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("ringo-record-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        fs::create_dir_all(&path).unwrap();
+        // Exercise record diffs in a normal project repository; the outside-project undo store has a separate
+        // Windows extended-path constraint that is unrelated to record sizing.
+        git(&path, &["init", "-q"]).unwrap();
+        Session::new(&path).unwrap()
+    }
+
+    fn record_turn(s: &mut Session, task: &str) -> usize {
+        let agent = Agent::from_name("codex").unwrap();
+        let id = s.new_job(Kind::Agent { agent, write: false }, task).unwrap();
+        s.jobs[id - 1].status = Status::Done;
+        id
+    }
+
+    #[test]
+    fn long_histories_and_oversized_single_turns_stay_inside_the_inline_byte_budget() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..200 {
+            let id = record_turn(&mut s, &format!("constraint-{n}: {}", "界🌍".repeat(700)));
+            let job = &mut s.jobs[id - 1];
+            job.talk = true;
+            fs::write(job.dir.join("reply.md"), "result🌍".repeat(1000)).unwrap();
+        }
+        let (inline, whole) = s.fresh_record(agent, &s.lane(agent, s.jobs.len() + 1));
+        assert!(inline.len() <= RECORD_BYTES, "{} bytes", inline.len());
+        assert!(inline.contains("constraint-199:") && inline.contains("earlier turns"));
+        assert!(whole.contains("constraint-0:") && whole.contains("constraint-199:"));
+
+        // Metadata alone used to escape the bound even when there was only one turn.
+        s.jobs.truncate(1);
+        let job = &mut s.jobs[0];
+        job.changed = (0..5000).map(|n| format!("file-{n}-{}.py", "界".repeat(100))).collect();
+        job.status = Status::Failed(format!("failure {} END-OF-FAILURE", "🌍".repeat(30_000)));
+        let (inline, whole) = s.record(&s.lane(agent, 2));
+        assert!(inline.len() <= RECORD_BYTES);
+        assert!(inline.starts_with("#1 · the owner to codex: constraint-0:"));
+        assert!(inline.contains("(cut; the whole is in the record)"));
+        assert!(whole.contains("END-OF-FAILURE") && whole.contains("file-4999-"));
+    }
+
+    #[test]
+    fn unicode_diffs_and_repeated_restarts_share_the_record_budget() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        fs::write(s.repo.join("large.txt"), "old\n").unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let before = git(&s.repo, &["write-tree"]).unwrap();
+        fs::write(s.repo.join("large.txt"), format!("{}\nEND-OF-DIFF\n", "🌍".repeat(30_000))).unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let after = git(&s.repo, &["write-tree"]).unwrap();
+        let id = record_turn(&mut s, "keep this exact constraint");
+        s.jobs[id - 1].before = Some(before);
+        s.jobs[id - 1].after = Some(after);
+        s.jobs[id - 1].changed = vec!["large.txt".into()];
+        let (inline, whole) = s.record(&s.lane(agent, 2));
+        assert!(inline.len() <= RECORD_BYTES);
+        assert!(inline.contains("+🌍") && !inline.contains("END-OF-DIFF"));
+        assert!(whole.contains("END-OF-DIFF"));
+        // Each restart has a small new turn. Bound the saved pointer, restart separators and cut notice together.
+        s.before.insert(agent, "old constraint\n".repeat(20_000));
+        s.told.insert(agent, "old unheard constraint\n".repeat(20_000));
+        for _ in 0..25 {
+            let (inline, _) = s.fresh_record(agent, &s.lane(agent, 2));
+            assert!(inline.len() <= RECORD_BYTES, "fresh: {} bytes", inline.len());
+            assert!(inline.contains("keep this exact constraint"));
+            for (_, record) in s.carry() { assert!(record.len() <= RECORD_BYTES, "carry: {}", record.len()); }
+            let records = s.carry_record();
+            for (_, _, record) in &records { assert!(record.len() <= RECORD_BYTES, "saved: {}", record.len()); }
+            s.resume(&[], &[], &records);
+        }
     }
 
     #[test]

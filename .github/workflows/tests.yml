@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  local-worker-containment:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Provision Linux worker containment
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Require real worker containment with the system Python
+        run: /usr/bin/python3 -m unittest discover -s tests -p 'test_local_worker*.py' -q
+        env:
+          RINGO_REQUIRE_WORKER_SANDBOX: '1'
+
   containment:
     runs-on: ubuntu-latest
     timeout-minutes: 10

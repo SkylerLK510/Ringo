@@ -525,7 +525,7 @@ def checks(spec, root, logdir, remaining):
     return results
 
 
-def run(spec_path, out, call_fn=harness.call):
+def run(spec_path, out, call_fn=harness.call, *, progress='auto'):
     import releases
     started = time.perf_counter_ns()
     spec = load_spec(spec_path)
@@ -600,18 +600,20 @@ def run(spec_path, out, call_fn=harness.call):
                 reply, usage = call_fn(spec_b, system, message, soft, **({'watch': watch} if watch else {}))
             except harness.AdmissionRefused as exc:
                 accounting.refuse_reservation()
-                accounting.record({**record, 'status': 'admission_refused', 'error': str(exc)})
+                accounting.record({**record, 'status': 'admission_refused', 'error': str(exc),
+                                   'seconds': round(time.monotonic() - t0, 6)})
                 raise
             except BaseException as exc:
                 stopped = harness.stop_reason(exc, watch)
                 accounting.record({**record, 'status': 'error', 'usage': getattr(exc, 'usage', None),
                                    'error': f'{type(exc).__name__}: {exc}',
+                                   'seconds': round(time.monotonic() - t0, 6),
                                    **({'stopped': stopped} if stopped else {})},
                                   raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
                 if stopped == 'person' and attempt == 1:
                     continue
                 raise
-            seconds = round(time.monotonic() - t0, 3)
+            seconds = round(time.monotonic() - t0, 6)
             accounting.record({**record, 'status': 'ok', 'usage': usage, 'seconds': seconds}, reply)
             accounting.finish(kind, seconds, usage)
             return reply
@@ -677,6 +679,8 @@ def run(spec_path, out, call_fn=harness.call):
                 'failing': failing[:15], 'failing_count': len(failing), 'failing_ids': [t['id'] for t in failing],
                 'disputed': sorted(disputed)}
 
+    status = harness.TerminalProgress(accounting, progress)
+    status.__enter__()
     try:
         if council:
             # Validate the bridge, rubric and brief offline before any inference.
@@ -1002,8 +1006,9 @@ def run(spec_path, out, call_fn=harness.call):
         report['status'] = 'interrupted'
         raise
     finally:
-        report['usage'] = accounting.summary()
+        status.__exit__(None, None, None)
         report['elapsed_s'] = (time.perf_counter_ns() - started) / 1_000_000_000
+        report['usage'] = accounting.summary(report['elapsed_s'])
         write_json(out / 'report.json', report)
         write_json(out / 'shortcomings.json', {'development_only': True, 'feedback': feedback,
                                               'status': report['status']})
@@ -1026,12 +1031,18 @@ def main(argv=None):
                                      epilog='Spec format and run guide: docs/COUNCIL-WORKFLOW.md')
     parser.add_argument('--spec', required=True, help='task JSON file')
     parser.add_argument('--out', required=True, help='new or empty folder outside the Ringo checkout (mode 0700)')
+    parser.add_argument('--progress', choices=('auto', 'always', 'never'), default='auto')
+    parser.add_argument('--summary-format', choices=('auto', 'text', 'json'), default='auto')
     args = parser.parse_args(argv)
     try:
-        report = run(args.spec, args.out)
+        report = run(args.spec, args.out, progress=args.progress)
+    except KeyboardInterrupt:
+        print(f'ringo work: interrupted; report: {Path(args.out) / "report.json"}', file=sys.stderr)
+        return 130
     except (ValueError, OSError) as exc:
         print(f'ringo work: {exc}', file=sys.stderr)
         return 2
+    harness.print_summary(report['usage'], args.summary_format)
     print(json.dumps(outcome(report, args.out)))  # the full report is in report.json
     return 0 if report['status'] == 'ready_for_review' else 1
 

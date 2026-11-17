@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame, Terminal};
 use ringo_cli::{Agent, Decision, is_wsl, Kind, Mode, Said, Session, Status, Tier};
+use ringo_cli::task::{ArtifactRef, DecisionStatus, TaskUpdate};
 use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -59,6 +60,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/design TEXT", "the one-call design pipeline"),
     ("/research TOPIC", "live web search, every quoted source checked"),
     ("/work SPEC.json", "the checked work loop on a task spec"),
+    ("/task ...", "persistent tasks: create, inspect, select, resume, update and attach agent jobs"),
     ("/show N", "print job N's log"),
     ("/diff N", "job N's change"),
     ("/apply N", "put job N's change in your tree"),
@@ -233,6 +235,21 @@ const AGENT_USAGE: &str = "/agent lists your own agents; /agent add NAME FILE ma
                            codex to run it there, skills to load your Claude Code skills in its turns); /agent remove NAME";
 
 #[derive(Debug, PartialEq)]
+pub enum TaskCmd {
+    List,
+    Create(String),
+    Inspect(Option<String>),
+    Select(String),
+    Resume(Option<String>),
+    Attach(usize),
+    Update(TaskUpdate),
+}
+
+const TASK_USAGE: &str = "/task lists tasks; /task create OBJECTIVE; /task inspect [ID]; /task select ID; /task resume [ID]; \
+                          /task attach #N; /task update objective|next TEXT; /task update constraint|issue add|remove ...; \
+                          /task update decision accept|propose|remove ...; /task update artifact add|remove ...";
+
+#[derive(Debug, PartialEq)]
 pub enum Cmd {
     /// A plain line: for the agent the owner is talking to.
     Talk(String),
@@ -261,6 +278,7 @@ pub enum Cmd {
     Design(String),
     Research(String),
     Work(String),
+    Task(TaskCmd),
     Help,
     Setup,
     Theme(Option<String>),
@@ -335,6 +353,51 @@ type Listing = std::thread::JoinHandle<Result<Vec<ringo_cli::Model>, String>>;
 
 fn job_number(word: Option<&str>) -> Result<usize, String> {
     word.map(|w| w.trim_start_matches('#')).and_then(|w| w.parse().ok()).ok_or("give a job number, e.g. 3".into())
+}
+
+fn task_command(tail: &str) -> Result<Cmd, String> {
+    let (verb, rest) = tail.split_once(char::is_whitespace).map_or((tail, ""), |(verb, rest)| (verb, rest.trim()));
+    let one = || (!rest.is_empty() && !rest.contains(char::is_whitespace)).then_some(rest);
+    match verb {
+        "" | "list" if rest.is_empty() => Ok(Cmd::Task(TaskCmd::List)),
+        "create" if !rest.is_empty() => Ok(Cmd::Task(TaskCmd::Create(rest.into()))),
+        "inspect" if rest.is_empty() || one().is_some() => Ok(Cmd::Task(TaskCmd::Inspect(one().map(str::to_string)))),
+        "select" => one().map(|id| Cmd::Task(TaskCmd::Select(id.into()))).ok_or_else(|| TASK_USAGE.into()),
+        "resume" if rest.is_empty() || one().is_some() => Ok(Cmd::Task(TaskCmd::Resume(one().map(str::to_string)))),
+        "attach" => one().map(|id| job_number(Some(id)).map(|id| Cmd::Task(TaskCmd::Attach(id))))
+            .transpose()?.ok_or_else(|| TASK_USAGE.into()),
+        "update" => parse_task_update(rest).map(|update| Cmd::Task(TaskCmd::Update(update))),
+        _ => Err(TASK_USAGE.into()),
+    }
+}
+
+fn task_index(value: &str) -> Result<usize, String> {
+    value.parse::<usize>().map_err(|_| TASK_USAGE.into())
+}
+
+fn parse_task_update(tail: &str) -> Result<TaskUpdate, String> {
+    let (field, rest) = tail.split_once(char::is_whitespace).map_or((tail, ""), |(field, rest)| (field, rest.trim()));
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    let text_value = rest.split_once(char::is_whitespace).map_or("", |(_, text)| text.trim_start());
+    match (field, parts.as_slice()) {
+        ("objective", _) if !rest.is_empty() => Ok(TaskUpdate::Objective(rest.into())),
+        ("next", _) if !rest.is_empty() => Ok(TaskUpdate::NextAction(rest.into())),
+        ("constraint", ["add", text @ ..]) if !text.is_empty() => Ok(TaskUpdate::AddConstraint(text_value.into())),
+        ("constraint", ["remove", index]) => Ok(TaskUpdate::RemoveConstraint(task_index(index)?)),
+        ("issue", ["add", text @ ..]) if !text.is_empty() => Ok(TaskUpdate::AddIssue(text_value.into())),
+        ("issue", ["remove", index]) => Ok(TaskUpdate::RemoveIssue(task_index(index)?)),
+        ("decision", ["accept", text @ ..]) if !text.is_empty() =>
+            Ok(TaskUpdate::AddDecision { text: text_value.into(), status: DecisionStatus::Accepted }),
+        ("decision", ["propose", text @ ..]) if !text.is_empty() =>
+            Ok(TaskUpdate::AddDecision { text: text_value.into(), status: DecisionStatus::Proposed }),
+        ("decision", ["remove", index]) => Ok(TaskUpdate::RemoveDecision(task_index(index)?)),
+        ("artifact", ["add", reference]) => Ok(TaskUpdate::AddArtifact(ArtifactRef { reference: (*reference).into(), identity: None })),
+        ("artifact", ["add", reference, identity]) => Ok(TaskUpdate::AddArtifact(ArtifactRef {
+            reference: (*reference).into(), identity: Some((*identity).into()),
+        })),
+        ("artifact", ["remove", index]) => Ok(TaskUpdate::RemoveArtifact(task_index(index)?)),
+        _ => Err(TASK_USAGE.into()),
+    }
 }
 
 /// One input line as a command. A line without `/` or `@` is for the agent the owner is talking to; @all means every
@@ -435,6 +498,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "design" if !tail.is_empty() => Ok(Cmd::Design(tail.into())),
             "research" if !tail.is_empty() => Ok(Cmd::Research(tail.into())),
             "work" if !tail.is_empty() => Ok(Cmd::Work(tail.into())),
+            "task" => task_command(tail),
             _ => Err(format!("unknown or incomplete command /{name}; /help lists them")),
         };
     }
@@ -2748,6 +2812,69 @@ impl App {
         true
     }
 
+    /// Persistent owner tasks. No command starts an agent: `/task resume` only prepares the next action as a draft,
+    /// so sending it follows the same native conversation resume, permissions and cancellation as ordinary chat.
+    fn task(&mut self, command: TaskCmd) -> Result<Option<String>, String> {
+        let store = self.s.task_store()?;
+        let selected = || self.s.selected_task.clone().ok_or("no task selected: /task select ID, or /task create OBJECTIVE".to_string());
+        let load_selected = || store.load(&selected()?).map_err(|e| e.to_string());
+        let text = match command {
+            TaskCmd::List => {
+                let tasks = store.list().map_err(|e| e.to_string())?;
+                if tasks.is_empty() {
+                    "  no persistent tasks in this repository; /task create OBJECTIVE makes one (ordinary chat stays unchanged)".into()
+                } else {
+                    tasks.into_iter().map(|task| {
+                        format!("  {} · r{} · {}{}", task.id, task.revision, task.objective.text,
+                                if self.s.selected_task.as_deref() == Some(task.id.as_str()) { " · selected" } else { "" })
+                    }).collect::<Vec<_>>().join("\n")
+                }
+            }
+            TaskCmd::Create(objective) => {
+                let task = store.create(&ringo_cli::task::request_id(), &objective).map_err(|e| e.to_string())?;
+                self.s.select_task(&task.id)?;
+                format!("  created and selected {}\n{}", task.id, task.concise_view())
+            }
+            TaskCmd::Inspect(id) => {
+                let id = id.map_or_else(selected, Ok)?;
+                store.load(&id).map_err(|e| e.to_string())?.concise_view()
+            }
+            TaskCmd::Select(id) => {
+                let task = self.s.select_task(&id)?;
+                format!("  selected {}\n{}", task.id, task.concise_view())
+            }
+            TaskCmd::Resume(id) => {
+                if !self.input.is_empty() {
+                    return Err("the input already holds a draft; send or clear it before /task resume".into());
+                }
+                let task = match id {
+                    Some(id) => self.s.select_task(&id)?,
+                    None => load_selected()?,
+                };
+                let next = task.next_action.as_ref().unwrap_or(&task.objective).text.clone();
+                self.input = next.chars().collect();
+                self.cursor = self.input.len();
+                format!("  selected {} at revision {}; its next action (or objective) is in the input. Enter sends it through \
+                         the existing agent conversation; no agent was started", task.id, task.revision)
+            }
+            TaskCmd::Attach(job_id) => {
+                let before = load_selected()?;
+                let job = ringo_cli::task::JobRef::from_job(self.s.job(job_id)?).map_err(|e| e.to_string())?;
+                let task = store.attach(&before.id, before.revision, &ringo_cli::task::request_id(), job)
+                    .map_err(|e| e.to_string())?;
+                format!("  attached agent job #{job_id} to {} at revision {}; its durable evidence references are stored",
+                        task.id, task.revision)
+            }
+            TaskCmd::Update(update) => {
+                let before = load_selected()?;
+                let task = store.update(&before.id, before.revision, &ringo_cli::task::request_id(), update)
+                    .map_err(|e| e.to_string())?;
+                format!("  updated {} to revision {}\n{}", task.id, task.revision, task.concise_view())
+            }
+        };
+        Ok(Some(text))
+    }
+
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
         // checked again here: a queued /compact can come up after /clear took its conversation away
         if task == "/compact" && !self.s.has_conversation(agent) {
@@ -3180,6 +3307,7 @@ impl App {
                 self.s.work(Path::new(&spec))?;
                 None
             }
+            Cmd::Task(command) => return self.task(command),
             Cmd::Switch(agent) => {
                 self.main = agent;
                 Some(format!("  plain lines go to {} now", agent.name()))
@@ -4343,6 +4471,9 @@ pub fn run(start: Start) -> ExitCode {
     }
     match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
+            if let Some(why) = app.s.selected_task_error.take() {
+                app.say(format!("  the resumed task was not selected: {why}; ordinary conversation resume is unaffected"));
+            }
             if let Some(path) = before["conversation"].as_str() {
                 app.restore_conversation(Path::new(path));
             }
@@ -6035,6 +6166,114 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
 
     fn plain(lines: &[Line]) -> Vec<String> {
         lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    #[test]
+    fn persistent_tasks_parse_without_starting_an_agent() {
+        let claude = Agent::from_name("claude").unwrap();
+        let parse = |line: &str| super::parse(line, &[claude]);
+        assert_eq!(parse("/task"), Ok(Cmd::Task(TaskCmd::List)));
+        assert_eq!(parse("/task list"), Ok(Cmd::Task(TaskCmd::List)));
+        assert_eq!(parse("/task create Ship Phase 1"), Ok(Cmd::Task(TaskCmd::Create("Ship Phase 1".into()))));
+        assert_eq!(parse("/task inspect"), Ok(Cmd::Task(TaskCmd::Inspect(None))));
+        assert_eq!(parse("/task inspect t-abc"), Ok(Cmd::Task(TaskCmd::Inspect(Some("t-abc".into())))));
+        assert_eq!(parse("/task select t-abc"), Ok(Cmd::Task(TaskCmd::Select("t-abc".into()))));
+        assert_eq!(parse("/task resume"), Ok(Cmd::Task(TaskCmd::Resume(None))));
+        assert_eq!(parse("/task resume t-abc"), Ok(Cmd::Task(TaskCmd::Resume(Some("t-abc".into())))));
+        assert_eq!(parse("/task attach #2"), Ok(Cmd::Task(TaskCmd::Attach(2))));
+        assert_eq!(parse("/task update objective Keep the API stable"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::Objective("Keep the API stable".into())))));
+        assert_eq!(parse("/task update next Add narrow tests"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::NextAction("Add narrow tests".into())))));
+        assert_eq!(parse("/task update constraint add Do not break auth"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddConstraint("Do not break auth".into())))));
+        assert_eq!(parse("/task update constraint add Keep  double\tspacing"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddConstraint("Keep  double\tspacing".into())))));
+        assert_eq!(parse("/task update issue add Keep  spacing"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddIssue("Keep  spacing".into())))));
+        assert_eq!(parse("/task update decision propose Keep  spacing"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddDecision {
+                       text: "Keep  spacing".into(), status: DecisionStatus::Proposed,
+                   }))));
+        assert_eq!(parse("/task update constraint remove 2"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::RemoveConstraint(2)))));
+        assert_eq!(parse("/task update decision accept Use the shared parser"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddDecision {
+                       text: "Use the shared parser".into(), status: DecisionStatus::Accepted,
+                   }))));
+        assert_eq!(parse("/task update issue add Owner must choose a scope"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddIssue("Owner must choose a scope".into())))));
+        assert_eq!(parse("/task update artifact add src/main.rs tree:abc"),
+                   Ok(Cmd::Task(TaskCmd::Update(TaskUpdate::AddArtifact(ArtifactRef {
+                       reference: "src/main.rs".into(), identity: Some("tree:abc".into()),
+                   })))));
+        for line in ["/task create", "/task select", "/task select a b", "/task attach", "/task attach #x",
+                     "/task update", "/task update constraint", "/task update decision maybe x",
+                     "/task inspect a b", "/task yolo"] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+    }
+
+    /// A shell on its own state folder, so a task test can save and reopen the same conversation.
+    fn task_app(name: &str, fresh: bool) -> App {
+        let dir = std::env::temp_dir().join(format!("ringo-tui-task-{}-{name}", std::process::id()));
+        if fresh {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        let (cwd, state) = (dir.join("folder"), dir.join("state"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let s = Session::with_state_home(&cwd, &state, &dir).unwrap();
+        App::new(s, vec![Agent::from_name("claude").unwrap()], "folder".into(),
+                 Theme::named("mono", crate::theme::Depth::Mono).unwrap(), Vec::new())
+    }
+
+    #[test]
+    fn task_commands_persist_a_selection_and_resume_only_fills_the_input() {
+        let mut a = task_app("resume", true);
+        a.send("/task create  Preserve the objective  ");
+        let id = a.s.selected_task.clone().expect("a created task is selected");
+        assert!(a.s.jobs.is_empty(), "creating a task starts no agent");
+        assert!(a.s.task_store().unwrap().load(&id).unwrap().objective.text == "Preserve the objective");
+
+        a.send("/task update next  Add narrow tests  ");
+        a.send("/task update constraint add Do not change auth");
+        let task = a.s.selected_task().unwrap().unwrap();
+        assert_eq!((task.revision, task.constraints.len()), (3, 1));
+
+        // The conversation remembers the task; reopening it selects the task again but starts nothing.
+        let path = a.s.keep(None).unwrap();
+        let mut next = task_app("resume", false);
+        next.s.go_on(&path).unwrap();
+        assert_eq!(next.s.selected_task.as_deref(), Some(id.as_str()));
+        next.send("/task resume");
+        assert!(next.s.jobs.is_empty(), "resume starts no agent");
+        assert_eq!(next.input.iter().collect::<String>(), "Add narrow tests");
+        assert_eq!(next.cursor, next.input.len());
+
+        // A plain line is ordinary chat: it neither creates nor selects a task.
+        let mut chat = task_app("chat", true);
+        chat.s.programs.insert(Agent::from_name("claude").unwrap(), "/bin/false".into());
+        chat.send("hello");
+        assert!(chat.s.selected_task.is_none());
+        assert!(chat.s.task_store().unwrap().list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_resumed_task_from_another_repository_is_reported_not_selected() {
+        let mut a = task_app("elsewhere", true);
+        a.send("/task create Ship it");
+        let path = a.s.keep(None).unwrap();
+        // The same state root, but a shell opened on a different folder: the task file is keyed by repository.
+        let dir = std::env::temp_dir().join(format!("ringo-tui-task-{}-elsewhere-moved", std::process::id()));
+        let (cwd, state) = (dir.join("folder"), dir.join("state"));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let s = Session::with_state_home(&cwd, &state, &dir).unwrap();
+        let mut other = App::new(s, vec![Agent::from_name("claude").unwrap()], "elsewhere".into(),
+                                 Theme::named("mono", crate::theme::Depth::Mono).unwrap(), Vec::new());
+        other.s.go_on(&path).unwrap();
+        assert!(other.s.selected_task.is_none(), "a task is bound to its repository");
+        assert!(other.s.selected_task_error.as_deref().unwrap_or_default().contains("no task"));
+        assert!(other.s.jobs.is_empty(), "ordinary conversation resume is unaffected");
     }
 
     #[test]

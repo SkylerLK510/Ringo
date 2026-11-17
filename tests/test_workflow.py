@@ -73,6 +73,21 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual((self.root / 'run/final/value.py').read_text(), good['files']['value.py'])
         self.assertTrue(json.loads((self.root / 'run/shortcomings.json').read_text())['development_only'])
 
+    def test_interrupt_preserves_report_usage_and_clears_progress(self):
+        path, out = self.root / 'task.json', self.root / 'interrupted'
+        path.write_text(json.dumps(self.spec))
+        def interrupt(*args):
+            raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            workflow.run(path, out, call_fn=interrupt, progress='always')
+        report = json.loads((out / 'report.json').read_text())
+        self.assertEqual(report['status'], 'interrupted')
+        self.assertEqual(report['usage']['calls'], 1)
+        self.assertEqual(report['usage']['untokened_calls'], 1)
+        self.assertIsNone(report['usage']['output_tokens_per_second'])
+        self.assertEqual(report['elapsed_s'], report['usage']['elapsed_s'])
+        self.assertEqual(json.loads((out / 'state.json').read_text())['status'], 'interrupted')
+
     def test_calls_are_max_rounds_times_one_writer_plus_samples(self):
         path = self.root / 'task.json'
         path.write_text(json.dumps({**self.spec, 'max_rounds': 2, 'samples': 3}))

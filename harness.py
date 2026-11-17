@@ -89,20 +89,20 @@ def valid_price(x):
 
 
 def claude_usage(reply):
-    """Usage from a Claude CLI JSON reply. Its tokens are measured when the usage block reports input_tokens or
-    output_tokens as a non-negative int (a bool or a float is not one); a field that is not one then counts as zero.
-    Otherwise the tokens are unknown, not zero, so the usage carries no token fields and the call counts as
-    untokened, as a Codex turn without usage does. The price is kept either way."""
+    """Usage from a Claude CLI JSON reply; missing input/output counts stay unknown, the price stays."""
     u = reply.get('usage') if isinstance(reply.get('usage'), dict) else {}
     def tokens(key):
         value = u.get(key)
         return value if type(value) is int and value >= 0 else 0
     models = reply.get('modelUsage')
-    usage = {'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
     if not any(type(u.get(k)) is int and u[k] >= 0 for k in ('input_tokens', 'output_tokens')):
-        return usage  # neither count was reported: unknown, not zero
-    return {'input': tokens('input_tokens'), 'cache_write': tokens('cache_creation_input_tokens'),
-            'cache_read': tokens('cache_read_input_tokens'), 'output': tokens('output_tokens'), **usage}
+        return {'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
+    usage = {'cache_write': tokens('cache_creation_input_tokens'), 'cache_read': tokens('cache_read_input_tokens'),
+             'cost_usd': reply.get('total_cost_usd'), 'models': sorted(models) if isinstance(models, dict) else []}
+    for field, key in (('input', 'input_tokens'), ('output', 'output_tokens')):
+        if type(u.get(key)) is int and u[key] >= 0:
+            usage[field] = u[key]
+    return usage
 
 
 def split_command(command):
@@ -252,6 +252,113 @@ TOKEN_KEYS = ('input', 'cache_write', 'cache_read', 'output')
 PAID_STATUSES = ('ok', 'malformed', 'error')  # every attempt is paid for, a failed one too
 
 
+def output_rate(usage, seconds):
+    """Reported output tokens / wall time, including startup and reasoning; not decode speed."""
+    count = usage.get('output') if isinstance(usage, dict) else None
+    if type(count) is not int or count < 0 or valid_price(seconds) is None or seconds <= 0:
+        return None
+    return round(count / seconds, 2)
+
+
+def terminal(stream):
+    return bool(getattr(stream, 'isatty', lambda: False)()) and os.environ.get('TERM') != 'dumb'
+
+
+def print_summary(summary, style='auto'):
+    if style == 'json' or (style == 'auto' and not terminal(sys.stderr)):
+        print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+        return
+    rate = summary.get('output_tokens_per_second')
+    speed = f'{rate:.1f} output tok/s' if rate is not None else 'output tok/s unknown'
+    def calls(count):
+        return f"{count} call" + ('' if count == 1 else 's')
+    unknown = summary['untokened_calls']
+    total = sum(summary[k] for k in TOKEN_KEYS)
+    tokens = f"{total:,} total tokens"
+    if unknown:
+        tokens += f' (partial; {calls(unknown)} unreported)'
+    elif summary['calls'] == 0:
+        tokens += ' (no calls)'
+    elif summary.get('unfinished_calls', 0):
+        tokens += ' (partial; unfinished call)'
+    tokens += (f" [{summary['input']:,} input + {summary['cache_read']:,} cache read + "
+               f"{summary['cache_write']:,} cache write + {summary['output']:,} output]")
+    price = f"${summary['cost_usd']:.4f}"
+    if summary['unpriced_calls']:
+        price += f" + {calls(summary['unpriced_calls'])} unpriced"
+    print(f"ringo: {calls(summary['calls'])} | {summary['elapsed_s']:.2f}s | {tokens} | {speed} (wall time) | {price}",
+          file=sys.stderr)
+
+
+class TerminalProgress:
+    """CLI-only status on stderr; redirected output has no animation or default chatter."""
+
+    def __init__(self, run, mode='auto', stream=None):
+        self.run, self.stream = run, sys.stderr if stream is None else stream
+        self.animated = terminal(self.stream)
+        self.enabled = mode == 'always' or (mode == 'auto' and self.animated)
+        self.active, self.lock, self.stop = {}, threading.Lock(), threading.Event()
+        self.worker = None
+
+    def __enter__(self):
+        if self.enabled:
+            self.run.progress = self.update
+            if self.animated:
+                self.worker = threading.Thread(target=self.refresh, daemon=True)
+                self.worker.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.run.progress = None
+        self.stop.set()
+        if self.worker:
+            self.worker.join()
+        if self.enabled and self.animated:
+            with self.lock:
+                self.stream.write('\r\033[K')
+                self.stream.flush()
+
+    def draw(self):
+        if not self.active:
+            return
+        label = next(iter(self.active.values()))
+        elapsed = time.monotonic() - self.run.clock_started
+        line = f'ringo: {label} | {len(self.active)} active | {elapsed:.1f}s elapsed'
+        try:
+            width = os.get_terminal_size(self.stream.fileno()).columns
+        except (AttributeError, OSError, ValueError):
+            width = 80
+        self.stream.write('\r\033[K' + line[:max(0, width - 1)])
+        self.stream.flush()
+
+    def refresh(self):
+        while not self.stop.wait(.2):
+            with self.lock:
+                self.draw()
+
+    def update(self, rec):
+        key = (rec.get('step'), rec.get('attempt'))
+        label = ''.join(c if c.isprintable() else '?' for c in str(rec.get('step', 'call')))[:60]
+        status = rec['status']
+        with self.lock:
+            if status in ('started', 'reserved'):
+                self.active[key] = f"{label} (attempt {rec.get('attempt', 1)})"
+                if self.animated:
+                    self.draw()
+                else:
+                    print(f'ringo: {self.active[key]} started', file=self.stream, flush=True)
+            else:
+                self.active.pop(key, None)
+                prefix = '\r\033[K' if self.animated else ''
+                seconds, rate = rec.get('seconds'), rec.get('output_tokens_per_second')
+                detail = f' | {seconds:.2f}s' if seconds is not None else ''
+                if rate is not None:
+                    detail += f' | {rate:.1f} output tok/s (wall time)'
+                print(f'{prefix}ringo: {label} {status}{detail}', file=self.stream, flush=True)
+                if self.animated:
+                    self.draw()
+
+
 def codex_reply(output, name='codex-chatgpt', tools=()):
     """Text and reported tokens from a single native Codex JSONL turn; price stays unknown. Fails closed on a tool
     item the backend does not declare (`tools`), a top-level error or turn.failed, a line that is not JSON, other
@@ -263,7 +370,7 @@ def codex_reply(output, name='codex-chatgpt', tools=()):
     `output` spent on reasoning, already counted in it."""
     usage = dict.fromkeys(TOKEN_KEYS, 0)
     usage['cost_usd'] = None
-    messages, completed, measured, reasons, items, warnings = [], 0, 0, [], {}, []
+    messages, completed, measured, measured_input, measured_output, reasons, items, warnings = [], 0, 0, 0, 0, [], {}, []
     for line in output.splitlines():
         if not line.strip():
             continue
@@ -282,6 +389,10 @@ def codex_reply(output, name='codex-chatgpt', tools=()):
             reported = reported if isinstance(reported, dict) else {}
             if any(type(reported.get(k)) is int and reported[k] >= 0 for k in ('input_tokens', 'output_tokens')):
                 measured += 1
+            if type(reported.get('input_tokens')) is int and reported['input_tokens'] >= 0:
+                measured_input += 1
+            if type(reported.get('output_tokens')) is int and reported['output_tokens'] >= 0:
+                measured_output += 1
             def tokens(key):
                 value = reported.get(key, 0)
                 return value if type(value) is int and value >= 0 else 0
@@ -314,6 +425,12 @@ def codex_reply(output, name='codex-chatgpt', tools=()):
     if not measured:  # no usage was reported (a timeout, crash, failed turn or a usage-less turn.completed): unknown, not zero
         for k in TOKEN_KEYS:
             del usage[k]
+    else:
+        if not measured_output:
+            del usage['output']
+        if not measured_input:
+            del usage['input']
+            del usage['cache_read']
     if reasons:
         counts = ', '.join(f'{k}={v}' for k, v in sorted(items.items())) or 'none'
         raise CallError(f"{name} turn rejected: {'; '.join(dict.fromkeys(reasons))} (items: {counts})", usage, output)
@@ -557,12 +674,13 @@ class Run:
         self.trace = Path(trace_dir) if trace_dir else None
         self.max_cost, self.unpriced_call_usd = max_cost, unpriced_call_usd
         self.calls, self.cost, self.unpriced, self.untokened = 0, 0.0, 0, 0
+        self.clock_started, self.completed, self.progress = time.monotonic(), 0, None
         self.admission_refusals, self.incidents = 0, 0
         self.tokens = dict.fromkeys(TOKEN_KEYS, 0)
         self.reasoning = None  # output tokens spent on reasoning, summed over the calls that report it (Codex)
         self.finished = {}  # kind -> [{'seconds', 'tokens'}] of successful calls, for soft-limit comparisons
         self.incident_dir = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         if self.trace:
             if self.trace.exists() and any(self.trace.iterdir()):
                 raise ValueError('the trace folder must be new or empty')
@@ -603,12 +721,16 @@ class Run:
         usage, or usage without token fields, counts under untokened_calls, as an unknown price counts under
         unpriced_calls."""
         with self.lock:
+            rec = dict(rec)
+            if 'seconds' in rec:
+                rec['output_tokens_per_second'] = output_rate(rec.get('usage'), rec['seconds'])
             usage = rec.get('usage')
             for k in self.tokens:
                 self.tokens[k] += (usage or {}).get(k) or 0
             if type((usage or {}).get('reasoning_output')) is int:
                 self.reasoning = (self.reasoning or 0) + usage['reasoning_output']
             if rec.get('status') in PAID_STATUSES:
+                self.completed += 1
                 if not isinstance(usage, dict) or not all(k in usage for k in TOKEN_KEYS):
                     self.untokened += 1
                 price = valid_price((usage or {}).get('cost_usd'))
@@ -628,6 +750,9 @@ class Run:
                 if raw:
                     (self.trace / 'steps' / f"{rec['step']}.{rec['attempt']}.raw.txt").write_bytes(
                         raw.encode('utf-8', 'replace')[:RAW_LIMIT])
+
+            if self.progress:
+                self.progress(rec)
 
     def finish(self, kind, seconds, usage):
         with self.lock:
@@ -667,11 +792,16 @@ class Run:
                                      'updated': round(time.time(), 3), 'last': self.last, **self.summary(),
                                      **{k: v for k, v in extra.items() if v is not None}})
 
-    def summary(self):
-        return {'calls': self.calls, 'cost_usd': round(self.cost, 6), 'unpriced_calls': self.unpriced,
-                'untokened_calls': self.untokened, 'admission_refusals': self.admission_refusals,
-                'incidents': self.incidents, **self.tokens,
-                **({} if self.reasoning is None else {'reasoning_output': self.reasoning})}
+    def summary(self, elapsed_s=None):
+        with self.lock:
+            elapsed = time.monotonic() - self.clock_started if elapsed_s is None else elapsed_s
+            known = self.calls > 0 and self.completed == self.calls and not self.untokened
+            return {'calls': self.calls, 'cost_usd': round(self.cost, 6), 'unpriced_calls': self.unpriced,
+                    'untokened_calls': self.untokened, 'admission_refusals': self.admission_refusals,
+                    'incidents': self.incidents, **self.tokens,
+                    **({} if self.reasoning is None else {'reasoning_output': self.reasoning}),
+                    'unfinished_calls': max(0, self.calls - self.completed), 'elapsed_s': elapsed,
+                    'output_tokens_per_second': output_rate(self.tokens, elapsed) if known else None}
 
 
 def outside_repo(path, what):
@@ -739,6 +869,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
         raise ValueError('a per-pass model needs a claude-style backend')
     system = (f'Evaluation scope: {scope}\n' if scope else '') + plan['role'] + '\n\n' + fence(
         'MATERIAL', material, 'untrusted change material written by its author')
+    system_hash = sha(system)
     replies, skipped = {}, set()
     gates, gate_lock, stop, failures = {}, threading.Lock(), threading.Event(), []
 
@@ -772,6 +903,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
 
     def attempts(label, p, message):
         last = None  # the earlier attempt's error, reported if the retry cannot start
+        message_hash = sha(message)
         for attempt in (1, 2):
             try:
                 if stop.is_set():
@@ -786,8 +918,8 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
             asked = chosen(backend['argv'])
             rec = {'step': label, 'attempt': attempt, 'pass': p['id'], 'backend': backend['name'],
                    'model': p.get('model') or asked['model'], 'effort': asked['effort'],
-                   'system_sha256': sha(system),
-                   'message_sha256': sha(message), 'started': time.time()}
+                   'system_sha256': system_hash,
+                   'message_sha256': message_hash, 'started': time.time()}
             soft, limit = timeout_s, limit_for(timeout_s)
             if left is not None:  # read once, so the limit is never below the soft limit
                 remaining = left()
@@ -805,16 +937,16 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
             except AdmissionRefused as exc:
                 run.refuse_reservation()
                 run.record({**rec, 'status': 'admission_refused', 'error': str(exc),
-                            'seconds': round(time.monotonic() - t0, 3)})
+                            'seconds': round(time.monotonic() - t0, 6)})
                 raise
             except OSError as exc:  # the command cannot run: every retry would fail too
                 run.record({**rec, 'status': 'fatal', 'error': f'{type(exc).__name__}: {exc}',
-                            'seconds': round(time.monotonic() - t0, 3)})
+                            'seconds': round(time.monotonic() - t0, 6)})
                 raise
             except Exception as exc:  # no usable reply; the attempt is settled either way, its cost unknown if unreported
                 stopped = stop_reason(exc, watch)
                 run.record({**rec, 'status': 'error', 'error': f'{type(exc).__name__}: {exc}'[:500],
-                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3),
+                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 6),
                             **({'stopped': stopped} if stopped else {})},
                            raw=getattr(exc, 'raw', None) or getattr(exc, 'stdout', None))
                 if attempt == 2 or stopped == 'limit' or 'input_too_large' in str(exc) or \
@@ -826,18 +958,18 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                 continue
             except BaseException as exc:
                 run.record({**rec, 'status': 'error', 'error': f'{type(exc).__name__}: {exc}',
-                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 3)})
+                            'usage': getattr(exc, 'usage', None), 'seconds': round(time.monotonic() - t0, 6)})
                 raise
             try:  # the reply is paid for whatever its shape, so it is charged before it is checked
                 pipelines.check_reply(plan, p, text)
             except ValueError as exc:
                 run.record({**rec, 'status': 'malformed', 'usage': usage, 'error': str(exc)[:500],
-                            'seconds': round(time.monotonic() - t0, 3)}, text)
+                            'seconds': round(time.monotonic() - t0, 6)}, text)
                 if attempt == 2:
                     raise
                 last = exc
                 continue
-            seconds = round(time.monotonic() - t0, 3)
+            seconds = round(time.monotonic() - t0, 6)
             run.record({**rec, 'status': 'ok', 'usage': usage, 'seconds': seconds}, text)
             run.finish(p['id'], seconds, usage)
             return text
@@ -956,24 +1088,30 @@ def task(args, kind):
     def elapsed():  # the whole task so far, its own work around the calls included
         return (time.perf_counter_ns() - started) / 1_000_000_000
     try:
-        text, stats = run_plan(plan, material, b, run, timeout_s=args.timeout, checker_spec=c)
-    except (backends.JudgeError, ValueError, OSError, subprocess.TimeoutExpired, BudgetExceeded, pipelines.NeedVerdicts) as exc:
-        print(f'harness: {kind} failed: {exc}', file=sys.stderr)
-        print(f'harness: {json.dumps({**run.summary(), **names, "elapsed_s": elapsed()})}', file=sys.stderr)
-        run.state('failed', error=f'{type(exc).__name__}: {exc}'[:500])
-        return 2
+        with TerminalProgress(run, getattr(args, 'progress', 'auto')):
+            text, stats = run_plan(plan, material, b, run, timeout_s=args.timeout, checker_spec=c)
+    except (backends.JudgeError, ValueError, OSError, subprocess.TimeoutExpired, BudgetExceeded,
+            pipelines.NeedVerdicts, KeyboardInterrupt) as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        print(f'harness: {kind} interrupted' if interrupted else f'harness: {kind} failed: {exc}', file=sys.stderr)
+        summary = {**run.summary(elapsed()), **names, 'status': 'interrupted' if interrupted else 'error'}
+        if run.trace:
+            with contextlib.suppress(OSError):
+                (run.trace / 'summary.json').write_text(json.dumps(summary, indent=1), encoding='utf-8')
+        print_summary(summary, getattr(args, 'summary_format', 'auto'))
+        run.state('interrupted' if interrupted else 'failed', error=f'{type(exc).__name__}: {exc}'[:500])
+        return 130 if interrupted else 2
     except BaseException:
         run.state('interrupted')
         raise
-    summary = {**run.summary(), **stats, **names}
-    summary['elapsed_s'] = elapsed()  # replaced below once the findings are written; kept if writing them fails
+    summary = {**run.summary(elapsed()), **stats, **names}
     try:
         if getattr(args, 'findings_json', None):
             summary.update(write_findings(args, text, run))
             if summary['findings_unshaped']:
                 print('harness: the review has no numbered finding and no "No defects found" line, so the findings '
                       'file is empty', file=sys.stderr)
-            summary['elapsed_s'] = elapsed()
+            summary.update(run.summary(elapsed()))
         if run.trace:
             (run.trace / 'result.md').write_text(text + '\n', encoding='utf-8')
             (run.trace / 'summary.json').write_text(json.dumps(summary, indent=1), encoding='utf-8')
@@ -983,12 +1121,12 @@ def task(args, kind):
             print(text)
     except (OSError, ValueError) as exc:
         print(text)
-        summary['elapsed_s'] = elapsed()  # the export that failed took its time too
+        summary.update(run.summary(elapsed()))  # include the export that failed
         print(f'harness: {kind} cannot write the result: {exc}', file=sys.stderr)
-        print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+        print_summary(summary, getattr(args, 'summary_format', 'auto'))
         run.state('failed', error=f'cannot write the result: {exc}'[:500])
         return 2
-    print(f'harness: {json.dumps(summary)}', file=sys.stderr)
+    print_summary(summary, getattr(args, 'summary_format', 'auto'))
     if run.trace:
         run.state('done', result=str(Path(args.out).resolve()) if args.out else str(run.trace / 'result.md'),
                   summary=str(run.trace / 'summary.json'))
@@ -1036,6 +1174,10 @@ def main(argv=None, *, prog='harness.py'):
         p.add_argument('--timeout', type=float, default=TIMEOUT_S,
                        help=f'soft seconds per call (default {TIMEOUT_S}): a call past it is checked and probed, '
                             f'not killed, and stopped at twice it, never under {HARD_FLOOR_S}s')
+        p.add_argument('--progress', choices=('auto', 'always', 'never'), default='auto',
+                       help='stderr progress: animate in a terminal, or log steps with always')
+        p.add_argument('--summary-format', choices=('auto', 'text', 'json'), default='auto',
+                       help='stderr summary: text in a terminal and JSON when redirected')
         p.add_argument('--max-calls', help=argparse.SUPPRESS)  # removed; kept only to explain why it fails
     args = parser.parse_args(argv)
     if args.command == 'review':

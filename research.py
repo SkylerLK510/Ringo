@@ -352,7 +352,7 @@ def parse_blocks(text, verified):
         elif ids:
             raise Rejected(f'block {n}: a {kind} cites no evidence')
         out.append({'type': kind, 'text': words, 'evidence': ids})
-    if not any(b['evidence'] for b in out):
+    if not any(b['evidence'] or b['type'] == 'gap' for b in out):
         raise Rejected('no block cites evidence')
     return out
 
@@ -656,6 +656,7 @@ BLOCK_TAGS = frozenset('address article aside blockquote body caption center dd 
 SKIP_TAGS = frozenset('script style template svg math noscript iframe object canvas select textarea'.split())
 META = frozenset(('citation_title', 'og:title', 'dc.title', 'citation_publication_date', 'citation_date',
                   'citation_online_date', 'article:published_time', 'dc.date', 'dcterms.issued', 'datepublished',
+                  'article:modified_time', 'dcterms.modified', 'datemodified',
                   'citation_doi', 'citation_arxiv_id'))
 HTML_TYPES = ('text/html', 'application/xhtml+xml')
 TEXT_TYPES = ('text/plain', 'text/markdown')
@@ -862,8 +863,8 @@ def before_unterminated_comment(text):
 
 
 def html_page(text, final_url, at=math.inf):
-    """(passages, page facts: title, published, canonical, scholarly) of an HTML text, parsed in FEED-sized pieces
-    with the deadline `at` (time.monotonic()) checked between them."""
+    """(passages, page facts: title, published, modified, canonical, scholarly) of an HTML text, parsed in
+    FEED-sized pieces with the deadline `at` (time.monotonic()) checked between them."""
     text = before_unterminated_comment(text)
     parser = _Page()
     try:
@@ -880,8 +881,10 @@ def html_page(text, final_url, at=math.inf):
     title = meta.get('citation_title') or meta.get('og:title') or meta.get('dc.title') or ' '.join(''.join(parser.title).split())
     published = next((meta[k] for k in ('citation_publication_date', 'citation_date', 'article:published_time',
                                          'citation_online_date', 'dcterms.issued', 'dc.date', 'datepublished') if k in meta), None)
+    modified = next((meta[k] for k in ('article:modified_time', 'dcterms.modified', 'datemodified') if k in meta), None)
     canonical = urljoin(final_url, parser.canonical) if parser.canonical else None
     return parser.passages, {'title': title[:TITLE_MAX] or None, 'published': published[:DATE_MAX] if published else None,
+                             'modified': modified[:DATE_MAX] if modified else None,
                              'canonical': canonical if canonical and canonical.startswith(('http://', 'https://')) else None,
                              'scholarly': any(k in meta for k in ('citation_title', 'citation_doi', 'citation_arxiv_id'))}
 
@@ -893,7 +896,7 @@ def extract(body, headers, final_url, at=math.inf):
     head = body[:1024].lstrip().lower()
     if ctype == 'application/pdf' or body.startswith(b'%PDF-'):
         raise Unsupported('a PDF: the standard library cannot extract its text')
-    page = {'title': None, 'published': None, 'canonical': None, 'scholarly': False}
+    page = {'title': None, 'published': None, 'modified': None, 'canonical': None, 'scholarly': False}
     if ctype in HTML_TYPES or (not ctype and (head.startswith(b'<!doctype html') or b'<html' in head)):
         passages, page = html_page(decode(body, headers), final_url, at)
     elif ctype in TEXT_TYPES or not ctype:
@@ -1210,18 +1213,21 @@ def verify(sources, net):
         r['display_title'] = page.get('title') or r['claimed']['title']
         r['title_source'] = 'page' if page.get('title') else 'search call'
         r['date'] = (page['published'], 'page metadata') if page.get('published') else \
-            (r['claimed']['published'], 'search call') if r['claimed']['published'] else None
+            (r['claimed']['published'], 'search call; not verified on page') if r['claimed']['published'] else None
     groups = works(verified)
     packets = []
     for w, group in enumerate(groups, 1):
         for r in group:
             r['work'] = w
+            page = r.get('page') or {}
             for c in r['claims']:
                 if c['level'] == 'verified':
                     c['evidence'] = f'E{len(packets) + 1}'
                     packets.append({'id': c['evidence'], 'work': w, 'source': r['source'], 'title': r['display_title'],
                                     'url': r['final_url'], 'signals': r['signals'],
-                                    'published': r['date'][0] if r['date'] else None, 'claim': c['claim'],
+                                    'published': page.get('published'), 'modified': page.get('modified'),
+                                    'search_reported_date': r['claimed']['published'], 'retrieved': r['retrieved'],
+                                    'claim': c['claim'],
                                     'quote': ' '.join(c['match']['text'].split()),
                                     'match': 'case-insensitive' if c['match']['case_insensitive'] else 'exact'})
     return {'records': records, 'works': groups, 'packets': packets, 'identifiers': list(table.values()),
@@ -1258,7 +1264,9 @@ def identity_check(rec, ident, res):
 DISCLAIMER = ('**What “verified” means.** Each cited quote was found, after whitespace and typography normalisation, '
               'inside one passage of the page at the listed address when Ringo fetched it. That shows the page held '
               'that text then. It does not show that the page is true, that the sentence citing it follows from the '
-              'quote, or that the source is the best one; source signals are rules about addresses and metadata, not '
+              'quote, or that the source is the best or most current one. Dates labeled page metadata are '
+              'not independent checks of freshness; search-reported dates are unverified. A retrieval time only records when the page was fetched. '
+              'Source signals are rules about addresses and metadata, not '
               'judgements of quality. Check claim-to-evidence support yourself before relying on this report.')
 
 
@@ -1290,10 +1298,23 @@ def source_entry(label, group, packets):
     lines = [f'**[{label}]** {title}. {link(head["final_url"])}',
              f'  {", ".join(head["signals"])}. Retrieved {head["retrieved"]}, SHA-256 {head["sha256"][:16]}'
              + (f', dated {md(head["date"][0])} ({head["date"][1]})' if head.get('date') else '') + '.']
+    if (head.get('page') or {}).get('modified'):
+        lines.append(f'  Updated {md(head["page"]["modified"])} (page metadata).')
     for p in packets:  # a quote verified on another address of the same work says where it was found
         where = f' (on {link(p["url"])})' if p['url'] != head['final_url'] else ''
         flag = ' (matched ignoring case: check the wording)' if p['match'] == 'case-insensitive' else ''
         lines.append(f'  - {p["id"]}{where}: “{md(p["quote"])}”{flag}')
+        if p.get('source') != head.get('source'):
+            dates = []
+            for key, name in (('published', 'Published'), ('modified', 'Updated')):
+                if p.get(key):
+                    dates.append(f'{name} {md(p[key])} (page metadata)')
+            if p.get('search_reported_date'):
+                dates.append(f'Search-reported {md(p["search_reported_date"])} (unverified)')
+            if p.get('retrieved'):
+                dates.append(f'Retrieved {md(p["retrieved"])}')
+            lines.append('    ' + ('; '.join(dates) if dates else 'Publication and update dates unknown') + '.')
+
     for other in group[1:]:
         lines.append(f'  - Also at {link(other["final_url"])}')
     for x in head.get('identifiers', ()):
@@ -1302,11 +1323,11 @@ def source_entry(label, group, packets):
     return lines + ['']
 
 
-def unused_lines(records, cited=frozenset()):
+def unused_lines(records, cited=None):
     """What was not used as evidence: uncited verified quotes, sources that could not be checked, dropped ones."""
     lines = []
-    uncited = [c for r in records for c in r['claims'] if c.get('evidence') and c['evidence'] not in cited]
-    if cited and uncited:
+    uncited = [c for r in records for c in r['claims'] if c.get('evidence') and c['evidence'] not in (cited or ())]
+    if cited is not None and uncited:
         lines.append(f'- Verified but not cited: {", ".join(c["evidence"] for c in uncited)}.')
     for r in records:
         if r['level'] == 'verified':
@@ -1341,7 +1362,7 @@ def render(blocks, result, calls):
             body += ['', (f'{text} {marks}' if marks else f'*Not covered by the verified sources:* {text}'), '']
     body_text = re.sub(r'\n{3,}', '\n\n', '\n'.join(body)).strip()
     found = {int(n) for n in re.findall(r'(?<!\\)\[(\d+)\]', body_text)}
-    if found != set(numbers.values()) or not found:
+    if found != set(numbers.values()):
         raise Rejected('a rendered citation does not map to cited verified evidence')
     lines = ['# Research report', '', body_text, '', '## Sources', '']
     for work, n in sorted(numbers.items(), key=lambda kv: kv[1]):

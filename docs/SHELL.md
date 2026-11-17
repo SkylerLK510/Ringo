@@ -283,8 +283,8 @@ How it works:
   argument.
 - **agy** can be asked and cannot ask: Ringo gives it no ask tool (its `mcp(*)` permission, auto mode's edits turns
   only, opens the owner's own MCP servers).
-- Ringo still does not start inside a turn it launched (`RINGO_CHILD`). The ask server is the one subcommand let
-  through, and it starts nothing.
+- Shell agents (`RINGO_CHILD=1`) may run `review`, `design` and `wait`, as well as their ask server.
+  Pipeline models also receive `RINGO_PIPELINE_CHILD=1` and cannot launch another pipeline.
 
 Checked live, one run each (Claude Code 2.1.322, codex-cli 0.167.0; `cargo run --example ask`, and the last through
 the shell in a pty):
@@ -413,6 +413,7 @@ renamed `resumed.json`, so one conversation is listed once. /restart goes throug
 | `/design TEXT` | Ringo's one-call design pipeline on `TEXT` |
 | `/research TOPIC` | Ringo's research role: one live web search call, every quoted source fetched and its quote checked in code, one write call that cites only verified evidence ([details](RESEARCH-ROLE.md)). Measured once at about 68,000 tokens, most of them search results |
 | `/work SPEC.json` | Ringo's checked work loop on a task spec |
+| `/task ...` | a persistent owner task, kept in Ringo's private state outside the repository: `/task` lists this repository's tasks; `/task create OBJECTIVE` makes and selects one; `/task inspect [ID]` shows it concisely; `/task select ID` selects it and the conversation remembers it; `/task resume [ID]` puts its next action in the input without starting an agent; `/task attach #N` records an agent job's durable answer and evidence references; `/task update` changes the objective, next action, constraints, decisions, issues and artifact references. Each update writes only if the revision it read is still current, so two shells cannot silently overwrite each other |
 | `@codex TASK` | talk to Codex from now on: this turn and later plain lines go to it, in this folder (`@codex` alone switches without a turn) |
 | `@codex! TASK` | Codex in its own copy of the folder (a git worktree of it as it is now, uncommitted changes included); nothing reaches your files until `/apply` |
 | `@codex @claude TASK`, `@all TASK` | the same task to several agents at once, each in its own copy, to compare |
@@ -729,10 +730,12 @@ added. Codex reads your `~/.codex/AGENTS.md` itself.
 A follow-up re-sends the conversation so far, so it costs a first turn plus that history, and within a turn every
 call re-reads everything before it. On a subscription login Claude runs Opus with a 1M window, where Claude Code
 compacts a conversation only near 967k tokens: one long turn started in a home folder read 3.9M tokens in all, its
-last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000`, the window Claude Code
-compacts at on a 200k model, and Claude compacts by itself when a conversation passes it, mid-turn as on resuming.
+last calls 140k each. So the shell runs Claude with `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000`, its minimum supported
+window. Claude subtracts output reserve and compaction headroom and compacts by itself, mid-turn as on resuming.
 Codex compacts near its own 475k window (one long turn here read 2.9M tokens, its calls still growing past 137k), so
-it runs with `-c model_auto_compact_token_limit=200000` too, unless your `config.toml` sets the key. A compaction
+it runs with `-c model_auto_compact_token_limit=64000`, unless your `config.toml` sets the key. Previously both
+defaults were 200,000. These are context thresholds, including cached history, rather than limits on accumulated
+token usage; large tool results can overshoot them until the next native compaction boundary. A compaction
 takes a minute or more (82 s for 171k tokens, measured), and the turn's row says "compacting the conversation" meanwhile.
 Compaction keeps the system prompt (with the files appended above) and re-reads the five files last changed; the
 rest of the history becomes Claude's summary. Set the variable yourself to choose another window (100000 to
@@ -742,8 +745,8 @@ use it.)
 
 agy's floor is its own: it declares 60 tools, about 20 of them for the browser, whatever the deny rules, mode or
 sandbox. Its startup event lists them, and no setting Ringo can pass removes them. Nor does Ringo set where agy
-compacts its conversation: in 24 real agy turns (2026-11-14) its calls grew past the 200,000 tokens where Claude's
-and Codex's compact (the largest read 256k), and fell back sharply only once (256k to 15k, within one turn).
+compacts its conversation: in 24 real agy turns (2026-11-14) its calls grew past the former 200,000-token defaults
+for Claude and Codex (the largest read 256k), and fell back sharply only once (256k to 15k, within one turn).
 
 Whatever the agent, a running turn's own count is told as it goes and warned about: each model call's usage is
 read as it lands (Claude per message, Codex per thread update, agy per step — Codex's and agy's were unparsed
@@ -1003,7 +1006,10 @@ before `turn/completed` is counted from its last `thread/tokenUsage/updated`, so
   since), with `git apply --3way`. A conflict leaves your files and the job untouched.
 - **Stopping:** `/kill` stops the job's whole process group. A Ringo pipeline is interrupted first, so Python's own
   cleanup ends its model calls, which run in sessions of their own.
-- **No recursion:** agents run with `RINGO_CHILD=1`, and both `ringo` and `ringo.py` refuse to start under it.
+- **Bounded nesting:** shell agents may request `review`, `design` and `wait`. Python and native pipeline
+  backends set `RINGO_PIPELINE_CHILD=1`; both entrypoints refuse further pipeline launches from those models.
+  Shell agents cannot launch another shell, `work`, research or release management. Reviews retain their plan
+  bounds (one call by default, at most two with a retry, plus the existing soft-limit probe when applicable).
 - **Fail closed:** a line that is not a JSON event, a failed turn, a missing completion record or an empty reply
   fails the job; it is never shown as done.
 - **Limits:** three jobs at a time, and one turn of each agent's at a time in your folder; a line for an agent

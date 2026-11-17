@@ -43,8 +43,9 @@ add a dark mode switch to the settings page
 - A long conversation costs more with every call, because the agent reads all of it again each time. Once it passes
   64,000 tokens, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
   reply, the steps taken, the files changed and the change itself. No extra call writes it, and the turn's log says
-  when it happens. Claude and Codex also shrink a conversation by themselves once it passes 200,000 tokens within
-  one turn; `/compact` makes Claude do that at once.
+  when it happens. Within one turn, Codex also compacts at a 64,000-token context threshold; Claude uses its
+  minimum 100,000-token window, minus its own output reserve and compaction headroom. Your explicit native
+  overrides take precedence. `/compact` makes Claude compact at once.
 - To give every Claude turn your own rules (how you push, what never to do), write them in `rules.md` in Ringo's
   state folder (`~/.local/share/ringo/rules.md`). Keep it short: every line is read on every call.
 
@@ -241,6 +242,32 @@ Using two agents at once also uses both plans at once: `/usage` shows how much e
 - To hand one job's answer and change to another agent, write `{#1}` in the message: `@codex check this: {#1}`.
 
 Copies need a git project.
+
+## Keep a task
+
+A task outlives the conversation: its objective, constraints, decisions, next action, artifacts, unresolved issues,
+and the agent jobs attached to it. Ringo keeps it in its private state, outside the repository, and binds it to this
+repository, so another folder cannot select it. Ordinary chat never reads or writes a task, so a damaged task file
+cannot stop a conversation.
+
+| Command | What it does |
+|---|---|
+| `/task` | list this repository's tasks, newest first |
+| `/task create OBJECTIVE` | make a task and select it |
+| `/task inspect [ID]` | show the selected task, or `ID`, concisely |
+| `/task select ID` | select a task; the conversation remembers it |
+| `/task resume [ID]` | put its next action (or objective) in the input; no agent starts |
+| `/task attach #N` | attach job N's durable answer and evidence references |
+| `/task update objective TEXT` | change the objective |
+| `/task update next TEXT` | set the next action |
+| `/task update constraint add TEXT`, `constraint remove N` | add or remove a constraint |
+| `/task update decision accept TEXT`, `decision propose TEXT`, `decision remove N` | record an owner decision |
+| `/task update issue add TEXT`, `issue remove N` | record or clear an unresolved issue |
+| `/task update artifact add REF [IDENTITY]`, `artifact remove N` | store an artifact reference |
+
+Each update is read at one revision and written only if that revision is still current, so two shells cannot silently
+overwrite each other; repeating a request is safe. `/task resume` only prepares the input: Enter sends it through the
+same agent conversation as ordinary chat, and no agent is started by the command itself.
 
 ## Run Ringo's pipelines
 
