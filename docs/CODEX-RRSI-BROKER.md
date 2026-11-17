@@ -19,9 +19,13 @@ runs in a separate isolated container; grading checks remain controller-only.
 Production Session routes Codex turns, restart handoffs and resumed threads
 through the broker. Native cumulative thread usage is differenced per turn,
 including cached input exactly once. Missing, interrupted or inconsistent usage
-retains the reservation and stops the campaign. Native HTTP request counts remain
+retains the reservation and stops the campaign. A usage update must follow the
+final assistant item and precede completion; otherwise observed counts remain
+a lower bound. Protocol variants without that ordering are refused. Native HTTP request counts remain
 unknown; reported usage updates and wall limits are admission checks, not a hard
-provider-side token or request cap. A single turn can overshoot its reservation.
+provider-side token or request cap. A single turn can overshoot its reservation. The built-in live provider may
+retry internally; offline replay disables retries, but does not certify live
+HTTP request counts.
 
 Build with `turnrun_codex_image.py` using publisher archive and catalog paths,
 their SHA-256 checksums, an immutable base image and a private build directory.

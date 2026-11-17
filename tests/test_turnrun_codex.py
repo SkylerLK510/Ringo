@@ -5,12 +5,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from turnrun import clean_env, usage_of
 from turnrun_broker import WorkerEndpoint
 from turnrun_codex import CodexBroker, MODEL, provider_socket, retained_usage, subscription_auth
-from turnrun_codex_bridge import arguments, environment
+from turnrun_codex_bridge import arguments, environment, fake_provider, CodexBridge
 from turnrun_isolation import DockerSandbox
 from turnrun_live import SessionTransport, scenario, write_json
 
@@ -84,6 +84,14 @@ class CodexProfileTests(unittest.TestCase):
                 rows[2]['params']['turnId'] = 'previous-turn'
             self.assertEqual(self.broker().parse_result(rows, 0, MODEL)['outcome'], 'failed')
 
+    def test_usage_before_final_reply_is_only_a_lower_bound(self):
+        rows = events()
+        rows[2], rows[3] = rows[3], rows[2]
+        result = self.broker().parse_result(rows, 0, MODEL)
+        self.assertEqual(result['outcome'], 'failed')
+        self.assertIsNone(usage_of(result)[1])
+        self.assertEqual(result['usage']['input'] + result['usage']['cache_read'] + result['usage']['output'], 40)
+
     def test_public_replay_remembers_cumulative_baseline(self):
         broker = self.broker()
         def replay(parent, **kwargs):
@@ -116,6 +124,41 @@ class CodexProfileTests(unittest.TestCase):
         self.assertIn('forced_login_method="chatgpt"', argv)
         self.assertIn('model_reasoning_effort="low"',argv)
         self.assertIn('features.multi_agent=false',argv)
+
+    def test_bridge_accepts_completion_on_last_allowed_usage_update(self):
+        import io
+        rows = [{'id': 1, 'result': {}}, {'id': 10, 'result': {}}, *events()]
+        proc = MagicMock()
+        proc.__enter__.return_value = proc
+        proc.stdout = io.BytesIO(b''.join(json.dumps(row).encode() + b'\n' for row in rows))
+        proc.stdin = io.BytesIO()
+        bridge = CodexBridge()
+        bridge.server = MagicMock(return_value=MagicMock(server_port=1))
+        bridge.rpc = MagicMock(return_value={'result': {'tools': [{'name': 'worker', 'inputSchema': {}}]}})
+        bridge.emit = MagicMock()
+        with patch('turnrun_codex_bridge.subprocess.Popen', return_value=proc), patch.object(Path, 'mkdir'):
+            bridge.run({'model': MODEL, 'prompt': 'x', 'instruction': '', 'resume': None,
+                        'oauth_token': {'access_token': 'test', 'account_id': 'test'}, 'max_turns': 1})
+        self.assertIn(unittest.mock.call(type='exit', code=0), bridge.emit.call_args_list)
+
+    def test_replay_rejects_worker_schema_drift(self):
+        import http.client
+        schema = {'type': 'object', 'properties': {'command': {'type': 'string'}}, 'required': ['command']}
+        for actual, status in ((schema, 200), ({'type': 'object'}, 400)):
+            server = fake_provider()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            server.worker_schema = schema
+            client = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=5)
+            self.addCleanup(client.close)
+            client.request('POST', '/v1/responses', json.dumps({'model': MODEL,
+                'reasoning': {'effort': 'low'}, 'tools': [{'type': 'function', 'name': 'worker', 'parameters': actual}]}),
+                {'Content-Type': 'application/json'})
+            response = client.getresponse()
+            self.assertEqual(response.status, status)
+            response.read()
+            self.assertEqual(server.requests, 1)
+            self.assertEqual(server.rejected, status == 400)
 
     def test_child_guard_precedes_credentials_and_container_probe(self):
         broker=self.broker()

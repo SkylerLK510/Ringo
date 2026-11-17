@@ -76,6 +76,18 @@ def retained_usage(events, previous=None):
                and tid is not None and e.get('params', {}).get('turnId') == tid]
     completions = [e for e in events if e.get('method') == 'turn/completed']
     observed, valid = [], bool(reports) and len(completions) == 1
+    # Only a usage update after the final assistant item establishes coverage
+    # of its request. Earlier tool-request usage is merely a lower bound.
+    final_items = [i for i, e in enumerate(events) if e.get('method') == 'item/completed'
+                   and e.get('params', {}).get('threadId') == sid
+                   and e.get('params', {}).get('turnId') == tid
+                   and e.get('params', {}).get('item', {}).get('type') == 'agentMessage']
+    final_reports = [i for i, e in enumerate(events) if e.get('method') == 'thread/tokenUsage/updated'
+                     and e.get('params', {}).get('threadId') == sid
+                     and e.get('params', {}).get('turnId') == tid]
+    completion_positions = [i for i, e in enumerate(events) if e.get('method') == 'turn/completed']
+    valid &= bool(final_items and final_reports and completion_positions
+                  and max(final_items) < max(final_reports) < completion_positions[0])
     if len(completions) == 1:
         valid &= (completions[0].get('params', {}).get('threadId') == sid
                   and tid is not None and completions[0].get('params', {}).get('turn', {}).get('id') == tid)

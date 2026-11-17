@@ -19,12 +19,13 @@ fn broker_client(args: &[String]) -> Result<(), String> {
         return Err("invalid broker client arguments".into());
     }
     let mut line = String::new();
-    std::io::stdin().lock().take(131_073).read_line(&mut line).map_err(|e| e.to_string())?;
-    if line.len() > 131_072 || !line.ends_with('\n') { return Err("invalid broker prompt".into()) }
+    std::io::stdin().lock().take(1_048_577).read_line(&mut line).map_err(|e| e.to_string())?;
+    if line.len() > 1_048_576 || !line.ends_with('\n') { return Err("invalid broker prompt".into()) }
     let message: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
     let codex = args[0] == "--codex-broker-client";
     let prompt = message.pointer(if codex { "/prompt" } else { "/message/content" })
         .and_then(Value::as_str).ok_or("broker requires text")?;
+    if prompt.len() > 128 * 1024 { return Err("broker prompt exceeds decoded limit".into()) }
     let resume = if codex { message["resume"].as_str() } else { args.get(3).map(String::as_str) };
     let mut socket = UnixStream::connect(&args[1]).map_err(|e| e.to_string())?;
     socket.set_read_timeout(Some(Duration::from_secs(360))).map_err(|e| e.to_string())?;

@@ -142,8 +142,8 @@ class SessionTransport:
     def handle(self, connection):
         connection.settimeout(min(5, max(0.1, self.deadline-time.monotonic())))
         with connection.makefile('rb') as stream:
-            data = stream.readline(131073)
-        if len(data) > 131072 or not data.endswith(b'\n'):
+            data = stream.readline(1048577)
+        if len(data) > 1048576 or not data.endswith(b'\n'):
             raise ValueError('invalid broker request framing')
         request = json.loads(data, object_pairs_hook=unique_object, parse_constant=reject_constant)
         if not isinstance(request, dict) or set(request) != {'prompt', 'resume'}:

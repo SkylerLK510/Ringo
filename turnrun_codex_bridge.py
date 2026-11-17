@@ -79,6 +79,8 @@ class CodexBridge(Bridge):
         if len(tools) != 1 or tools[0].get('name') != 'worker':
             raise ValueError('unexpected worker discovery')
         tool = tools[0]
+        if fake:
+            fake.worker_schema = tool['inputSchema']
         with subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, cwd='/tmp/native/empty',
                               env=environment(f'http://127.0.0.1:{proxy.server_port}')) as proc:
@@ -164,7 +166,7 @@ class CodexBridge(Bridge):
                     self.emit(type='event', event=message)
                     if method == 'thread/tokenUsage/updated':
                         reports += 1
-                        if reports >= request['max_turns']:
+                        if reports > request['max_turns']:
                             # Each reported model request counts against this profile's
                             # soft request bound. No implicit repair/retry is permitted.
                             raise ValueError('Codex model request admission limit reached')
@@ -208,13 +210,16 @@ def fake_provider():
             for item in body.get('input', []):
                 if item.get('type') == 'additional_tools':
                     specs.extend(item.get('tools', []))
-            names = []
+            names, schemas = [], []
             for tool in specs:
                 if tool.get('type') == 'namespace' and tool.get('name') == 'functions':
                     names.extend(t.get('name') for t in tool.get('tools', []))
+                    schemas.extend(t.get('parameters') for t in tool.get('tools', []))
                 else:
                     names.append(tool.get('name'))
-            if names != ['worker'] or body.get('model') != MODEL or body.get('reasoning', {}).get('effort') != 'low':
+                    schemas.append(tool.get('parameters'))
+            if (names != ['worker'] or schemas != [self.server.worker_schema]
+                    or body.get('model') != MODEL or body.get('reasoning', {}).get('effort') != 'low'):
                 self.server.rejected = True
                 data = json.dumps({'error': {'message': 'Offline profile rejected tools '+json.dumps(names)
                     +' model '+str(body.get('model'))+' keys '+json.dumps(list(body))}}).encode()
@@ -251,6 +256,7 @@ def fake_provider():
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Replay)
     server.daemon_threads = True
     server.requests, server.tool_result_seen, server.rejected = 0, False, False
+    server.worker_schema = None
     server.prefix = 'offline-'+os.urandom(8).hex()+'-'
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server

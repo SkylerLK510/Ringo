@@ -60,6 +60,13 @@ class TransportTest(unittest.TestCase):
                 data += chunk
             return [json.loads(line) for line in data.splitlines()]
 
+    def test_worst_case_escaped_prompt_reaches_provider_once(self):
+        prompt = '\x00' * (128 * 1024)
+        with self.service() as service:
+            output = self.request(service, prompt)
+        self.assertFalse(output[-1].get('is_error', False))
+        self.assertEqual(self.calls, [(prompt, None, 100)])
+
     def test_continuation_and_fresh_turn_share_one_budget(self):
         with self.service() as service:
             self.request(service, 'first')
