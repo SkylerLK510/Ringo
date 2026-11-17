@@ -2,9 +2,11 @@
 //! agent edits in private git worktrees until the owner applies them. The terminal shell (`ringo`) and, later,
 //! the IDE drive a `Session` and render its jobs.
 
+pub mod evidence;
 pub mod parse;
 pub mod rt;
 pub mod task;
+pub mod task_assignment;
 
 pub mod images;
 pub mod turn_policy;
@@ -529,6 +531,16 @@ pub struct Job {
     /// What starting this turn marked as told to its agent: the other agents' turns (job ids) and the turns before a
     /// restart. A turn that fails before its agent takes its message in gives them back (`end_with`).
     told_now: (Vec<usize>, Option<String>),
+    /// A persisted task assignment awaiting provider-backed delivery acknowledgement. Process creation is insufficient.
+    task_assignment: Option<task_assignment::PreparedAssignment>,
+    /// The native provider thread observed for this job; task cursors are scoped to it, not just to the agent.
+    task_thread: Option<String>,
+    /// The native thread this turn resumed, when it resumed one. Only that thread may stand in for an
+    /// unobserved thread id: a fresh turn's activity must never acknowledge an older conversation's cursor.
+    task_resume: Option<String>,
+    /// The native conversation state a fresh handoff replaced this turn. Restored when the turn fails before any
+    /// provider call, so a refused launch leaves the conversation available for retry.
+    fresh_rollback: Option<(String, Option<Tokens>, Option<u64>)>,
 }
 
 impl Job {
@@ -663,6 +675,10 @@ pub struct Session {
     start: usize,
     /// The running total each resumable conversation last reported, by agent and conversation id.
     usage_so_far: HashMap<(Agent, String), Tokens>,
+    /// Conversations whose `usage_so_far` this process has actually observed a provider total for. A watermark
+    /// restored from a kept file can be behind a turn that crashed after the provider advanced, so it is not evidence
+    /// of this turn's work until a note reaches this process and re-syncs it.
+    usage_synced: HashSet<(Agent, String)>,
     /// How far agents act without asking.
     pub mode: Mode,
     /// How hard they think (see `Tier`).
@@ -1074,7 +1090,7 @@ impl Session {
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
-                     usage_so_far: HashMap::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
+                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
     }
 
@@ -1243,6 +1259,9 @@ impl Session {
     /// Goes on with what the shell before a /restart handed on: each agent's conversation, what it had yet to be told,
     /// and how full that conversation is with Ringo's record of it (agents no longer set up are left out).
     pub fn resume(&mut self, threads: &[(String, String)], told: &[(String, String)], records: &[(String, u64, String)]) {
+        // Restored conversations carry no observation of this process: a watermark handed on from a kept file is
+        // untrusted until a provider note reaches here (see `usage_synced`).
+        self.usage_synced.clear();
         for (name, id) in threads {
             if let Some(agent) = Agent::from_name(name) {
                 self.threads.insert(agent, id.clone());
@@ -1337,7 +1356,8 @@ impl Session {
     /// codex-cli 0.167.0: resumed with no model named, each ran the model it was last given). False when it had none.
     pub fn start_over(&mut self, agent: Agent) -> bool {
         let Some(old) = self.threads.remove(&agent) else { return false };
-        self.usage_so_far.remove(&(agent, old));
+        self.usage_so_far.remove(&(agent, old.clone()));
+        self.usage_synced.remove(&(agent, old));
         self.context.remove(&agent);
         true
     }
@@ -1653,11 +1673,36 @@ impl Session {
             self.told.remove(&agent); // the turns before the restart it had not heard are in the record (`carried`)
         }
         if fresh && let Some(old) = resume.take() {
+            let usage = self.usage_so_far.remove(&(agent, old.clone()));
+            // The replacement conversation has not been observed here: its watermark, if restored, is untrusted again.
+            self.usage_synced.remove(&(agent, old.clone()));
+            let context = self.context.remove(&agent);
             self.threads.remove(&agent);
-            self.usage_so_far.remove(&(agent, old));
-            self.context.remove(&agent);
+            // Stashed on the job so a failure before dispatch can put the conversation back.
+            self.jobs[id - 1].fresh_rollback = Some((old, usage, context));
         }
         Some((text, note))
+    }
+
+    /// Undoes this turn's optimistic state after a failure before dispatch: the generic-handoff markers, and a
+    /// fresh handoff's replaced conversation, so a refused launch leaves everything retryable.
+    fn roll_back_turn(&mut self, id: usize, agent: Agent, heard: Option<BTreeSet<usize>>, untold: Option<String>) {
+        match heard {
+            Some(heard) => { self.heard.insert(agent, heard); }
+            None => { self.heard.remove(&agent); }
+        };
+        if let Some(untold) = untold {
+            self.told.insert(agent, untold);
+        }
+        if let Some((old, usage, context)) = self.jobs[id - 1].fresh_rollback.take() {
+            if let Some(usage) = usage {
+                self.usage_so_far.insert((agent, old.clone()), usage);
+            }
+            self.threads.insert(agent, old);
+            if let Some(context) = context {
+                self.context.insert(agent, context);
+            }
+        }
     }
 
     /// The turns before a /restart that `agent`'s fresh start begins with: the record of its conversation there, or,
@@ -1819,7 +1864,8 @@ impl Session {
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
-                             uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None) });
+                             uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
+                              task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None });
         Ok(id)
     }
 
@@ -1918,6 +1964,45 @@ impl Session {
                                 can be wrong; the files here are the truth):\n\n{}\n\n{rest}", before.trim_end());
                 self.jobs[id - 1].push_log(format!("told {} the turns before the restart (about {} tokens)", agent.name(),
                                                    fmt_k(before.len() as u64 / 4)));
+            }
+        }
+        let selected = if prompt.trim() != "/compact" {
+            match self.selected_task() {
+                Ok(task) => task,
+                Err(why) => {
+                    // Selected-task state is required before dispatch. Roll back the optimistic generic-handoff
+                    // markers and fail the job, so it is not left Running and no model call was made.
+                    self.roll_back_turn(id, agent, heard.clone(), untold.clone());
+                    self.end(id, Status::Failed(why.clone()));
+                    return Err(why);
+                }
+            }
+        } else { None };
+        if let Some(task) = selected {
+            let prepared = task_assignment::AssignmentStore::new(&self.root, &task.repository)
+                .and_then(|store| store.prepare(&task, name, resume.as_deref(), task_assignment::ContextPolicy::bounded()));
+            match prepared {
+                Ok(Some(prepared)) => {
+                    let kind = match prepared.manifest.kind {
+                        task_assignment::AssignmentKind::Full => "full assignment",
+                        task_assignment::AssignmentKind::Delta => "assignment delta",
+                    };
+                    self.jobs[id - 1].push_log(format!("prepared {} {} for task {} at revision {}", kind,
+                                                       prepared.manifest.assignment_id, task.id, task.revision));
+                    sent = format!("{}\n\n{sent}", prepared.text);
+                    self.jobs[id - 1].task_assignment = Some(prepared);
+                    // Only the thread this turn resumed may later stand in for an unobserved thread id.
+                    self.jobs[id - 1].task_resume = resume.clone();
+                }
+                Ok(None) => {}
+                Err(why) => {
+                    let why = why.to_string();
+                    // Assignment state is required once a task is selected. Fail before dispatch and roll back the
+                    // optimistic generic-handoff markers too; no cursor has advanced and no model call was made.
+                    self.roll_back_turn(id, agent, heard.clone(), untold.clone());
+                    self.end(id, Status::Failed(why.clone()));
+                    return Err(why);
+                }
             }
         }
         // The connectors load for a message that names one, and for the conversation's turn after one that called one
@@ -2291,13 +2376,7 @@ impl Session {
         };
         if let Err(e) = self.spawn(id, cmd, parser, input, None) {
             // the agent never got this turn's handoff, so its next turn is told those turns again
-            match heard {
-                Some(heard) => self.heard.insert(agent, heard),
-                None => self.heard.remove(&agent),
-            };
-            if let Some(untold) = untold {
-                self.told.insert(agent, untold);
-            }
+            self.roll_back_turn(id, agent, heard, untold);
             return Err(e);
         }
         // A turn that starts can still fail before its agent reads a word (`end_with` gives these back then).
@@ -2457,7 +2536,16 @@ impl Session {
              -> Result<(), String> {
         let style = parser.style();
         let dir = self.jobs[id - 1].dir.clone();
-        let stderr = fs::File::create(dir.join("stderr.txt")).map_err(|e| e.to_string())?;
+        // A setup failure must not leave the job Running: no child exists to end it, so a later turn would be
+        // refused as busy and /kill would have no process to stop. Mark it failed here, as the spawn path below does.
+        let stderr = match fs::File::create(dir.join("stderr.txt")) {
+            Ok(file) => file,
+            Err(e) => {
+                let reason = format!("{}: {e}", cmd.get_program().to_string_lossy());
+                self.end(id, Status::Failed(reason.clone()));
+                return Err(reason);
+            }
+        };
         cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() }).stderr(stderr);
         cmd.stdout(if trace.is_some() { Stdio::null() } else { Stdio::piped() });
         #[cfg(unix)]
@@ -2733,6 +2821,31 @@ impl Session {
         }
     }
 
+    /// Acknowledge a prepared task assignment after provider-backed activity. A process spawn, thread initialization or
+    /// clean exit alone does not get here. Failed persistence leaves the previous cursor intact for the next turn.
+    fn acknowledge_assignment(&mut self, id: usize) {
+        let Some(prepared) = self.jobs[id - 1].task_assignment.take() else { return };
+        let Kind::Agent { agent, .. } = self.jobs[id - 1].kind else { return };
+        // Only the thread this turn resumed may stand in for an unobserved thread id; a fresh turn's activity must
+        // never acknowledge an older conversation's cursor.
+        let thread = self.jobs[id - 1].task_thread.clone().or(self.jobs[id - 1].task_resume.clone());
+        let Some(thread) = thread else {
+            self.jobs[id - 1].task_assignment = Some(prepared); // a native activity note can supply it later
+            return;
+        };
+        let result = self.task_store().map_err(|e| e.to_string()).and_then(|store| {
+            let task = store.load(&prepared.manifest.task_id).map_err(|e| e.to_string())?;
+            task_assignment::AssignmentStore::new(&self.root, &task.repository)
+                .and_then(|assignments| assignments.acknowledge(&task, agent.name(), &thread, &prepared.manifest.assignment_id))
+                .map_err(|e| e.to_string())
+        });
+        if let Err(why) = result {
+            // Do not retry every event in this turn: the durable cursor is authoritative and unadvanced. The next
+            // assignment preparation will repeat the still-pending state.
+            self.jobs[id - 1].push_log(format!("task assignment was not acknowledged: {why}; its state will be included again next turn"));
+        }
+    }
+
     /// Folds pending events into the jobs; true when anything changed.
     pub fn pump(&mut self) -> bool {
         let mut changed = self.take_asks();
@@ -2763,6 +2876,7 @@ impl Session {
                     self.end_with(id, status, reply);
                 }
                 Event::Note(id, Note::Session(session)) => {
+                    self.jobs[id - 1].task_thread = Some(session.clone());
                     if let Kind::Agent { agent, write: false } = self.jobs[id - 1].kind {
                         self.threads.insert(agent, session);
                     }
@@ -2784,6 +2898,15 @@ impl Session {
                     }
                 }
                 Event::Note(id, note) => {
+                    if let Note::Turn { thread, .. } = &note {
+                        self.jobs[id - 1].task_thread = Some(thread.clone());
+                    }
+                    // Turn and thread creation identify the conversation but are not delivery: a turn that is
+                    // created and then fails before its first model request must leave the assignment pending.
+                    // A model action is delivery; usage is judged below, where this turn's own increment is known —
+                    // a resumed thread's unchanged cumulative total is history, not work.
+                    let acted = note_acknowledges_delivery(&note);
+                    let mut used = false;
                     let job = &mut self.jobs[id - 1];
                     let so_far = matches!(note, Note::TokensSoFar(_));
                     match note {
@@ -2817,15 +2940,24 @@ impl Session {
                             // cannot (`TokensSoFar`) its total is counted the same way. A running total never
                             // falls, so a result without usage (zero) keeps the last one.
                             job.counted = true;
+                            // A cumulative total only proves this turn worked when this process has already seen the
+                            // thread's earlier total. A watermark restored from a kept file can be behind a turn that
+                            // crashed after the provider advanced, so the first report after a restart is history, not
+                            // evidence; a model action or reply acknowledges that turn instead.
+                            let mut trusted = true;
                             let t = match job.kind {
                                 Kind::Agent { agent, write: false }
                                     if so_far || matches!(agent.spec().adapter, Adapter::Codex | Adapter::Agy) =>
                                 {
                                     let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
+                                    let known = self.usage_synced.contains(&key);
                                     let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
                                     if t.total() >= before.total() {
-                                        self.usage_so_far.insert(key, t);
+                                        self.usage_so_far.insert(key.clone(), t);
                                     }
+                                    // Observed here from now on: a later delta in this turn is a real increment.
+                                    self.usage_synced.insert(key);
+                                    trusted = known;
                                     // agy tells each model call's own count as it goes (`Live`), and an agy turn
                                     // takes no line while it works, so one result ends it: the calls summed are the
                                     // turn's own, whatever total was kept. A total kept before agy's cache reads were
@@ -2850,7 +2982,13 @@ impl Session {
                                 _ => t,
                             };
                             job.tokens.add(t);
+                            // Only usage this turn added proves the model worked. A resumed Codex or agy report
+                            // that repeats the thread's earlier total adds nothing, and a first report after a
+                            // restart may be history the restored watermark missed.
                             if t.total() > 0 {
+                                if trusted {
+                                    used = true;
+                                }
                                 // the turn's own count replaces what its messages said; a result without one (an
                                 // error result) keeps them
                                 job.live = Tokens::default();
@@ -2860,17 +2998,25 @@ impl Session {
                             job.counted = true;
                             // Codex's live total is its thread's so far (its updates carry the earlier turns of a
                             // resumed conversation), so the turn's own is told the same way its final count is.
-                            // Claude's and agy's totals are each run's own already.
+                            // Claude's and agy's totals are each run's own already. A live total is delivery evidence
+                            // only when this process already knew the thread's earlier total; after a restart the
+                            // restored watermark can lag a crashed turn, so a model action or reply settles it.
+                            let mut trusted = true;
                             job.live = match job.kind {
                                 Kind::Agent { agent, write: false }
                                     if matches!(agent.spec().adapter, Adapter::Codex) =>
                                 {
                                     let key = (agent, self.threads.get(&agent).cloned().unwrap_or_default());
+                                    trusted = self.usage_synced.contains(&key);
                                     let before = self.usage_so_far.get(&key).copied().unwrap_or_default();
                                     t.since(before)
                                 }
                                 _ => t,
                             };
+                            // A live total that equals the thread's earlier one added nothing this turn.
+                            if trusted && job.live.total() > 0 {
+                                used = true;
+                            }
                             // The turn's tokens so far (final counts plus live ones: a line the owner sends while
                             // it works ends in a final count of its own, and the live count starts again from 0)
                             // past the next line: a warning in its log, with /kill named.
@@ -2918,6 +3064,10 @@ impl Session {
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
                         Note::Limits(info) => self.claude_limits = Some(info),
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above
+                    }
+                    // Provider-backed delivery, not process creation: a model action, or usage this turn added.
+                    if acted || used {
+                        self.acknowledge_assignment(id);
                     }
                 }
             }
@@ -3170,6 +3320,13 @@ impl Session {
 }
 
 // --- Agents the owner has set up, and their sign-in -------------------------------------------------------------
+
+/// True when a provider note is a model action that proves the turn's prompt reached the model. Turn and thread
+/// creation identify the conversation but are not delivery, and a usage note is not either: a resumed thread's
+/// unchanged cumulative total is history, so the token accounting decides from the turn's own increment.
+fn note_acknowledges_delivery(note: &Note) -> bool {
+    matches!(note, Note::Step(_) | Note::Looked { .. } | Note::Partial(_) | Note::Reply(_))
+}
 
 fn agents_file(root: &Path) -> PathBuf {
     root.join("agents.json")
@@ -3632,6 +3789,62 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delivery_needs_model_activity_not_just_a_created_turn() {
+        // A created turn or session identifies the conversation; it does not prove the model received anything.
+        assert!(!note_acknowledges_delivery(&Note::Turn { thread: "t".into(), turn: "u".into() }));
+        assert!(!note_acknowledges_delivery(&Note::Session("t".into())));
+        // A usage report is not delivery by itself: the token accounting acknowledges only what this turn added,
+        // because a resumed thread repeats its earlier total.
+        assert!(!note_acknowledges_delivery(&Note::Live(Tokens::default())));
+        assert!(!note_acknowledges_delivery(&Note::Tokens(Tokens::default())));
+        let used = Tokens { input: 12, output: 3, ..Tokens::default() };
+        assert!(!note_acknowledges_delivery(&Note::Live(used)));
+        assert!(!note_acknowledges_delivery(&Note::TokensSoFar(used)));
+        assert!(note_acknowledges_delivery(&Note::Step("$ ls".into())));
+        assert!(note_acknowledges_delivery(&Note::Looked { kind: "read", text: "read f".into() }));
+        assert!(note_acknowledges_delivery(&Note::Partial("some".into())));
+        assert!(note_acknowledges_delivery(&Note::Reply("done".into())));
+    }
+
+    #[test]
+    fn a_fresh_handoff_that_then_fails_to_prepare_leaves_the_conversation_retryable() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        let prior = record_turn(&mut s, "the earlier turn");
+        fs::write(s.jobs[prior - 1].dir.join("reply.md"), "an earlier reply").unwrap();
+        // A task whose required state cannot fit: preparation fails before dispatch, after the fresh handoff
+        // already replaced the agent's native conversation state.
+        let store = s.task_store().unwrap();
+        let task = store.create("overflow-task", &"🌍".repeat(15_000)).unwrap();
+        s.select_task(&task.id).unwrap();
+        s.handoff_at = 0;
+        s.context.insert(agent, 1_000_000);
+        s.threads.insert(agent, "thread-1".into());
+        s.usage_so_far.insert((agent, "thread-1".into()), Tokens { input: 11, output: 7, ..Tokens::default() });
+        let error = s.launch_agent(agent, false, "the owner's message").unwrap_err();
+        assert!(error.contains("context budget"), "{error}");
+        // The conversation is back for a retry, and the job did not stay Running.
+        assert_eq!(s.threads.get(&agent), Some(&"thread-1".to_string()));
+        assert!(s.usage_so_far.contains_key(&(agent, "thread-1".to_string())));
+        assert_eq!(s.context.get(&agent), Some(&1_000_000));
+        assert!(matches!(s.jobs.last().unwrap().status, Status::Failed(_)));
+    }
+
+    #[test]
+    fn a_spawn_setup_failure_marks_the_job_failed_instead_of_leaving_it_running() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        let id = s.new_job(Kind::Agent { agent, write: false }, "a turn that cannot start").unwrap();
+        // stderr.txt cannot be created: a directory occupies its path (a full disk fails the same way). No child
+        // will exist to end this job, so it must not stay Running: the next turn would be refused as busy.
+        fs::create_dir(s.jobs[id - 1].dir.join("stderr.txt")).unwrap();
+        let error = s.spawn(id, Command::new("true"), Parser::new(Style::Plain), None, None).unwrap_err();
+        assert!(error.contains("true"), "{error}");
+        assert!(matches!(s.jobs[id - 1].status, Status::Failed(_)));
+        assert!(!s.jobs[id - 1].running());
+    }
 
     #[test]
     fn wsl_shows_in_the_distro_variable_and_proc_version() {

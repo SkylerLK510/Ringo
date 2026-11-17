@@ -2,7 +2,7 @@
 #![cfg(unix)]
 
 use ringo_cli::{kept, parse::Tokens, Agent, Decision, Kept, Mode, Session, Status};
-use ringo_cli::task::JobRef;
+use ringo_cli::task::{DecisionStatus, JobRef, TaskUpdate};
 
 fn agent(name: &str) -> Agent {
     Agent::from_name(name).unwrap()
@@ -1639,6 +1639,149 @@ fn a_task_attaches_a_finished_agent_job_and_survives_resume() {
     assert_eq!(task.jobs, vec![job]);
     assert!(task.concise_view().contains("completion does not accept the task"));
     assert!(next.selected_task_error.is_none());
+}
+
+#[test]
+fn task_assignments_cross_agents_and_restart_with_immutable_evidence_and_native_deltas() {
+    let r = repo("task-context");
+    let (codex, claude) = (fake(&root(), "codex-task-context", &codex_ok()),
+                           fake(&root(), "claude-task-context", CLAUDE_TALKS));
+    let state = root().join("task-context-state");
+    let open = || {
+        let mut s = Session::with_state_home(&r, &state, &state).unwrap();
+        s.programs.insert(agent("codex"), codex.clone());
+        s.programs.insert(agent("claude"), claude.clone());
+        s.codex_home = root().join("codex-home-golden");
+        s
+    };
+    let mut s = open();
+    let claude_job = said(&mut s, "claude", "fix it before the task exists");
+    assert_eq!(claude_heard(&claude), ("fix it before the task exists".into(), false), "no-task chat stays lean");
+    let store = s.task_store().unwrap();
+    let mut task = store.create("context-create", "  Preserve the exact objective 🌍.  ").unwrap();
+    s.select_task(&task.id).unwrap();
+    for (request, update) in [
+        ("context-constraint", TaskUpdate::AddConstraint("Never weaken authentication.".into())),
+        ("context-decision", TaskUpdate::AddDecision { text: "Reuse the existing parser.".into(), status: DecisionStatus::Accepted }),
+        ("context-issue", TaskUpdate::AddIssue("The owner must choose the rollout.".into())),
+        ("context-next", TaskUpdate::NextAction("Continue with Codex.".into())),
+    ] {
+        task = store.update(&task.id, task.revision, request, update).unwrap();
+    }
+    task = store.attach(&task.id, task.revision, "context-attach", JobRef::from_job(s.job(claude_job).unwrap()).unwrap()).unwrap();
+    let private_job = s.job(claude_job).unwrap().dir.clone();
+    said(&mut s, "codex", "take over this task");
+    let full = turn_text(&codex);
+    assert!(full.starts_with("RINGO TASK ASSIGNMENT\nKind: full"), "{full}");
+    for expected in ["  Preserve the exact objective 🌍.  ", "Never weaken authentication.", "Reuse the existing parser.",
+                     "The owner must choose the rollout.", "Continue with Codex.", "ATTRIBUTED AGENT CLAIM", "e-"] {
+        assert!(full.contains(expected), "missing {expected:?}:\n{full}");
+    }
+    assert!(!full.contains(&private_job.to_string_lossy().into_owned()), "private paths are not evidence capabilities");
+    assert!(threads(&codex).last().unwrap()["method"] == "thread/start");
+
+    // Only acknowledged state becomes the resume baseline. Survive a shell restart and persist a second owner change.
+    task = store.update(&task.id, task.revision, "context-pending", TaskUpdate::AddConstraint("Preserve undo as well.".into())).unwrap();
+    let kept = s.keep(None).unwrap();
+    drop(s);
+    let mut s = open();
+    s.go_on(&kept).unwrap();
+    let store = s.task_store().unwrap();
+    task = store.update(&task.id, task.revision, "context-after-restart", TaskUpdate::NextAction("Retry the pending delta.".into())).unwrap();
+    said(&mut s, "codex", "after restart");
+    let delta = turn_text(&codex);
+    assert!(delta.starts_with("RINGO TASK ASSIGNMENT\nKind: delta"), "{delta}");
+    assert!(delta.contains("Preserve undo as well.") && delta.contains("Retry the pending delta."), "{delta}");
+    assert!(!delta.contains("Never weaken authentication.") && !delta.contains("ATTRIBUTED AGENT CLAIM"), "unchanged state was repeated:\n{delta}");
+    assert!(threads(&codex).last().unwrap()["method"] == "thread/resume");
+    said(&mut s, "codex", "no task changes");
+    assert!(!turn_text(&codex).contains("RINGO TASK ASSIGNMENT"), "an unchanged resume repeats no assignment");
+
+    // Reverse direction: Claude already has a native thread, but no task cursor on it, so it gets a complete assignment.
+    let codex_job = s.jobs.iter().find(|j| matches!(j.kind, ringo_cli::Kind::Agent { agent: who, .. } if who == agent("codex"))).unwrap().id;
+    let _task = store.attach(&task.id, task.revision, "reverse-attach", JobRef::from_job(s.job(codex_job).unwrap()).unwrap()).unwrap();
+    said(&mut s, "claude", "take it back");
+    let (reverse, resumed) = claude_heard(&claude);
+    assert!(resumed && reverse.starts_with("RINGO TASK ASSIGNMENT\nKind: full"), "{reverse}");
+    assert!(reverse.contains("Preserve undo as well.") && reverse.contains("Retry the pending delta."), "{reverse}");
+}
+
+#[test]
+fn a_restarted_shell_cannot_acknowledge_from_a_provider_total_it_never_observed() {
+    // The crash window: the provider thread advanced after the shell's last keep, so the restored watermark lags
+    // the thread. A resumed turn that only repeats that historical total and fails did no work here: its first
+    // cumulative report is untrusted until this process has observed the thread's earlier total, or a model
+    // action or reply settles the turn.
+    let r = repo("task-restart-usage");
+    let working = fake(&root(), "codex-restart-usage-working", &codex_ok());
+    let ahead = fake(&root(), "codex-restart-usage-ahead", &codex_script("", r#"echo '{"method":"thread/tokenUsage/updated","params":{"threadId":"t-1","tokenUsage":{"total":{"inputTokens":20,"cachedInputTokens":8,"outputTokens":4}}}}'
+echo '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"status":"failed","error":{"message":"no model work"}}}}'"#));
+    let state = root().join("task-restart-usage-state");
+    let open = || {
+        let mut s = Session::with_state_home(&r, &state, &state).unwrap();
+        s.codex_home = root().join("codex-home-restart-usage");
+        s
+    };
+    let mut s = open();
+    s.programs.insert(agent("codex"), working.clone());
+    let store = s.task_store().unwrap();
+    let task = store.create("restart-create", "Keep the pending delta across a crash.").unwrap();
+    s.select_task(&task.id).unwrap();
+    said(&mut s, "codex", "begin the task");
+    assert!(turn_text(&working).starts_with("RINGO TASK ASSIGNMENT\nKind: full"));
+    // The shell kept its watermark at the first turn's total (10/4/2), then crashed: the provider thread is ahead.
+    let kept = s.keep(None).unwrap();
+    drop(s);
+    let _task = store.update(&task.id, task.revision, "restart-constraint",
+                              TaskUpdate::AddConstraint("Survives the crash window.".into())).unwrap();
+    let mut next = open();
+    assert!(next.go_on(&kept).is_some());
+    next.programs.insert(agent("codex"), ahead.clone());
+    let failed = next.launch_agent(agent("codex"), false, "do no work").unwrap();
+    assert_eq!(wait(&mut next, failed), Status::Failed("codex: no model work".into()));
+    // The historical total did not acknowledge: the next turn is still a delta carrying the owner's change.
+    next.programs.insert(agent("codex"), working.clone());
+    said(&mut next, "codex", "retry the task");
+    let delta = turn_text(&working);
+    assert!(delta.starts_with("RINGO TASK ASSIGNMENT\nKind: delta"), "{delta}");
+    assert!(delta.contains("Survives the crash window."), "the undelivered change was lost:\n{delta}");
+}
+
+#[test]
+fn a_task_update_that_cannot_start_stays_pending_and_required_overflow_makes_no_provider_request() {
+    let r = repo("task-pending");
+    let claude = fake(&root(), "claude-task-pending", CLAUDE_TALKS);
+    let mut s = session(&r, agent("claude"), &claude);
+    let store = s.task_store().unwrap();
+    let mut task = store.create("pending-create", "Preserve pending updates.").unwrap();
+    task = store.update(&task.id, task.revision, "initial-constraint", TaskUpdate::AddConstraint("Keep auth.".into())).unwrap();
+    s.select_task(&task.id).unwrap();
+    said(&mut s, "claude", "begin");
+
+    task = store.update(&task.id, task.revision, "pending-constraint", TaskUpdate::AddConstraint("Keep own work.".into())).unwrap();
+    let broken = root().join("claude-task-broken");
+    fs::write(&broken, "#!/bin/sh\n").unwrap();
+    fs::set_permissions(&broken, fs::Permissions::from_mode(0o644)).unwrap();
+    s.programs.insert(agent("claude"), broken);
+    assert!(s.launch_agent(agent("claude"), false, "must not be delivered").is_err());
+    let _task = store.update(&task.id, task.revision, "pending-next", TaskUpdate::NextAction("Retry both pending fields.".into())).unwrap();
+    s.programs.insert(agent("claude"), claude.clone());
+    said(&mut s, "claude", "retry");
+    let (delta, resumed) = claude_heard(&claude);
+    assert!(resumed && delta.starts_with("RINGO TASK ASSIGNMENT\nKind: delta"), "{delta}");
+    assert!(delta.contains("Keep own work.") && delta.contains("Retry both pending fields."), "{delta}");
+    assert!(!delta.contains("Keep auth."), "the unchanged constraint was repeated: {delta}");
+
+    let huge = store.create("overflow-create", &"🌍".repeat(9_000)).unwrap();
+    s.select_task(&huge.id).unwrap();
+    let missing = fake(&root(), "claude-overflow-runs", CLAUDE_TALKS);
+    // Remove its observation files to prove that the required overflow returns before spawning this otherwise valid fake.
+    let _ = fs::remove_file(format!("{}.stdin", missing.display()));
+    let _ = fs::remove_file(format!("{}.argv", missing.display()));
+    s.programs.insert(agent("claude"), missing.clone());
+    let error = s.launch_agent(agent("claude"), false, "this cannot make a model call").unwrap_err();
+    assert!(error.contains("required task state needs") && error.contains("nothing was sent or truncated"), "{error}");
+    assert!(!PathBuf::from(format!("{}.stdin", missing.display())).exists());
 }
 
 #[test]
