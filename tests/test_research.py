@@ -317,13 +317,21 @@ class ParseTest(unittest.TestCase):
                'evidence id in text': blocks({**para, 'text': 'Three retries (E1).'}),
                'heading with evidence': blocks({'type': 'heading', 'text': 'H', 'evidence': ['E1']}),
                'paragraph without evidence': blocks({'type': 'paragraph', 'text': 'x'}),
-               'no evidence anywhere': blocks({'type': 'gap', 'text': 'x'}), 'unknown type': blocks({**para, 'type': 'quote'}),
+               'headings only': blocks({'type': 'heading', 'text': 'x'}), 'unknown type': blocks({**para, 'type': 'quote'}),
                'extra key': blocks({**para, 'url': 'u'}), 'extra top key': json.dumps({**ok, 'title': 't'}),
                'duplicate ids': blocks({**para, 'evidence': ['E1', 'E1']}), 'no blocks': blocks(),
                'repeated key': '{"blocks": [], "blocks": []}'}
         for name, text in bad.items():
             with self.subTest(name=name), self.assertRaises(research.Rejected):
                 research.parse_blocks(text, {'E1'})
+
+    def test_gap_only_answer_renders_without_inventing_citations(self):
+        blocks = research.parse_blocks(json.dumps({'blocks': [
+            {'type': 'gap', 'text': 'Current status cannot be established.'}]}), {'E1'})
+        text, cited = research.render(blocks, {'packets': [], 'works': [], 'records': []}, 2)
+        self.assertEqual(cited, [])
+        self.assertIn('Not covered by the verified sources', text)
+        self.assertNotIn('[1]', text)
 
     def test_normalisation_is_conservative_and_maps_back_to_the_page(self):
         self.assertEqual(research.norm('\u201cIt\u2019s\u201d \u2014 a\u00a0b\n\tc\u2026\u00ad'), '"It\'s" - a b c...')
@@ -442,6 +450,18 @@ class VerifierTest(Fixture):
         self.assertNotIn('dated 2099', entry)
         # Historical primary evidence stays usable; date metadata never changes quote verification.
         self.assertEqual(packet['quote'], QUOTE)
+
+    def test_grouped_quote_keeps_its_own_date_provenance(self):
+        self.page('/first', html(QUOTE, 'Enough extra text to make this a useful source.'))
+        result = self.verify(self.source('/first'))
+        packet = {**result['packets'][0], 'id': 'E2', 'url': self.url('/other'),
+                  'published': '2000-01-02', 'modified': '2026-11-16',
+                  'search_reported_date': '2099-01-01'}
+        text = '\n'.join(research.source_entry('1', result['works'][0], [packet]))
+        self.assertIn('Published 2000-01-02 (page metadata)', text)
+        self.assertIn('Updated 2026-11-16 (page metadata)', text)
+        self.assertIn('Search-reported 2099-01-01 (unverified)', text)
+        self.assertIn('Retrieved ' + packet['retrieved'], text)
 
     def test_unknown_dates_are_not_replaced_with_the_retrieval_date(self):
         self.page('/plain', QUOTE + '\n\nText that makes the page long enough to count.', ctype='text/plain')

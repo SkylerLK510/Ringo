@@ -352,7 +352,7 @@ def parse_blocks(text, verified):
         elif ids:
             raise Rejected(f'block {n}: a {kind} cites no evidence')
         out.append({'type': kind, 'text': words, 'evidence': ids})
-    if not any(b['evidence'] for b in out):
+    if not any(b['evidence'] or b['type'] == 'gap' for b in out):
         raise Rejected('no block cites evidence')
     return out
 
@@ -1264,8 +1264,8 @@ def identity_check(rec, ident, res):
 DISCLAIMER = ('**What “verified” means.** Each cited quote was found, after whitespace and typography normalisation, '
               'inside one passage of the page at the listed address when Ringo fetched it. That shows the page held '
               'that text then. It does not show that the page is true, that the sentence citing it follows from the '
-              'quote, or that the source is the best or most current one. Publication and update dates are page '
-              'metadata, not independent checks of freshness; a retrieval time only records when the page was fetched. '
+              'quote, or that the source is the best or most current one. Dates labeled page metadata are '
+              'not independent checks of freshness; search-reported dates are unverified. A retrieval time only records when the page was fetched. '
               'Source signals are rules about addresses and metadata, not '
               'judgements of quality. Check claim-to-evidence support yourself before relying on this report.')
 
@@ -1304,6 +1304,17 @@ def source_entry(label, group, packets):
         where = f' (on {link(p["url"])})' if p['url'] != head['final_url'] else ''
         flag = ' (matched ignoring case: check the wording)' if p['match'] == 'case-insensitive' else ''
         lines.append(f'  - {p["id"]}{where}: “{md(p["quote"])}”{flag}')
+        if p['url'] != head['final_url']:
+            dates = []
+            for key, name in (('published', 'Published'), ('modified', 'Updated')):
+                if p.get(key):
+                    dates.append(f'{name} {md(p[key])} (page metadata)')
+            if p.get('search_reported_date'):
+                dates.append(f'Search-reported {md(p["search_reported_date"])} (unverified)')
+            if p.get('retrieved'):
+                dates.append(f'Retrieved {md(p["retrieved"])}')
+            lines.append('    ' + ('; '.join(dates) if dates else 'Publication and update dates unknown') + '.')
+
     for other in group[1:]:
         lines.append(f'  - Also at {link(other["final_url"])}')
     for x in head.get('identifiers', ()):
@@ -1351,7 +1362,7 @@ def render(blocks, result, calls):
             body += ['', (f'{text} {marks}' if marks else f'*Not covered by the verified sources:* {text}'), '']
     body_text = re.sub(r'\n{3,}', '\n\n', '\n'.join(body)).strip()
     found = {int(n) for n in re.findall(r'(?<!\\)\[(\d+)\]', body_text)}
-    if found != set(numbers.values()) or not found:
+    if found != set(numbers.values()):
         raise Rejected('a rendered citation does not map to cited verified evidence')
     lines = ['# Research report', '', body_text, '', '## Sources', '']
     for work, n in sorted(numbers.items(), key=lambda kv: kv[1]):
