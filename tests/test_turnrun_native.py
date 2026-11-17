@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import socket
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -16,6 +17,7 @@ from turnrun_native import (NativeAttemptError, NativeBroker, NativeProfileError
 from turnrun_native_bridge import Bridge, arguments, environment
 from turnrun_broker import WorkerEndpoint
 from turnrun_isolation import DockerSandbox
+from turnrun import usage_of
 
 
 MODEL = 'claude-test-pinned'
@@ -195,6 +197,22 @@ class NativeProfileTest(unittest.TestCase):
         self.assertEqual(retained_usage(events())['input'], 10)
         self.assertTrue(retained_usage(events())['counted'])
 
+    def test_partial_aggregate_keeps_valid_categories_without_double_counting_messages(self):
+        for invalid_output in (None, True, -1, 'unknown'):
+            sample = [
+                {'type': 'assistant', 'message': {'id': 'one', 'usage': {
+                    'input_tokens': 10, 'cache_read_input_tokens': 20000, 'output_tokens': 7}}},
+                {'type': 'result', 'usage': {'input_tokens': 150000,
+                    'cache_read_input_tokens': 30000, 'output_tokens': invalid_output}}]
+            with self.subTest(output=invalid_output):
+                usage = retained_usage(sample)
+                self.assertEqual(usage, {'input': 150000, 'cache_write': 0, 'cache_read': 30000,
+                                        'output': 7, 'counted': False, 'uncounted_calls': 1})
+                self.assertIsNone(usage_of({'usage': usage})[1])
+                self.assertEqual(retained_usage(sample[1:])['input'], 150000)
+        sample.append(copy.deepcopy(sample[-1]))
+        self.assertEqual(retained_usage(sample)['cache_read'], 30000)
+
     def test_aggregate_usage_counts_cache_without_double_counting_messages(self):
         result = native_result(events(), 0, MODEL)
         self.assertEqual(result['outcome'], 'done')
@@ -295,6 +313,69 @@ class NativeProfileTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'non-public'):
                     provider_socket('api.anthropic.com:443')
             sock.assert_not_called()
+
+
+class CertificationFinalizationTest(unittest.TestCase):
+    def test_cleanup_failure_refuses_certification_and_preserves_known_usage(self):
+        # All boundaries and authentication are mocks. No live session or inherited
+        # environment is changed while exercising standalone-only finalization.
+        cases = [(boundary, 'success') for boundary in (None, 'broker', 'endpoint', 'worker')]
+        cases += [('broker', 'overshoot'), (None, 'native-error')]
+        cases += [(boundary, 'unknown-native-error') for boundary in ('broker', 'endpoint', 'worker')]
+        for failing_boundary, kind in cases:
+            with self.subTest(boundary=failing_boundary, kind=kind), tempfile.TemporaryDirectory() as folder:
+                work = Path(folder) / 'proof'
+                with patch('turnrun_native.os', SimpleNamespace(environ={})), \
+                     patch('turnrun_native.oauth_token'), \
+                     patch('turnrun_native.DockerSandbox') as sandbox, \
+                     patch('turnrun_native.NativeBroker') as native, \
+                     patch('turnrun_broker.WorkerEndpoint') as endpoint, \
+                     patch('secrets.token_hex', return_value='fixed-test-nonce'):
+                    worker = sandbox.return_value.__enter__.return_value
+                    service = endpoint.return_value.__enter__.return_value
+                    service.calls, service.failed = 1, False
+                    broker = native.return_value.__enter__.return_value
+                    native_error = 'native-error' in kind
+                    unknown = kind == 'unknown-native-error'
+                    tokens = 11 if kind == 'success' else 151
+                    result = {'outcome': 'failed' if native_error else 'done', 'usage': {
+                        'input': tokens-6, 'cache_write': 0, 'cache_read': 0, 'output': 6,
+                        'counted': not unknown, 'uncounted_calls': int(unknown)}}
+                    if native_error:
+                        failure = NativeAttemptError('mock provider failure', [], 1)
+                        failure.result = result
+                        broker.run.side_effect = failure
+                    else:
+                        broker.run.return_value = result
+
+                    def submission(output):
+                        output.mkdir()
+                        (output / 'native-proof.txt').write_bytes(b'fixed-test-nonce\n')
+                        return output
+
+                    worker.submission.side_effect = submission
+                    boundaries = {'worker': sandbox, 'endpoint': endpoint, 'broker': native}
+                    if failing_boundary:
+                        boundaries[failing_boundary].return_value.__exit__.side_effect = RuntimeError('cleanup')
+                    report = certify(image='mock-native', worker_image='mock-worker', model=MODEL,
+                                     token_file='never-read', budget_tokens=100, seconds=30, work=work)
+                self.assertEqual(report['process_profile_certified'], failing_boundary is None and kind == 'success')
+                self.assertEqual(report['known_tokens'], None if unknown else tokens)
+                self.assertEqual(report['reserved_tokens'], tokens if unknown else 0)
+                self.assertEqual(report['result'], result)
+                rows = [json.loads(line) for line in (work / 'ledger.jsonl').read_text().splitlines()]
+                kinds = ['start', 'finish']
+                if kind == 'overshoot':
+                    kinds.append('halt')
+                kinds.append('halt' if failing_boundary or native_error else 'complete')
+                self.assertEqual([row['kind'] for row in rows], kinds)
+                self.assertEqual(rows[1]['tokens'], None if unknown else tokens)
+                self.assertEqual(rows[1]['lower_bound'], tokens)
+                self.assertEqual(json.loads((work / 'report.json').read_text()), report)
+                if failing_boundary:
+                    self.assertEqual(report['error'], 'RuntimeError')
+                elif native_error:
+                    self.assertEqual(report['error'], 'NativeAttemptError')
 
 
 class BridgeBoundaryTest(unittest.TestCase):

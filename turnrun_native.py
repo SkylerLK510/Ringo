@@ -29,8 +29,16 @@ USAGE_FIELDS = {'input': 'input_tokens', 'cache_write': 'cache_creation_input_to
 
 
 def retained_usage(events):
-    """Preserve a complete aggregate, or a conservative observed per-message lower bound."""
+    """Preserve complete usage, or observed aggregate/message lower bounds without overlap."""
     finals = [e for e in events if e.get('type') == 'result']
+    observed = {key: 0 for key in USAGE_FIELDS}
+    for final in finals:
+        aggregate = final.get('usage')
+        if isinstance(aggregate, dict):
+            for key, field in USAGE_FIELDS.items():
+                n = aggregate.get(field)
+                if type(n) is int and n >= 0:
+                    observed[key] = max(observed[key], n)
     if len(finals) == 1:
         aggregate = finals[0].get('usage')
         aggregate = aggregate if isinstance(aggregate, dict) else {}
@@ -49,7 +57,7 @@ def retained_usage(events):
             n = reported.get(field)
             if type(n) is int and n >= 0:
                 row[key] = max(row[key], n)
-    return {**{key: sum(row[key] for row in messages.values()) for key in USAGE_FIELDS},
+    return {**{key: max(observed[key], sum(row[key] for row in messages.values())) for key in USAGE_FIELDS},
             'counted': False, 'uncounted_calls': 1}
 
 
@@ -519,41 +527,50 @@ def certify(*, image, worker_image, model, token_file, budget_tokens, seconds, w
     report = {'process_profile_certified': False, 'live_campaign_certified': False,
               'provider_requests': None, 'known_tokens': None, 'reserved_tokens': budget_tokens,
               'image': image, 'worker_image': worker_image, 'model': model, 'sources': sources}
+
+    def retain_result(result):
+        counts, total = usage_of(result)
+        lower_bound = sum((counts or {}).values())
+        report.update(result=result, known_tokens=total,
+                      reserved_tokens=0 if total is not None else max(budget_tokens, lower_bound))
+        if 'diagnostics' in result:
+            report['diagnostics'] = result['diagnostics']
+        ledger_append(ledger, {'kind': 'finish', 'tokens': total, 'lower_bound': lower_bound, 'result': result})
+        return total
+
     try:
         with DockerSandbox(worker_image, lifetime=seconds+60) as worker:
             with WorkerEndpoint(worker, lifetime=seconds+30) as endpoint:
                 with NativeBroker(image, lifetime=seconds+45) as broker:
-                    result = broker.run(prompt='Use the worker tool to write exactly '+nonce+
-                        ' followed by a newline to /work/native-proof.txt. Then finish.',
-                        instruction='Use only the provided worker tool to complete the task.',
-                        model=model, token_file=token_file, endpoint=endpoint,
-                        token_cap=budget_tokens, seconds=seconds, max_turns=4,
-                        error_file=work / 'provider-error.json')
-                usage, total = usage_of(result)
-                report.update(known_tokens=total, reserved_tokens=0 if total is not None else budget_tokens,
-                              result=result, worker_calls=endpoint.calls)
-                if 'diagnostics' in result:
-                    report['diagnostics'] = result['diagnostics']
-                ledger_append(ledger, {'kind': 'finish', 'tokens': total, 'result': result})
-                if result['outcome'] != 'done' or total is None or total > budget_tokens:
-                    ledger_append(ledger, {'kind': 'halt', 'reason': 'usage or delivery gate failed'})
+                    try:
+                        result = broker.run(prompt='Use the worker tool to write exactly '+nonce+
+                            ' followed by a newline to /work/native-proof.txt. Then finish.',
+                            instruction='Use only the provided worker tool to complete the task.',
+                            model=model, token_file=token_file, endpoint=endpoint,
+                            token_cap=budget_tokens, seconds=seconds, max_turns=4,
+                            error_file=work / 'provider-error.json')
+                    except NativeAttemptError as exc:
+                        # A teardown error must not replace a known provider result.
+                        retain_result(exc.result)
+                        raise
+                    total = retain_result(result)
+                    report['worker_calls'] = endpoint.calls
+                    if result['outcome'] != 'done' or total is None or total > budget_tokens:
+                        ledger_append(ledger, {'kind': 'halt', 'reason': 'usage or delivery gate failed'})
             submitted = worker.submission(work / 'submission')
             proof = submitted / 'native-proof.txt'
             valid = proof.is_file() and proof.read_bytes() == (nonce+'\n').encode()
             pins_valid = all(sha256_file(Path(__file__).parent / name) == value for name, value in sources.items())
-            report['process_profile_certified'] = bool(valid and pins_valid and endpoint.calls > 0
+            certified = bool(valid and pins_valid and endpoint.calls > 0
                 and not endpoint.failed and result['outcome'] == 'done' and total is not None and total <= budget_tokens)
-            ledger_append(ledger, {'kind': 'complete', 'process_profile_certified': report['process_profile_certified'],
-                                   'live_campaign_certified': False})
+        # Certification includes successful teardown of every isolation boundary.
+        report['process_profile_certified'] = certified
+        ledger_append(ledger, {'kind': 'complete', 'process_profile_certified': certified,
+                               'live_campaign_certified': False})
     except Exception as exc:
-        if isinstance(exc, NativeAttemptError):
-            counts, total = usage_of(exc.result)
-            lower_bound = sum(counts.values())
-            report.update(result=exc.result, known_tokens=total,
-                          diagnostics=exc.result['diagnostics'],
-                          reserved_tokens=0 if total is not None else max(budget_tokens, lower_bound))
-            ledger_append(ledger, {'kind': 'finish', 'tokens': total, 'lower_bound': lower_bound,
-                                   'result': exc.result})
+        report['process_profile_certified'] = False
+        if isinstance(exc, NativeAttemptError) and 'result' not in report:
+            retain_result(exc.result)
         report['error'] = type(exc).__name__
         ledger_append(ledger, {'kind': 'halt', 'reason': type(exc).__name__,
                                'reserved_tokens': report['reserved_tokens']})
