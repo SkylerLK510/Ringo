@@ -789,7 +789,7 @@ mod tests {
         fn new(name: &str) -> Self {
             let path = std::env::temp_dir().join(format!("ringo-assignment-{name}-{}", crate::task::request_id()));
             fs::create_dir_all(path.join("repo")).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
         fn store(&self) -> TaskStore {
             TaskStore::new(&self.0.join("state"), self.0.join("repo").canonicalize().unwrap(), true).unwrap()

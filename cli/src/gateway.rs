@@ -684,7 +684,7 @@ mod tests {
                                                         COUNTER.fetch_add(1, Ordering::SeqCst)));
             fs::create_dir_all(path.join("state")).unwrap();
             fs::create_dir_all(path.join("repo")).unwrap();
-            Self(path)
+            Self(path.canonicalize().unwrap())
         }
     }
     impl Drop for Temp {
