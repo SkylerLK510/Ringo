@@ -2867,8 +2867,7 @@ impl App {
         true
     }
 
-    /// Persistent owner tasks. No command starts an agent: `/task resume` only prepares the next action as a draft,
-    /// so sending it follows the same native conversation resume, permissions and cancellation as ordinary chat.
+    /// Persistent owner tasks. Resume prepares a draft; start explicitly launches one assigned worker turn.
     fn task(&mut self, command: TaskCmd) -> Result<Option<String>, String> {
         let store = self.s.task_store()?;
         let selected = || self.s.selected_task.clone().ok_or("no task selected: /task select ID, or /task create OBJECTIVE".to_string());
