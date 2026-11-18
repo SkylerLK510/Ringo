@@ -151,6 +151,8 @@ pub struct Parser {
     heard: bool,
     /// Claude: the tool call whose input is being written (tool, characters so far), shown before the call is whole.
     writing: Option<(String, usize)>,
+    /// Codex: the turn's id, once its turn/start was answered; its events are the turn's own, another turn's are not.
+    turn_id: String,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -322,7 +324,7 @@ impl Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
-                 total: Tokens::default() }
+                 total: Tokens::default(), turn_id: String::new() }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -383,6 +385,11 @@ impl Parser {
         }
     }
 
+    /// A framing violation: the stream cannot be trusted past this point. Fails the turn closed.
+    pub fn violation(&mut self, reason: String) -> Vec<Note> {
+        self.fail(reason)
+    }
+
     fn fail(&mut self, reason: String) -> Vec<Note> {
         self.failure.get_or_insert(reason.clone());
         vec![Note::Fail(reason)]
@@ -410,7 +417,12 @@ impl Parser {
             if let Some(e) = m.get("error") {
                 return self.fail(format!("codex: {}", short(e.get("message").and_then(Value::as_str).unwrap_or("an error"), 200)));
             }
+            // Ringo asks three things (1 initialize, 2 the thread, 3 the turn), each once: an answer that repeats, or
+            // that answers a request never made, is a replay or a confused stream, and the turn fails closed.
             if id.as_u64() == Some(2) {
+                if !self.thread.is_empty() {
+                    return self.fail("codex: the thread was answered twice".into());
+                }
                 self.thread = m.pointer("/result/thread/id").and_then(Value::as_str).unwrap_or("").to_string();
                 if let Some(mut turn) = self.turn.take() {
                     turn["params"]["threadId"] = self.thread.clone().into();
@@ -419,8 +431,18 @@ impl Parser {
                 let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
                 return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
             }
-            if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
-                return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
+            if id.as_u64() == Some(3) {
+                if !self.turn_id.is_empty() {
+                    return self.fail("codex: the turn was answered twice".into());
+                }
+                if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
+                    self.turn_id = turn.to_string();
+                    return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
+                }
+                return Vec::new();
+            }
+            if id.as_u64() != Some(1) {
+                return self.fail(format!("codex: an answer to a request never made (id {id})"));
             }
             return Vec::new();
         }
@@ -527,16 +549,27 @@ impl Parser {
             // turn/completed), so a long turn was invisible while it grew — measured 2026-11-14: real codex jobs
             // reached 14.8M tokens, one making 255 model calls that re-read ~176k cached tokens each, compacting
             // only 3 times (the shell's ledger: 264M tokens for claude and 149M for codex, 96% of it cache reads).
+            // Counter rule: a total counts only when its input and output are whole numbers that have not gone down
+            // since the last one accepted (the thread's totals are cumulative, compaction included). Anything else
+            // is ignored with a note: the last good count stays, and a missing count stays unknown, not zero.
             ("thread/tokenUsage/updated", _) => {
-                self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
-                if ["inputTokens", "outputTokens"].iter().all(|k| self.usage.get(k).and_then(Value::as_u64).is_some()) {
-                    notes.push(Note::Live(self.thread_tokens()));
+                let total = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                let whole = ["inputTokens", "outputTokens"].iter().all(|k| total.get(k).and_then(Value::as_u64).is_some());
+                let behind = ["inputTokens", "outputTokens"].iter().any(|k| u(&total, k) < u(&self.usage, k));
+                if !whole || behind {
+                    return vec![Note::Log("ignored a token count that is malformed or went down".into())];
                 }
+                self.usage = total;
+                notes.push(Note::Live(self.thread_tokens()));
                 if let Some(last) = p.pointer("/tokenUsage/last") { // the latest call alone; its input counts the cached part
                     notes.push(Note::Context(u(last, "inputTokens") + u(last, "outputTokens")));
                 }
             }
             ("turn/completed", _) => {
+                let other = s(p.get("turn").unwrap_or(&NULL), "id");
+                if !self.turn_id.is_empty() && !other.is_empty() && other != self.turn_id {
+                    return vec![Note::Log("ignored another turn's completion".into())];
+                }
                 self.completed += 1;
                 let turn = p.get("turn").unwrap_or(&NULL);
                 if s(turn, "status") == "failed" {
@@ -1492,6 +1525,81 @@ mod tests {
         assert_eq!(p.finish(), Ok(()));
         assert!(notes.contains(&Note::Call));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 2444, cache_write: 0, cache_read: 0, output: 1324 })));
+    }
+
+    fn codex_open() -> Parser {
+        let mut p = Parser::new(Style::Codex);
+        p.line(r#"{"id":1,"result":{}}"#);
+        p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+        p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
+        p
+    }
+
+    #[test]
+    fn codex_replayed_or_unrequested_answers_fail_closed() {
+        for line in [r#"{"id":2,"result":{"thread":{"id":"OTHER"}}}"#, r#"{"id":3,"result":{"turn":{"id":"V"}}}"#,
+                     r#"{"id":9,"result":{}}"#] {
+            let mut p = codex_open();
+            assert!(p.line(line).iter().any(|n| matches!(n, Note::Fail(_))), "{line}");
+            assert!(p.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn codex_another_turns_or_threads_events_do_not_complete_or_count_this_one() {
+        let mut p = codex_open();
+        p.line(r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"CHILD","tokenUsage":{"total":{"inputTokens":9,"outputTokens":9}}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"CHILD","turn":{"id":"X","status":"completed"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"failed"}}}"#);
+        assert!(p.finish().is_err(), "no completion of its own yet");
+        assert!(!p.completed());
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+        assert_eq!(p.finish(), Ok(()));
+    }
+
+    #[test]
+    fn codex_duplicate_completion_fails() {
+        let mut p = codex_open();
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        let done = r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#;
+        p.line(done);
+        p.line(done);
+        assert!(p.finish().is_err());
+    }
+
+    #[test]
+    fn codex_counters_that_are_malformed_or_go_down_are_ignored_and_known_usage_survives() {
+        let mut p = codex_open();
+        let upd = |i: &str, o: &str| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"threadId":"T","tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":{o}}}}}}}}}"#);
+        assert!(p.line(&upd("100", "10")).iter().any(|n| matches!(n, Note::Live(_))));
+        for bad in [upd("-5", "10"), upd("50", "10"), upd("100", "\"x\""), upd("100", "9")] {
+            let notes = p.line(&bad);
+            assert!(!notes.iter().any(|n| matches!(n, Note::Live(_) | Note::Fail(_))), "{bad}");
+        }
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        let notes = p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+        assert!(notes.contains(&Note::Tokens(Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 })));
+    }
+
+    #[test]
+    fn codex_server_requests_are_refused_never_served_and_error_or_eof_is_not_success() {
+        let mut p = codex_open();
+        p.line(r#"{"id":"abc","method":"item/tool/call","params":{"threadId":"T","tool":"shell"}}"#);
+        assert_eq!(p.take_writes().len(), 1, "refused at once");
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"text but no completion"}}}"#);
+        assert!(p.finish().is_err(), "text without a completion is not success");
+        let mut q = codex_open();
+        assert!(q.line(r#"{"id":4,"error":{"message":"boom"}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+    }
+
+    #[test]
+    fn a_framing_violation_fails_the_turn_and_keeps_known_usage() {
+        let mut p = codex_open();
+        p.line(r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"T","tokenUsage":{"total":{"inputTokens":7,"outputTokens":3}}}}"#);
+        assert!(p.violation("too long".into()).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(p.finish().is_err());
+        assert!(p.leftover().contains(&Note::Tokens(Tokens { input: 7, cache_read: 0, cache_write: 0, output: 3 })));
     }
 
     #[test]

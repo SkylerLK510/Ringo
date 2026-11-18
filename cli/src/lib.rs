@@ -3,6 +3,7 @@
 //! the IDE drive a `Session` and render its jobs.
 
 pub mod evidence;
+pub mod framing;
 pub mod gateway;
 pub mod parse;
 pub mod routing;
@@ -2636,9 +2637,14 @@ impl Session {
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
             let mut events = (style != Style::Trace).then(|| fs::OpenOptions::new().create(true).append(true)
                 .open(dir.join("events.jsonl")).ok()).flatten();
+            let mut logged = 0u64;
             let mut handle = |line: &str, parser: &mut Parser| {
                 if let Some(f) = events.as_mut() {
-                    let _ = writeln!(f, "{line}");
+                    // Aggregate budget for the raw log: past it the log stops growing, the turn does not.
+                    if logged < framing::MAX_EVENTS_LOG {
+                        logged += line.len() as u64 + 1;
+                        let _ = writeln!(f, "{line}");
+                    }
                 }
                 for note in parser.line(line) {
                     if matches!(note, Note::Fail(_)) && style != Style::Trace {
@@ -2662,11 +2668,36 @@ impl Session {
                 }
             };
             if let Some(out) = stdout {
-                let mut reader = BufReader::new(out);
-                let mut buf = Vec::new();
-                while reader.read_until(b'\n', &mut buf).map(|n| n > 0).unwrap_or(false) {
-                    handle(String::from_utf8_lossy(&buf).trim_end(), &mut parser);
-                    buf.clear();
+                // Bounded framing: a frame over the cap or not UTF-8 fails the turn closed (the child is stopped), and
+                // the pipe is still drained so nothing blocks on it. A cut final frame goes to the parser, which
+                // rejects it unless it is whole JSON.
+                let mut frames = framing::FrameReader::new(BufReader::new(out), framing::MAX_FRAME);
+                let mut violated = false;
+                while let Some(frame) = frames.next_frame() {
+                    match frame {
+                        framing::Frame::Line { text, .. } if !violated => handle(text.trim_end(), &mut parser),
+                        framing::Frame::Line { .. } => {}
+                        framing::Frame::Oversized { bytes } if !violated => {
+                            violated = true;
+                            let reason = format!("a protocol frame of {bytes} bytes (limit {})", framing::MAX_FRAME);
+                            for note in parser.violation(reason) {
+                                if style != Style::Trace {
+                                    stop_group(pid, Duration::from_secs(3), false);
+                                }
+                                let _ = tx.send(Event::Note(id, note));
+                            }
+                        }
+                        framing::Frame::InvalidUtf8 if !violated => {
+                            violated = true;
+                            for note in parser.violation("a protocol frame that is not valid UTF-8".into()) {
+                                if style != Style::Trace {
+                                    stop_group(pid, Duration::from_secs(3), false);
+                                }
+                                let _ = tx.send(Event::Note(id, note));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             } else if let Some(trace) = trace {
                 // A Ringo pipeline appends to its trace as it goes: poll for new whole lines.
@@ -3930,6 +3961,27 @@ mod tests {
         assert!(error.contains("true"), "{error}");
         assert!(matches!(s.jobs[id - 1].status, Status::Failed(_)));
         assert!(!s.jobs[id - 1].running());
+    }
+
+    /// An agent that writes a newline-free frame past the cap is stopped and the turn fails closed, with bounded memory.
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_frame_fails_the_turn_closed() {
+        let mut s = record_session();
+        let agent = Agent::from_name("claude").unwrap();
+        let id = s.new_job(Kind::Agent { agent, write: false }, "a runaway stream").unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 20000000 /dev/zero | tr '\\0' a; sleep 30"]);
+        s.spawn(id, cmd, Parser::new(Style::Claude), None, None).unwrap();
+        let start = Instant::now();
+        while s.jobs[id - 1].running() && start.elapsed() < Duration::from_secs(20) {
+            s.pump();
+            thread::sleep(Duration::from_millis(20));
+        }
+        match &s.jobs[id - 1].status {
+            Status::Failed(why) => assert!(why.contains("protocol frame"), "{why}"),
+            other => panic!("expected a failed job, got {other:?}"),
+        }
     }
 
     #[test]
