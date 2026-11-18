@@ -248,13 +248,15 @@ pub enum TaskCmd {
     Unassign(Role),
     Capabilities(Option<String>),
     Progress,
+    CheckRun { request: String, seconds: u64, command: String },
+    CheckCancel(String),
     Attach(usize),
     Update(TaskUpdate),
 }
 
 const TASK_USAGE: &str = "/task lists tasks; /task create OBJECTIVE; /task inspect [ID]; /task progress; /task select ID; \
                           /task resume [ID]; /task start; /task assign ROLE AGENT [MODEL]; /task unassign ROLE; \
-                          /task capabilities [AGENT]; /task attach #N; /task update objective|next TEXT; \
+                          /task capabilities [AGENT]; /task check run REQUEST_ID SECONDS COMMAND; /task check cancel ID; /task attach #N; /task update objective|next TEXT; \
                           /task update constraint|issue add|remove ...; /task update decision accept|propose|remove ...; \
                           /task update artifact add|remove ...";
 
@@ -392,6 +394,25 @@ fn task_command(tail: &str) -> Result<Cmd, String> {
             .ok_or_else(|| TASK_USAGE.into()),
         "attach" => one().map(|id| job_number(Some(id)).map(|id| Cmd::Task(TaskCmd::Attach(id))))
             .transpose()?.ok_or_else(|| TASK_USAGE.into()),
+        "check" => {
+            let mut tail = rest.trim();
+            let mut parts = Vec::new();
+            for _ in 0..3 {
+                let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+                parts.push(&tail[..end]);
+                tail = tail[end..].trim_start();
+                if tail.is_empty() { break; }
+            }
+            if !tail.is_empty() { parts.push(tail); }
+            match parts.as_slice() {
+                ["run", request, seconds, command] if !command.trim().is_empty() => {
+                    let seconds = seconds.parse::<u64>().map_err(|_| TASK_USAGE.to_string())?;
+                    Ok(Cmd::Task(TaskCmd::CheckRun { request: (*request).into(), seconds, command: command.trim().into() }))
+                }
+                ["cancel", id] if ringo_cli::task_check::valid_id(id) => Ok(Cmd::Task(TaskCmd::CheckCancel((*id).into()))),
+                _ => Err(TASK_USAGE.into()),
+            }
+        }
         "update" => parse_task_update(rest).map(|update| Cmd::Task(TaskCmd::Update(update))),
         _ => Err(TASK_USAGE.into()),
     }
@@ -2982,6 +3003,14 @@ impl App {
                 lines.join("\n")
             }
             TaskCmd::Progress => self.task_progress(&load_selected()?)?,
+            TaskCmd::CheckRun { request, seconds, command } => {
+                let check = self.s.check_store()?.run(&load_selected()?, &request, seconds, &command)?;
+                format!("  check {}: {} · zero model calls; /task progress shows results. Passing does not accept the task", check.id, check.outcome)
+            }
+            TaskCmd::CheckCancel(id) => {
+                self.s.check_store()?.cancel(&load_selected()?, &id)?;
+                format!("  cancellation requested for {id}; /task progress shows the recorded outcome")
+            }
             TaskCmd::Attach(job_id) => {
                 let before = load_selected()?;
                 let job = ringo_cli::task::JobRef::from_job(self.s.job(job_id)?).map_err(|e| e.to_string())?;
@@ -3100,7 +3129,8 @@ impl App {
             out.push(format!("    #{} {} · {state} · {evidence} · {}", job.shell_id, job.agent,
                              usage_line(&self.s.job_usage(&job.directory))));
         }
-        out.push("  Checks: none recorded (the check workflow is not wired yet)".into());
+        out.push("  Checks (passing does not accept the task):".into());
+        out.extend(self.s.check_store()?.progress(task));
         out.push("  Review: none recorded (reviews stay /review until the next change)".into());
         let mut actions: Vec<String> = Role::ALL.iter()
             .filter(|role| task.assignment(**role).is_none())
@@ -6506,6 +6536,26 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
     }
 
     #[test]
+    fn check_commands_preserve_shell_text_and_refuse_unavailable_launches() {
+        let claude = Agent::from_name("claude").unwrap();
+        assert_eq!(super::parse("/task check run   test-id  10  printf 'a  b' | cat", &[claude]),
+            Ok(Cmd::Task(TaskCmd::CheckRun { request: "test-id".into(), seconds: 10,
+                                            command: "printf 'a  b' | cat".into() })));
+        let id = format!("c-{}", "a".repeat(64));
+        assert_eq!(super::parse(&format!("/task check cancel {id}"), &[claude]),
+                   Ok(Cmd::Task(TaskCmd::CheckCancel(id))));
+        for command in ["/task check", "/task check run id 10", "/task check run id xx true",
+                        "/task check cancel bad", "/task check cancel bad extra"] {
+            assert!(super::parse(command, &[claude]).is_err());
+        }
+        let mut a = task_app("check-refusal", true);
+        assert!(a.task(TaskCmd::CheckRun { request: "none".into(), seconds: 1, command: "true".into() }).is_err());
+        a.send("/task create Verify");
+        assert!(a.task(TaskCmd::CheckRun { request: "nongit".into(), seconds: 1, command: "true".into() }).is_err());
+        assert!(a.s.jobs.is_empty(), "checks never start a model job");
+    }
+
+    #[test]
     fn routing_commands_parse_and_assignments_persist_without_substitution() {
         let claude = Agent::from_name("claude").unwrap();
         let parse = |line: &str| super::parse(line, &[claude]);
@@ -6634,7 +6684,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         a.send("/task attach #1");
         let view = a.run(Cmd::Task(TaskCmd::Progress), "/task progress").unwrap().unwrap();
         assert!(view.contains("worker: claude/opus (task assignment)"), "{view}");
-        assert!(view.contains("Checks: none recorded") && view.contains("Review: none recorded"), "{view}");
+        assert!(view.contains("Checks (passing does not accept the task)") && view.contains("Review: none recorded"), "{view}");
         assert!(view.contains("usage unknown (not zero: counts unavailable)"), "{view}");
         assert!(view.contains("Owner action: choose a reviewer assignment"), "{view}");
         let text = std::fs::read_to_string(&script).unwrap().replace("\"result\":\"done\"", "\"result\":\"done\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}");

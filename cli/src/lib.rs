@@ -9,6 +9,7 @@ pub mod routing;
 pub mod rt;
 pub mod task;
 pub mod task_assignment;
+pub mod task_check;
 
 pub mod images;
 pub mod turn_policy;

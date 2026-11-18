@@ -253,4 +253,27 @@ refusal → shell restart → the same revision and evidence bytes, with the fak
 
 ## Task checks status
 
-Task checks and task-linked review are not yet wired in this branch; see OPENCODE-TASK-VERIFICATION-HANDOFF.md.
+Explicit task checks use `/task check run REQUEST_ID SECONDS COMMAND` and
+`/task check cancel CHECK_ID`. Commands execute through `/bin/sh` in the selected
+Git repository on Unix, with no model calls. Task-linked model review remains a
+separate follow-up; see OPENCODE-TASK-VERIFICATION-HANDOFF.md.
+
+The request ID durably claims a launch. Repeating the same request and arguments
+returns its record; different arguments are refused. A crash after reservation
+can leave an unknown outcome. Ringo never automatically reruns it, recovers a PID
+from disk, or treats a passing check as task acceptance. Use a new request ID only
+after inspecting the earlier operation.
+
+`/task progress` shows outcomes, missing output, truncation and source staleness.
+Each stream retains at most 512 KiB in private state; completed outputs and their
+record are available through the existing immutable task-evidence registration.
+HEAD, index entries and tracked/non-ignored untracked contents identify source
+(up to 10,000 files / 128 MiB). Ignored files, external inputs and services are not
+covered. Unreadable or larger trees refuse launch. Checks run in the owner's
+repository, not a sandbox, and can edit it. A changed source invalidates freshness.
+
+Timeouts (1–3600 seconds) and cancellation kill the owned process group; commands
+that deliberately create a separate session can escape that group. Closing or
+crashing Ringo can leave a command alive: recovered records are unknown and no
+recovered PID is signalled. At most three checks run per shell process. Existing
+model-job limits are separate. Windows and non-Git folders refuse before launch.

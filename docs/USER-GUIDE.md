@@ -257,6 +257,8 @@ cannot stop a conversation.
 | `/task inspect [ID]` | show the selected task, or `ID`, concisely |
 | `/task select ID` | select a task; the conversation remembers it |
 | `/task resume [ID]` | put its next action (or objective) in the input; no agent starts |
+| `/task check run REQUEST_ID SECONDS COMMAND` | run an explicit Unix Git check, with durable results and zero model calls; reuse the request ID to inspect rather than repeat |
+| `/task check cancel CHECK_ID` | cancel a check launched in this shell; progress reports its final outcome |
 | `/task progress` | the effective worker/reviewer/design assignments, operation state, checks, review, next action, and each attached job's usage (unknown stays unknown) |
 | `/task start` | run the worker's next action (or the objective) as exactly one turn by the assigned agent and model; unavailable work refuses and starts no call |
 | `/task assign worker\|reviewer\|design AGENT [MODEL]` | record the owner's choice for one role; no agent is started |
@@ -377,3 +379,7 @@ says how.
 | `no agent NAME` | add it with `/setup` |
 | `#N is running; /kill it first` | `/kill N`, then try again |
 | a turn that seems stuck | Esc stops it; `/show N` reads its log |
+
+Task checks retain at most 512 KiB per output stream. `/task progress` reports
+truncation, missing output, stale source and unfinished records after restart.
+A pass never accepts the task. See [task check limits](SHARED-TASK-TOOLS.md#task-checks-status).
