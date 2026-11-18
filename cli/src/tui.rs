@@ -2341,7 +2341,14 @@ impl App {
         if self.talking.as_ref().is_some_and(|talk| talk.job == id) {
             return self.talk_on(id);
         }
-        if self.task_turns.remove(&id) { return; }
+        if self.task_turns.remove(&id) {
+            // Do not carry an assignment's provider model through /restart into ordinary chat.
+            // Ringo retains the turn in its own record for the next fresh conversation.
+            if let Kind::Agent { agent, write: false } = self.s.jobs[id - 1].kind {
+                self.s.start_over(agent);
+            }
+            return;
+        }
         let job = &self.s.jobs[id - 1];
         // From the home folder, a turn whose edits all went to one project points there, once (11/03: a whole project
         // was built from the home folder, past the opening line that says to start in the project)
@@ -6614,6 +6621,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         a.feed();
         assert_eq!((a.s.jobs.len(), a.s.jobs[0].status.clone()), (1, Status::Done));
         assert!(a.checking.is_none(), "no check or review follows the start");
+        assert!(a.s.threads().is_empty(), "restart must not retain the task model conversation");
         let args = std::fs::read_to_string(script.with_extension("args")).unwrap();
         assert_eq!(args.lines().count(), 1, "one model call, with the assignment's model: {args}");
         assert!(args.contains("--model opus"), "{args}");
