@@ -442,7 +442,17 @@ impl Gateway {
         });
         let map = result.as_object_mut().expect("the result is an object");
         match String::from_utf8(content) {
-            Ok(text) => { map.insert("encoding".into(), json!("utf8")); map.insert("content".into(), json!(text)); }
+            Ok(text) => {
+                // Control characters can expand sixfold in JSON. Preserve the page and its cursor
+                // using bounded base64 when UTF-8 would exhaust the response envelope.
+                if serde_json::to_vec(&text).map_or(true, |bytes| bytes.len() > MAX_READ_BYTES + 2) {
+                    map.insert("encoding".into(), json!("base64"));
+                    map.insert("content".into(), json!(b64url_encode(text.as_bytes())));
+                } else {
+                    map.insert("encoding".into(), json!("utf8"));
+                    map.insert("content".into(), json!(text));
+                }
+            }
             Err(error) => {
                 map.insert("encoding".into(), json!("base64"));
                 map.insert("content".into(), json!(b64url_encode(&error.into_bytes())));
@@ -798,6 +808,19 @@ mod tests {
         let read = gateway(&temp).dispatch(&request("evidence_read",
             json!({ "task_id": task.id, "evidence_id": old_id })));
         assert_eq!(ok(&read)["content"], json!("original bytes"));
+    }
+
+    #[test]
+    fn control_character_pages_preserve_content_and_cursor_within_wire_limit() {
+        let temp = Temp::new("escaped-page");
+        let task = task_with_artifact(&temp, "control.txt", &"\0".repeat(20000));
+        let id = evidence(&temp, &task).register_task(&task).unwrap().pop().unwrap().evidence_id.unwrap();
+        let response = gateway(&temp).dispatch(&request("evidence_read", json!({"task_id":task.id,"evidence_id":id})));
+        assert!(serde_json::to_vec(&response).unwrap().len() <= MAX_RESPONSE_BYTES);
+        let result = ok(&response);
+        assert_eq!(result["encoding"], json!("base64"));
+        assert!(result["next_cursor"].is_string());
+        assert!(!b64url_decode(result["content"].as_str().unwrap()).unwrap().is_empty());
     }
 
     #[test]

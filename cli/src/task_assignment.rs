@@ -377,7 +377,10 @@ impl AssignmentStore {
                 return Ok(());
             }
             if existing.assignment_id != record.manifest.base_assignment_id.as_deref().unwrap_or_default() {
-                return Err(AssignmentError::StaleAcknowledgement(format!("native thread already acknowledged {}; {} was not applied", existing.assignment_id, assignment_id)));
+                // Both deliveries may have reached the provider in the opposite order. Force a full
+                // refresh next turn rather than assuming the newer acknowledged state is still current.
+                fs::remove_file(&path).map_err(|e| AssignmentError::Io(e.to_string()))?;
+                return Err(AssignmentError::StaleAcknowledgement(format!("native thread already acknowledged {}; baseline invalidated after conflicting delivery of {}", existing.assignment_id, assignment_id)));
             }
         }
         // A delta builds on a base this native thread must already have acknowledged. A thread with no cursor never
@@ -944,6 +947,8 @@ mod tests {
         let next = store.prepare(&task, "claude", Some("thread"), ContextPolicy::bounded()).unwrap().unwrap();
         store.acknowledge(&task, "claude", "thread", &next.manifest.assignment_id).unwrap();
         assert!(store.acknowledge(&task, "claude", "thread", &full.manifest.assignment_id).is_err());
+        let refresh = store.prepare(&task, "claude", Some("thread"), ContextPolicy::bounded()).unwrap().unwrap();
+        assert_eq!(refresh.manifest.kind, AssignmentKind::Full);
     }
 
     #[test]

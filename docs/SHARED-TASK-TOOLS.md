@@ -59,6 +59,7 @@ before dispatch:
 - The assignment ID is content-derived (`a-<24 hex>`), and the rendered text includes an inclusion/omission manifest
   plus the exact task revision.
 
+Conflicting delivery acknowledgements invalidate the native thread baseline, so its next assignment is a full refresh.
 Acknowledgement is separate from preparation. A prepared assignment advances a native thread's cursor only after a
 provider note proves the model worked in that turn — a step, a tool action, a partial reply, a reply, or usage this
 turn actually added. A created turn or thread, process start, or a zero-token usage report does not acknowledge
@@ -74,7 +75,7 @@ acknowledge a turn; cumulative usage is additionally gated by the per-process ob
 
 A task artifact reference or attached job log path is a **label, not a read capability**. Registration:
 
-1. opens the source beneath its authorized root without following symlinks (jobs use a strict component-by-component
+1. opens the source beneath its authorized root without following symlinks (repository and job roots use a strict component-by-component
    `openat(O_NOFOLLOW)` walker),
 2. copies at most 1 MiB into private state,
 3. issues `e-<24 hex>`, derived from task, origin and content digest.
@@ -149,6 +150,7 @@ response limit.
   `corrupt_snapshot` even on a page that does not cover the changed bytes. A snapshot whose file length no longer
   matches its registration is refused the same way, never a short page with a cursor that cannot advance. Text is
   returned as `utf8`, other bytes as unpadded base64url.
+- Valid UTF-8 with excessive JSON escaping is also returned as base64, keeping control-character pages within the response limit.
 - `truncated` and `next_cursor` describe paging. A cursor binds protocol, task, evidence ID, digest and offset; a
   cursor naming other content or scope is `stale_cursor`. Cursors survive a gateway restart because they name
   immutable content, not process state.

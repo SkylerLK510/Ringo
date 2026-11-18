@@ -302,6 +302,7 @@ impl EvidenceStore {
             .map_err(|e| EvidenceError::Corrupt(format!("evidence metadata is corrupt and was left untouched: {e}")))?;
         if record.schema_version != EVIDENCE_SCHEMA_VERSION || record.id != evidence_id || record.task_id != task_id
             || record.repository != self.repository || !valid_digest(&record.digest)
+            || record.id != format!("e-{}", &hex(&Sha256::digest(format!("{}\0{}\0{}", task_id, record.origin, record.digest).as_bytes()))[..24])
             || record.bytes > MAX_SNAPSHOT_BYTES
             || record.snapshot != format!("{}.bin", &record.digest[7..]) {
             return Err(EvidenceError::Corrupt("evidence metadata failed its scope or identity check".into()));
@@ -335,12 +336,12 @@ impl EvidenceStore {
     #[allow(clippy::too_many_arguments)]
     fn register_one(
         &self, task: &Task, origin: &str, display: String, declared: Option<String>, root: &Path, relative: &Path,
-        job: bool, publish: bool,
+        _job: bool, publish: bool,
     ) -> Result<Registration> {
         if relative.as_os_str().is_empty() {
             return Err(EvidenceError::NotFound(display));
         }
-        let mut file = match if job { open_regular_beneath_strict(root, relative) } else { open_regular_beneath(root, relative) } {
+        let mut file = match open_regular_beneath_strict(root, relative) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(EvidenceError::NotFound(display)),
             Err(e) => return Err(EvidenceError::Invalid(format!("evidence source was refused: {e}"))),
@@ -437,7 +438,7 @@ impl EvidenceStore {
         if fs::symlink_metadata(&latest).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(EvidenceError::Corrupt(format!("{} is a symlink and was left untouched", latest.display())));
         }
-        fs::write(&latest, &record.id).map_err(|e| EvidenceError::Io(format!("{}: {e}", latest.display())))
+        replace_atomic(&latest, record.id.as_bytes())
     }
 }
 
@@ -473,6 +474,29 @@ fn private_dir(path: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| EvidenceError::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+fn replace_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let part = path.with_extension(format!("replace-{}-{}", std::process::id(), SEQ.fetch_add(1, Ordering::Relaxed)));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&part).map_err(|e| EvidenceError::Io(e.to_string()))?;
+    let result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&part, path)
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&part);
+        return Err(EvidenceError::Io(error.to_string()));
     }
     Ok(())
 }
@@ -672,6 +696,47 @@ mod tests {
         temp.store().update(&task.id, task.revision, &crate::task::request_id(), TaskUpdate::AddArtifact(ArtifactRef {
             reference: reference.into(), identity,
         })).unwrap()
+    }
+
+    #[test]
+    fn metadata_cannot_rebind_an_existing_evidence_id() {
+        let temp = Temp::new("rebind");
+        let task = temp.task();
+        fs::write(temp.0.join("repo/note.txt"), "first").unwrap();
+        let task = add_artifact(&temp, &task, "note.txt", None);
+        let store = evidence(&temp, &task);
+        let first = store.register_task(&task).unwrap().pop().unwrap().evidence_id.unwrap();
+        fs::write(temp.0.join("repo/note.txt"), "second").unwrap();
+        let second = store.register_task(&task).unwrap().pop().unwrap().evidence_id.unwrap();
+        let mut record = store.load_record(&task.id, &second).unwrap();
+        record.id = first.clone();
+        fs::write(store.dir.join(&task.id).join("records").join(format!("{first}.json")), serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(store.load_record(&task.id, &first).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn redirected_repository_roots_are_refused() {
+        let temp = Temp::new("redirect-repository");
+        let task = temp.task();
+        fs::write(temp.0.join("repo/note.txt"), "original").unwrap();
+        let task = add_artifact(&temp, &task, "note.txt", None);
+        let store = evidence(&temp, &task);
+        fs::rename(temp.0.join("repo"), temp.0.join("replacement")).unwrap();
+        std::os::unix::fs::symlink(temp.0.join("replacement"), temp.0.join("repo")).unwrap();
+        assert_eq!(store.register_task(&task).unwrap()[0].status, EvidenceStatus::Unavailable);
+    }
+
+    #[test]
+    fn latest_replacement_is_atomic_and_reports_failure() {
+        let temp = Temp::new("replace");
+        let path = temp.0.join("latest");
+        fs::write(&path, "old").unwrap();
+        replace_atomic(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(replace_atomic(&path, b"refused").is_err());
     }
 
     #[test]
