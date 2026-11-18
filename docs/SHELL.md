@@ -1053,3 +1053,8 @@ tasks, answers and follow-ups. One run each on a toy repository is enough not to
 agy. An agy turn in your folder that has to search meets the same refusals. To try again: a lighter agent that reads
 from a cache between calls and can search without a command, or a lighter model of Claude's or Codex's own, measured
 the same way.
+
+Task capability status is checked in the background without a model call. A pending status check asks you to
+retry the command shortly; a hung status command is stopped after three seconds. Status answers are cached
+for up to ten seconds. `/task start` refuses pending or unavailable workers, queued work and active review
+holds. Its single turn has no Ringo peer-delegation tool and starts no automatic Ultra review.

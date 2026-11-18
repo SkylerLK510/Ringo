@@ -111,8 +111,8 @@ impl Capability {
             Readiness::Unavailable { reason, corrective } => format!("unavailable: {reason} ({corrective})"),
         };
         let context = self.context.map_or("unknown".to_string(), |tokens| tokens.to_string());
-        format!("{} [{}] · {state} · roles {roles} · tools {} · edit {} · cancellation {} · context {context} · usage {}",
-                self.name, self.adapter, self.tools, self.edit, self.cancellation, self.usage.name())
+        format!("{} [{}] · {state} · installed {} · sign-in {} · roles {roles} · tools {} · edit {} · cancellation {} · context {context} · usage {}",
+                self.name, self.adapter, self.installed, self.sign_in, self.tools, self.edit, self.cancellation, self.usage.name())
     }
 }
 
@@ -162,9 +162,9 @@ pub fn agent_capability(
     };
     let usage = match spec.adapter {
         // These report token counts on every call; the subscription has no per-call dollar amount.
-        Adapter::Claude | Adapter::Codex => UsageCoverage::Partial,
+        Adapter::Claude | Adapter::Codex | Adapter::Agy => UsageCoverage::Partial,
         // No token accounting in the protocol Ringo reads.
-        Adapter::Agy | Adapter::Plain => UsageCoverage::Unknown,
+        Adapter::Plain => UsageCoverage::Unknown,
     };
     Capability {
         name: spec.name.clone(),

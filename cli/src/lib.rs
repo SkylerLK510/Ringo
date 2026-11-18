@@ -681,6 +681,7 @@ pub struct Session {
     /// The model each agent's turns run on, where the owner chose one (`/model`): a name the agent's own program
     /// takes (Claude Code's `--model`, Codex's thread `model`). None for an agent: its own default.
     pub models: HashMap<Agent, String>,
+    thread_models: HashMap<Agent, Option<String>>,
     /// Ringo's state folder, where `usage.jsonl` keeps what each finished job used.
     root: PathBuf,
     /// The owner's home folder, where the agents they made for Claude Code are (`.claude/agents`).
@@ -1079,7 +1080,7 @@ impl Session {
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(),
                      selected_task: None, selected_task_error: None, max_jobs: 3,
-                     backend: "codex-chatgpt".into(), models: HashMap::new(),
+                     backend: "codex-chatgpt".into(), models: HashMap::new(), thread_models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
                      context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
                      #[cfg(feature = "turnrun")]
@@ -1882,6 +1883,13 @@ impl Session {
         };
         // This turn's model: an assignment's explicit choice first, then the shell's /model (launch_agent_with_model).
         let chosen_model = model.map(str::to_string).or_else(|| self.models.get(&agent).cloned());
+        if !write {
+            let effective_model = chosen_model.clone().or(own_model.clone());
+            if self.thread_models.get(&agent).is_some_and(|previous| previous != &effective_model) {
+                self.start_over(agent);
+            }
+            self.thread_models.insert(agent, effective_model);
+        }
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
         let _ = fs::write(dir.join("prompt.txt"), prompt);
@@ -2666,11 +2674,14 @@ impl Session {
         let used = Tokens { input: job.tokens.input + job.live.input, cache_read: job.tokens.cache_read + job.live.cache_read,
                             cache_write: job.tokens.cache_write + job.live.cache_write, output: job.tokens.output + job.live.output };
         // A job that finished without reporting a count used tokens nobody counted: recorded as unknown, not left
-        // out. One that reported counts and added none (a resumed conversation's unchanged total) leaves no line, and
-        // neither does a pipeline that made no call.
+        // out. A reported zero delta is retained; a pipeline that made no call leaves no line.
         let called = match job.kind { Kind::Ringo { .. } => job.calls > 0, Kind::Agent { .. } => job.pid.is_some() };
         let unknown = !job.counted && used.total() == 0 && status == Status::Done && called;
-        if used.total() > 0 || unknown {
+        // Message-level counts without a final total cover only part of the call.
+        if matches!(job.kind, Kind::Agent { .. }) && job.live.total() > 0 {
+            job.uncounted += 1;
+        }
+        if job.counted || used.total() > 0 || unknown {
             let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
             let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             // What the counts are of: the tier (it sets the effort), the model when the agent names it, a pipeline's
@@ -3335,7 +3346,7 @@ pub fn save_agents_in(root: &Path, agents: &[Agent]) -> Result<(), String> {
     })
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum SignIn {
     /// Signed in with the subscription login; the detail names it.
     Yes(String),
@@ -3356,7 +3367,20 @@ pub fn sign_in(agent: Agent, program: &Path) -> SignIn {
     let mut cmd = Command::new(program);
     cmd.args(args).stdin(Stdio::null());
     agent_env(&mut cmd);
-    let Ok(out) = cmd.output() else { return SignIn::No("its status command did not run".into()) };
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    { use std::os::unix::process::CommandExt; cmd.process_group(0); }
+    let Ok(child) = cmd.spawn() else { return SignIn::No("its status command did not run".into()) };
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || { let _ = tx.send(child.wait_with_output()); });
+    let out = match rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(out)) => out,
+        _ => {
+            stop_group(pid, Duration::from_millis(100), false);
+            return SignIn::No("status probe timed out or failed; retry /task capabilities".into());
+        }
+    };
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     match adapter {
         Adapter::Codex if out.status.success() && text.contains("ChatGPT") => SignIn::Yes("ChatGPT".into()),

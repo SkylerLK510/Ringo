@@ -1604,6 +1604,7 @@ type Mark = (usize, usize, usize);
 const KEEP: usize = 20_000;
 
 struct App {
+    capability_probes: std::cell::RefCell<std::collections::HashMap<Agent, (PathBuf, Instant, std::sync::mpsc::Receiver<ringo_cli::SignIn>, Option<ringo_cli::SignIn>)>>,
     s: Session,
     input: Vec<char>,
     cursor: usize,
@@ -1773,7 +1774,7 @@ fn mascot(state: &str) -> Vec<Vec<&'static str>> {
 
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
-        App { s, input: Vec::new(), cursor: 0, input_anchor: None, input_dragging: false, input_view: Rect::default(),
+        App { capability_probes: Default::default(), s, input: Vec::new(), cursor: 0, input_anchor: None, input_dragging: false, input_view: Rect::default(),
               input_top: 0, input_mark_w: 0, hist: history.len(), history, draft: None, cleared: None, out: Vec::new(), fitted: Vec::new(),
               fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
@@ -2919,6 +2920,9 @@ impl App {
                 let task = load_selected()?;
                 let effective = self.effective_assignment(&task, Role::Worker)?.ok_or(
                     "no worker assignment: /task assign worker AGENT [MODEL]")?;
+                if self.must_wait(effective.agent) {
+                    return Err("worker must wait for queued work or the current review; retry /task start when it finishes".into());
+                }
                 let capability = self.capability(effective.agent);
                 if let Some(problem) = capability.readiness.problem() {
                     return Err(format!("worker {} is unavailable: {problem}. No model call was started",
@@ -2928,7 +2932,7 @@ impl App {
                 let head = format!("  starting worker {} · {} · one turn; no checks or review were started",
                                    effective.summary(), capability.summary());
                 let expanded = self.s.expand(&prompt)?;
-                self.s.peers = self.agents.clone();
+                self.s.peers.clear();
                 let id = self.s.launch_agent_with_model(effective.agent, !effective.agent.spec().read,
                                                        &expanded, effective.model.as_deref())?;
                 self.task_turns.insert(id);
@@ -2938,6 +2942,9 @@ impl App {
             TaskCmd::Assign { role, agent, model } => {
                 let before = load_selected()?;
                 let agent = self.set_up_agent(&agent)?;
+                if role != Role::Worker && !agent.spec().read {
+                    return Err(format!("{} does not support the {role} role", agent.name()));
+                }
                 if let Some(model) = &model && let Some(problem) = routing::model_problem(agent, model) {
                     return Err(problem);
                 }
@@ -3002,7 +3009,16 @@ impl App {
     /// status). Called only by explicit commands, so a status command never holds up an ordinary turn.
     fn capability(&self, agent: Agent) -> routing::Capability {
         let program = self.s.program(agent);
-        let sign_in = ringo_cli::sign_in(agent, &program);
+        let mut probes = self.capability_probes.borrow_mut();
+        let entry = probes.entry(agent).or_insert_with(|| (PathBuf::new(), Instant::now(), std::sync::mpsc::channel().1, None));
+        if entry.0 != program || entry.1.elapsed() > Duration::from_secs(10) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = program.clone();
+            std::thread::spawn(move || { let _ = tx.send(ringo_cli::sign_in(agent, &path)); });
+            *entry = (program.clone(), Instant::now(), rx, None);
+        }
+        if let Ok(answer) = entry.2.try_recv() { entry.3 = Some(answer); }
+        let sign_in = entry.3.clone().unwrap_or_else(|| ringo_cli::SignIn::No("checking sign-in in background; retry this command shortly".into()));
         routing::agent_capability(agent, &program, self.s.installed(agent), &sign_in, self.s.git, self.s.mode == Mode::Read)
     }
 
@@ -3014,6 +3030,9 @@ impl App {
             .ok_or_else(|| format!("{role} names agent {:?}, which Ringo does not know", item.agent))?;
         if !self.agents.contains(&agent) {
             return Err(format!("{role} names {}, which is not set up here; /setup adds it", agent.name()));
+        }
+        if role != Role::Worker && !agent.spec().read {
+            return Err(format!("{role}: {} is unavailable: adapter does not support this role", agent.name()));
         }
         Ok(Some(routing::effective(role, agent, item.model.as_deref(), self.s.models.get(&agent).map(String::as_str))))
     }
@@ -6566,11 +6585,25 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(a.s.jobs.is_empty(), "an unavailable worker starts no call");
 
         fake_claude(&script, r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}"#);
+        a.capability_probes.borrow_mut().clear();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.capability(claude).readiness.problem().is_some() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
         a.s.tier = Tier::Ultra;
+        let codex = Agent::from_name("codex").unwrap();
+        a.agents.push(codex);
+        a.s.programs.insert(codex, script.clone());
+        a.queue.push_back((claude, "queued".into(), "queued".into()));
+        assert!(a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap_err().contains("must wait"));
+        a.queue.clear();
         a.send("/task update next  Add narrow tests  ");
         let said = a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap().unwrap();
         assert!(said.contains("one turn; no checks or review were started"), "{said}");
         assert_eq!(a.s.jobs.len(), 1, "exactly one worker turn");
+        assert!(!a.s.jobs[0].can_ask, "task workers cannot delegate to another provider");
         let deadline = Instant::now() + Duration::from_secs(30);
         while a.s.running() > 0 {
             assert!(Instant::now() < deadline, "the one turn did not finish");
@@ -6594,9 +6627,48 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(view.contains("Checks: none recorded") && view.contains("Review: none recorded"), "{view}");
         assert!(view.contains("usage unknown (not zero: counts unavailable)"), "{view}");
         assert!(view.contains("Owner action: choose a reviewer assignment"), "{view}");
+        let text = std::fs::read_to_string(&script).unwrap().replace("\"result\":\"done\"", "\"result\":\"done\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}");
+        std::fs::write(&script, text).unwrap();
+        let next = a.s.launch_agent(claude, false, "ordinary default model").unwrap();
+        while a.s.running() > 0 {
+            assert!(Instant::now() < deadline);
+            a.s.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let args = std::fs::read_to_string(script.with_extension("args")).unwrap();
+        let ordinary = args.lines().last().unwrap();
+        assert!(!ordinary.contains("--resume") && !ordinary.contains("--model"), "{ordinary}");
+        let usage = a.s.job_usage(&a.s.jobs[next - 1].dir);
+        assert!(usage.recorded && !usage.unknown && usage.tokens.total() == 0, "{usage:?}");
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(script.with_extension("args"));
         let _ = std::fs::remove_file(script.with_extension("stdin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_status_probes_do_not_block_and_unsupported_roles_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = task_app("probe-timeout", true);
+        let claude = Agent::from_name("claude").unwrap();
+        let script = std::env::temp_dir().join(format!("ringo-status-timeout-{}", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(claude, script.clone());
+        let started = Instant::now();
+        assert!(a.capability(claude).readiness.problem().is_some());
+        assert!(started.elapsed() < Duration::from_millis(250), "TUI blocked on status");
+        let answer = ringo_cli::sign_in(claude, &script);
+        assert!(matches!(answer, ringo_cli::SignIn::No(ref why) if why.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(6));
+        a.send("/task create Check role support");
+        let grok = Agent::from_name("grok").unwrap();
+        a.agents.push(grok);
+        let before = a.s.selected_task().unwrap().unwrap().revision;
+        let error = a.run(Cmd::Task(TaskCmd::Assign { role: Role::Reviewer, agent: "grok".into(), model: None }), "").unwrap_err();
+        assert!(error.contains("does not support"), "{error}");
+        assert_eq!(a.s.selected_task().unwrap().unwrap().revision, before);
+        let _ = std::fs::remove_file(script);
     }
 
     #[test]
