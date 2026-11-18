@@ -122,6 +122,9 @@ impl EvidenceStore {
                 match store.and_then(|store| {
                     let check = store.load(task, id)?;
                     if check.finished_unix.is_none() { return Err("check output is not final".into()); }
+                    if artifact.identity.as_deref() != Some(crate::task_check::command_identity(&check.command, check.seconds).as_str()) {
+                        return Err("check command identity mismatch".into());
+                    }
                     Ok(store.directory(task, id)?)
                 }) {
                     Ok(dir) => for name in ["record.json", "stdout", "stderr"] {

@@ -3005,7 +3005,7 @@ impl App {
             TaskCmd::Progress => self.task_progress(&load_selected()?)?,
             TaskCmd::CheckRun { request, seconds, command } => {
                 let check = self.s.check_store()?.run(&load_selected()?, &request, seconds, &command)?;
-                format!("  check {}: {} · zero model calls; /task progress shows results. Passing does not accept the task", check.id, check.outcome)
+                format!("  check {}: {} · zero model calls; /task progress shows results. Passing does not accept the task", check.id, self.s.check_store()?.status(&load_selected()?, &check))
             }
             TaskCmd::CheckCancel(id) => {
                 self.s.check_store()?.cancel(&load_selected()?, &id)?;
@@ -3514,8 +3514,8 @@ impl App {
                 self.quit = true;
                 None
             }
-            Cmd::Restart if self.s.running() > 0 => {
-                Some("  a job is running: /restart once it ends (Esc stops the turn, /kill N a job)".into())
+            Cmd::Restart if self.s.running() > 0 || self.s.check_store().is_ok_and(|c| c.running() > 0) => {
+                Some("  a job or task check is running: restart once it ends; /task check cancel CHECK_ID stops a check".into())
             }
             Cmd::Restart => {
                 (self.restart, self.quit) = (true, true);
@@ -6553,6 +6553,36 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         a.send("/task create Verify");
         assert!(a.task(TaskCmd::CheckRun { request: "nongit".into(), seconds: 1, command: "true".into() }).is_err());
         assert!(a.s.jobs.is_empty(), "checks never start a model job");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_check_result_survives_conversation_restart_without_model_jobs() {
+        let first = task_app("check-restart", true);
+        let repo = first.s.repo.clone();
+        drop(first);
+        for args in [vec!["init", "-q"], vec!["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                              "commit", "--allow-empty", "-qm", "initial"]] {
+            assert!(std::process::Command::new("git").args(args).current_dir(&repo).status().unwrap().success());
+        }
+        let mut a = task_app("check-restart", false);
+        a.task(TaskCmd::Create("Verify".into())).unwrap();
+        a.task(TaskCmd::CheckRun { request: "restart".into(), seconds: 5, command: "sleep 0.2; printf checked".into() }).unwrap();
+        assert!(a.run(Cmd::Restart, "/restart").unwrap().unwrap().contains("check is running"));
+        assert!(!a.restart && !a.quit);
+        let task = a.s.selected_task().unwrap().unwrap();
+        let id = task.artifacts[0].reference.strip_prefix("check:").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while a.s.check_store().unwrap().load(&task, id).unwrap().finished_unix.is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let path = a.s.keep(None).unwrap();
+        let mut reopened = task_app("check-restart", false);
+        reopened.s.go_on(&path).unwrap();
+        let view = reopened.task(TaskCmd::Progress).unwrap().unwrap();
+        assert!(view.contains("passed") && view.contains("zero model calls"));
+        assert!(reopened.s.jobs.is_empty());
     }
 
     #[test]

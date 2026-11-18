@@ -273,7 +273,21 @@ covered. Unreadable or larger trees refuse launch. Checks run in the owner's
 repository, not a sandbox, and can edit it. A changed source invalidates freshness.
 
 Timeouts (1–3600 seconds) and cancellation kill the owned process group; commands
-that deliberately create a separate session can escape that group. Closing or
+that deliberately create a separate session can escape that group. Forcibly terminating or
 crashing Ringo can leave a command alive: recovered records are unknown and no
 recovered PID is signalled. At most three checks run per shell process. Existing
 model-job limits are separate. Windows and non-Git folders refuse before launch.
+
+Source identities are bounded samples before and after execution, plus an asynchronous
+sample when progress is opened. Matching samples do not attest that the live tree
+stayed unchanged during a check. Reopen progress if source sampling is pending.
+Git enumeration is capped at 4 MiB per command with a two-second deadline;
+content sampling allows at most 10,000 files and 128 MiB. Sampling runs outside
+the interface thread. Unsupported or unreadable inputs refuse execution.
+
+Restart refuses while checks have live supervisors. Orderly shell shutdown cancels
+owned checks and waits for cleanup; forced process termination can still leave
+commands alive. Reservation deduplication covers process crashes, not a guarantee
+of exactly-once execution across host power loss. A check artifact's declared
+`check-command-sha256:` identity binds its command and timeout; each published
+output snapshot separately binds its bytes. A mismatched declaration grants no evidence.
