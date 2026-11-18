@@ -153,6 +153,9 @@ pub struct Parser {
     writing: Option<(String, usize)>,
     /// Codex: the turn's id, once its turn/start was answered; its events are the turn's own, another turn's are not.
     turn_id: String,
+    /// Codex: initialize answered; turn/start sent (so a completion before its acknowledgement is not this turn's).
+    init: bool,
+    turn_sent: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -324,7 +327,7 @@ impl Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
-                 total: Tokens::default(), turn_id: String::new() }
+                 total: Tokens::default(), turn_id: String::new(), init: false, turn_sent: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -424,14 +427,21 @@ impl Parser {
                     return self.fail("codex: the thread was answered twice".into());
                 }
                 self.thread = m.pointer("/result/thread/id").and_then(Value::as_str).unwrap_or("").to_string();
+                if self.thread.is_empty() {
+                    return self.fail("codex: the thread answer names no thread".into());
+                }
                 if let Some(mut turn) = self.turn.take() {
                     turn["params"]["threadId"] = self.thread.clone().into();
                     self.writes.push(turn.to_string());
+                    self.turn_sent = true;
                 }
                 let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
                 return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
             }
             if id.as_u64() == Some(3) {
+                if self.thread.is_empty() || self.turn.is_some() {
+                    return self.fail("codex: the turn was answered before it was asked for".into());
+                }
                 if !self.turn_id.is_empty() {
                     return self.fail("codex: the turn was answered twice".into());
                 }
@@ -443,6 +453,9 @@ impl Parser {
             }
             if id.as_u64() != Some(1) {
                 return self.fail(format!("codex: an answer to a request never made (id {id})"));
+            }
+            if std::mem::replace(&mut self.init, true) {
+                return self.fail("codex: initialize was answered twice".into());
             }
             return Vec::new();
         }
@@ -566,9 +579,15 @@ impl Parser {
                 }
             }
             ("turn/completed", _) => {
+                // Only the requested turn's own completion counts: one before its acknowledgement, or naming no
+                // turn or another, is an earlier turn's (a resumed thread's) and is ignored.
                 let other = s(p.get("turn").unwrap_or(&NULL), "id");
-                if !self.turn_id.is_empty() && !other.is_empty() && other != self.turn_id {
-                    return vec![Note::Log("ignored another turn's completion".into())];
+                if (self.turn_sent && self.turn_id.is_empty()) || (!self.turn_id.is_empty() && other != self.turn_id) {
+                    return vec![Note::Log("ignored a completion that is not this turn's".into())];
+                }
+                if self.completed > 0 {
+                    // a repeat is never counted again: its usage would be charged twice
+                    return self.fail("codex: more than one turn/completed".into());
                 }
                 self.completed += 1;
                 let turn = p.get("turn").unwrap_or(&NULL);
@@ -1600,6 +1619,31 @@ mod tests {
         assert!(p.violation("too long".into()).iter().any(|n| matches!(n, Note::Fail(_))));
         assert!(p.finish().is_err());
         assert!(p.leftover().contains(&Note::Tokens(Tokens { input: 7, cache_read: 0, cache_write: 0, output: 3 })));
+    }
+
+    #[test]
+    fn codex_review_findings_stay_fixed() {
+        // a repeated completion fails without emitting a second count
+        let mut p = codex_open();
+        p.line(r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"T","tokenUsage":{"total":{"inputTokens":5,"outputTokens":1}}}}"#);
+        let done = r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#;
+        assert!(p.line(done).iter().any(|n| matches!(n, Note::Tokens(_))));
+        let again = p.line(done);
+        assert!(again.iter().any(|n| matches!(n, Note::Fail(_))) && !again.iter().any(|n| matches!(n, Note::Tokens(_))));
+        // a completion naming no turn, before or after the acknowledgement, is not this turn's
+        let mut p = Parser::new(Style::Codex).with_turn(json!({"id": 3, "method": "turn/start", "params": {}}));
+        p.line(r#"{"id":1,"result":{}}"#);
+        p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+        p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"status":"completed"}}}"#);
+        assert!(!p.completed());
+        // an empty thread, a second initialize, a turn answered before it was asked for
+        assert!(Parser::new(Style::Codex).line(r#"{"id":2,"result":{"thread":{}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        let mut p = Parser::new(Style::Codex);
+        p.line(r#"{"id":1,"result":{}}"#);
+        assert!(p.line(r#"{"id":1,"result":{}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(Parser::new(Style::Codex).line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
     }
 
     #[test]

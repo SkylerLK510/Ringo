@@ -32,11 +32,18 @@ pub struct FrameReader<R: BufRead> {
     max: usize,
     /// The rest of an oversized frame is still arriving: dropped unseen until its newline.
     discarding: bool,
+    lossy: bool,
 }
 
 impl<R: BufRead> FrameReader<R> {
     pub fn new(inner: R, max: usize) -> Self {
-        FrameReader { inner, max: max.max(1), discarding: false }
+        FrameReader { inner, max: max.max(1), discarding: false, lossy: false }
+    }
+
+    /// Decode invalid UTF-8 as U+FFFD instead of refusing it: for free-text output that speaks no protocol.
+    pub fn lossy(mut self) -> Self {
+        self.lossy = true;
+        self
     }
 
     /// The next frame; None at the end of the stream. An I/O error ends it as the end of the stream would
@@ -69,10 +76,10 @@ impl<R: BufRead> FrameReader<R> {
             let chunk = match self.inner.fill_buf() {
                 Ok(c) => c,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => return Self::finish(buf, any, false),
+                Err(_) => return self.finish(buf, any, false),
             };
             if chunk.is_empty() {
-                return Self::finish(buf, any, false);
+                return self.finish(buf, any, false);
             }
             any = true;
             let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
@@ -91,19 +98,22 @@ impl<R: BufRead> FrameReader<R> {
             buf.extend_from_slice(body);
             self.inner.consume(take);
             if done {
-                return Self::finish(buf, any, true);
+                return self.finish(buf, any, true);
             }
         }
     }
 
-    fn finish(buf: Vec<u8>, any: bool, newline: bool) -> Option<Frame> {
+    fn finish(&self, buf: Vec<u8>, any: bool, newline: bool) -> Option<Frame> {
         if !any {
             return None;
         }
-        match String::from_utf8(buf) {
-            Ok(text) => Some(Frame::Line { text: text.trim_end_matches('\r').to_string(), partial: !newline }),
-            Err(_) => Some(Frame::InvalidUtf8),
-        }
+        let mut text = match String::from_utf8(buf) {
+            Ok(text) => text,
+            Err(e) if self.lossy => String::from_utf8_lossy(e.as_bytes()).into_owned(),
+            Err(_) => return Some(Frame::InvalidUtf8),
+        };
+        text.truncate(text.trim_end_matches('\r').len()); // in place: no second copy of a large frame
+        Some(Frame::Line { text, partial: !newline })
     }
 }
 
@@ -178,6 +188,12 @@ mod tests {
     fn a_frame_cut_at_the_end_of_the_stream_is_flagged_partial() {
         let got = frames(b"{\"a\":1}\n{\"b\":", 4, 64);
         assert_eq!(got, vec![line("{\"a\":1}"), Frame::Line { text: "{\"b\":".into(), partial: true }]);
+    }
+
+    #[test]
+    fn lossy_mode_keeps_free_text_readable_but_still_caps_it() {
+        let mut r = FrameReader::new(BufReader::new(Cursor::new(b"a\xffb\n".to_vec())), 64).lossy();
+        assert_eq!(r.next_frame(), Some(line("a\u{fffd}b")));
     }
 
     #[test]

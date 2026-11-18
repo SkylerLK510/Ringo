@@ -2641,7 +2641,7 @@ impl Session {
             let mut handle = |line: &str, parser: &mut Parser| {
                 if let Some(f) = events.as_mut() {
                     // Aggregate budget for the raw log: past it the log stops growing, the turn does not.
-                    if logged < framing::MAX_EVENTS_LOG {
+                    if logged + line.len() as u64 + 1 <= framing::MAX_EVENTS_LOG {
                         logged += line.len() as u64 + 1;
                         let _ = writeln!(f, "{line}");
                     }
@@ -2672,6 +2672,9 @@ impl Session {
                 // the pipe is still drained so nothing blocks on it. A cut final frame goes to the parser, which
                 // rejects it unless it is whole JSON.
                 let mut frames = framing::FrameReader::new(BufReader::new(out), framing::MAX_FRAME);
+                if style == Style::Plain {
+                    frames = frames.lossy(); // free text speaks no protocol: still capped, never refused for its bytes
+                }
                 let mut violated = false;
                 while let Some(frame) = frames.next_frame() {
                     match frame {
