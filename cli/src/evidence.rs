@@ -654,6 +654,9 @@ fn open_regular_beneath_strict(root: &Path, relative: &Path) -> std::io::Result<
     let mut walked = PathBuf::new();
     for part in root.components() {
         walked.push(part);
+        // A Windows drive/UNC prefix is not an independently accessible path. Check
+        // after RootDir makes it a complete volume root, then every child component.
+        if matches!(part, Component::Prefix(_)) { continue; }
         if fs::symlink_metadata(&walked)?.file_type().is_symlink() {
             return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "the evidence root redirects through a symlink"));
         }
