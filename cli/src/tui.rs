@@ -19,8 +19,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use ratatui::{DefaultTerminal, Frame, Terminal};
-use ringo_cli::{Agent, Decision, is_wsl, Kind, Mode, Said, Session, Status, Tier};
-use ringo_cli::task::{ArtifactRef, DecisionStatus, TaskUpdate};
+use ringo_cli::{Agent, Decision, is_wsl, JobUsage, Kind, Mode, routing, Said, Session, Status, Tier};
+use ringo_cli::routing::Role;
+use ringo_cli::task::{ArtifactRef, DecisionStatus, Task, TaskUpdate};
 use std::collections::VecDeque;
 use std::io::stdout;
 use std::path::{Path, PathBuf};
@@ -241,13 +242,21 @@ pub enum TaskCmd {
     Inspect(Option<String>),
     Select(String),
     Resume(Option<String>),
+    /// One explicit worker turn from the task's next action, with the assigned agent and model. Never a silent start.
+    Start,
+    Assign { role: Role, agent: String, model: Option<String> },
+    Unassign(Role),
+    Capabilities(Option<String>),
+    Progress,
     Attach(usize),
     Update(TaskUpdate),
 }
 
-const TASK_USAGE: &str = "/task lists tasks; /task create OBJECTIVE; /task inspect [ID]; /task select ID; /task resume [ID]; \
-                          /task attach #N; /task update objective|next TEXT; /task update constraint|issue add|remove ...; \
-                          /task update decision accept|propose|remove ...; /task update artifact add|remove ...";
+const TASK_USAGE: &str = "/task lists tasks; /task create OBJECTIVE; /task inspect [ID]; /task progress; /task select ID; \
+                          /task resume [ID]; /task start; /task assign ROLE AGENT [MODEL]; /task unassign ROLE; \
+                          /task capabilities [AGENT]; /task attach #N; /task update objective|next TEXT; \
+                          /task update constraint|issue add|remove ...; /task update decision accept|propose|remove ...; \
+                          /task update artifact add|remove ...";
 
 #[derive(Debug, PartialEq)]
 pub enum Cmd {
@@ -364,6 +373,23 @@ fn task_command(tail: &str) -> Result<Cmd, String> {
         "inspect" if rest.is_empty() || one().is_some() => Ok(Cmd::Task(TaskCmd::Inspect(one().map(str::to_string)))),
         "select" => one().map(|id| Cmd::Task(TaskCmd::Select(id.into()))).ok_or_else(|| TASK_USAGE.into()),
         "resume" if rest.is_empty() || one().is_some() => Ok(Cmd::Task(TaskCmd::Resume(one().map(str::to_string)))),
+        "start" if rest.is_empty() => Ok(Cmd::Task(TaskCmd::Start)),
+        "progress" if rest.is_empty() => Ok(Cmd::Task(TaskCmd::Progress)),
+        "capabilities" if rest.is_empty() || one().is_some() =>
+            Ok(Cmd::Task(TaskCmd::Capabilities(one().map(str::to_string)))),
+        "assign" => {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            let (role, agent, model) = match parts.as_slice() {
+                [role, agent] => (role, agent, None),
+                [role, agent, model] => (role, agent, Some((*model).to_string())),
+                _ => return Err(TASK_USAGE.into()),
+            };
+            Role::parse(role).map(|role| Cmd::Task(TaskCmd::Assign {
+                role, agent: (*agent).into(), model,
+            })).ok_or_else(|| TASK_USAGE.into())
+        }
+        "unassign" => one().and_then(Role::parse).map(|role| Cmd::Task(TaskCmd::Unassign(role)))
+            .ok_or_else(|| TASK_USAGE.into()),
         "attach" => one().map(|id| job_number(Some(id)).map(|id| Cmd::Task(TaskCmd::Attach(id))))
             .transpose()?.ok_or_else(|| TASK_USAGE.into()),
         "update" => parse_task_update(rest).map(|update| Cmd::Task(TaskCmd::Update(update))),
@@ -614,6 +640,32 @@ pub use ringo_cli::parse::fmt_tokens;
 fn fmt_age(d: Duration) -> String {
     let s = d.as_secs();
     if s < 3600 { format!("{}:{:02}", s / 60, s % 60) } else { format!("{}h{:02}", s / 3600, s / 60 % 60) }
+}
+
+/// A job's state in one word, as the task progress view reports it.
+fn status_label(status: &Status) -> String {
+    match status {
+        Status::Running => "running".into(),
+        Status::Done => "done".into(),
+        Status::Failed(_) => "failed".into(),
+        Status::Cancelled => "stopped".into(),
+    }
+}
+
+/// What a job's usage record can honestly say. No record is unknown, never zero; a record with uncounted calls is
+/// partial; subscription tokens are counted but carry no per-call dollar cost.
+fn usage_line(usage: &JobUsage) -> String {
+    if !usage.recorded {
+        return "usage unknown (not zero: no record in usage.jsonl)".into();
+    }
+    if usage.unknown {
+        return "usage unknown (not zero: counts unavailable)".into();
+    }
+    if usage.uncounted_calls > 0 {
+        return format!("usage partial: {} tokens in counted calls, {} uncounted", usage.tokens.total(),
+                       usage.uncounted_calls);
+    }
+    format!("usage {} tokens (subscription cost unknown)", usage.tokens.total())
 }
 
 /// A line as rows of at most `width` columns: the widest prefix is taken, through the last space that fits when
@@ -1552,6 +1604,7 @@ type Mark = (usize, usize, usize);
 const KEEP: usize = 20_000;
 
 struct App {
+    capability_probes: std::cell::RefCell<std::collections::HashMap<Agent, (PathBuf, Instant, std::sync::mpsc::Receiver<ringo_cli::SignIn>, Option<ringo_cli::SignIn>)>>,
     s: Session,
     input: Vec<char>,
     cursor: usize,
@@ -1644,6 +1697,8 @@ struct App {
     talking: Option<Talk>,
     revision: Option<String>,
     revision_id: Option<usize>,
+    /// Explicit task starts never schedule automatic review or repair turns.
+    task_turns: std::collections::HashSet<usize>,
     /// Ultra: the plan read a turn here started (the turn, the read), then its answer (see `reviewer`).
     quota: Option<(usize, std::thread::JoinHandle<Pick>)>,
     reviewer: Option<(usize, Pick)>,
@@ -1719,7 +1774,7 @@ fn mascot(state: &str) -> Vec<Vec<&'static str>> {
 
 impl App {
     fn new(s: Session, agents: Vec<Agent>, label: String, theme: Theme, history: Vec<String>) -> App {
-        App { s, input: Vec::new(), cursor: 0, input_anchor: None, input_dragging: false, input_view: Rect::default(),
+        App { capability_probes: Default::default(), s, input: Vec::new(), cursor: 0, input_anchor: None, input_dragging: false, input_view: Rect::default(),
               input_top: 0, input_mark_w: 0, hist: history.len(), history, draft: None, cleared: None, out: Vec::new(), fitted: Vec::new(),
               fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
@@ -1727,7 +1782,7 @@ impl App {
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
-              revision: None, revision_id: None, quota: None, reviewer: None }
+              revision: None, revision_id: None, task_turns: Default::default(), quota: None, reviewer: None }
     }
 
     /// What the shell opens with: only what this session needs said. An empty conversation shows where to start
@@ -2286,6 +2341,14 @@ impl App {
         if self.talking.as_ref().is_some_and(|talk| talk.job == id) {
             return self.talk_on(id);
         }
+        if self.task_turns.remove(&id) {
+            // Do not carry an assignment's provider model through /restart into ordinary chat.
+            // Ringo retains the turn in its own record for the next fresh conversation.
+            if let Kind::Agent { agent, write: false } = self.s.jobs[id - 1].kind {
+                self.s.start_over(agent);
+            }
+            return;
+        }
         let job = &self.s.jobs[id - 1];
         // From the home folder, a turn whose edits all went to one project points there, once (11/03: a whole project
         // was built from the home folder, past the opening line that says to start in the project)
@@ -2812,8 +2875,7 @@ impl App {
         true
     }
 
-    /// Persistent owner tasks. No command starts an agent: `/task resume` only prepares the next action as a draft,
-    /// so sending it follows the same native conversation resume, permissions and cancellation as ordinary chat.
+    /// Persistent owner tasks. Resume prepares a draft; start explicitly launches one assigned worker turn.
     fn task(&mut self, command: TaskCmd) -> Result<Option<String>, String> {
         let store = self.s.task_store()?;
         let selected = || self.s.selected_task.clone().ok_or("no task selected: /task select ID, or /task create OBJECTIVE".to_string());
@@ -2855,8 +2917,71 @@ impl App {
                 self.input = next.chars().collect();
                 self.cursor = self.input.len();
                 format!("  selected {} at revision {}; its next action (or objective) is in the input. Enter sends it through \
-                         the existing agent conversation; no agent was started", task.id, task.revision)
+                         the existing agent conversation; no agent was started. Worker: {}",
+                        task.id, task.revision, self.worker_line(&task))
             }
+            TaskCmd::Start => {
+                if !self.input.is_empty() {
+                    return Err("the input already holds a draft; send or clear it before /task start".into());
+                }
+                let task = load_selected()?;
+                let effective = self.effective_assignment(&task, Role::Worker)?.ok_or(
+                    "no worker assignment: /task assign worker AGENT [MODEL]")?;
+                if self.must_wait(effective.agent) {
+                    return Err("worker must wait for queued work or the current review; retry /task start when it finishes".into());
+                }
+                let capability = self.capability(effective.agent);
+                if let Some(problem) = capability.readiness.problem() {
+                    return Err(format!("worker {} is unavailable: {problem}. No model call was started",
+                                       effective.agent.name()));
+                }
+                let prompt = task.next_action.as_ref().unwrap_or(&task.objective).text.clone();
+                let head = format!("  starting worker {} · {} · one turn; no checks or review were started",
+                                   effective.summary(), capability.summary());
+                let expanded = self.s.expand(&prompt)?;
+                self.s.peers.clear();
+                let id = self.s.launch_agent_with_model(effective.agent, !effective.agent.spec().read,
+                                                       &expanded, effective.model.as_deref())?;
+                self.task_turns.insert(id);
+                let note: Option<String> = (expanded != prompt).then(|| format!("  expanded task:\n{expanded}"));
+                format!("{head}{}", note.map(|n| format!("\n{n}")).unwrap_or_default())
+            }
+            TaskCmd::Assign { role, agent, model } => {
+                let before = load_selected()?;
+                let agent = self.set_up_agent(&agent)?;
+                if role != Role::Worker && !agent.spec().read {
+                    return Err(format!("{} does not support the {role} role", agent.name()));
+                }
+                if let Some(model) = &model && let Some(problem) = routing::model_problem(agent, model) {
+                    return Err(problem);
+                }
+                let task = store.update(&before.id, before.revision, &ringo_cli::task::request_id(),
+                                        TaskUpdate::Assign { role, agent: agent.name().into(), model })
+                    .map_err(|e| e.to_string())?;
+                let capability = self.capability(agent);
+                format!("  assigned {role} to {}{} at revision {} · {}\n  /task progress shows the effective assignment",
+                        agent.name(), task.assignment(role).and_then(|a| a.model.as_ref()).map(|m| format!("/{m}"))
+                            .unwrap_or_default(), task.revision, capability.summary())
+            }
+            TaskCmd::Unassign(role) => {
+                let before = load_selected()?;
+                let task = store.update(&before.id, before.revision, &ringo_cli::task::request_id(),
+                                        TaskUpdate::Unassign(role)).map_err(|e| e.to_string())?;
+                format!("  {role} is unassigned at revision {}; no other role changes", task.revision)
+            }
+            TaskCmd::Capabilities(agent) => {
+                let agents: Vec<Agent> = match agent {
+                    Some(name) => vec![self.set_up_agent(&name)?],
+                    None => self.agents.clone(),
+                };
+                let mut lines = Vec::new();
+                for agent in agents {
+                    lines.push(format!("  {}", self.capability(agent).summary()));
+                }
+                lines.push(format!("  {}", routing::local_worker_capability(&self.s.ringo_home).summary()));
+                lines.join("\n")
+            }
+            TaskCmd::Progress => self.task_progress(&load_selected()?)?,
             TaskCmd::Attach(job_id) => {
                 let before = load_selected()?;
                 let job = ringo_cli::task::JobRef::from_job(self.s.job(job_id)?).map_err(|e| e.to_string())?;
@@ -2875,7 +3000,128 @@ impl App {
         Ok(Some(text))
     }
 
+    /// An agent named by this shell, set up here. Unknown or not set up is refused before anything is stored or run.
+    fn set_up_agent(&self, name: &str) -> Result<Agent, String> {
+        let agent = Agent::from_name(name).ok_or_else(|| {
+            format!("no agent {name}: the agents here are {}",
+                    self.agents.iter().map(|a| a.name()).collect::<Vec<_>>().join(", "))
+        })?;
+        if !self.agents.contains(&agent) {
+            return Err(format!("{} is not set up here; /setup adds it", agent.name()));
+        }
+        Ok(agent)
+    }
+
+    /// One agent's capability, from probes that make no model call (installed program, the agent's own sign-in
+    /// status). Called only by explicit commands, so a status command never holds up an ordinary turn.
+    fn capability(&self, agent: Agent) -> routing::Capability {
+        let program = self.s.program(agent);
+        let mut probes = self.capability_probes.borrow_mut();
+        let entry = probes.entry(agent).or_insert_with(|| (PathBuf::new(), Instant::now(), std::sync::mpsc::channel().1, None));
+        if entry.0 != program || entry.1.elapsed() > Duration::from_secs(10) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = program.clone();
+            std::thread::spawn(move || { let _ = tx.send(ringo_cli::sign_in(agent, &path)); });
+            *entry = (program.clone(), Instant::now(), rx, None);
+        }
+        if let Ok(answer) = entry.2.try_recv() { entry.3 = Some(answer); }
+        let sign_in = entry.3.clone().unwrap_or_else(|| ringo_cli::SignIn::No("checking sign-in in background; retry this command shortly".into()));
+        routing::agent_capability(agent, &program, self.s.installed(agent), &sign_in, self.s.git, self.s.mode == Mode::Read)
+    }
+
+    /// The assignment a role resolves to in this task, or None when the role is unassigned. An assigned agent that is
+    /// not set up here is an error, never a silent substitution.
+    fn effective_assignment(&self, task: &Task, role: Role) -> Result<Option<routing::Effective>, String> {
+        let Some(item) = task.assignment(role) else { return Ok(None) };
+        let agent = Agent::from_name(&item.agent)
+            .ok_or_else(|| format!("{role} names agent {:?}, which Ringo does not know", item.agent))?;
+        if !self.agents.contains(&agent) {
+            return Err(format!("{role} names {}, which is not set up here; /setup adds it", agent.name()));
+        }
+        if role != Role::Worker && !agent.spec().read {
+            return Err(format!("{role}: {} is unavailable: adapter does not support this role", agent.name()));
+        }
+        Ok(Some(routing::effective(role, agent, item.model.as_deref(), self.s.models.get(&agent).map(String::as_str))))
+    }
+
+    fn worker_line(&self, task: &Task) -> String {
+        match self.effective_assignment(task, Role::Worker) {
+            Ok(Some(effective)) => {
+                let capability = self.capability(effective.agent);
+                match capability.readiness.problem() {
+                    None => effective.summary(),
+                    Some(problem) => format!("{} (unavailable: {problem})", effective.summary()),
+                }
+            }
+            Ok(None) => "unassigned (/task assign worker AGENT [MODEL])".into(),
+            Err(why) => why,
+        }
+    }
+
+    /// One concise view of the task's real state. Checks and review are reported as not recorded rather than guessed:
+    /// this change stores assignments and reads durable job usage, and the check/review workflow is the next one.
+    fn task_progress(&self, task: &Task) -> Result<String, String> {
+        let mut out = vec![
+            format!("  task {} · revision {} · {}", task.id, task.revision, task.repository.path.display()),
+            format!("  Objective: {}", task.objective.text),
+            "  Effective assignments:".into(),
+        ];
+        for role in Role::ALL {
+            out.push(match self.effective_assignment(task, role) {
+                Ok(Some(effective)) => {
+                    let capability = self.capability(effective.agent);
+                    match capability.readiness.problem() {
+                        None => format!("    {role}: {} · available · usage {} · edit {}",
+                                        effective.summary(), capability.usage.name(), capability.edit),
+                        Some(problem) => format!("    {role}: {} · unavailable: {problem}", effective.summary()),
+                    }
+                }
+                Ok(None) => format!("    {role}: unassigned"),
+                Err(why) => format!("    {role}: {why}"),
+            });
+        }
+        out.push(format!("  Next action: {}", task.next_action.as_ref().map_or("not set", |next| next.text.as_str())));
+        out.push("  Operations:".into());
+        if task.jobs.is_empty() {
+            out.push("    none attached (/task attach #N records an agent job's durable answer and evidence)".into());
+        }
+        for job in &task.jobs {
+            let state = match self.s.job_by_dir(&job.directory) {
+                Some(live) => status_label(&live.status),
+                None if job.status_at_attach == "running" =>
+                    "unknown (attached while running; no process evidence after restart)".into(),
+                None => format!("{} (at attach)", job.status_at_attach),
+            };
+            let evidence = job.evidence.iter().map(|item| {
+                let path = Path::new(&item.reference);
+                let name = path.file_name().map_or_else(|| item.reference.clone(), |n| n.to_string_lossy().into_owned());
+                format!("{name} {}", if path.exists() { "present" } else { "missing" })
+            }).collect::<Vec<_>>().join(", ");
+            out.push(format!("    #{} {} · {state} · {evidence} · {}", job.shell_id, job.agent,
+                             usage_line(&self.s.job_usage(&job.directory))));
+        }
+        out.push("  Checks: none recorded (the check workflow is not wired yet)".into());
+        out.push("  Review: none recorded (reviews stay /review until the next change)".into());
+        let mut actions: Vec<String> = Role::ALL.iter()
+            .filter(|role| task.assignment(**role).is_none())
+            .map(|role| format!("choose a {role} assignment (/task assign {role} AGENT)"))
+            .collect();
+        if let Some((id, _)) = self.s.pending() {
+            actions.push(format!("answer #{id}'s waiting permission"));
+        }
+        if actions.is_empty() {
+            actions.push("none: /task start runs the worker's next action as one turn".into());
+        }
+        out.push(format!("  Owner action: {}", actions.join("; ")));
+        Ok(out.join("\n"))
+    }
+
     fn turn(&mut self, agent: Agent, task: &str) -> Result<Option<String>, String> {
+        self.turn_with_model(agent, None, task)
+    }
+
+    /// `model`: the explicit model of the turn's assignment, or None for the shell's ordinary /model precedence.
+    fn turn_with_model(&mut self, agent: Agent, model: Option<&str>, task: &str) -> Result<Option<String>, String> {
         // checked again here: a queued /compact can come up after /clear took its conversation away
         if task == "/compact" && !self.s.has_conversation(agent) {
             return Err(format!("{} has no conversation here to compact", agent.name()));
@@ -2883,7 +3129,7 @@ impl App {
         let expanded = self.s.expand(task)?;
         // whom this turn may ask in the middle of its work: the agents set up here
         self.s.peers = self.agents.clone();
-        let id = self.s.launch_agent(agent, false, &expanded)?;
+        let id = self.s.launch_agent_with_model(agent, false, &expanded, model)?;
         // Ultra: the plans are read while the turn runs (about a second, no model call), so its review can go to
         // a plan with room, and when none has any the owner hears it now, not after the turn.
         if self.s.tier == Tier::Ultra && self.s.mode != Mode::Read && self.s.undoable() && task != "/compact"
@@ -6235,6 +6481,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(a.s.jobs.is_empty(), "creating a task starts no agent");
         assert!(a.s.task_store().unwrap().load(&id).unwrap().objective.text == "Preserve the objective");
 
+        a.s.tier = Tier::Ultra;
         a.send("/task update next  Add narrow tests  ");
         a.send("/task update constraint add Do not change auth");
         let task = a.s.selected_task().unwrap().unwrap();
@@ -6256,6 +6503,202 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         chat.send("hello");
         assert!(chat.s.selected_task.is_none());
         assert!(chat.s.task_store().unwrap().list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn routing_commands_parse_and_assignments_persist_without_substitution() {
+        let claude = Agent::from_name("claude").unwrap();
+        let parse = |line: &str| super::parse(line, &[claude]);
+        assert_eq!(parse("/task start"), Ok(Cmd::Task(TaskCmd::Start)));
+        assert_eq!(parse("/task progress"), Ok(Cmd::Task(TaskCmd::Progress)));
+        assert_eq!(parse("/task capabilities"), Ok(Cmd::Task(TaskCmd::Capabilities(None))));
+        assert_eq!(parse("/task capabilities claude"), Ok(Cmd::Task(TaskCmd::Capabilities(Some("claude".into())))));
+        assert_eq!(parse("/task assign worker claude"),
+                   Ok(Cmd::Task(TaskCmd::Assign { role: Role::Worker, agent: "claude".into(), model: None })));
+        assert_eq!(parse("/task assign reviewer claude opus"),
+                   Ok(Cmd::Task(TaskCmd::Assign { role: Role::Reviewer, agent: "claude".into(),
+                                                  model: Some("opus".into()) })));
+        assert_eq!(parse("/task unassign design"), Ok(Cmd::Task(TaskCmd::Unassign(Role::Design))));
+        for line in ["/task assign", "/task assign worker", "/task assign planner claude",
+                     "/task assign worker claude a b", "/task unassign", "/task unassign planner",
+                     "/task start now", "/task progress now", "/task capabilities a b"] {
+            assert!(parse(line).is_err(), "{line}");
+        }
+
+        let mut a = task_app("assign", true);
+        a.send("/task create Ship routing");
+        let id = a.s.selected_task.clone().expect("a created task is selected");
+        a.send("/task assign worker claude opus");
+        let task = a.s.selected_task().unwrap().unwrap();
+        assert_eq!(task.assignment(Role::Worker).unwrap().model.as_deref(), Some("opus"));
+        assert!(task.assignment(Role::Reviewer).is_none(), "one role changes at a time");
+        let stored = task.revision;
+        a.send("/task assign worker nosuch opus");
+        assert_eq!(a.s.task_store().unwrap().load(&id).unwrap().revision, stored, "an unknown agent changes nothing");
+        a.send("/task assign worker claude bad!");
+        assert_eq!(a.s.task_store().unwrap().load(&id).unwrap().revision, stored, "an invalid model changes nothing");
+        a.send("/task unassign worker");
+        assert!(a.s.selected_task().unwrap().unwrap().assignment(Role::Worker).is_none());
+        a.send("/task assign design claude sonnet");
+
+        // The choice is durable: reopening the shell finds it without being told again.
+        let path = a.s.keep(None).unwrap();
+        let mut next = task_app("assign", false);
+        next.s.go_on(&path).unwrap();
+        let task = next.s.selected_task().unwrap().unwrap();
+        assert_eq!(task.id, id);
+        assert_eq!(task.assignment(Role::Design).unwrap().model.as_deref(), Some("sonnet"));
+        assert!(task.assignment(Role::Worker).is_none());
+        let view = next.run(Cmd::Task(TaskCmd::Progress), "/task progress").unwrap().unwrap();
+        assert!(view.contains("worker: unassigned") && view.contains("design: claude/sonnet (task assignment)"),
+                "{view}");
+    }
+
+    /// A fake Claude CLI: it answers `auth status --json` with `auth`, records a turn's arguments and input, and
+    /// reports a bare successful turn with no token counts (as an adapter that reports none does).
+    #[cfg(unix)]
+    fn fake_claude(path: &std::path::Path, auth: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let text = [
+            "#!/bin/sh\n",
+            "case \"$*\" in\n",
+            "  *\"auth status\"*) printf '%s\\n' '", auth, "'; exit 0;;\n",
+            "esac\n",
+            "echo \"$@\" >> \"$0.args\"\n",
+            "head -n 1 > \"$0.stdin\"\n",
+            "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-task\",\"apiKeySource\":\"none\"}'\n",
+            "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
+        ].concat();
+        let pending = path.with_extension("pending");
+        std::fs::write(&pending, text).unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(pending, path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_start_refuses_unassigned_or_unavailable_work_and_runs_exactly_one_turn() {
+        let mut a = task_app("start", true);
+        a.send("/task create Ship routing");
+        let error = a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap_err();
+        assert!(error.contains("no worker assignment"), "{error}");
+        assert!(a.s.jobs.is_empty(), "no assignment starts no agent");
+
+        let claude = Agent::from_name("claude").unwrap();
+        let script = std::env::temp_dir().join(format!("ringo-fake-claude-{}", std::process::id()));
+        fake_claude(&script, r#"{"loggedIn":false}"#);
+        a.s.programs.insert(claude, script.clone());
+        a.send("/task assign worker claude opus");
+        let error = a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap_err();
+        assert!(error.contains("unavailable") && error.contains("No model call was started"), "{error}");
+        assert!(a.s.jobs.is_empty(), "an unavailable worker starts no call");
+
+        fake_claude(&script, r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}"#);
+        a.capability_probes.borrow_mut().clear();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.capability(claude).readiness.problem().is_some() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        a.s.tier = Tier::Ultra;
+        let codex = Agent::from_name("codex").unwrap();
+        a.agents.push(codex);
+        a.s.programs.insert(codex, script.clone());
+        a.queue.push_back((claude, "queued".into(), "queued".into()));
+        assert!(a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap_err().contains("must wait"));
+        a.queue.clear();
+        a.send("/task update next  Add narrow tests  ");
+        let said = a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap().unwrap();
+        assert!(said.contains("one turn; no checks or review were started"), "{said}");
+        assert_eq!(a.s.jobs.len(), 1, "exactly one worker turn");
+        assert!(!a.s.jobs[0].can_ask, "task workers cannot delegate to another provider");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while a.s.running() > 0 {
+            assert!(Instant::now() < deadline, "the one turn did not finish");
+            a.s.pump();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        a.s.jobs[0].changed.push("routing.rs".into());
+        a.feed();
+        assert_eq!((a.s.jobs.len(), a.s.jobs[0].status.clone()), (1, Status::Done));
+        assert!(a.checking.is_none(), "no check or review follows the start");
+        assert!(a.s.threads().is_empty(), "restart must not retain the task model conversation");
+        let args = std::fs::read_to_string(script.with_extension("args")).unwrap();
+        assert_eq!(args.lines().count(), 1, "one model call, with the assignment's model: {args}");
+        assert!(args.contains("--model opus"), "{args}");
+        let stdin = std::fs::read_to_string(script.with_extension("stdin")).unwrap();
+        assert!(stdin.contains("Add narrow tests"), "{stdin}");
+
+        // Attaching the one job shows its honest state and usage: a turn that reported no counts is unknown, not zero.
+        a.send("/task attach #1");
+        let view = a.run(Cmd::Task(TaskCmd::Progress), "/task progress").unwrap().unwrap();
+        assert!(view.contains("worker: claude/opus (task assignment)"), "{view}");
+        assert!(view.contains("Checks: none recorded") && view.contains("Review: none recorded"), "{view}");
+        assert!(view.contains("usage unknown (not zero: counts unavailable)"), "{view}");
+        assert!(view.contains("Owner action: choose a reviewer assignment"), "{view}");
+        let text = std::fs::read_to_string(&script).unwrap().replace("\"result\":\"done\"", "\"result\":\"done\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}");
+        let pending = script.with_extension("pending");
+        std::fs::copy(&script, &pending).unwrap();
+        std::fs::write(&pending, text).unwrap();
+        std::fs::rename(pending, &script).unwrap();
+        let next = a.s.launch_agent(claude, false, "ordinary default model").unwrap();
+        while a.s.running() > 0 {
+            assert!(Instant::now() < deadline);
+            a.s.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let args = std::fs::read_to_string(script.with_extension("args")).unwrap();
+        let ordinary = args.lines().last().unwrap();
+        assert!(!ordinary.contains("--resume") && !ordinary.contains("--model"), "{ordinary}");
+        let usage = a.s.job_usage(&a.s.jobs[next - 1].dir);
+        assert!(usage.recorded && !usage.unknown && usage.tokens.total() == 0, "{usage:?}");
+        let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(script.with_extension("args"));
+        let _ = std::fs::remove_file(script.with_extension("stdin"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn task_status_probes_do_not_block_and_unsupported_roles_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut a = task_app("probe-timeout", true);
+        let claude = Agent::from_name("claude").unwrap();
+        let script = std::env::temp_dir().join(format!("ringo-status-timeout-{}", std::process::id()));
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        a.s.programs.insert(claude, script.clone());
+        let started = Instant::now();
+        assert!(a.capability(claude).readiness.problem().is_some());
+        assert!(started.elapsed() < Duration::from_millis(250), "TUI blocked on status");
+        let answer = ringo_cli::sign_in(claude, &script);
+        assert!(matches!(answer, ringo_cli::SignIn::No(ref why) if why.contains("timed out")));
+        assert!(started.elapsed() < Duration::from_secs(6));
+        a.send("/task create Check role support");
+        let grok = Agent::from_name("grok").unwrap();
+        a.agents.push(grok);
+        let before = a.s.selected_task().unwrap().unwrap().revision;
+        let error = a.run(Cmd::Task(TaskCmd::Assign { role: Role::Reviewer, agent: "grok".into(), model: None }), "").unwrap_err();
+        assert!(error.contains("does not support"), "{error}");
+        assert_eq!(a.s.selected_task().unwrap().unwrap().revision, before);
+        let _ = std::fs::remove_file(script);
+    }
+
+    #[test]
+    fn task_usage_distinguishes_missing_partial_and_complete_counts() {
+        let a = task_app("usage-coverage", true);
+        let root = std::env::temp_dir().join(format!("ringo-tui-task-{}-usage-coverage/state", std::process::id()));
+        let dir = root.join("worker-job");
+        let record = |extra: &str| {
+            let line = format!("{{\"job\":{},{} }}", serde_json::to_string(&dir).unwrap(), extra);
+            std::fs::write(root.join("usage.jsonl"), line).unwrap();
+            a.s.job_usage(&dir)
+        };
+        assert!(usage_line(&a.s.job_usage(&dir)).contains("unknown"));
+        assert!(record("\"input\":1").unknown, "missing counts cannot become zero");
+        let counts = "\"input\":1,\"output\":2,\"cache_read\":3,\"cache_write\":4";
+        assert_eq!(usage_line(&record(counts)), "usage 10 tokens (subscription cost unknown)");
+        assert!(usage_line(&record(&format!("{counts},\"uncounted_calls\":1"))).contains("partial"));
     }
 
     #[test]
