@@ -6569,8 +6569,10 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
             "echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-task\",\"apiKeySource\":\"none\"}'\n",
             "echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
         ].concat();
-        std::fs::write(path, text).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let pending = path.with_extension("pending");
+        std::fs::write(&pending, text).unwrap();
+        std::fs::set_permissions(&pending, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::rename(pending, path).unwrap();
     }
 
     #[cfg(unix)]
@@ -6636,7 +6638,10 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(view.contains("usage unknown (not zero: counts unavailable)"), "{view}");
         assert!(view.contains("Owner action: choose a reviewer assignment"), "{view}");
         let text = std::fs::read_to_string(&script).unwrap().replace("\"result\":\"done\"", "\"result\":\"done\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0}");
-        std::fs::write(&script, text).unwrap();
+        let pending = script.with_extension("pending");
+        std::fs::copy(&script, &pending).unwrap();
+        std::fs::write(&pending, text).unwrap();
+        std::fs::rename(pending, &script).unwrap();
         let next = a.s.launch_agent(claude, false, "ordinary default model").unwrap();
         while a.s.running() > 0 {
             assert!(Instant::now() < deadline);
