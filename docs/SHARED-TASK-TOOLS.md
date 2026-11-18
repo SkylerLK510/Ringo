@@ -250,3 +250,7 @@ python3 -m unittest discover -s tests -q
 The integration test `a_read_only_batch_serves_the_same_evidence_across_agents_and_a_restart_without_a_model_call`
 covers the acceptance path: task → bounded handoff naming evidence IDs → batch through `ringo tools` → structured
 refusal → shell restart → the same revision and evidence bytes, with the fake provider's call log unchanged.
+
+## Task checks status
+
+Task checks and task-linked review are not yet wired in this branch; see OPENCODE-TASK-VERIFICATION-HANDOFF.md.
