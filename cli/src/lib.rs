@@ -3,6 +3,7 @@
 //! the IDE drive a `Session` and render its jobs.
 
 pub mod parse;
+pub mod routing;
 pub mod rt;
 pub mod task;
 
@@ -568,6 +569,16 @@ impl Job {
         }
         self.fresh.push(said);
     }
+}
+
+/// What a finished job's usage record says, found by its durable private folder. No record is unknown, never zero: a
+/// turn whose adapter reported no counts, or one from a shell that did not reach `usage.jsonl`, stays unaccounted.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct JobUsage {
+    pub recorded: bool,
+    pub unknown: bool,
+    pub uncounted_calls: u64,
+    pub tokens: Tokens,
 }
 
 /// How many of the owner's lines went to a running turn, and whether its stdin has closed: the sender and the reader
@@ -1826,6 +1837,17 @@ impl Session {
     /// One agent turn. Read turns run in the repository with the agent's read-only setting and continue that
     /// agent's conversation; write turns start fresh in a private worktree from HEAD.
     pub fn launch_agent(&mut self, agent: Agent, write: bool, prompt: &str) -> Result<usize, String> {
+        self.launch_agent_with_model(agent, write, prompt, None)
+    }
+
+    /// One turn with an explicit model from a task assignment. The explicit model wins over the shell's /model choice;
+    /// None keeps the ordinary precedence (the owner's /model, then the agent's own default). A model the agent does
+    /// not take is refused here, before any job or model call.
+    pub fn launch_agent_with_model(&mut self, agent: Agent, write: bool, prompt: &str,
+                                   model: Option<&str>) -> Result<usize, String> {
+        if let Some(model) = model && let Some(problem) = routing::model_problem(agent, model) {
+            return Err(problem);
+        }
         if write && !self.git {
             return Err(format!("@{}! edits in a private git worktree, so it needs a git project: start ringo inside one \
                                 (or run git init here). @{} without ! works in any folder", agent.name(), agent.name()));
@@ -1858,6 +1880,8 @@ impl Session {
             Some(file) => (Some(file.text), file.model, file.tools),
             None => (None, None, None),
         };
+        // This turn's model: an assignment's explicit choice first, then the shell's /model (launch_agent_with_model).
+        let chosen_model = model.map(str::to_string).or_else(|| self.models.get(&agent).cloned());
         let id = self.new_job(Kind::Agent { agent, write }, prompt)?;
         let dir = self.jobs[id - 1].dir.clone();
         let _ = fs::write(dir.join("prompt.txt"), prompt);
@@ -2020,8 +2044,9 @@ impl Session {
                 if auto {
                     thread["approvalsReviewer"] = "auto_review".into();
                 }
-                // the owner's choice of model (/model); given on resuming too, so a conversation goes on with it
-                if let Some(model) = self.models.get(&agent) {
+                // the owner's choice of model (/model, or a task assignment's explicit model); given on resuming too,
+                // so a conversation goes on with it
+                if let Some(model) = &chosen_model {
                     thread["model"] = model.as_str().into();
                 }
                 // Kept by the thread once it is given; given on resuming too, for a thread started without it. A
@@ -2158,9 +2183,10 @@ impl Session {
                 if !allowed.is_empty() {
                     cmd.arg("--allowedTools").args(&allowed);
                 }
-                // the owner's choice of model (/model): an alias or a full name, as Claude Code's --model takes it.
-                // With none, a specialist runs on the model its file names, as it does in Claude Code.
-                if let Some(model) = self.models.get(&agent).or(own_model.as_ref()) {
+                // the owner's choice of model (/model, or a task assignment's explicit model): an alias or a full
+                // name, as Claude Code's --model takes it. With none, a specialist runs on the model its file names,
+                // as it does in Claude Code.
+                if let Some(model) = chosen_model.as_ref().or(own_model.as_ref()) {
                     cmd.args(["--model", model]);
                 }
                 // A specialist's file may list the tools it uses: Claude Code then offers it those of its own and no
@@ -2952,6 +2978,34 @@ impl Session {
             }
         }
         (by, first)
+    }
+
+    /// The live job whose durable private folder is `dir`. A job from an earlier shell has no entry: its record and
+    /// evidence on disk are the only evidence left.
+    pub fn job_by_dir(&self, dir: &Path) -> Option<&Job> {
+        self.jobs.iter().find(|job| job.dir == dir)
+    }
+
+    /// A finished job's usage record, read from `usage.jsonl` by its durable folder. An operation with no record is
+    /// unknown, never a free call.
+    pub fn job_usage(&self, dir: &Path) -> JobUsage {
+        let wanted = dir.to_string_lossy();
+        let mut found = None;
+        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
+            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if r["job"].as_str() != Some(wanted.as_ref()) {
+                continue;
+            }
+            let n = |key: &str| r[key].as_u64().unwrap_or(0);
+            found = Some(JobUsage {
+                recorded: true,
+                unknown: r["unknown"].as_bool().unwrap_or(false),
+                uncounted_calls: n("uncounted_calls"),
+                tokens: Tokens { input: n("input"), cache_read: n("cache_read"), cache_write: n("cache_write"),
+                                 output: n("output") },
+            });
+        }
+        found.unwrap_or_default()
     }
 
     /// The oldest action an agent waits on the owner for, across every job: (job, what it asks).
