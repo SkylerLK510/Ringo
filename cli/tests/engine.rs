@@ -1188,12 +1188,12 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
     }
     // every job that used tokens is in the record /usage totals. Claude: 7 a turn. Codex and agy count what a turn
     // added to its thread's total, and these fakes answer with one thread and one total every time, so only their
-    // first turn adds any (12 and 2), and the jobs that added none leave no line.
+    // first turn adds any (12 and 2). Every counted call keeps a ledger row, including known zero usage.
     let (day, first) = s.used_since(86_400);
     let total = |name: &str| day.get(name).map(|t| t.total()).unwrap_or(0);
     assert_eq!((total("claude"), total("codex"), total("agy")), (28, 12, 2));
     assert!(first.is_some());
-    assert_eq!(fs::read_to_string(state.join("usage.jsonl")).unwrap().lines().count(), 6);
+    assert_eq!(fs::read_to_string(state.join("usage.jsonl")).unwrap().lines().count(), 12);
 }
 
 #[test]
@@ -2169,7 +2169,7 @@ fn each_agent_is_started_on_the_model_its_owner_chose() {
     assert_eq!(run(&mut s), ("thread/start".into(), None, None), "no choice: each on its own default");
     s.models.insert(agent("codex"), "gpt-test".into());
     s.models.insert(agent("claude"), "opus".into());
-    assert_eq!(run(&mut s), ("thread/resume".into(), Some("gpt-test".into()), Some("opus".into())), "a conversation goes on with it");
+    assert_eq!(run(&mut s), ("thread/start".into(), Some("gpt-test".into()), Some("opus".into())), "a changed model starts a fresh provider conversation");
     s.forget();
     assert_eq!(run(&mut s), ("thread/start".into(), Some("gpt-test".into()), Some("opus".into())), "and a new one starts on it");
     // back to its own: no model is named, and the conversation starts again, because one under way keeps its model

@@ -2,6 +2,7 @@
 //! conversations. Every change reloads under an exclusive lock, checks the expected revision, and replaces the
 //! record atomically; a stale writer or damaged record never overwrites newer state.
 
+use crate::routing::Role;
 use crate::{Job, Kind, Status};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 const MAX_TEXT: usize = 64 * 1024;
 const MAX_REQUEST_ID: usize = 128;
 
@@ -82,6 +83,20 @@ pub struct Decision {
     pub author: String,
 }
 
+/// The owner's explicit choice for one task role. Phase 1 records and displays it; the workflow paths that consume
+/// it are added by later phases. An assignment never names a silent fallback.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Assignment {
+    pub role: Role,
+    /// An agent name from the shell's registered adapters (`agents.json`), not a command line.
+    pub agent: String,
+    /// A model that agent takes, or None for its own default (and the shell's /model choice).
+    pub model: Option<String>,
+    pub provenance: String,
+    pub assigned_unix: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
@@ -147,6 +162,9 @@ pub struct Task {
     pub objective: OwnerText,
     pub constraints: Vec<OwnerText>,
     pub decisions: Vec<Decision>,
+    /// Version 1 records have none; a missing list migrates to unassigned roles in memory.
+    #[serde(default)]
+    pub assignments: Vec<Assignment>,
     pub next_action: Option<OwnerText>,
     pub artifacts: Vec<ArtifactRef>,
     pub unresolved_issues: Vec<OwnerText>,
@@ -170,6 +188,10 @@ impl Task {
                 let status = match item.status { DecisionStatus::Proposed => "proposed", DecisionStatus::Accepted => "accepted" };
                 format!("  {}. [{}] {} (by {})", i + 1, status, item.text, item.author)
             }));
+        }
+        out.push("Assignments:".into());
+        for role in Role::ALL {
+            out.push(format!("  {role}: {}", self.assignment_line(role)));
         }
         out.push(format!("Next action: {}", self.next_action.as_ref().map_or("not set", |next| next.text.as_str())));
         if !self.artifacts.is_empty() {
@@ -195,6 +217,17 @@ impl Task {
         out.join("\n")
     }
 
+    pub fn assignment(&self, role: Role) -> Option<&Assignment> {
+        self.assignments.iter().find(|item| item.role == role)
+    }
+
+    pub fn assignment_line(&self, role: Role) -> String {
+        self.assignment(role).map_or_else(|| "unassigned".into(), |item| match &item.model {
+            Some(model) => format!("{}/{model} (owner)", item.agent),
+            None => format!("{} (owner; its own default or the shell's /model)", item.agent),
+        })
+    }
+
     fn validate(&self) -> Result<()> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(TaskError::UnsupportedVersion(self.schema_version));
@@ -216,6 +249,13 @@ impl Task {
         for item in &self.decisions {
             bounded(&item.text, "decision")?;
             bounded(&item.author, "decision author")?;
+        }
+        let mut roles = std::collections::BTreeSet::new();
+        for item in &self.assignments {
+            validate_assignment(item)?;
+            if !roles.insert(item.role) {
+                return Err(TaskError::Corrupt(format!("task assigns the {} role twice", item.role)));
+            }
         }
         for item in &self.artifacts {
             validate_artifact(item)?;
@@ -280,6 +320,8 @@ pub enum TaskUpdate {
     RemoveConstraint(usize),
     AddDecision { text: String, status: DecisionStatus },
     RemoveDecision(usize),
+    Assign { role: Role, agent: String, model: Option<String> },
+    Unassign(Role),
     AddArtifact(ArtifactRef),
     RemoveArtifact(usize),
     AddIssue(String),
@@ -326,7 +368,7 @@ impl TaskStore {
             let task = Task {
                 schema_version: SCHEMA_VERSION, id: id.clone(), revision: 1, repository: self.repository.clone(),
                 objective: OwnerText::owner(objective.into()), constraints: Vec::new(), decisions: Vec::new(),
-                next_action: None, artifacts: Vec::new(), unresolved_issues: Vec::new(), jobs: Vec::new(),
+                next_action: None, assignments: Vec::new(), artifacts: Vec::new(), unresolved_issues: Vec::new(), jobs: Vec::new(),
                 requests: vec![RequestReceipt { request_id: request_id.into(), fingerprint: create_fingerprint(objective), revision: 1 }],
                 created_unix: now, updated_unix: now,
             };
@@ -443,6 +485,14 @@ fn apply(task: &mut Task, update: TaskUpdate) -> Result<()> {
             task.decisions.push(Decision { text, status, author: "owner".into() });
         }
         TaskUpdate::RemoveDecision(index) => remove(&mut task.decisions, index, "decision")?,
+        TaskUpdate::Assign { role, agent, model } => {
+            let item = Assignment { role, agent, model, provenance: "owner".into(), assigned_unix: now() };
+            validate_assignment(&item)?;
+            task.assignments.retain(|old| old.role != role);
+            task.assignments.push(item);
+            task.assignments.sort_by_key(|item| item.role);
+        }
+        TaskUpdate::Unassign(role) => task.assignments.retain(|item| item.role != role),
         TaskUpdate::AddArtifact(item) => { validate_artifact(&item)?; task.artifacts.push(item); }
         TaskUpdate::RemoveArtifact(index) => remove(&mut task.artifacts, index, "artifact")?,
         TaskUpdate::AddIssue(text) => { bounded(&text, "unresolved issue")?; task.unresolved_issues.push(OwnerText::owner(text)); }
@@ -471,6 +521,8 @@ fn fingerprint(update: &TaskUpdate) -> String {
         TaskUpdate::RemoveConstraint(index) => serde_json::json!(["remove_constraint", index]),
         TaskUpdate::AddDecision { text, status } => serde_json::json!(["add_decision", text, status]),
         TaskUpdate::RemoveDecision(index) => serde_json::json!(["remove_decision", index]),
+        TaskUpdate::Assign { role, agent, model } => serde_json::json!(["assign", role, agent, model]),
+        TaskUpdate::Unassign(role) => serde_json::json!(["unassign", role]),
         TaskUpdate::AddArtifact(item) => serde_json::json!(["add_artifact", item]),
         TaskUpdate::RemoveArtifact(index) => serde_json::json!(["remove_artifact", index]),
         TaskUpdate::AddIssue(text) => serde_json::json!(["add_issue", text]),
@@ -484,7 +536,7 @@ fn apply_v0(old: TaskV0) -> Task {
         schema_version: SCHEMA_VERSION, id: old.id, revision: old.revision, repository: old.repository,
         objective: OwnerText::owner(old.objective),
         constraints: old.constraints.into_iter().map(OwnerText::owner).collect(), decisions: Vec::new(),
-        next_action: old.next_action.map(OwnerText::owner), artifacts: old.artifacts,
+        assignments: Vec::new(), next_action: old.next_action.map(OwnerText::owner), artifacts: old.artifacts,
         unresolved_issues: old.unresolved_issues.into_iter().map(OwnerText::owner).collect(),
         jobs: old.jobs, requests: Vec::new(), created_unix: old.created_unix, updated_unix: old.updated_unix,
     }
@@ -496,6 +548,10 @@ fn decode(bytes: &[u8]) -> Result<Task> {
         .ok_or_else(|| TaskError::Corrupt("missing integer schema_version".into()))?;
     match version {
         version if version == SCHEMA_VERSION as u64 => serde_json::from_slice(bytes).map_err(|e| TaskError::Corrupt(e.to_string())),
+        // Version 1 has no assignments; the missing list defaults to empty and the record becomes version 2 in
+        // memory, persisted only by a later update.
+        1 => serde_json::from_slice::<Task>(bytes).map(|mut task| { task.schema_version = SCHEMA_VERSION; task })
+            .map_err(|e| TaskError::Corrupt(e.to_string())),
         0 => serde_json::from_slice::<TaskV0>(bytes).map(apply_v0).map_err(|e| TaskError::Corrupt(e.to_string())),
         newer if newer > SCHEMA_VERSION as u64 => Err(TaskError::UnsupportedVersion(newer.min(u32::MAX as u64) as u32)),
         _ => Err(TaskError::Corrupt(format!("unknown schema version {version}"))),
@@ -622,6 +678,23 @@ fn bounded(text: &str, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_assignment(item: &Assignment) -> Result<()> {
+    bounded(&item.agent, "assignment agent")?;
+    if let Some(model) = &item.model {
+        bounded(model, "assignment model")?;
+        if model.contains(char::is_whitespace) {
+            return Err(TaskError::Invalid("an assignment model is one word, as its agent takes it".into()));
+        }
+    }
+    if item.provenance != "owner" {
+        return Err(TaskError::Corrupt(format!("assignment has unsupported provenance {:?}", item.provenance)));
+    }
+    if item.assigned_unix == 0 {
+        return Err(TaskError::Corrupt("assignment has no assignment time".into()));
+    }
+    Ok(())
+}
+
 fn validate_artifact(item: &ArtifactRef) -> Result<()> {
     bounded(&item.reference, "artifact reference")?;
     if let Some(identity) = &item.identity {
@@ -683,7 +756,7 @@ mod tests {
         let store = temp.store();
         let made = task(&temp);
         assert_eq!((made.schema_version, made.revision, made.objective.text.as_str()),
-                   (1, 1, "  Preserve the original objective.  "));
+                   (2, 1, "  Preserve the original objective.  "));
         let revised = store.update(&made.id, 1, "constraint-1", TaskUpdate::AddConstraint("Do not change auth.".into())).unwrap();
         let revised = store.update(&made.id, revised.revision, "decision-1", TaskUpdate::AddDecision {
             text: "Use the existing context builder.".into(), status: DecisionStatus::Accepted,
@@ -773,10 +846,10 @@ mod tests {
         let made = task(&temp);
         let path = temp.store().dir.join(&made.id).join("task.json");
         for (contents, future) in [(b"{\"schema_version\":".as_slice(), false),
-                                   (br#"{"schema_version":2,"id":"future"}"#.as_slice(), true)] {
+                                   (br#"{"schema_version":3,"id":"future"}"#.as_slice(), true)] {
             fs::write(&path, contents).unwrap();
             let error = temp.store().load(&made.id).unwrap_err();
-            assert_eq!(matches!(error, TaskError::UnsupportedVersion(2)), future, "{error}");
+            assert_eq!(matches!(error, TaskError::UnsupportedVersion(3)), future, "{error}");
             let update = temp.store().update(&made.id, made.revision, "must-not-write", TaskUpdate::AddConstraint("lost".into()));
             assert!(update.is_err());
             assert_eq!(fs::read(&path).unwrap(), contents, "inspection and mutation leave the original bytes alone");
@@ -802,7 +875,8 @@ mod tests {
         });
         fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
         let migrated = temp.store().load(&made.id).unwrap();
-        assert_eq!(migrated.schema_version, 1);
+        assert_eq!(migrated.schema_version, 2);
+        assert!(migrated.assignments.is_empty());
         assert_eq!(migrated.objective.provenance, "owner");
         assert_eq!(migrated.constraints[0].text, "keep undo");
         assert_eq!(migrated.unresolved_issues[0].text, "question");
@@ -811,6 +885,58 @@ mod tests {
         let updated = temp.store().update(&made.id, 1, "after-migration", TaskUpdate::AddConstraint("also keep mode".into())).unwrap();
         assert_eq!(updated.revision, 2);
         assert_eq!(temp.store().load(&made.id).unwrap().constraints.len(), 2);
+    }
+
+    #[test]
+    fn assignments_are_one_per_role_only_and_survive_reopening() {
+        let temp = Temp::new("assignments");
+        let store = temp.store();
+        let made = task(&temp);
+        let assigned = store.update(&made.id, 1, "assign-worker", TaskUpdate::Assign {
+            role: Role::Worker, agent: "claude".into(), model: Some("opus".into()),
+        }).unwrap();
+        assert_eq!(assigned.revision, 2);
+        assert_eq!(assigned.assignment_line(Role::Worker), "claude/opus (owner)");
+        assert!(assigned.assignment(Role::Reviewer).is_none());
+        let replaced = store.update(&made.id, assigned.revision, "assign-worker-again", TaskUpdate::Assign {
+            role: Role::Worker, agent: "codex".into(), model: None,
+        }).unwrap();
+        assert_eq!(replaced.assignments.len(), 1, "one agent per role, never two");
+        assert_eq!(replaced.assignment_line(Role::Worker), "codex (owner; its own default or the shell's /model)");
+        // A model that is not one token is refused before anything is written.
+        assert!(matches!(store.update(&made.id, replaced.revision, "bad-model", TaskUpdate::Assign {
+            role: Role::Reviewer, agent: "claude".into(), model: Some("two words".into()),
+        }), Err(TaskError::Invalid(_))));
+        assert_eq!(store.load(&made.id).unwrap(), replaced);
+        let unassigned = store.update(&made.id, replaced.revision, "unassign", TaskUpdate::Unassign(Role::Worker)).unwrap();
+        assert!(unassigned.assignments.is_empty());
+        drop(store);
+        let loaded = temp.store().load(&made.id).unwrap();
+        assert_eq!(loaded, unassigned);
+        assert!(loaded.concise_view().contains("worker: unassigned"));
+    }
+
+    #[test]
+    fn version_one_records_load_as_version_two_with_no_assignments() {
+        let temp = Temp::new("v1-migration");
+        let store = temp.store();
+        let made = task(&temp);
+        let path = store.dir.join(&made.id).join("task.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        value["schema_version"] = 1.into();
+        value.as_object_mut().unwrap().remove("assignments");
+        let v1 = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &v1).unwrap();
+        let migrated = temp.store().load(&made.id).unwrap();
+        assert_eq!(migrated.schema_version, SCHEMA_VERSION);
+        assert!(migrated.assignments.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), v1, "loading does not rewrite the record");
+        let updated = temp.store().update(&made.id, 1, "after-v1", TaskUpdate::Assign {
+            role: Role::Design, agent: "claude".into(), model: None,
+        }).unwrap();
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.schema_version, SCHEMA_VERSION);
+        assert_eq!(temp.store().load(&made.id).unwrap().assignment(Role::Design).unwrap().agent, "claude");
     }
 
     #[test]

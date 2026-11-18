@@ -257,6 +257,11 @@ cannot stop a conversation.
 | `/task inspect [ID]` | show the selected task, or `ID`, concisely |
 | `/task select ID` | select a task; the conversation remembers it |
 | `/task resume [ID]` | put its next action (or objective) in the input; no agent starts |
+| `/task progress` | the effective worker/reviewer/design assignments, operation state, checks, review, next action, and each attached job's usage (unknown stays unknown) |
+| `/task start` | run the worker's next action (or the objective) as exactly one turn by the assigned agent and model; unavailable work refuses and starts no call |
+| `/task assign worker\|reviewer\|design AGENT [MODEL]` | record the owner's choice for one role; no agent is started |
+| `/task unassign worker\|reviewer\|design` | clear one role; other roles are untouched |
+| `/task capabilities [AGENT]` | what each agent, or one, can do here and now: installed, sign-in, roles, editing, cancellation, context, usage coverage, and why it is unavailable; also the local worker's refusal |
 | `/task attach #N` | attach job N's durable answer and evidence references |
 | `/task update objective TEXT` | change the objective |
 | `/task update next TEXT` | set the next action |
@@ -268,6 +273,13 @@ cannot stop a conversation.
 Each update is read at one revision and written only if that revision is still current, so two shells cannot silently
 overwrite each other; repeating a request is safe. `/task resume` only prepares the input: Enter sends it through the
 same agent conversation as ordinary chat, and no agent is started by the command itself.
+
+Assignments are manual and explicit: Ringo never recommends one, switches provider, or treats one agent's failure as
+another's turn. An assignment's model wins over the shell's `/model`, which wins over that agent's own default. A model
+belongs to the agent assigned to the role, and an agent that takes no model from Ringo is refused. `/task start` is the
+only task command that runs a turn, and it starts exactly one; an unassigned or unavailable worker refuses with the
+reason and the action that changes it, before any model call. Routing reviewer and design assignments to execution is
+not wired yet: `/review` and `/design` remain the commands that run them.
 
 ## Run Ringo's pipelines
 
