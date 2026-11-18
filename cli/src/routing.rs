@@ -118,7 +118,11 @@ impl Capability {
 
 /// One agent's capability, from probes the caller already made. `sign_in` is the agent's own status answer (no model
 /// call); `git` says whether this folder can host a worktree copy.
-pub fn agent_capability(agent: Agent, program: &Path, installed: bool, sign_in: &SignIn, git: bool) -> Capability {
+/// `read_mode`: the shell is in read mode, where no agent edits, so an adapter whose only turns edit its own copy
+/// cannot take a worker turn until the owner changes mode.
+pub fn agent_capability(
+    agent: Agent, program: &Path, installed: bool, sign_in: &SignIn, git: bool, read_mode: bool,
+) -> Capability {
     let spec: &Spec = agent.spec();
     let signed = match sign_in {
         SignIn::Yes(how) => format!("signed in ({how})"),
@@ -136,6 +140,11 @@ pub fn agent_capability(agent: Agent, program: &Path, installed: bool, sign_in: 
         Readiness::Unavailable {
             reason: "its only edit mode is its own git worktree copy, which needs a git repository".into(),
             corrective: "start Ringo inside a git project (or run git init here)".into(),
+        }
+    } else if read_mode && !spec.read {
+        Readiness::Unavailable {
+            reason: "read mode: its only turns edit its own copy, and in read mode no agent edits".into(),
+            corrective: "/mode ask (or Shift-Tab)".into(),
         }
     } else {
         Readiness::Ready
@@ -308,7 +317,7 @@ mod tests {
 
     #[test]
     fn not_installed_has_a_corrective_action() {
-        let capability = agent_capability(claude(), Path::new("/nope/claude"), false, &SignIn::Unknown, true);
+        let capability = agent_capability(claude(), Path::new("/nope/claude"), false, &SignIn::Unknown, true, false);
         assert!(!capability.available());
         let problem = capability.readiness.problem().unwrap();
         assert!(problem.contains("not installed") && problem.contains("/setup"), "{problem}");
@@ -317,7 +326,7 @@ mod tests {
     #[test]
     fn an_api_key_login_is_unavailable_and_names_the_subscription_login() {
         let capability = agent_capability(
-            claude(), Path::new("/bin/true"), true, &SignIn::No("signed in with api_key".into()), true,
+            claude(), Path::new("/bin/true"), true, &SignIn::No("signed in with api_key".into()), true, false,
         );
         let problem = capability.readiness.problem().unwrap();
         assert!(problem.contains("not signed in") && problem.contains("claude auth login"), "{problem}");
@@ -325,23 +334,28 @@ mod tests {
 
     #[test]
     fn write_only_adapters_support_only_the_worker_role_and_need_git() {
-        let capability = agent_capability(claude(), Path::new("/bin/true"), true, &SignIn::Unknown, true);
+        let capability = agent_capability(claude(), Path::new("/bin/true"), true, &SignIn::Unknown, true, false);
         assert_eq!(capability.roles, vec![Role::Worker, Role::Reviewer, Role::Design]);
         // Grok is shipped with read: false.
         let grok = Agent::from_name("grok").unwrap();
-        let write_only = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, true);
+        let write_only = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, true, false);
         assert_eq!(write_only.roles, vec![Role::Worker]);
-        let no_git = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, false);
+        let no_git = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, false, false);
         assert!(!no_git.available());
         assert!(no_git.readiness.problem().unwrap().contains("git repository"));
+        // Read mode lets no agent edit, so a write-only adapter cannot take a worker turn; a read adapter still can.
+        let read_mode = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, true, true);
+        let problem = read_mode.readiness.problem().unwrap();
+        assert!(problem.contains("read mode") && problem.contains("/mode ask"), "{problem}");
+        assert!(agent_capability(claude(), Path::new("/bin/true"), true, &SignIn::Unknown, true, true).available());
     }
 
     #[test]
     fn token_reporting_is_partial_not_complete_and_plain_is_unknown() {
-        let claude = agent_capability(self::claude(), Path::new("/bin/true"), true, &SignIn::Yes("claude.ai".into()), true);
+        let claude = agent_capability(self::claude(), Path::new("/bin/true"), true, &SignIn::Yes("claude.ai".into()), true, false);
         assert_eq!(claude.usage, UsageCoverage::Partial);
         let grok = Agent::from_name("grok").unwrap();
-        let plain = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, true);
+        let plain = agent_capability(grok, Path::new("/bin/true"), true, &SignIn::Unknown, true, false);
         assert_eq!(plain.usage, UsageCoverage::Unknown);
     }
 

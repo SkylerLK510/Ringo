@@ -2999,7 +2999,10 @@ impl Session {
             let n = |key: &str| r[key].as_u64().unwrap_or(0);
             found = Some(JobUsage {
                 recorded: true,
-                unknown: r["unknown"].as_bool().unwrap_or(false),
+                unknown: r["unknown"].as_bool().unwrap_or(false)
+                    || ["input", "cache_read", "cache_write", "output"]
+                        .iter().any(|key| r[*key].as_u64().is_none())
+                    || (r.get("uncounted_calls").is_some() && r["uncounted_calls"].as_u64().is_none()),
                 uncounted_calls: n("uncounted_calls"),
                 tokens: Tokens { input: n("input"), cache_read: n("cache_read"), cache_write: n("cache_write"),
                                  output: n("output") },

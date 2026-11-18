@@ -659,7 +659,7 @@ fn usage_line(usage: &JobUsage) -> String {
         return "usage unknown (not zero: no record in usage.jsonl)".into();
     }
     if usage.unknown {
-        return "usage unknown (the adapter reported no counts)".into();
+        return "usage unknown (not zero: counts unavailable)".into();
     }
     if usage.uncounted_calls > 0 {
         return format!("usage partial: {} tokens in counted calls, {} uncounted", usage.tokens.total(),
@@ -1696,6 +1696,8 @@ struct App {
     talking: Option<Talk>,
     revision: Option<String>,
     revision_id: Option<usize>,
+    /// Explicit task starts never schedule automatic review or repair turns.
+    task_turns: std::collections::HashSet<usize>,
     /// Ultra: the plan read a turn here started (the turn, the read), then its answer (see `reviewer`).
     quota: Option<(usize, std::thread::JoinHandle<Pick>)>,
     reviewer: Option<(usize, Pick)>,
@@ -1779,7 +1781,7 @@ impl App {
               last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
-              revision: None, revision_id: None, quota: None, reviewer: None }
+              revision: None, revision_id: None, task_turns: Default::default(), quota: None, reviewer: None }
     }
 
     /// What the shell opens with: only what this session needs said. An empty conversation shows where to start
@@ -2338,6 +2340,7 @@ impl App {
         if self.talking.as_ref().is_some_and(|talk| talk.job == id) {
             return self.talk_on(id);
         }
+        if self.task_turns.remove(&id) { return; }
         let job = &self.s.jobs[id - 1];
         // From the home folder, a turn whose edits all went to one project points there, once (11/03: a whole project
         // was built from the home folder, past the opening line that says to start in the project)
@@ -2925,7 +2928,12 @@ impl App {
                 let prompt = task.next_action.as_ref().unwrap_or(&task.objective).text.clone();
                 let head = format!("  starting worker {} · {} · one turn; no checks or review were started",
                                    effective.summary(), capability.summary());
-                let note = self.turn_with_model(effective.agent, effective.model.as_deref(), &prompt)?;
+                let expanded = self.s.expand(&prompt)?;
+                self.s.peers = self.agents.clone();
+                let id = self.s.launch_agent_with_model(effective.agent, !effective.agent.spec().read,
+                                                       &expanded, effective.model.as_deref())?;
+                self.task_turns.insert(id);
+                let note: Option<String> = (expanded != prompt).then(|| format!("  expanded task:\n{expanded}"));
                 format!("{head}{}", note.map(|n| format!("\n{n}")).unwrap_or_default())
             }
             TaskCmd::Assign { role, agent, model } => {
@@ -2996,7 +3004,7 @@ impl App {
     fn capability(&self, agent: Agent) -> routing::Capability {
         let program = self.s.program(agent);
         let sign_in = ringo_cli::sign_in(agent, &program);
-        routing::agent_capability(agent, &program, self.s.installed(agent), &sign_in, self.s.git)
+        routing::agent_capability(agent, &program, self.s.installed(agent), &sign_in, self.s.git, self.s.mode == Mode::Read)
     }
 
     /// The assignment a role resolves to in this task, or None when the role is unassigned. An assigned agent that is
@@ -6448,6 +6456,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(a.s.jobs.is_empty(), "creating a task starts no agent");
         assert!(a.s.task_store().unwrap().load(&id).unwrap().objective.text == "Preserve the objective");
 
+        a.s.tier = Tier::Ultra;
         a.send("/task update next  Add narrow tests  ");
         a.send("/task update constraint add Do not change auth");
         let task = a.s.selected_task().unwrap().unwrap();
@@ -6558,6 +6567,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert!(a.s.jobs.is_empty(), "an unavailable worker starts no call");
 
         fake_claude(&script, r#"{"loggedIn":true,"authMethod":"claude.ai","subscriptionType":"max"}"#);
+        a.s.tier = Tier::Ultra;
         a.send("/task update next  Add narrow tests  ");
         let said = a.run(Cmd::Task(TaskCmd::Start), "/task start").unwrap().unwrap();
         assert!(said.contains("one turn; no checks or review were started"), "{said}");
@@ -6568,6 +6578,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
             a.s.pump();
             std::thread::sleep(Duration::from_millis(20));
         }
+        a.s.jobs[0].changed.push("routing.rs".into());
         a.feed();
         assert_eq!((a.s.jobs.len(), a.s.jobs[0].status.clone()), (1, Status::Done));
         assert!(a.checking.is_none(), "no check or review follows the start");
@@ -6582,11 +6593,28 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         let view = a.run(Cmd::Task(TaskCmd::Progress), "/task progress").unwrap().unwrap();
         assert!(view.contains("worker: claude/opus (task assignment)"), "{view}");
         assert!(view.contains("Checks: none recorded") && view.contains("Review: none recorded"), "{view}");
-        assert!(view.contains("usage unknown (the adapter reported no counts)"), "{view}");
+        assert!(view.contains("usage unknown (not zero: counts unavailable)"), "{view}");
         assert!(view.contains("Owner action: choose a reviewer assignment"), "{view}");
         let _ = std::fs::remove_file(&script);
         let _ = std::fs::remove_file(script.with_extension("args"));
         let _ = std::fs::remove_file(script.with_extension("stdin"));
+    }
+
+    #[test]
+    fn task_usage_distinguishes_missing_partial_and_complete_counts() {
+        let a = task_app("usage-coverage", true);
+        let root = std::env::temp_dir().join(format!("ringo-tui-task-{}-usage-coverage/state", std::process::id()));
+        let dir = root.join("worker-job");
+        let record = |extra: &str| {
+            let line = format!("{{\"job\":{},{} }}", serde_json::to_string(&dir).unwrap(), extra);
+            std::fs::write(root.join("usage.jsonl"), line).unwrap();
+            a.s.job_usage(&dir)
+        };
+        assert!(usage_line(&a.s.job_usage(&dir)).contains("unknown"));
+        assert!(record("\"input\":1").unknown, "missing counts cannot become zero");
+        let counts = "\"input\":1,\"output\":2,\"cache_read\":3,\"cache_write\":4";
+        assert_eq!(usage_line(&record(counts)), "usage 10 tokens (subscription cost unknown)");
+        assert!(usage_line(&record(&format!("{counts},\"uncounted_calls\":1"))).contains("partial"));
     }
 
     #[test]
