@@ -80,6 +80,7 @@ struct EvidenceRecord {
 pub struct EvidenceStore {
     repository: RepositoryBinding,
     dir: PathBuf,
+    root: PathBuf,
 }
 
 impl EvidenceStore {
@@ -95,7 +96,7 @@ impl EvidenceStore {
         if dir.starts_with(&repository.path) {
             return Err(EvidenceError::Invalid("evidence snapshots must stay outside the repository".into()));
         }
-        Ok(Self { repository: repository.clone(), dir })
+        Ok(Self { repository: repository.clone(), dir, root: root.into() })
     }
 
     /// Register all currently named task artifacts and attached job outputs in stable task order. A source that
@@ -116,6 +117,26 @@ impl EvidenceStore {
         private_dir(&self.dir.join(&task.id))?;
         let mut out = Vec::new();
         for artifact in &task.artifacts {
+            if let Some(id) = artifact.reference.strip_prefix("check:") {
+                let store = crate::task_check::CheckStore::new(&self.root, &task.repository);
+                match store.and_then(|store| {
+                    let check = store.load(task, id)?;
+                    if check.finished_unix.is_none() { return Err("check output is not final".into()); }
+                    if artifact.identity.as_deref() != Some(crate::task_check::command_identity(&check.command, check.seconds).as_str()) {
+                        return Err("check command identity mismatch".into());
+                    }
+                    Ok(store.directory(task, id)?)
+                }) {
+                    Ok(dir) => for name in ["record.json", "stdout", "stderr"] {
+                        let label = format!("check:{id}/{name}");
+                        out.push(self.register_source(task, label.clone(), label, None,
+                                                      &dir, Path::new(name), true, false));
+                    },
+                    Err(error) => out.push(unavailable(artifact_origin(&artifact.reference), artifact.reference.clone(),
+                                                       None, &error)),
+                }
+                continue;
+            }
             let origin = artifact_origin(&artifact.reference);
             out.push(self.register_source(task, origin, artifact.reference.clone(), artifact.identity.clone(),
                                           &task.repository.path, Path::new(&artifact.reference), false, false));
@@ -561,7 +582,7 @@ fn open_regular_beneath(root: &Path, relative: &Path) -> std::io::Result<fs::Fil
 /// Like `open_regular_beneath`, but the root itself is reached component by component without following a single
 /// symlink: a job directory whose old path now redirects must be refused, not read at its new destination.
 #[cfg(unix)]
-fn open_regular_beneath_strict(root: &Path, relative: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn open_regular_beneath_strict(root: &Path, relative: &Path) -> std::io::Result<fs::File> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
     use std::os::unix::ffi::OsStrExt;
@@ -650,7 +671,7 @@ fn open_regular_beneath(root: &Path, relative: &Path) -> std::io::Result<fs::Fil
 
 /// On non-unix there is no dirfd confinement; the root is checked component by component for symlinks first.
 #[cfg(not(unix))]
-fn open_regular_beneath_strict(root: &Path, relative: &Path) -> std::io::Result<fs::File> {
+pub(crate) fn open_regular_beneath_strict(root: &Path, relative: &Path) -> std::io::Result<fs::File> {
     let mut walked = PathBuf::new();
     for part in root.components() {
         walked.push(part);

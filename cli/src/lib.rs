@@ -9,6 +9,7 @@ pub mod routing;
 pub mod rt;
 pub mod task;
 pub mod task_assignment;
+pub mod task_check;
 
 pub mod images;
 pub mod turn_policy;
@@ -3358,6 +3359,7 @@ impl Session {
 
     /// Stops every running job (the shell is closing).
     pub fn shutdown(&mut self) {
+        if let Ok(checks) = self.check_store() { checks.shutdown(); }
         for job in self.jobs.iter().filter(|j| j.running()) {
             if let Some(pid) = job.pid {
                 job.cancel.store(true, Ordering::SeqCst);

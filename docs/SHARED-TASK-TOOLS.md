@@ -250,3 +250,44 @@ python3 -m unittest discover -s tests -q
 The integration test `a_read_only_batch_serves_the_same_evidence_across_agents_and_a_restart_without_a_model_call`
 covers the acceptance path: task → bounded handoff naming evidence IDs → batch through `ringo tools` → structured
 refusal → shell restart → the same revision and evidence bytes, with the fake provider's call log unchanged.
+
+## Task checks status
+
+Explicit task checks use `/task check run REQUEST_ID SECONDS COMMAND` and
+`/task check cancel CHECK_ID`. Commands execute through `/bin/sh` in the selected
+Git repository on Unix, with no model calls. Task-linked model review remains a
+separate follow-up; see OPENCODE-TASK-VERIFICATION-HANDOFF.md.
+
+The request ID durably claims a launch. Repeating the same request and arguments
+returns its record; different arguments are refused. A crash after reservation
+can leave an unknown outcome. Ringo never automatically reruns it, recovers a PID
+from disk, or treats a passing check as task acceptance. Use a new request ID only
+after inspecting the earlier operation.
+
+`/task progress` shows outcomes, missing output, truncation and source staleness.
+Each stream retains at most 512 KiB in private state; completed outputs and their
+record are available through the existing immutable task-evidence registration.
+HEAD, index entries and tracked/non-ignored untracked contents identify source
+(up to 10,000 files / 128 MiB). Ignored files, external inputs and services are not
+covered. Unreadable or larger trees refuse launch. Checks run in the owner's
+repository, not a sandbox, and can edit it. A changed source invalidates freshness.
+
+Timeouts (1–3600 seconds) and cancellation kill the owned process group; commands
+that deliberately create a separate session can escape that group. Forcibly terminating or
+crashing Ringo can leave a command alive: recovered records are unknown and no
+recovered PID is signalled. At most three checks run per shell process. Existing
+model-job limits are separate. Windows and non-Git folders refuse before launch.
+
+Source identities are bounded samples before and after execution, plus an asynchronous
+sample when progress is opened. Matching samples do not attest that the live tree
+stayed unchanged during a check. Reopen progress if source sampling is pending.
+Git enumeration is capped at 4 MiB per command with a two-second deadline;
+content sampling allows at most 10,000 files and 128 MiB. Sampling runs outside
+the interface thread. Unsupported or unreadable inputs refuse execution.
+
+Restart refuses while checks have live supervisors. Orderly shell shutdown cancels
+owned checks and waits for cleanup; forced process termination can still leave
+commands alive. Reservation deduplication covers process crashes, not a guarantee
+of exactly-once execution across host power loss. A check artifact's declared
+`check-command-sha256:` identity binds its command and timeout; each published
+output snapshot separately binds its bytes. A mismatched declaration grants no evidence.
