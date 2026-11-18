@@ -3813,6 +3813,8 @@ mod tests {
     fn a_fresh_handoff_that_then_fails_to_prepare_leaves_the_conversation_retryable() {
         let mut s = record_session();
         let agent = Agent::from_name("codex").unwrap();
+        // Preparation must fail before this executable can run; do not require a provider CLI on test hosts.
+        s.programs.insert(agent, std::env::current_exe().unwrap());
         let prior = record_turn(&mut s, "the earlier turn");
         fs::write(s.jobs[prior - 1].dir.join("reply.md"), "an earlier reply").unwrap();
         // A task whose required state cannot fit: preparation fails before dispatch, after the fresh handoff
