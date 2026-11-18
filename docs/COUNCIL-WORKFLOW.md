@@ -140,16 +140,19 @@ folder off `sys.path`.
 | `timeout_s` | 120 | Soft limit for each model call: past it the call is checked, probed and kept running; it is stopped at twice this, never under 900 seconds, capped by the time left. |
 | `max_cost`, `unpriced_call_usd` | none | Optional dollar cap and fallback price for calls reporting none. A dollar cap requires a declared fallback. |
 | `protocol` | `json` | `text` replaces the JSON writer protocol with `@@@` blocks (`prompts/work-code.md`, or `work-doc.md` when every editable file is a document): code is not JSON-escaped, and revisions send `REPLACE` edits. A JSON reply is still read. |
-| `roles` | `{}` | Model and reasoning effort per call role: `writer` (round 1), `revision`, `escalate` (a round after failed checks; falls back to `revision`), `tests` and `review`, each `{"model", "effort"}`. Codex takes both; a Claude backend takes a model only. |
+| `roles` | `{}` | Model and reasoning effort per call role: `writer` (round 1), `revision`, `escalate` (a round after failed checks; falls back to `revision`), `tests`, `review` and `plan` (the planner's call; needs `planner`), each `{"model", "effort"}`. Codex takes both; a Claude backend takes a model only. |
 | `spec_tests` | none | `{"python", "timeout_s"}`: one call (role `tests`) writes a unittest module from the brief and the starting files alone, never a candidate. It runs after the checks pass; its failures drive one revision before the review, and the writer may `DISPUTE` a test with the brief sentence it contradicts. A suite that cannot load is dropped. Code tasks only; not with `council`. |
 | `candidates` | 1 | 1 to 4. Round 1 makes this many writer calls on the same input (in parallel unless a cost cap is set); each distinct candidate runs the checks and the spec tests, and the one passing the checks with the most spec tests continues. Not with `council`. |
+| `planner` | none | A backend spec (e.g. `claude@opus`, `codex-chatgpt@gpt-6-astra/high`) or `"judge"` (the judge backend). One `plan` call (role `plan`) after the spec tests and before round 1 sees the brief, material, files, fixtures and the checks, and returns a JSON plan (`prompts/plan.md`): summary, steps, risks and parts (disjoint editable files with instructions). The writer sees the plan in every round, as guidance the brief overrules; the reviewer does not. An unusable plan is recorded in `report.plan.error` and the run goes on without it. `--planner` overrides it. |
+| `builders` | 1 | 1 to 4, needs `planner` when above 1, not with `candidates` above 1 or with `scripts`. Round 1 makes one writer call per plan part (at most this many, in parallel unless a cost cap is set), each limited to its part's files; the replies merge into one candidate. Later rounds use one writer with every file. A part reply that does not apply (including one touching another part's file) makes the round malformed. `--builders` overrides it. |
 | `protocol_repair` | `false` | When no reply of a round can be applied (a bad anchor, a missing block), make one immediate repair call to the same role with the exact error, asking for complete FILE blocks, instead of spending the round. At most one per round. |
 | `no_regression` | `false` | Once a candidate passes the checks, a later revision that fails a check or newly fails a spec test it passed is set aside (`round-N/rejected`), and the writer gets the earlier code back with what broke. With `scripts`, a document revision that introduces a number no successful script printed (and the brief does not give) is set aside too, so a review's claim alone cannot overturn a computed value. With `candidates`, a spec test that every candidate fails stops gating whatever this says (dual agreement). |
 | `scripts` | none | `{"python", "timeout_s"}` (text protocol; default 60 s): a document writer adds one `@@@ SCRIPT` that computes its numbers from the fixtures (`prompts/work-doc-script.md`). Ringo runs it in a scratch copy and shows the output to the review, and to the writer in the next round (one round, while the review still fits) unless every number the document states is already given or printed. The script is never delivered. |
 
 **Calls.** With `candidates`, round 1 makes that many writer calls, so a run makes at most
 `max_rounds - 1 + candidates` writer calls (plus at most one repair call per round with `protocol_repair`), plus
-one `spec_tests` call when set; scripts and checks are not model calls. There is no call cap: the task's rounds decide the calls. Each round
+one `spec_tests` call when set; scripts and checks are not model calls. A `planner` adds exactly one call (never retried
+beyond the retry of a call the person stops), and `builders` adds at most `builders - 1` writer calls, in round 1 only. There is no call cap: the task's rounds decide the calls. Each round
 makes one writer call, and one review call follows the first candidate that passes
 every check. The review call is retried once if it fails or comes back empty, like
 any harness pass. So a run makes at most `max_rounds + 2` calls: the example above
@@ -200,6 +203,16 @@ Markdown report.
 Paths in `files` and `fixtures` must be normalized relative POSIX paths without
 backslashes or components that start with `.`, so `.github/` is refused. No path
 may also be a parent folder of another. Each map holds at most 2 MB of text.
+
+**Plan with a strong model, build with a cheaper one.** One strong model plans, a cheaper writer builds, and the plan
+may split into up to `builders` parallel writer calls:
+
+```json
+{"planner": "claude@opus", "writer": "claude@sonnet", "judge": "claude@opus", "builders": 2}
+```
+
+or with Codex: `"planner": "codex-chatgpt@gpt-6-astra/high", "writer": "codex-chatgpt@gpt-6.1-sol/medium"`. Keep the
+writer at low or medium effort: EXPERIMENTS.md found high effort on every call bought nothing.
 
 ## Run
 

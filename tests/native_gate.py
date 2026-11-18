@@ -30,7 +30,7 @@ sys.path.insert(0, str(HERE))
 import releases  # noqa: E402
 from latency import sha  # noqa: E402
 
-TIMES = {'started', 'updated', 'seconds', 'elapsed_s', 'pid'}
+TIMES = {'started', 'updated', 'seconds', 'elapsed_s', 'pid', 'elapsed_seconds', 'output_tokens_per_second', 'limit_s'}
 IDENTITY = {'mode', 'id', 'root', 'checkout_root', 'bootstrap_sha256', 'runtime', 'binary_sha256'}
 AUTH_ENV = ('HOME', 'CODEX_HOME', 'USERPROFILE', 'RINGO_CHILD', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY',
             'OPENAI_BASE_URL', 'ANTHROPIC_AUTH_TOKEN', 'TYPESAFE_API_KEY', 'GATE_SECRET_API_KEY')
@@ -121,6 +121,29 @@ SLUG_EDIT = '''@@@ REPLACE slug.py
 SLUG_BAD = SLUG_OK.replace('[:40]', '[:41]')
 
 
+PLAN_ONE = json.dumps({'summary': 'One function.', 'steps': ['write slugify', 'check the edge cases'],
+                       'parts': [{'files': ['slug.py'], 'instructions': 'implement slugify as the brief says'}],
+                       'risks': ['the 40 character cut can leave a hyphen']})
+PLAN_TWO = json.dumps({'summary': 'Two modules, ünïcode ✓.', 'steps': ['set A_VALUE', 'set B_VALUE'],
+                       'parts': [{'files': ['a.py'], 'instructions': 'make A_VALUE 1'},
+                                 {'files': ['b.py'], 'instructions': 'make B_VALUE 2'}],
+                       'risks': []}, ensure_ascii=False)
+PART_A = '@@@ RATIONALE\nA is 1.\n@@@ FILE a.py\nA_VALUE = 1\n@@@ END\n'
+PART_B = '@@@ RATIONALE\nB is 2.\n@@@ FILE b.py\nB_VALUE = 2\n@@@ END\n'
+PART_A_JSON = json.dumps({'files': {'a.py': 'A_VALUE = 1\n'}, 'rationale': 'A is 1.'})
+PART_B_JSON = json.dumps({'files': {'b.py': 'B_VALUE = 2\n'}, 'rationale': 'B is 2.'})
+
+
+def two_file_spec(**changes):
+    """A task with two editable files, for planner and builders; claude backends, so each call costs 0.0125 USD."""
+    return {'version': 1, 'brief': 'Set A_VALUE in a.py to 1 and B_VALUE in b.py to 2.\n',
+            'files': {'a.py': 'A_VALUE = 0\n', 'b.py': 'B_VALUE = 0\n'},
+            'fixtures': {'check.py': 'import a, b\nassert (a.A_VALUE, b.B_VALUE) == (1, 2)\nprint("ok")\n'},
+            'checks': [{'name': 'ref', 'argv': ['{python}', '-B', 'check.py']}], 'allow_execution': True,
+            'writer': 'claude', 'judge': 'claude', 'max_rounds': 2, 'max_seconds': 300, 'timeout_s': 60,
+            'max_cost': 5, 'unpriced_call_usd': 0.05, **changes}  # max_cost: calls run one at a time, in a fixed order
+
+
 def tasks(source, gate_repo):
     """(name, argv, replies, files) for the built-in tasks; {DIR} in argv is the task's own input folder."""
     spec = json.loads((source / 'examples/v3-codex.json').read_text(encoding='utf-8'))
@@ -175,6 +198,21 @@ def tasks(source, gate_repo):
          [SLUG_BAD, SLUG_EDIT, 'No defects found.'], {'spec.json': json.dumps(spec)}),
         ('work-claude-protocol-repair', ['work', '--spec', '{DIR}/spec.json', '--out', '{OUT}/work'],
          ['I would rewrite slugify.', SLUG_OK, 'No defects found.'], {'spec.json': json.dumps(spec_claude)}),
+        # a planner: one plan call before round 1, its plan shown to the writer
+        ('work-plan-text', ['work', '--spec', '{DIR}/spec.json', '--out', '{OUT}/work'],
+         [PLAN_ONE, SLUG_OK, 'No defects found.'], {'spec.json': json.dumps({**spec, 'planner': 'codex-chatgpt'})}),
+        # two builders: round 1 asks one writer per plan part (one at a time under max_cost), then merges them
+        ('work-plan-builders', ['work', '--spec', '{DIR}/spec.json', '--out', '{OUT}/work'],
+         [PLAN_TWO, PART_A, PART_B, 'No defects found.'],
+         {'spec.json': json.dumps(two_file_spec(protocol='text', planner='claude', builders=2))}),
+        # the JSON protocol, with --planner and --builders on the command line instead of in the spec
+        ('work-plan-builders-json-cli', ['work', '--spec', '{DIR}/spec.json', '--out', '{OUT}/work',
+                                         '--planner', 'judge', '--builders', '2'],
+         [PLAN_TWO, PART_A_JSON, PART_B_JSON, 'No defects found.'], {'spec.json': json.dumps(two_file_spec())}),
+        # a reply that is no plan: recorded, and the run goes on without one
+        ('work-plan-bad-plan', ['work', '--spec', '{DIR}/spec.json', '--out', '{OUT}/work'],
+         ['I would split this in two.', SLUG_OK, 'No defects found.'],
+         {'spec.json': json.dumps({**spec, 'planner': 'judge'})}),
     ]
 
 

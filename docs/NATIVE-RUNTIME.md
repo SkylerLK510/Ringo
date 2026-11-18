@@ -28,10 +28,10 @@ was fixed in Python, by giving each call's private Codex home the owner's cached
   corpus and git-history inputs: over a million cases in all, most of them generated JSON inputs. No mismatch was
   accepted. The deviations left (a JSON nesting limit near 1,000 levels instead of about 116,000, 128-bit integers)
   are listed in the test files.
-- **End to end.** `tests/native_gate.py` runs 16 review, design and work tasks through both runtimes, with fake
+- **End to end.** `tests/native_gate.py` runs 24 review, design and work tasks through both runtimes, with fake
   `codex`, `claude` and plain programs. It compares every request and every record each run writes. A request here
   means the argv, stdin, the system prompt, the private Codex home, and the environment variables that decide
-  auth. The run uses no model calls; today all 16 tasks are identical.
+  auth. The run uses no model calls; today all 24 tasks are identical.
 - **Real use.** Through the binary with real Codex calls, the same commands worked:
   - a design (1 call);
   - a review of a commit (1 call);
