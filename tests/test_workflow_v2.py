@@ -451,5 +451,251 @@ class SpecTestLoopTest(unittest.TestCase):
         self.assertEqual(ran.returncode, 1)
 
 
+PLAN = {'summary': 'Two modules.', 'steps': ['write a', 'write b'], 'risks': ['off by one'],
+        'parts': [{'files': ['a.py'], 'instructions': 'make A_VALUE 1'},
+                  {'files': ['b.py'], 'instructions': 'make B_VALUE 2'}]}
+
+
+def by_part(a_reply, b_reply, rest=()):
+    """Writer replies chosen by the part a message gives (parallel part calls arrive in any order); other writer
+    calls take rest in order."""
+    rest = iter(rest)
+
+    def answer(message):
+        if 'YOUR PART' not in message:
+            return next(rest)
+        return a_reply if message.split('=== YOUR PART (change only these files) ===\n')[1].startswith('a.py') else b_reply
+    return answer
+
+
+class PlanBuildTest(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.spec = {'version': 1, 'brief': 'Set A_VALUE in a.py to 1 and B_VALUE in b.py to 2.\n',
+                     'files': {'a.py': 'A_VALUE = 0\n', 'b.py': 'B_VALUE = 0\n'},
+                     'fixtures': {'check.py': 'import a, b\nassert (a.A_VALUE, b.B_VALUE) == (1, 2)\n'},
+                     'checks': [{'name': 'ref', 'argv': [sys.executable, '-B', 'check.py']}],
+                     'writer': 'fake', 'judge': 'fake', 'allow_tool_backends': True, 'allow_execution': True,
+                     'max_rounds': 3, 'max_seconds': 60, 'protocol': 'text'}
+
+    def run_with(self, writers, plan=PLAN, **changes):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**self.spec, **changes}))
+        seen = []
+
+        def call(backend, system, message, timeout_s):
+            seen.append((system, message, backend))
+            if system.startswith('Plan the work'):
+                return (plan if isinstance(plan, str) else json.dumps(plan)), {}
+            if system.startswith('Implement'):  # work-code.md and, for the JSON protocol, work.md
+                # Parallel part calls run in threads: a callable answers by message, so the order cannot matter.
+                return (writers(message) if callable(writers) else next(writers)), {}
+            return REVIEW_OK, {}
+        writers = writers if callable(writers) else iter(writers)
+        return workflow.run(path, self.root / 'run', call_fn=call), seen
+
+    def load(self, **changes):
+        path = self.root / 'bad.json'
+        path.write_text(json.dumps({**self.spec, **changes}))
+        return workflow.load_spec(path)
+
+    ONE = '@@@ FILE a.py\nA_VALUE = 1\n@@@ FILE b.py\nB_VALUE = 2\n'
+
+    def test_one_plan_call_runs_before_the_writer_and_only_the_writer_sees_it(self):
+        report, seen = self.run_with([self.ONE], plan={**PLAN, 'parts': [{'files': ['a.py', 'b.py'], 'instructions': 'both'}]},
+                                     planner='claude@opus', writer='claude@sonnet', judge='claude@opus',
+                                     roles={'plan': {'model': 'opus'}})
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual([s[0].split()[0] for s in seen], ['Plan', 'Implement', 'You'])
+        self.assertEqual(report['usage']['calls'], 3)  # plan, writer, review
+        self.assertEqual(seen[0][2]['name'], 'claude@opus')
+        self.assertEqual(seen[0][2]['argv'][seen[0][2]['argv'].index('--model') + 1], 'opus')
+        self.assertEqual(json.loads(seen[0][1])['max_parts'], 1)
+        self.assertEqual(json.loads(seen[0][1])['checks'], [{'name': 'ref', 'argv': self.load(planner='claude')['checks'][0]['argv']}])
+        self.assertIn('=== PLAN FROM THE PLANNER', seen[1][1])
+        self.assertIn('1. write a', seen[1][1])
+        self.assertNotIn('YOUR PART', seen[1][1])
+        self.assertNotIn('Two modules.', seen[2][1] + seen[2][0])
+        self.assertEqual(report['plan']['parts'], 1)
+        text = (self.root / 'run/plan.json').read_text()
+        self.assertEqual(report['plan']['sha256'], harness.sha(text))
+
+    def test_the_json_protocol_carries_the_plan_as_a_key(self):
+        spec = {k: v for k, v in self.spec.items() if k != 'protocol'}
+        path = self.root / 'task.json'
+        path.write_text(json.dumps({**spec, 'planner': 'fake'}))
+        seen = []
+
+        def call(backend, system, message, timeout_s):
+            seen.append((system, message))
+            if system.startswith('Plan the work'):
+                return json.dumps({**PLAN, 'parts': [{'files': ['a.py'], 'instructions': 'x'}]}), {}
+            if system.startswith('Implement the task'):
+                return json.dumps({'files': {'a.py': 'A_VALUE = 1\n', 'b.py': 'B_VALUE = 2\n'}, 'rationale': 'r'}), {}
+            return REVIEW_OK, {}
+        workflow.run(path, self.root / 'run', call_fn=call)
+        body = json.loads(seen[1][1])
+        self.assertEqual(body['plan']['summary'], 'Two modules.')
+        self.assertEqual(body['plan']['parts'][0]['files'], ['a.py', 'b.py'])  # unassigned b.py joined part 1
+        self.assertNotIn('part', body)
+
+    def test_planner_judge_means_the_judge_backend(self):
+        report, seen = self.run_with([self.ONE], plan={**PLAN, 'parts': [{'files': ['a.py', 'b.py'], 'instructions': 'x'}]},
+                                     planner='judge', judge='claude@opus')
+        self.assertEqual(seen[0][2]['name'], 'claude@opus')
+        self.assertEqual(report['plan']['backend'], 'claude@opus')
+
+    def test_an_invalid_plan_is_recorded_and_the_run_goes_on_without_it(self):
+        for bad in ('not json', {**PLAN, 'parts': []}, {**PLAN, 'parts': [{'files': ['c.py'], 'instructions': 'x'}]},
+                    {**PLAN, 'parts': [{'files': ['check.py'], 'instructions': 'x'}]},
+                    {**PLAN, 'parts': [{'files': ['a.py'], 'instructions': 'x'}, {'files': ['a.py'], 'instructions': 'y'}]},
+                    PLAN):  # PLAN has 2 parts, more than builders=1 allows
+            with self.subTest(bad=bad):
+                report, seen = self.run_with([self.ONE], plan=bad, planner='fake')
+                self.assertEqual(report['status'], 'ready_for_review')
+                self.assertIn('error', report['plan'])
+                self.assertNotIn('sha256', report['plan'])
+                self.assertNotIn('PLAN FROM THE PLANNER', seen[1][1])
+                self.assertEqual(report['usage']['calls'], 3)  # plan + the usual writer and review
+                self.assertFalse((self.root / 'run/plan.json').exists())
+                import shutil
+                shutil.rmtree(self.root / 'run')
+
+    def test_two_builders_make_two_part_calls_and_the_merge_has_both(self):
+        a, b = '@@@ FILE a.py\nA_VALUE = 1\n', '@@@ FILE b.py\nB_VALUE = 2\n'
+        report, seen = self.run_with(by_part(a, b), planner='fake', builders=2)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 4)  # 1 plan + 2 part writers + 1 review
+        self.assertEqual(report['rounds'][0]['parts'], 2)
+        writers = [m for system, m, _ in seen if system.startswith('Implement the brief')]
+        self.assertEqual(len(writers), 2)
+        sections = sorted(m.split('=== YOUR PART (change only these files) ===\n')[1].split('\n\n')[0] for m in writers)
+        self.assertEqual(sections, ['a.py\nmake A_VALUE 1', 'b.py\nmake B_VALUE 2'])
+        self.assertEqual((self.root / 'run/final/a.py').read_text(), 'A_VALUE = 1\n')
+        self.assertEqual((self.root / 'run/final/b.py').read_text(), 'B_VALUE = 2\n')
+        self.assertIn('part 1:', json.loads((self.root / 'run/round-1/proposal.json').read_text())['rationale'])
+        self.assertNotIn('YOUR PART', seen[-1][1])
+
+    def test_a_json_part_may_send_its_own_files_whole(self):
+        """Under the JSON protocol a "files" reply must supply exactly the declared files: a part's are its own."""
+        def answer(message):
+            body = json.loads(message)
+            self.assertIn('supplies exactly these files', body['part']['reply'])
+            name = body['part']['files'][0]
+            return json.dumps({'files': {name: {'a.py': 'A_VALUE = 1\n', 'b.py': 'B_VALUE = 2\n'}[name]},
+                               'rationale': name})
+        spec = {k: v for k, v in self.spec.items() if k != 'protocol'}
+        self.spec = spec
+        report, seen = self.run_with(answer, planner='fake', builders=2)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 4)  # plan, two parts, review
+        self.assertEqual((self.root / 'run/final/a.py').read_text(), 'A_VALUE = 1\n')
+        self.assertEqual((self.root / 'run/final/b.py').read_text(), 'B_VALUE = 2\n')
+
+    def test_merged_parts_must_fit_the_candidate_limit(self):
+        big = 'x' * (workflow.LIMIT // 2 + 10)
+        report, _ = self.run_with(by_part(f'@@@ FILE a.py\nA = "{big}"\n', f'@@@ FILE b.py\nB = "{big}"\n'),
+                                  planner='fake', builders=2, max_rounds=1)
+        first = report['rounds'][0]
+        self.assertEqual(first['status'], 'malformed')
+        self.assertIn('merged parts: file material exceeds 2 MB', first['feedback']['protocol_error'])
+        self.assertEqual(report['usage']['calls'], 3)  # plan and two parts; nothing reached the checks
+
+    def test_a_plan_that_cannot_be_written_never_reaches_the_writer(self):
+        bad = json.dumps({**PLAN, 'parts': [{'files': ['a.py', 'b.py'], 'instructions': 'both'}]}).replace(
+            'Two modules.', 'Two \\ud800 modules.')
+        report, seen = self.run_with([self.ONE], plan=bad, planner='fake')
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertIn('error', report['plan'])
+        self.assertNotIn('PLAN FROM THE PLANNER', seen[1][1])
+
+    def test_a_whole_task_writer_sees_every_parts_instructions(self):
+        plan = {**PLAN, 'parts': [{'files': ['a.py', 'b.py'], 'instructions': 'name the constant A_VALUE'}]}
+        report, seen = self.run_with([self.ONE], plan=plan, planner='fake')
+        self.assertIn('By file:\n- a.py, b.py: name the constant A_VALUE', seen[1][1])
+
+    def test_a_part_that_touches_another_parts_file_makes_the_round_malformed(self):
+        a, trespass = '@@@ FILE a.py\nA_VALUE = 1\n', self.ONE
+        report, seen = self.run_with(by_part(a, trespass, [self.ONE]), planner='fake', builders=2, max_rounds=2)
+        first = report['rounds'][0]
+        self.assertEqual(first['status'], 'malformed')
+        self.assertIn('part 2: ', first['feedback']['protocol_error'])
+        self.assertIn('not a declared editable file', first['feedback']['protocol_error'])
+        # round 2 is one writer with every file, and sees the error and the plan
+        self.assertEqual(report['rounds'][1]['status'], 'ready_for_review')
+        self.assertEqual(report['usage']['calls'], 1 + 2 + 1 + 1)  # plan, two parts, one revision writer, review
+
+    def test_protocol_repair_after_malformed_parts_is_one_whole_writer_call(self):
+        report, seen = self.run_with(by_part('@@@ nonsense\n', self.ONE, [self.ONE]), planner='fake', builders=2,
+                                     protocol_repair=True)
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertEqual(len(report['rounds']), 1)
+        self.assertEqual(report['usage']['calls'], 1 + 2 + 1 + 1)  # plan, two parts, one repair, review
+        repair = [m for system, m, _ in seen if system.startswith('Implement the brief')][2]
+        self.assertNotIn('YOUR PART', repair)
+        self.assertIn('could not be applied', repair)
+
+    def test_builders_add_calls_in_round_one_only(self):
+        wrong = lambda n: f'@@@ FILE a.py\nA_VALUE = {n}\n@@@ FILE b.py\nB_VALUE = 2\n'
+        report, seen = self.run_with(by_part('@@@ FILE a.py\nA_VALUE = 5\n', '@@@ FILE b.py\nB_VALUE = 2\n', [wrong(8), wrong(7)]),
+                                     planner='fake', builders=2, max_rounds=3)
+        self.assertEqual(report['status'], 'needs_revision')  # no candidate ever passes, so no review
+        self.assertEqual(sum('YOUR PART' in m for _, m, _ in seen), 2)
+        self.assertEqual(sum(system.startswith('Implement the brief') for system, _, _ in seen), 3 - 1 + 2)
+        self.assertEqual(report['usage']['calls'], 1 + (3 - 1 + 2))  # plan + (max_rounds - 1) + builders
+
+    def test_builders_and_planner_are_validated(self):
+        for changes, message in (({'builders': 2}, 'planner'),
+                                 ({'builders': 2, 'planner': 'fake', 'candidates': 2}, 'candidates'),
+                                 ({'builders': 0, 'planner': 'fake'}, 'builders'),
+                                 ({'builders': 5, 'planner': 'fake'}, 'builders'),
+                                 ({'builders': True, 'planner': 'fake'}, 'builders'),
+                                 ({'roles': {'plan': {'model': 'opus'}}}, 'roles.plan needs a planner'),
+                                 ({'planner': ''}, 'planner'), ({'planner': 3}, 'planner'),
+                                 ({'builders': 2, 'planner': 'fake', 'protocol': 'text',
+                                   'scripts': {'python': sys.executable}}, 'scripts')):
+            with self.subTest(changes=changes), self.assertRaisesRegex(ValueError, message):
+                self.load(**changes)
+        self.assertEqual(self.load(planner='judge', builders=4)['builders'], 4)
+        self.assertNotIn('builders', self.load())  # plan-free specs stay exactly as written
+
+    def test_planner_backends_need_the_tool_opt_in(self):
+        with self.assertRaisesRegex(ValueError, 'allow_tool_backends'):
+            self.load(planner='codex', writer='claude', judge='claude', allow_tool_backends=False)
+
+    def test_a_plan_free_run_makes_no_plan_call_and_no_plan_field(self):
+        report, seen = self.run_with([self.ONE])
+        self.assertNotIn('plan', report)
+        self.assertEqual(report['usage']['calls'], 2)
+        self.assertNotIn('PLAN', seen[0][1])
+        self.assertNotIn('plan', json.loads((self.root / 'run/spec.json').read_text()))
+
+    def test_cli_overrides_reach_the_run_and_spec_json(self):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(self.spec))
+        with mock.patch.object(workflow, 'run', return_value={'status': 'x', 'usage': {}, 'rounds': [], 'final': None,
+                                                                'elapsed_s': 0}) as run, \
+                mock.patch.object(harness, 'print_summary'):
+            workflow.main(['--spec', str(path), '--out', str(self.root / 'o'), '--planner', 'judge', '--builders', '3'])
+        self.assertEqual((run.call_args.kwargs['planner'], run.call_args.kwargs['builders']), ('judge', 3))
+        report, _ = self.run_with([self.ONE], planner='judge', builders=1)  # file values, then overridden below
+        shutil_spec = self.root / 'task.json'
+        shutil_spec.write_text(json.dumps(self.spec))
+        import shutil
+        shutil.rmtree(self.root / 'run')
+
+        def call(backend, system, message, timeout_s):
+            if system.startswith('Plan the work'):
+                return json.dumps({**PLAN, 'parts': [{'files': ['a.py'], 'instructions': 'x'}, {'files': ['b.py'], 'instructions': 'y'}]}), {}
+            return (REVIEW_OK if not system.startswith('Implement') else
+                    '@@@ FILE a.py\nA_VALUE = 1\n' if 'a.py\n' in message.split('YOUR PART')[-1][:80] else
+                    '@@@ FILE b.py\nB_VALUE = 2\n'), {}
+        workflow.run(shutil_spec, self.root / 'run', call_fn=call, planner='fake', builders=2)
+        recorded = json.loads((self.root / 'run/spec.json').read_text())
+        self.assertEqual((recorded['planner'], recorded['builders']), ('fake', 2))
+
+
 if __name__ == '__main__':
     unittest.main()

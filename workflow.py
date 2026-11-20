@@ -13,8 +13,9 @@ samples only if those do not recommend, at most max_rounds x (1 + samples) calls
 why the Council is opt-in).
 Writer and judge calls are not retried and there is no call cap; max_seconds, timeout_s and max_cost bound time
 and money. Opt-in spec fields (docs/COUNCIL-WORKFLOW.md) add bounded calls: candidates adds k - 1 writer calls in
-round 1, protocol_repair at most one call per round, spec_tests one call; roles, protocol, no_regression and
-scripts add none.
+round 1, protocol_repair at most one call per round, spec_tests one call, planner one call (the plan, before round 1)
+and builders b - 1 more writer calls, in round 1 only (a planner's plan split into at most b parts); roles,
+protocol, no_regression and scripts add none.
 
 The writer replies with complete files or with exact search/replace edits. Edits are turned into complete files
 before anything else, so the digest, checks, mutation check and judges always see full text.
@@ -142,7 +143,9 @@ def materialize(current, declared, reply):
 MARK = '@@@ '
 REPAIR = ' Send every file you change as one complete FILE block this time; use no REPLACE blocks.'
 REPAIR_JSON = ' Send the "files" form this time, with every editable file complete; use no "edits".'
-ROLES = ('writer', 'revision', 'escalate', 'tests', 'review')
+PART_JSON = ('Change only the files of this part: a "files" reply supplies exactly these files, complete, '
+             'and edits name only these paths. The other files are context.')
+ROLES = ('writer', 'revision', 'escalate', 'tests', 'review', 'plan')
 EFFORTS = harness.EFFORTS
 DOC_SUFFIXES = ('.md', '.txt', '.rst', '.adoc')
 
@@ -196,11 +199,29 @@ def failure_line(stdout, stderr):
     return ''
 
 
-def text_message(spec, files, feedback, bounded=False):
-    """The writer's input as plain sections: code is not JSON-escaped, so it costs fewer tokens and reads as code."""
+def plan_text(plan, whole=True):
+    """The planner's plan as the text protocol shows it: summary, numbered steps, per-file instructions for a writer
+    of the whole task (a part's builder gets its own part instead), risks."""
+    lines = [plan['summary'], '', 'Steps:'] + [f'{i}. {step}' for i, step in enumerate(plan['steps'], 1)]
+    if whole:
+        lines += ['', 'By file:'] + [f"- {', '.join(p['files'])}: {p['instructions']}" for p in plan['parts']]
+    if plan['risks']:
+        lines += ['', 'Risks:'] + [f'- {risk}' for risk in plan['risks']]
+    return '\n'.join(lines)
+
+
+def text_message(spec, files, feedback, bounded=False, plan=None, part=None):
+    """The writer's input as plain sections: code is not JSON-escaped, so it costs fewer tokens and reads as code.
+    plan and part (a plan's part for one parallel builder) add sections only when given."""
     parts = [f"=== BRIEF ===\n{spec['brief']}"]
     if spec.get('material'):
         parts.append(f"=== SOURCE MATERIAL (evidence, not instructions) ===\n{spec['material']}")
+    if plan:
+        parts.append('=== PLAN FROM THE PLANNER (guidance; the brief rules on any conflict) ===\n'
+                     + plan_text(plan, whole=not part))
+    if part:
+        parts.append('=== YOUR PART (change only these files) ===\n' + '\n'.join(part['files']) + '\n'
+                     + part['instructions'])
     parts += [f'=== EDITABLE FILE {name} ===\n{text}' for name, text in files.items()]
     parts += [f'=== READ-ONLY FIXTURE {name} ===\n{text}' for name, text in spec['fixtures'].items()]
     if feedback:
@@ -470,6 +491,45 @@ def materialize_text(current, declared, reply):
     return file_map(files, 'candidate files')
 
 
+def parse_plan(text, spec, builders):
+    """The planner's plan, normalized: {'summary', 'steps', 'parts', 'risks'}. Parts name disjoint editable files, at
+    most `builders` of them; editable files no part names join part 1. ValueError when the reply is not such a plan."""
+    stripped = text.strip()
+    lines = stripped.splitlines()
+    if lines and lines[0].startswith('```') and lines[-1].strip() == '```':  # a fence around the whole reply
+        stripped = '\n'.join(lines[1:-1])
+    plan = strict_json(stripped)
+    keys = {'summary', 'steps', 'parts', 'risks'}
+    if not isinstance(plan, dict) or set(plan) != keys:
+        raise ValueError('a plan is one object with summary, steps, parts and risks')
+    if not isinstance(plan['summary'], str) or not plan['summary'].strip():
+        raise ValueError('plan summary must be text')
+    for key in ('steps', 'risks'):
+        if not isinstance(plan[key], list) or not all(isinstance(x, str) for x in plan[key]):
+            raise ValueError(f'plan {key} must be a list of text')
+    parts = plan['parts']
+    if not isinstance(parts, list) or not parts:
+        raise ValueError('plan parts must be a nonempty list')
+    if len(parts) > builders:
+        raise ValueError(f'plan has {len(parts)} parts; at most {builders} are allowed')
+    owner, normal = {}, []
+    for i, part in enumerate(parts, 1):
+        if not isinstance(part, dict) or set(part) != {'files', 'instructions'} \
+                or not isinstance(part['files'], list) or not part['files'] \
+                or not all(isinstance(f, str) for f in part['files']) \
+                or not isinstance(part['instructions'], str) or not part['instructions'].strip():
+            raise ValueError(f'plan part {i} needs files (a nonempty list) and instructions (text)')
+        for name in part['files']:
+            if name not in spec['files']:
+                raise ValueError(f'plan part {i} names {name!r}, which is not an editable file')
+            if name in owner:
+                raise ValueError(f'plan names {name!r} in parts {owner[name]} and {i}')
+            owner[name] = i
+        normal.append({'files': list(part['files']), 'instructions': part['instructions']})
+    normal[0]['files'] += [name for name in spec['files'] if name not in owner]
+    return {'summary': plan['summary'], 'steps': plan['steps'], 'parts': normal, 'risks': plan['risks']}
+
+
 def spec_test_file(text):
     """The Python test module in a spec-test writer's reply (its largest fenced block, or the whole reply),
     checked to compile; with the ids of its test methods."""
@@ -505,12 +565,21 @@ def positive(value, name, integer=False):
     return value
 
 
-def load_spec(path):
+def planner_spec(spec):
+    """The backend spec the plan call uses: the planner, or the judge's when the planner is "judge"."""
+    return spec['judge'] if spec['planner'] == 'judge' else spec['planner']
+
+
+def load_spec(path, overrides=None):
+    """The validated spec. overrides (the CLI's --planner and --builders) replace the file's fields before validation."""
     spec = strict_json(Path(path).read_text(encoding='utf-8'))
+    if overrides and isinstance(spec, dict):
+        spec.update({k: v for k, v in overrides.items() if v is not None})
     allowed = {'version', 'brief', 'material', 'files', 'fixtures', 'checks', 'council', 'rubric',
                'writer', 'judge', 'samples', 'first_judges', 'max_rounds', 'max_seconds', 'timeout_s',
                'max_cost', 'max_tokens', 'unpriced_call_usd', 'allow_tool_backends', 'allow_execution',
-               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair', 'no_regression'}
+               'roles', 'protocol', 'spec_tests', 'candidates', 'scripts', 'protocol_repair', 'no_regression',
+               'planner', 'builders'}
     if isinstance(spec, dict) and 'max_calls' in spec:
         raise ValueError('max_calls was removed: calls are set by max_rounds and samples')
     if not isinstance(spec, dict) or set(spec) - allowed or spec.get('version') != 1:
@@ -542,9 +611,12 @@ def load_spec(path):
     for key in ('allow_execution', 'allow_tool_backends'):
         if type(spec.setdefault(key, False)) is not bool:
             raise ValueError(f'{key} must be boolean')
-    harness.check_backends([spec['writer'], spec['judge']], spec['allow_tool_backends'])
-    for key in ('writer', 'judge'):
-        harness.backend(spec[key])  # Reject invalid command syntax before inference.
+    if 'planner' in spec and (not isinstance(spec['planner'], str) or not spec['planner'].strip()):
+        raise ValueError('planner must be a backend spec or "judge"')
+    planned = [planner_spec(spec)] if 'planner' in spec else []
+    harness.check_backends([spec['writer'], spec['judge'], *planned], spec['allow_tool_backends'])
+    for backend_spec in (spec['writer'], spec['judge'], *planned):
+        harness.backend(backend_spec)  # Reject invalid command syntax before inference.
     if spec.setdefault('protocol', 'json') not in ('text', 'json'):
         raise ValueError('protocol must be text or json')
     roles = spec.setdefault('roles', {})
@@ -555,7 +627,10 @@ def load_spec(path):
                 or not all(isinstance(v, str) and v for v in opts.values()) \
                 or opts.get('effort', 'low') not in EFFORTS:
             raise ValueError(f'roles.{role} takes model and effort ({"/".join(EFFORTS)}) only')
-        role_backend(harness.backend(spec['judge' if role == 'review' else 'writer']), opts)
+        if role == 'plan' and 'planner' not in spec:
+            raise ValueError('roles.plan needs a planner')
+        role_backend(harness.backend(planner_spec(spec) if role == 'plan'
+                                     else spec['judge' if role == 'review' else 'writer']), opts)
     tests = spec.get('spec_tests')
     if tests is not None:
         if council:
@@ -571,6 +646,15 @@ def load_spec(path):
         raise ValueError('candidates must be from 1 to 4')
     if spec['candidates'] > 1 and council:
         raise ValueError('candidates select by checks and spec tests; they do not combine with the Council')
+    if 'builders' in spec:  # absent stays absent, so a spec without the field keeps its task hash
+        if type(spec['builders']) is not int or not 1 <= spec['builders'] <= 4:
+            raise ValueError('builders must be an integer from 1 to 4')
+        if spec['builders'] > 1 and 'planner' not in spec:
+            raise ValueError('builders > 1 split the planner\'s plan: set a planner')
+        if spec['builders'] > 1 and spec['candidates'] > 1:
+            raise ValueError('builders and candidates both widen round 1: use one of them')
+        if spec['builders'] > 1 and spec.get('scripts') is not None:
+            raise ValueError('builders > 1 do not combine with scripts: a split round would run only one script')
     scripts = spec.get('scripts')
     if scripts is not None:
         if not isinstance(scripts, dict) or set(scripts) - {'python', 'timeout_s'} \
@@ -781,10 +865,10 @@ def checks(spec, root, logdir, remaining):
 
 
 def run(spec_path, out, call_fn=harness.call, *, progress='auto',
-        feedback_cap=FEEDBACK_CAP_BYTES, material_cap=MATERIAL_CAP_BYTES):
+        feedback_cap=FEEDBACK_CAP_BYTES, material_cap=MATERIAL_CAP_BYTES, planner=None, builders=None):
     import releases
     started = time.perf_counter_ns()
-    spec = load_spec(spec_path)
+    spec = load_spec(spec_path, {'planner': planner, 'builders': builders})
     out = harness.outside_repo(out, 'workflow run')
     accounting = harness.Run(out, max_cost=spec.get('max_cost'), unpriced_call_usd=spec.get('unpriced_call_usd'), max_tokens=spec.get('max_tokens'))
     try:
@@ -924,6 +1008,7 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
     # writes a unittest module, and runs after the declared checks pass. Its failures go back to the writer,
     # who may dispute a test with the brief sentence it contradicts; a disputed test stops gating the run.
     spec_suite, disputed, last_spec = None, {}, None
+    plan = None  # the planner's normalized plan, once it has made a usable one
 
     def spec_summary(result):
         if not result:
@@ -973,18 +1058,38 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
                 report['spec_tests'] = {'tests': len(ids)}
             except (ValueError, SyntaxError) as exc:  # no usable suite: the run continues without one
                 report['spec_tests'] = {'error': f'{type(exc).__name__}: {exc}'}
+        if spec.get('planner'):
+            # One plan call: the planner sees what the writer sees plus the checks, never a candidate. An unusable plan
+            # is recorded and the run goes on without one; a provider error propagates like any other call's.
+            limit = spec.get('builders', 1)
+            planner_name = role_backend(harness.backend(planner_spec(spec)), spec['roles'].get('plan'))['name']
+            reply = call('plan', planner_spec(spec), (HERE / 'prompts' / 'plan.md').read_text(encoding='utf-8'),
+                         json.dumps({'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
+                                     'fixtures': spec['fixtures'],
+                                     'checks': [{'name': c['name'], 'argv': c['argv']} for c in spec['checks']],
+                                     'max_parts': limit}, ensure_ascii=False), role='plan')
+            try:
+                made = parse_plan(reply, spec, limit)
+                write_json(out / 'plan.json', made)  # text that cannot be written as UTF-8 cannot reach a writer
+                report['plan'] = {'backend': planner_name, 'parts': len(made['parts']), 'steps': len(made['steps']),
+                                  'sha256': harness.sha((out / 'plan.json').read_text(encoding='utf-8'))}
+                plan = made
+            except (ValueError, UnicodeError) as exc:
+                report['plan'] = {'backend': planner_name, 'error': f'{type(exc).__name__}: {exc}'}
         failed_checks, last_script = False, None
         adopted = None  # the last candidate that passed the checks: {'files', 'failing' spec-test ids}
         script_numbers = set()  # every number a successful writer script printed in this run
         given_numbers = numbers(spec['brief']) | numbers(text_of(spec['fixtures'])) | numbers(text_of(spec['files']))
 
-        def parse(text):
-            """(candidate, files) of a writer reply; ValueError when it cannot be applied."""
+        def parse(text, declared=None):
+            """(candidate, files) of a writer reply; ValueError when it cannot be applied. declared: the files a
+            parallel builder may change (default: every editable file)."""
+            declared = spec['files'] if declared is None else declared
             if text_protocol:
                 candidate = parse_text_reply(text)
-                return candidate, materialize_text(current, spec['files'], candidate)
+                return candidate, materialize_text(current, declared, candidate)
             candidate = strict_json(text)
-            return candidate, materialize(current, spec['files'], candidate)
+            return candidate, materialize(current, declared, candidate)
 
         def evaluate(folder, files):
             """Write files and fixtures into folder/candidate, run the declared checks and, when they pass, the spec
@@ -1026,13 +1131,20 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
                          root, logs, remaining)[0]
             return {**ran, 'source': script}
 
-        def writer_message(fb):
+        def writer_message(fb, part=None):
             report = None
             if feedback_cap is not None:  # bounded for the model; the unbounded feedback stays in the record
                 fb, report = bound_feedback(fb, feedback_cap, text_protocol=text_protocol)
-            message = text_message(spec, current, fb, bounded=report is not None) if text_protocol else json.dumps(
-                {'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
-                 'fixtures': spec['fixtures'], 'feedback': fb}, ensure_ascii=False)
+            if text_protocol:
+                message = text_message(spec, current, fb, bounded=report is not None, plan=plan, part=part)
+            else:
+                body = {'brief': spec['brief'], 'material': spec.get('material', ''), 'files': current,
+                        'fixtures': spec['fixtures'], 'feedback': fb}
+                if plan:
+                    body['plan'] = plan
+                if part:
+                    body['part'] = {**part, 'reply': PART_JSON}
+                message = json.dumps(body, ensure_ascii=False)
             return message, report
 
         def undisputed(result):
@@ -1061,7 +1173,21 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
             role = 'writer' if n == 1 else 'escalate' if failed_checks and 'escalate' in spec['roles'] else 'revision'
             entry['role'] = role
             k = spec['candidates'] if n == 1 else 1
-            if k == 1:
+            # Parallel builders: round 1 only, one writer call per part of a plan that has several.
+            split = plan['parts'] if plan and n == 1 and spec.get('builders', 1) > 1 and len(plan['parts']) > 1 else None
+            if split:
+                entry['parts'] = len(split)
+                part_messages = [writer_message(feedback, part)[0] for part in split]
+
+                def ask_part(i):
+                    return call(f'writer-{n}.p{i}', spec['writer'], writer_prompt, part_messages[i - 1], role=role)
+                if spec.get('max_cost') is None:
+                    import concurrent.futures
+                    with concurrent.futures.ThreadPoolExecutor(len(split)) as pool:
+                        texts = list(pool.map(ask_part, range(1, len(split) + 1)))
+                else:  # under a cost cap, calls run one at a time
+                    texts = [ask_part(i) for i in range(1, len(split) + 1)]
+            elif k == 1:
                 texts = [call(f'writer-{n}', spec['writer'], writer_prompt, message, role=role)]
             else:  # round 1 draws k independent candidates from the same input and keeps the best by execution
                 def ask(i):
@@ -1073,11 +1199,35 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
                 else:  # under a cost cap, calls run one at a time
                     texts = [ask(i) for i in range(1, k + 1)]
             parsed, errors = [], []
-            for i, text in enumerate(texts, 1):
-                try:
-                    parsed.append((i, *parse(text)))
-                except ValueError as exc:
-                    errors.append({'sample': i, 'protocol_error': str(exc)})
+            if split:  # every part must apply to its own files; the merge overlays each part's files on current
+                results = []
+                for i, (text, part) in enumerate(zip(texts, split), 1):
+                    try:
+                        results.append(parse(text, {name: spec['files'][name] for name in part['files']}))
+                    except ValueError as exc:
+                        errors.append({'sample': f'p{i}', 'protocol_error': f'part {i}: {exc}'})
+                if not errors:
+                    merged = dict(current)
+                    for (_, files), part in zip(results, split):
+                        merged.update({name: files[name] for name in part['files']})
+                    try:  # each part passed the size limit alone; the merge must pass it too
+                        file_map(merged, 'candidate files')
+                    except ValueError as exc:
+                        errors.append({'sample': 'merge', 'protocol_error': f'merged parts: {exc}'})
+                if not errors:
+                    cands = [c for c, _ in results]
+                    candidate = {'rationale': '\n\n'.join(f"part {i}: {c['rationale']}" for i, c in enumerate(cands, 1)),
+                                 'files': {name: merged[name] for c in cands for name in c.get('files') or {}},
+                                 'edits': [e for c in cands for e in c.get('edits') or []],
+                                 'disputes': {t: why for c in cands for t, why in (c.get('disputes') or {}).items()},
+                                 'script': next((c['script'] for c in cands if c.get('script')), None)}
+                    parsed.append((1, candidate, merged))
+            else:
+                for i, text in enumerate(texts, 1):
+                    try:
+                        parsed.append((i, *parse(text)))
+                    except ValueError as exc:
+                        errors.append({'sample': i, 'protocol_error': str(exc)})
             if not parsed and spec['protocol_repair']:
                 # One immediate repair call with the exact error, so a reply that cannot be applied costs a call,
                 # not the round (and the review or check feedback it was answering).
@@ -1312,11 +1462,14 @@ def main(argv=None):
                                      epilog='Spec format and run guide: docs/COUNCIL-WORKFLOW.md')
     parser.add_argument('--spec', required=True, help='task JSON file')
     parser.add_argument('--out', required=True, help='new or empty folder outside the Ringo checkout (mode 0700)')
+    parser.add_argument('--planner', metavar='BACKEND', help='override the spec: backend that plans (or "judge")')
+    parser.add_argument('--builders', type=int, metavar='N', help='override the spec: most parallel writer calls in round 1 (1 to 4)')
     parser.add_argument('--progress', choices=('auto', 'always', 'never'), default='auto')
     parser.add_argument('--summary-format', choices=('auto', 'text', 'json'), default='auto')
     args = parser.parse_args(argv)
     try:
-        report = run(args.spec, args.out, progress=args.progress)
+        overrides = {k: v for k, v in (('planner', args.planner), ('builders', args.builders)) if v is not None}
+        report = run(args.spec, args.out, progress=args.progress, **overrides)
     except KeyboardInterrupt:
         print(f'ringo work: interrupted; report: {Path(args.out) / "report.json"}', file=sys.stderr)
         return 130

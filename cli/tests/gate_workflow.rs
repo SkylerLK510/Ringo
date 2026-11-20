@@ -1653,6 +1653,21 @@ fn main_arguments_and_help_match_python() {
         vec!["-"],
         vec!["--spec", &missing, "--out", "o"],
         vec!["--spec", &spec, "--out", &inside],
+        vec!["--planner"],
+        vec!["--builders"],
+        vec!["--builders", "x"],
+        vec!["--builders", "2.5"],
+        vec!["--builders", " 1_0 ", "--spec", "a", "--out", "o"],
+        vec!["--builders", "-3", "--spec", &missing, "--out", "o"],
+        vec!["--builders=\u{663}", "--spec", &missing, "--out", "o"],
+        vec!["--builders", "99999999999999999999999", "--spec", &spec, "--out", &inside],
+        vec!["--builders", "2", "--planner", "judge", "--spec", &missing, "--out", "o"],
+        vec!["--planner=judge", "--spec", &spec, "--out", &inside],
+        vec!["--planner", "", "--spec", &spec, "--out", &inside],
+        vec!["--builders", "0", "--spec", &spec, "--out", &inside],
+        vec!["--p", "x", "--spec", "a", "--out", "o"],
+        vec!["--pl", "x", "--bu", "2", "--pr", "never", "--spec", "a", "--out", "o"],
+        vec!["--b"],
     ]
     .iter()
     .map(|a| a.iter().map(|x| x.to_string()).collect())
@@ -1889,6 +1904,16 @@ const SPEC_TESTS_REPLY: &str = "```python\nimport unittest\nfrom value import f\
 
 const THREE_SPEC_TESTS: &str = "```python\nimport unittest\nfrom value import f\n\n\nclass Brief(unittest.TestCase):\n    def test_ints(self):\n        self.assertEqual(f(5), 10)\n\n    def test_floats(self):\n        self.assertIsInstance(f(0.5), float)\n\n    def test_negative(self):\n        self.assertEqual(f(-2), -4)\n```";
 
+const TWO_FILES: &str = "@@@ RATIONALE\nboth\n@@@ FILE a.py\nA_VALUE = 1\n@@@ FILE b.py\nB_VALUE = 2\n";
+const PART_A: &str = "@@@ RATIONALE\nA\n@@@ FILE a.py\nA_VALUE = 1\n";
+const PART_B: &str = "@@@ RATIONALE\nB\n@@@ FILE b.py\nB_VALUE = 2\n";
+
+/// A planner's reply: parts as (files, instructions).
+fn plan_json(parts: &[(&[&str], &str)]) -> String {
+    let parts: Vec<Value> = parts.iter().map(|(files, what)| json!({"files": files, "instructions": what})).collect();
+    pyjson::dumps(&json!({"summary": "the plan, \u{fc}n\u{ef}code", "steps": ["write a", "write b"], "parts": parts, "risks": ["off by one"]}))
+}
+
 fn run_cases(dir: &Path) -> Vec<RunCase> {
     let base = council_spec(dir);
     let text = with(&base, json!({"protocol": "text"}));
@@ -1898,6 +1923,11 @@ fn run_cases(dir: &Path) -> Vec<RunCase> {
         "fixtures": {"check.py": "from value import f\nassert f(5) == 10\n"}, "checks": [{"name": "reference", "argv": ["{python}", "-B", "check.py"]}],
         "writer": "fake", "judge": "fake", "allow_tool_backends": true, "allow_execution": true, "max_rounds": 3, "max_seconds": 60,
         "protocol": "text", "spec_tests": {"python": "{python}"}});
+    // a task with two editable files, text protocol, a cost cap (so part calls run one at a time) and the fake backend
+    let two = json!({"version": 1, "brief": "Set A_VALUE in a.py to 1 and B_VALUE in b.py to 2.\n", "files": {"a.py": "A_VALUE = 0\n", "b.py": "B_VALUE = 0\n"},
+        "fixtures": {"check.py": "import a, b\nassert (a.A_VALUE, b.B_VALUE) == (1, 2)\n"}, "checks": [{"name": "ref", "argv": ["{python}", "-B", "check.py"]}],
+        "writer": "fake", "judge": "fake", "allow_tool_backends": true, "allow_execution": true, "max_rounds": 3, "max_seconds": 60,
+        "protocol": "text", "max_cost": 5, "unpriced_call_usd": 0.0});
     vec![
         RunCase { watch: false, name: "ready", spec: base.clone(), replies: vec![proposal(good), accept(true), accept(true)] },
         RunCase { watch: false, name: "revise", spec: base.clone(), replies: vec![proposal("def f(x): return x\n"), proposal(good), accept(true), accept(true)] },
@@ -1971,6 +2001,66 @@ fn run_cases(dir: &Path) -> Vec<RunCase> {
             replies: vec![json!({"reply": proposal(good)["reply"], "soft": true}), accept(true), accept(true)] },
         RunCase { watch: true, name: "watch-stopped", spec: with(&base, json!({"timeout_s": 120, "max_seconds": 1000})),
             replies: vec![raise("Stopped", "", json!({})), proposal(good), accept(true), accept(true)] },
+        // a planner and parallel builders (max_cost makes the part calls run one at a time, so the replies keep their order)
+        RunCase { watch: false, name: "plan-one", spec: with(&two, json!({"planner": "fake"})), replies: vec![reply(&plan_json(&[(&["a.py", "b.py"], "both")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-fenced-judge", spec: with(&two, json!({"planner": "judge"})),
+            replies: vec![reply(&format!("```json\n{}\n```", plan_json(&[(&["a.py"], "just a")]))), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-builders-text", spec: with(&two, json!({"planner": "fake", "builders": 2})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "make A_VALUE 1"), (&["b.py"], "make B_VALUE 2")])), reply(PART_A), reply(PART_B), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-builders-json", spec: with(&two, json!({"planner": "fake", "builders": 2, "protocol": null})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "make A_VALUE 1"), (&["b.py"], "make B_VALUE 2")])),
+                reply(&pyjson::dumps(&json!({"files": {"a.py": "A_VALUE = 1\n"}, "rationale": "A"}))),
+                reply(&pyjson::dumps(&json!({"edits": [{"path": "b.py", "old": "0", "new": "2"}], "rationale": "B"}))), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-unassigned-file-joins-part-1", spec: with(&two, json!({"planner": "fake", "builders": 3, "max_rounds": 1})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-part-trespass", spec: with(&two, json!({"planner": "fake", "builders": 2, "max_rounds": 2})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x"), (&["b.py"], "y")])), reply(PART_A), reply(TWO_FILES), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-repair-after-bad-parts", spec: with(&two, json!({"planner": "fake", "builders": 2, "protocol_repair": true})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x"), (&["b.py"], "y")])), reply("@@@ nonsense\n"), reply(PART_B), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-merge-too-big", spec: with(&two, json!({"planner": "fake", "builders": 2, "max_rounds": 1})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x"), (&["b.py"], "y")])),
+                reply(&format!("@@@ FILE a.py\nA = \"{}\"\n", "x".repeat(1_000_010))), reply(&format!("@@@ FILE b.py\nB = \"{}\"\n", "x".repeat(1_000_010)))] },
+        RunCase { watch: false, name: "plan-builders-no-pass", spec: with(&two, json!({"planner": "fake", "builders": 2, "max_rounds": 2})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x"), (&["b.py"], "y")])), reply("@@@ FILE a.py\nA_VALUE = 5\n"), reply(PART_B), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-role-model", spec: with(&two, json!({"writer": "claude", "judge": "claude", "planner": "claude@sonnet", "roles": {"plan": {"model": "opus"}}})),
+            replies: vec![reply(&plan_json(&[(&["a.py", "b.py"], "both")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-script-writer", spec: with(&two, json!({"planner": "fake", "scripts": {"python": "{python}"}})),
+            replies: vec![reply(&plan_json(&[(&["a.py", "b.py"], "both")])), reply(&format!("@@@ SCRIPT\nprint(1)\n{TWO_FILES}")), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-not-a-plan", spec: with(&two, json!({"planner": "fake"})), replies: vec![reply("I would split this in two."), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-lone-fence", spec: with(&two, json!({"planner": "fake"})), replies: vec![reply("```"), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-provider-error", spec: with(&two, json!({"planner": "fake"})), replies: vec![raise("CallError", "bad reply", json!({}))] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-1", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})), replies: vec![reply("{\"summary\": \"s\", \"steps\": [], \"parts\": [], \"risks\": []}"), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-2", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})), replies: vec![reply("{\"summary\": \"s\", \"steps\": [1], \"parts\": [], \"risks\": []}"), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-3", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})), replies: vec![reply("{\"summary\": \" \", \"steps\": [], \"parts\": [], \"risks\": []}"), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-4", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})), replies: vec![reply("[1]"), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-5", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})),
+            replies: vec![reply("{\"summary\": \"s\", \"steps\": [], \"parts\": [{\"files\": [\"a.py\"]}], \"risks\": []}"), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-6", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})),
+            replies: vec![reply(&plan_json(&[(&["c.py"], "x")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-7", spec: with(&two, json!({"planner": "fake", "builders": 2, "max_rounds": 1})),
+            replies: vec![reply(&plan_json(&[(&["a.py", "a.py"], "x")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-8", spec: with(&two, json!({"planner": "fake", "builders": 2, "max_rounds": 1})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x"), (&["a.py"], "y")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-9", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})),
+            replies: vec![reply(&plan_json(&[(&["a.py"], "x"), (&["b.py"], "y")])), reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-valid-and-invalid-shapes-10", spec: with(&two, json!({"planner": "fake", "max_rounds": 1})),
+            replies: vec![reply("```\n```"), reply(TWO_FILES), reply("No defects found.")] },
+        // invalid specs: the same ValueError, with the same text
+        RunCase { watch: false, name: "plan-bad-builders-0", spec: with(&two, json!({"planner": "fake", "builders": 0})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-builders-5", spec: with(&two, json!({"planner": "fake", "builders": 5})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-builders-true", spec: with(&two, json!({"planner": "fake", "builders": true})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-builders-float", spec: with(&two, json!({"planner": "fake", "builders": 2.0})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-builders-without-planner", spec: with(&two, json!({"builders": 2})), replies: vec![] },
+        RunCase { watch: false, name: "plan-ok-builders-1-without-planner", spec: with(&two, json!({"builders": 1})), replies: vec![reply(TWO_FILES), reply("No defects found.")] },
+        RunCase { watch: false, name: "plan-bad-builders-candidates", spec: with(&two, json!({"planner": "fake", "builders": 2, "candidates": 2})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-builders-scripts", spec: with(&two, json!({"planner": "fake", "builders": 2, "scripts": {"python": "{python}"}})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-planner-empty", spec: with(&two, json!({"planner": " "})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-planner-number", spec: with(&two, json!({"planner": 3})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-planner-null", spec: with(&two, json!({"planner": null, "builders": null, "roles": {"plan": {"model": "x"}}})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-planner-syntax", spec: with(&two, json!({"planner": "codex:"})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-planner-tools", spec: with(&two, json!({"planner": "codex", "allow_tool_backends": false, "writer": "claude", "judge": "claude"})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-role-without-planner", spec: with(&two, json!({"roles": {"plan": {"model": "opus"}}})), replies: vec![] },
+        RunCase { watch: false, name: "plan-bad-role-options", spec: with(&two, json!({"planner": "fake", "roles": {"plan": {"model": "opus"}}})), replies: vec![] },
         RunCase { watch: false, name: "spec-tests-none", spec: with(&plain, json!({"max_rounds": 2})), replies: vec![reply("no tests here"), reply("@@@ FILE value.py\ndef f(x):\n    return x\n"),
             reply("@@@ FILE value.py\ndef f(x):\n    return x + 1\n")] },
     ]
