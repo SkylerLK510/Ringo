@@ -13,6 +13,8 @@ shapes recorded in `parse.rs` tests. Live behavior of other versions is an assum
 | F4 | Frames split at any byte boundary, or coalesced, decode identically | guarantee | `frames_survive_every_split_and_coalescing` |
 | F5 | A final frame without newline is passed on; non-JSON or cut JSON fails in the parser, so it is never success | guarantee | `a_frame_cut_at_the_end_of_the_stream_is_flagged_partial`, `Parser::line` |
 | F7 | Free-text (`Plain`) output is capped but decoded lossily, as before | guarantee | `lossy_mode_keeps_free_text_readable_but_still_caps_it` |
+| F8 | Every JSON-speaking adapter (Claude, Codex, agy) is strict: invalid UTF-8 fails the turn; only `Plain` is lossy | guarantee | `invalid_utf8_is_refused_not_replaced` |
+| F9 | Images in one Claude message total at most 11 MiB, so Claude's `--replay-user-messages` echo (base64) stays under `MAX_FRAME`; Codex is sent paths | guarantee | `images_to_claude_stay_small_enough_for_the_echoed_stream_line` |
 | F6 | Raw `events.jsonl` log ends at `MAX_EVENTS_LOG` (256 MiB): the first record that would pass it is replaced by one marker line and nothing is logged after it; the turn is unaffected | guarantee | `the_event_log_ends_at_its_cap_with_one_marker_and_writes_nothing_after` |
 | C1 | Codex: requests 1/2/3 are each answered once, the thread names a thread, the turn answer names a turn and comes only after the turn was asked for; a repeat, an answer to an unmade request, or a turn answer naming another turn than a completion that came first fails the turn | guarantee | `codex_replayed_or_unrequested_answers_fail_closed` |
 | C2 | Codex: events of another thread, a `turn/completed` before this parser sent its turn/start, and one naming another turn than the acknowledged one, do not complete, fail or count this turn. A completion before the turn/start answer counts (Codex may send them in that order) and its turn id is adopted; one naming no turn counts, as before | guarantee | `codex_another_turns_or_threads_events_...`, `codex_a_completion_before_the_turn_answer_counts_and_must_agree_with_it`, `codex_a_completion_before_the_thread_answer_is_ignored` |
@@ -24,5 +26,7 @@ shapes recorded in `parse.rs` tests. Live behavior of other versions is an assum
 | A2 | Cancellation, stdout/stderr flood and blocked-stdin behavior beyond the stop-group path, queue saturation (`mpsc` channels are unbounded) | gap | not hardened in this PR |
 | A3 | Descendants that leave the process group are not reached by stop | limitation | existing |
 | A4 | Delivery reconciliation after disconnect (PR 1 item 4) | gap | not addressed here |
+| A5 | A resumed thread that delivers an earlier turn's `turn/completed` after the thread answer but before the turn/start answer: its id is adopted and the real answer then fails the turn (fail closed, never a wrong count). Whether Codex ever sends that order is unverified | gap | `codex_a_completion_before_the_turn_answer_counts_and_must_agree_with_it` |
+| A6 | A single legitimate output line over 16 MiB (e.g. a huge Codex `aggregatedOutput`) now fails the turn instead of passing; whether the clients cap these is unverified | limitation | F2 |
 
-Gaps A1-A4 remain open; do not call the stream airtight.
+Gaps A1-A6 remain open; do not call the stream airtight.

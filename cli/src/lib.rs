@@ -2705,7 +2705,7 @@ impl Session {
                         framing::Frame::Line { .. } => {}
                         framing::Frame::Oversized { bytes } if !violated => {
                             violated = true;
-                            let reason = format!("a protocol frame of {bytes} bytes (limit {})", framing::MAX_FRAME);
+                            let reason = format!("an output line over the {}-byte limit ({bytes} bytes seen before it was cut off)", framing::MAX_FRAME);
                             for note in parser.violation(reason) {
                                 if style != Style::Trace {
                                     stop_group(pid, Duration::from_secs(3), false);
@@ -4025,7 +4025,7 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         match &s.jobs[id - 1].status {
-            Status::Failed(why) => assert!(why.contains("protocol frame"), "{why}"),
+            Status::Failed(why) => assert!(why.contains("output line over the"), "{why}"),
             other => panic!("expected a failed job, got {other:?}"),
         }
     }
