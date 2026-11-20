@@ -1771,7 +1771,8 @@ impl Session {
                     let signals = context_policy::Signals {
                         fills,
                         base,
-                        record: fresh_built.as_ref().map_or(0, |b| b.2),
+                        // not built only when even an empty record could not pay (or the size test decides)
+                        record: fresh_built.as_ref().map(|b| b.2).or((base.is_none()).then_some(0)),
                         calls,
                         idle_s,
                         ttl_s,

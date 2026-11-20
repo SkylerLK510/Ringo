@@ -70,7 +70,8 @@ pub struct Signals {
     /// The agent's fixed base (median of the last 3 measurements); None = unmeasured.
     pub base: Option<u64>,
     /// About = record text bytes / 4: the exact text the fresh start would send.
-    pub record: u64,
+    /// None when the record was not built because even an empty one could not pay (`could_start_fresh`).
+    pub record: Option<u64>,
     /// Median `calls` of the agent's last <= 5 finished read turns in this lane.
     pub calls: Option<u64>,
     /// Seconds since the agent's previous read turn ended.
@@ -116,19 +117,26 @@ pub fn decide(s: &Signals, fallback_threshold: u64) -> Verdict {
             saving: None,
         };
     };
-    // s = (1 - RHO) * (fills - base) - record, in whole tokens
-    let saving = (s.fills.saturating_sub(base) * RHO_PERCENT_KEPT / 100) as i64 - s.record as i64;
-    let n = s.calls.unwrap_or(DEFAULT_CALLS).max(1);
-    let cold = s.idle_s.is_some_and(|i| i > s.ttl_s);
-    let margin = if cold { 0 } else { MARGIN };
-    let fresh = saving > 0 && (n as i128) * (saving as i128) >= margin as i128;
-    let idle = match s.idle_s {
+    let idle_note = |cold: bool| match s.idle_s {
         Some(i) => format!(" idle {}m ({})", i / 60, if cold { "cold" } else { "warm" }),
         None => String::new(),
     };
+    let n = s.calls.unwrap_or(DEFAULT_CALLS).max(1);
+    let cold = s.idle_s.is_some_and(|i| i > s.ttl_s);
+    let Some(record) = s.record else {
+        // not built: a fresh start could not pay even with an empty record, so no record size or saving is claimed
+        return Verdict { action: Action::Resume, saving: None,
+                         reason: format!("fills {} base {} calls~{n}: cannot pay even with an empty record{}",
+                                         fmt_k(s.fills), fmt_k(base), idle_note(cold)) };
+    };
+    // s = (1 - RHO) * (fills - base) - record, in whole tokens
+    let saving = (s.fills.saturating_sub(base) * RHO_PERCENT_KEPT / 100) as i64 - record as i64;
+    let margin = if cold { 0 } else { MARGIN };
+    let fresh = saving > 0 && (n as i128) * (saving as i128) >= margin as i128;
+    let idle = idle_note(cold);
     Verdict {
         action: if fresh { Action::Fresh } else { Action::Resume },
-        reason: format!("fills {} base {} record {} calls~{n} save~{}{idle}", fmt_k(s.fills), fmt_k(base), fmt_k(s.record),
+        reason: format!("fills {} base {} record {} calls~{n} save~{}{idle}", fmt_k(s.fills), fmt_k(base), fmt_k(record),
                         fmt_signed_k(saving.saturating_mul(n as i64))),
         saving: Some(saving),
     }
@@ -163,7 +171,7 @@ mod tests {
     use super::*;
 
     fn warm(fills: u64, calls: u64) -> Signals {
-        Signals { fills, base: Some(13_000), record: 10_000, calls: Some(calls), idle_s: Some(60), ttl_s: CODEX_TTL_S,
+        Signals { fills, base: Some(13_000), record: Some(10_000), calls: Some(calls), idle_s: Some(60), ttl_s: CODEX_TTL_S,
                   previous_ended_badly: false, continuation: false, fresh_last_turn: false }
     }
 
@@ -251,6 +259,16 @@ mod tests {
         assert!(!could_start_fresh(20_000, Some(13_000), Some(5), false), "5 x 5.25k < 32k even with no record");
         assert!(could_start_fresh(20_000, Some(13_000), Some(5), true), "cold: any positive saving");
         assert!(could_start_fresh(56_000, Some(13_000), None, false), "the default 5 calls");
+    }
+
+
+    #[test]
+    fn an_unbuilt_record_claims_no_size_or_saving() {
+        let s = Signals { fills: 30_000, base: Some(13_000), record: None, calls: Some(1), idle_s: Some(60),
+                          ttl_s: CODEX_TTL_S, previous_ended_badly: false, continuation: false, fresh_last_turn: false };
+        let v = decide(&s, 48_000);
+        assert_eq!((v.action, v.saving), (Action::Resume, None));
+        assert!(v.reason.contains("cannot pay even with an empty record") && !v.reason.contains("record 0"), "{}", v.reason);
     }
 
 }
