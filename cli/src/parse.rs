@@ -130,6 +130,9 @@ pub struct Parser {
     /// usage, so each id counts once. The sum is 93% of the turn's own count on a real 452.9k-token turn (a message's
     /// output tokens are reported before it is written).
     seen: Vec<(String, Tokens)>,
+    /// Codex: this turn's id once its turn/start is answered. A resumed thread first replays the previous turn's
+    /// usage (tagged with that turn's id), which is no model call of this turn.
+    turn_now: String,
     /// Claude reported a compaction (`/compact`), whose result may carry no text.
     compacted: bool,
     /// agy's model calls' counts so far (`step_update` usage): the running turn's own total, told live.
@@ -320,7 +323,7 @@ impl Parser {
 
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
+                 seen: Vec::new(), turn_now: String::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
                  total: Tokens::default() }
     }
@@ -420,6 +423,7 @@ impl Parser {
                 return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
             }
             if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
+                self.turn_now = turn.to_string();
                 return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
             }
             return Vec::new();
@@ -529,8 +533,12 @@ impl Parser {
             // only 3 times (the shell's ledger: 264M tokens for claude and 149M for codex, 96% of it cache reads).
             ("thread/tokenUsage/updated", _) => {
                 let total = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
-                if total != self.usage && p.pointer("/tokenUsage/last").is_some() {
-                    notes.push(Note::Call); // each model call reports a new total; a repeated one is the same call
+                // each model call of this turn reports a new total; a repeated one is the same call, and one before
+                // the turn is known, or tagged with another turn, is a resumed thread's replay of its last turn
+                let tagged = p.get("turnId").and_then(Value::as_str);
+                if total != self.usage && p.pointer("/tokenUsage/last").is_some() && !self.turn_now.is_empty()
+                    && tagged.is_none_or(|t| t == self.turn_now) {
+                    notes.push(Note::Call);
                 }
                 self.usage = total;
                 if ["inputTokens", "outputTokens"].iter().all(|k| self.usage.get(k).and_then(Value::as_u64).is_some()) {
@@ -1401,8 +1409,11 @@ mod tests {
     fn codex_and_claude_count_one_call_per_model_request() {
         // the adaptive context policy expects a turn's calls from these: before, only agy and pipelines counted any
         let upd = |i: u64| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":1}},"last":{{"inputTokens":{i},"outputTokens":1}}}}}}}}"#);
-        let (_, notes) = run(Style::Codex, &[&upd(100), &upd(100), &upd(250)]);
-        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2, "a repeated total is the same call");
+        let replay = r#"{"method":"thread/tokenUsage/updated","params":{"turnId":"OLD","tokenUsage":{"total":{"inputTokens":50,"outputTokens":1},"last":{"inputTokens":50,"outputTokens":1}}}}"#;
+        let answer = r#"{"id":3,"result":{"turn":{"id":"U"}}}"#;
+        let (_, notes) = run(Style::Codex, &[replay, answer, &upd(100), &upd(100), &upd(250)]);
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2,
+                   "a resumed thread's replay before the turn is none; a repeated total is the same call");
         let msg = |id: &str, parent: &str, text: &str| format!(r#"{{"type":"assistant","parent_tool_use_id":{parent},"message":{{"id":"{id}","usage":{{"input_tokens":5,"output_tokens":1}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#);
         let (_, notes) = run(Style::Claude, &[&msg("m1", "null", "a"), &msg("m1", "null", "b"), &msg("m2", "null", "c"),
                                              &msg("s1", r#""toolu_1""#, "sub")]);

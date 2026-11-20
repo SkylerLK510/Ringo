@@ -1750,10 +1750,8 @@ impl Session {
         } else if !eligible {
             fills > threshold
         } else {
-            fresh_built = build(true);
-            match (&fresh_built, mode) {
-                (None, _) => false,
-                (Some(built), mode) => {
+            {
+                {
                     let mine: Vec<&&Job> = lane.iter().filter(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)).collect();
                     let last = mine.last();
                     // a turn that made no call (it failed first) says nothing about how long turns run
@@ -1761,13 +1759,22 @@ impl Session {
                     calls.sort_unstable();
                     let mut bases: Vec<u64> = self.bases.get(&agent).map(|b| b.iter().copied().collect()).unwrap_or_default();
                     bases.sort_unstable();
+                    let (base, calls) = (bases.get(bases.len() / 2).copied(), calls.get(calls.len() / 2).copied());
+                    let idle_s = last.and_then(|j| j.elapsed.map(|e| j.started.elapsed().saturating_sub(e).as_secs()));
+                    let ttl_s = if agent.spec().adapter == Adapter::Claude { context_policy::CLAUDE_TTL_S } else { context_policy::CODEX_TTL_S };
+                    // The record is built (every turn of the lane rendered, and a git diff) only when it can matter:
+                    // the size test would start fresh, or the cost model could. Otherwise its size is not needed.
+                    let cold = idle_s.is_some_and(|i| i > ttl_s);
+                    if fills > threshold || context_policy::could_start_fresh(fills, base, calls, cold) {
+                        fresh_built = build(true);
+                    }
                     let signals = context_policy::Signals {
                         fills,
-                        base: bases.get(bases.len() / 2).copied(),
-                        record: built.2,
-                        calls: calls.get(calls.len() / 2).copied(),
-                        idle_s: last.and_then(|j| j.elapsed.map(|e| j.started.elapsed().saturating_sub(e).as_secs())),
-                        ttl_s: if agent.spec().adapter == Adapter::Claude { context_policy::CLAUDE_TTL_S } else { context_policy::CODEX_TTL_S },
+                        base,
+                        record: fresh_built.as_ref().map_or(0, |b| b.2),
+                        calls,
+                        idle_s,
+                        ttl_s,
                         previous_ended_badly: last.is_some_and(|j| matches!(j.status, Status::Failed(_) | Status::Cancelled)),
                         continuation: context_policy::is_continuation(prompt),
                         fresh_last_turn: last.is_some_and(|j| j.started_fresh),

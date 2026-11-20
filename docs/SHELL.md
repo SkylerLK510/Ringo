@@ -806,7 +806,9 @@ threads that can be resumed:
   (bytes / 4, the exact text a fresh start would send) and `N`, the median model calls of the agent's last five read
   turns that made any (5 until it has one; Codex counts a call per new token total, Claude per message): the saving per call is `0.75 (f - B) - R`, and the thread starts fresh when that is positive and
   `N` times it is at least 32,000 tokens (no margin once the idle time passes the assumed cache life: 30 minutes for
-  Codex, 1 hour for Claude). Until a base is measured it is the size test. The constants (0.25 re-read, 32,000 margin,
+  Codex, 1 hour for Claude). Until a base is measured it is the size test (the guards below still come first). The
+  base includes the first call's own output (usually about a hundred tokens), so it reads slightly high. A Codex call
+  is counted only once the turn is known: a resumed thread first replays its previous turn's usage. The constants (0.25 re-read, 32,000 margin,
   the cache lives) are assumptions from the proposal, not measurements. The log says what it did: `ctx codex: fresh —
   fills 56.0k base 13.0k record 10.0k calls~5 save~111.2k idle 41m (cold)` (5 × (0.75 × 43.0k − 10.0k)). When the
   model says fresh but the half-size rule below stops it, the line says so and keeps the inputs.

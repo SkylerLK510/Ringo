@@ -72,7 +72,7 @@ def validate_plan(value):
             cluster_sides[cluster] = side
     if set(p['clusters']) != seen:
         raise ValueError('cluster inventory differs from the splits')
-    if not isinstance(p['coverage'], list) or set(p['coverage']) - POLICY_DEFAULTS.keys():
+    if not isinstance(p['coverage'], list) or set(p['coverage']) - (POLICY_DEFAULTS.keys() | {'context'}):
         raise ValueError('coverage must name tested policy fields')
     for key in ('baseline', 'degraded', 'manual'):
         p[key] = policy(p[key])
@@ -127,7 +127,7 @@ def code_identity():
             'turnrun_broker.py', 'turnrun_certify.py', 'turnrun_live.py',
             'turnrun_native.py', 'turnrun_native_bridge.py',
             'turnrun.py', 'cli/src/turn_policy.rs', 'cli/src/bin/scenariorun.rs',
-            'cli/src/bin/turnrun.rs', 'cli/src/lib.rs', 'cli/src/parse.rs')}
+            'cli/src/bin/turnrun.rs', 'cli/src/lib.rs', 'cli/src/parse.rs', 'cli/src/context_policy.rs')}
 
 
 def demonstration_plan():
@@ -360,7 +360,8 @@ class Campaign:
                                                    self.plan['proposal_cap']), round=round_no, split='dev')
                     try:
                         candidate = policy(result['policy'])
-                        changes = [k for k in POLICY_DEFAULTS if candidate[k] != parent[k]]
+                        # 'context' counts as a mechanism too, and is uncovered unless the plan names it
+                        changes = [k for k in [*POLICY_DEFAULTS, 'context'] if candidate.get(k) != parent.get(k)]
                         if len(changes) != 1 or changes[0] not in self.plan['coverage']:
                             raise ValueError('one covered mechanism must change')
                         if not isinstance(result.get('hypothesis'), str) or not result['hypothesis'].strip():
@@ -372,8 +373,8 @@ class Campaign:
                     if not self.find('proposal', round=round_no, sibling=sibling):
                         self.append('proposal', round=round_no, sibling=sibling, parent=digest(parent),
                                     parent_policy=parent, policy=candidate,
-                                    diff={k: [parent[k], candidate[k]] for k in POLICY_DEFAULTS
-                                          if candidate is not None and candidate[k] != parent[k]},
+                                    diff={k: [parent.get(k), candidate.get(k)] for k in [*POLICY_DEFAULTS, 'context']
+                                          if candidate is not None and candidate.get(k) != parent.get(k)},
                                     hypothesis=result.get('hypothesis'), screen=reason)
                 schedule = [(t, rep) for t in self.plan['splits']['dev']
                             for rep in range(1, self.plan['search_repetitions']+1)]

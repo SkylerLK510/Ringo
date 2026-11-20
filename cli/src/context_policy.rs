@@ -50,6 +50,14 @@ const RHO_PERCENT_KEPT: u64 = 75; // 1 - RHO, with RHO = 0.25
 pub const MARGIN: u64 = 32_000;
 /// Calls per turn assumed when the agent has no finished read turn here yet (the measured median in PROPOSAL.md).
 pub const DEFAULT_CALLS: u64 = 5;
+
+/// Whether the cost model could say fresh at all, with an empty record (its best case): when not, the record need
+/// not be built to know the answer is resume. Guards and the no-base fallback do not need the record either.
+pub fn could_start_fresh(fills: u64, base: Option<u64>, calls: Option<u64>, cold: bool) -> bool {
+    let Some(base) = base else { return false };
+    let best = fills.saturating_sub(base) * RHO_PERCENT_KEPT / 100;
+    best > 0 && (cold || calls.unwrap_or(DEFAULT_CALLS).max(1) * best >= MARGIN)
+}
 /// Assumed prompt-cache lifetime of a Claude subscription turn, in seconds.
 pub const CLAUDE_TTL_S: u64 = 3600;
 /// Assumed prompt-cache lifetime of a Codex turn, in seconds (not documented by the provider).
@@ -235,4 +243,14 @@ mod tests {
         assert_eq!(Mode::parse(Some("off")), (Mode::Off, None));
         assert_eq!(Mode::parse(Some("sometimes")), (Mode::Static, Some("sometimes".into())));
     }
+
+    #[test]
+    fn the_record_is_needed_only_when_the_cost_model_could_say_fresh() {
+        assert!(!could_start_fresh(60_000, None, Some(5), false), "no base: the size test, no record needed");
+        assert!(!could_start_fresh(13_000, Some(13_000), Some(50), true), "nothing to save");
+        assert!(!could_start_fresh(20_000, Some(13_000), Some(5), false), "5 x 5.25k < 32k even with no record");
+        assert!(could_start_fresh(20_000, Some(13_000), Some(5), true), "cold: any positive saving");
+        assert!(could_start_fresh(56_000, Some(13_000), None, false), "the default 5 calls");
+    }
+
 }

@@ -41,7 +41,8 @@ add a dark mode switch to the settings page
 - The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
   `/clear` starts a new conversation.
 - A long conversation costs more with every call, because the agent reads all of it again each time. Once it passes
-  64,000 tokens, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
+  48,000 tokens for Codex (three quarters of your own `model_auto_compact_token_limit` if you set one) or 64,000 for
+  Claude, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
   reply, the steps taken, the files changed and the change itself. No extra call writes it, and the turn's log says
   when it happens. Within one turn, Codex also compacts at a 64,000-token context threshold; Claude uses its
   minimum 100,000-token window, minus its own output reserve and compaction headroom. Your explicit native
