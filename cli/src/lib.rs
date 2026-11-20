@@ -2,6 +2,7 @@
 //! agent edits in private git worktrees until the owner applies them. The terminal shell (`ringo`) and, later,
 //! the IDE drive a `Session` and render its jobs.
 
+pub mod context_policy;
 pub mod evidence;
 pub mod gateway;
 pub mod parse;
@@ -544,6 +545,13 @@ pub struct Job {
     /// The native conversation state a fresh handoff replaced this turn. Restored when the turn fails before any
     /// provider call, so a refused launch leaves the conversation available for retry.
     fresh_rollback: Option<(String, Option<Tokens>, Option<u64>)>,
+    /// A read turn that began a new native conversation (no thread was resumed), and the bytes of the text sent to
+    /// it: its first context report, less this text, measures the agent's fixed base (`Session::bases`).
+    fresh_thread: bool,
+    sent_bytes: u64,
+    measured: bool,
+    /// The turn began from Ringo's record (a handoff), which the next turn's dwell guard reads.
+    started_fresh: bool,
 }
 
 impl Job {
@@ -675,6 +683,18 @@ pub struct Session {
     heard: HashMap<Agent, BTreeSet<usize>>,
     /// Past this, an agent's next turn starts fresh from Ringo's record instead (tests lower it).
     pub handoff_at: u64,
+    /// Whether the turn policy (or turnrun) set `handoff_at`: the owner's number is then used exactly, for every agent.
+    pub handoff_pinned: bool,
+    /// `RINGO_CONTEXT`, read once when the session opens (tests set the field).
+    pub context_mode: context_policy::Mode,
+    /// A line for the first read turn's log: the variable's value was not a mode.
+    context_note: Option<String>,
+    /// The context mode came from the turn policy (an evaluation arm), not from RINGO_CONTEXT.
+    context_from_policy: bool,
+    /// Whether the log already said that the Codex handoff may be unreachable (once per session).
+    unreachable_said: bool,
+    /// Each agent's fixed base, as its last three fresh conversations measured it.
+    bases: HashMap<Agent, VecDeque<u64>>,
     turn_policy: turn_policy::TurnPolicy,
     /// Evaluation-only transport to a controller-owned isolated native broker.
     #[cfg(feature = "turnrun")]
@@ -1095,12 +1115,14 @@ impl Session {
             },
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
+        let (context_mode, context_note) = context_policy::Mode::parse(std::env::var("RINGO_CONTEXT").ok().as_deref());
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(),
                      selected_task: None, selected_task_error: None, max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(), thread_models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
-                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
+                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, handoff_pinned: false, context_mode, context_note, context_from_policy: false, unreachable_said: false,
+                     bases: HashMap::new(), turn_policy: Default::default(), separate: false,
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
@@ -1150,6 +1172,12 @@ impl Session {
     /// Select an experimental policy explicitly. Normal sessions retain the exact default behavior.
     pub fn set_turn_policy(&mut self, policy: turn_policy::TurnPolicy) {
         self.handoff_at = policy.handoff_at.unwrap_or(HANDOFF_AT);
+        self.handoff_pinned = policy.handoff_at.is_some();
+        if let Some(mode) = policy.context {
+            // a policy names its context mode so a matched evaluation records and pins it (RINGO_CONTEXT does not)
+            self.context_mode = mode;
+            self.context_from_policy = true;
+        }
         self.turn_policy = policy;
     }
 
@@ -1489,6 +1517,37 @@ impl Session {
             .any(|l| l.trim_start().strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))))
     }
 
+    /// The in-turn compaction limit Codex runs with: Ringo's `CODEX_COMPACT_AT`, or the owner's own integer in
+    /// config.toml (None when they set it to something that is not an integer).
+    fn codex_limit(&self) -> Option<u64> {
+        const KEY: &str = "model_auto_compact_token_limit";
+        if !self.codex_sets(KEY) {
+            return Some(CODEX_COMPACT_AT);
+        }
+        let text = fs::read(self.codex_home.join("config.toml")).ok().map(|b| String::from_utf8_lossy(&b).into_owned())?;
+        let value = text.lines().find_map(|l| l.trim_start().strip_prefix(KEY).and_then(|r| r.trim_start().strip_prefix('=')))?;
+        value.split('#').next()?.trim().replace('_', "").parse().ok()
+    }
+
+    /// The between-turn size past which `agent`'s next turn starts fresh from the record, and whether that number
+    /// could not be made sound. An owner's pinned `handoff_at` is used exactly. For Codex otherwise, a conversation
+    /// that reaches the in-turn limit L is compacted there (its fills drop), so a handoff at or above L would never
+    /// fire: the threshold is the lower of `handoff_at` and 3/4 of L.
+    fn static_threshold(&self, agent: Agent) -> (u64, bool) {
+        // a brokered trial's Codex is given no in-turn limit (see the launch), so it has no dead zone to avoid
+        #[cfg(feature = "turnrun")]
+        let brokered = self.trial_broker.is_some();
+        #[cfg(not(feature = "turnrun"))]
+        let brokered = false;
+        if self.handoff_pinned || agent.spec().adapter != Adapter::Codex || brokered {
+            return (self.handoff_at, false);
+        }
+        match self.codex_limit() {
+            Some(limit) => (self.handoff_at.min(limit / 4 * 3), false),
+            None => (self.handoff_at, true),
+        }
+    }
+
     fn codex_told_to_use_ringo(&self) -> bool {
         let read = |name: &str| fs::read(self.codex_home.join(name)).map(|b| String::from_utf8_lossy(&b).to_lowercase());
         let own = read("config.toml").is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
@@ -1619,10 +1678,23 @@ impl Session {
     /// a summary. The record uncut goes in the job's folder.
     fn handoff(&mut self, id: usize, agent: Agent, resume: &mut Option<String>, prompt: &str) -> Option<(String, String)> {
         let fills = self.context.get(&agent).copied().unwrap_or(0);
+        let (threshold, unreadable) = self.static_threshold(agent);
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(bad) = self.context_note.take() {
+            notes.push(format!("RINGO_CONTEXT={bad} is not static, adaptive or off: the default mode is used"));
+        }
+        if unreadable && !self.unreachable_said {
+            self.unreachable_said = true;
+            notes.push(format!("model_auto_compact_token_limit in codex's config.toml is not a number Ringo can read: \
+                                the handoff at {} may be unreachable", fmt_k(self.handoff_at)));
+        }
+        let (mode, pinned) = (self.context_mode, self.handoff_pinned);
+        let eligible = matches!(agent.spec().adapter, Adapter::Codex | Adapter::Claude);
         let lane = self.lane(agent, id);
         let unheard = self.unheard(agent, &lane);
-        // a fresh start that would save too little resumes, told what the others did since, as any other turn
-        let picked = [resume.is_none() || fills > self.handoff_at, false].into_iter().find_map(|fresh| {
+        // The text a start from the record would send (`fresh`), or the turns the agent missed (not), before the
+        // guard that a fresh start must be at most half the conversation it replaces.
+        let build = |fresh: bool| -> Option<(bool, String, u64, String, String, Vec<usize>)> {
             let turns = if fresh { &lane[..] } else { &unheard[..] };
             let restarted = fresh && self.carried(agent).is_some();
             let span = match (turns.first(), turns.last()) {
@@ -1657,8 +1729,86 @@ impl Session {
             }
             let about = text.len() as u64 / 4; // the owner's message goes either way
             let ids: Vec<usize> = turns.iter().map(|j| j.id).collect();
-            (!fresh || resume.is_none() || about * 2 <= fills).then_some((fresh, text, about, span, whole, ids))
+            Some((fresh, text, about, span, whole, ids))
+        };
+        let mut fresh_built = None;
+        let mut verdict: Option<context_policy::Verdict> = None;
+        let mut shadow = false;
+        let want = if resume.is_none() {
+            true
+        } else if pinned && !(mode == context_policy::Mode::Adaptive && self.context_from_policy) {
+            // the owner's pinned number, exactly, whatever RINGO_CONTEXT says (a policy that also names adaptive
+            // asks for the cost model, with its number as the fallback)
+            if mode == context_policy::Mode::Adaptive {
+                verdict = Some(context_policy::Verdict {
+                    action: if fills > threshold { context_policy::Action::Fresh } else { context_policy::Action::Resume },
+                    reason: format!("owner handoff_at {}k", self.handoff_at / 1000), saving: None });
+            }
+            fills > threshold
+        } else if mode == context_policy::Mode::Off {
+            false
+        } else if !eligible {
+            fills > threshold
+        } else {
+            fresh_built = build(true);
+            match (&fresh_built, mode) {
+                (None, _) => false,
+                (Some(built), mode) => {
+                    let mine: Vec<&&Job> = lane.iter().filter(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)).collect();
+                    let last = mine.last();
+                    // a turn that made no call (it failed first) says nothing about how long turns run
+                    let mut calls: Vec<u64> = mine.iter().rev().filter(|j| j.calls > 0).take(5).map(|j| j.calls as u64).collect();
+                    calls.sort_unstable();
+                    let mut bases: Vec<u64> = self.bases.get(&agent).map(|b| b.iter().copied().collect()).unwrap_or_default();
+                    bases.sort_unstable();
+                    let signals = context_policy::Signals {
+                        fills,
+                        base: bases.get(bases.len() / 2).copied(),
+                        record: built.2,
+                        calls: calls.get(calls.len() / 2).copied(),
+                        idle_s: last.and_then(|j| j.elapsed.map(|e| j.started.elapsed().saturating_sub(e).as_secs())),
+                        ttl_s: if agent.spec().adapter == Adapter::Claude { context_policy::CLAUDE_TTL_S } else { context_policy::CODEX_TTL_S },
+                        previous_ended_badly: last.is_some_and(|j| matches!(j.status, Status::Failed(_) | Status::Cancelled)),
+                        continuation: context_policy::is_continuation(prompt),
+                        fresh_last_turn: last.is_some_and(|j| j.started_fresh),
+                    };
+                    let v = context_policy::decide(&signals, threshold);
+                    let adaptive = mode == context_policy::Mode::Adaptive;
+                    shadow = !adaptive;
+                    let action = v.action;
+                    verdict = Some(v);
+                    if adaptive { action == context_policy::Action::Fresh } else { fills > threshold }
+                }
+            }
+        };
+        // the half-size guard below applies to any fresh start, so a verdict is compared after it, like the rule's
+        let fits = fresh_built.as_ref().is_some_and(|b| b.2 * 2 <= fills);
+        let picked = [want, false].into_iter().find_map(|fresh| {
+            let built = if fresh { fresh_built.take().or_else(|| build(true)) } else { build(false) }?;
+            (!fresh || resume.is_none() || built.2 * 2 <= fills).then_some(built)
         });
+        if resume.is_some() && let Some(v) = verdict {
+            let did_fresh = matches!(picked, Some((true, ..)));
+            let who = agent.name();
+            if shadow {
+                // only when it would have done otherwise than the static rule did
+                let would = v.action == context_policy::Action::Fresh && fits;
+                if would != did_fresh {
+                    let word = if would { "fresh" } else { "resume" };
+                    notes.push(format!("ctx {who} (shadow): adaptive would {word} — {}", v.reason));
+                }
+            } else if v.action == context_policy::Action::Fresh && !did_fresh {
+                notes.push(format!("ctx {who}: resume — the record is over half of {}; {}", fmt_k(fills), v.reason));
+            } else {
+                notes.push(format!("ctx {who}: {} — {}", v.action.word(), v.reason));
+            }
+        }
+        if matches!(picked, Some((true, ..))) {
+            self.jobs[id - 1].started_fresh = true;
+        }
+        for note in notes {
+            self.jobs[id - 1].push_log(note);
+        }
         let busy = self.in_flight(id, agent);
         let heard = self.heard.entry(agent).or_default();
         match &picked {
@@ -1879,7 +2029,8 @@ impl Session {
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
-                              task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None });
+                              task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
+                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false });
         Ok(id)
     }
 
@@ -2064,6 +2215,11 @@ impl Session {
         }
         // `sent` is what the agent gets; the owner's message (`prompt`) stays the job's title, prompt.txt and what
         // decides the turn's settings
+        if !write && prompt.trim() != "/compact" {
+            let job = &mut self.jobs[id - 1];
+            job.fresh_thread = resume.is_none();
+            job.sent_bytes = sent.len() as u64;
+        }
         let (mut input, mut turn) = (Some(sent.clone()), None);
         let style = match spec.adapter {
             #[cfg(feature = "turnrun")]
@@ -3078,6 +3234,15 @@ impl Session {
                         Note::Context(n) => {
                             if let Kind::Agent { agent, write: false } = job.kind {
                                 self.context.insert(agent, n);
+                                // the first call of a new conversation read the fixed base plus what was sent
+                                if job.fresh_thread && !job.measured && n > 0 {
+                                    job.measured = true;
+                                    let bases = self.bases.entry(agent).or_default();
+                                    bases.push_back(n.saturating_sub(job.sent_bytes / 4).max(1_000));
+                                    while bases.len() > 3 {
+                                        bases.pop_front();
+                                    }
+                                }
                             }
                         }
                         Note::Call => job.calls += 1,
@@ -4162,5 +4327,292 @@ mod tests {
         assert!(store.is_absolute() && store.join("HEAD").is_file(), "{}", store.display());
         let _ = fs::remove_dir_all(&relative);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- the boundary context policy (see context_policy.rs) ---
+
+    /// A session with `agent`'s one finished read turn behind it, a thread to resume and `fills` in its window.
+    fn ctx_session(name: &str, fills: u64) -> (Session, Agent) {
+        let mut s = record_session();
+        s.context_mode = context_policy::Mode::Static;
+        s.codex_home = s.dir.join("codex-home");
+        fs::create_dir_all(&s.codex_home).unwrap();
+        let agent = Agent::from_name(name).unwrap();
+        ctx_turn(&mut s, agent, Status::Done, 5);
+        s.context.insert(agent, fills);
+        s.threads.insert(agent, "thread-1".into());
+        (s, agent)
+    }
+
+    fn ctx_turn(s: &mut Session, agent: Agent, status: Status, calls: u32) -> usize {
+        let id = s.new_job(Kind::Agent { agent, write: false }, "the earlier turn").unwrap();
+        fs::write(s.jobs[id - 1].dir.join("reply.md"), "an earlier reply").unwrap();
+        let job = &mut s.jobs[id - 1];
+        job.status = status;
+        job.calls = calls;
+        job.elapsed = Some(Duration::from_secs(1));
+        id
+    }
+
+    /// Runs the handoff of a new turn: whether the thread started fresh, and the job's log.
+    fn ctx_next(s: &mut Session, agent: Agent, prompt: &str) -> (bool, String) {
+        let jobs = s.jobs.len();
+        let id = s.new_job(Kind::Agent { agent, write: false }, prompt).unwrap();
+        let mut resume = s.threads.get(&agent).cloned();
+        let _ = s.handoff(id, agent, &mut resume, prompt);
+        assert_eq!(s.jobs.len(), jobs + 1, "the decision starts no job and calls no model");
+        let job = &mut s.jobs[id - 1]; // it ends, a turn behind the next
+        (job.status, job.calls, job.elapsed) = (Status::Done, 5, Some(Duration::from_secs(1)));
+        (resume.is_none(), s.jobs[id - 1].log.iter().cloned().collect::<Vec<_>>().join("\n"))
+    }
+
+    #[test]
+    fn codex_in_the_default_mode_starts_fresh_at_50k_and_not_at_40k() {
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh, "{log}");
+        assert!(!log.contains("ctx codex"), "no shadow line when the verdicts agree: {log}");
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+    }
+
+    #[test]
+    fn a_pinned_policy_handoff_is_used_exactly() {
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 64000})).unwrap());
+        assert!(s.handoff_pinned);
+        assert_eq!(s.static_threshold(agent), (64_000, false));
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0, "50k is under the owner's 64k");
+        s.context.insert(agent, 64_001);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        // a policy without handoff_at pins nothing
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"instruction": "x"})).unwrap());
+        assert!(!s.handoff_pinned);
+        assert_eq!(s.static_threshold(agent), (48_000, false));
+    }
+
+    #[test]
+    fn the_owners_own_codex_limit_sets_the_threshold_to_three_quarters_of_it() {
+        let (mut s, agent) = ctx_session("codex", 35_000);
+        fs::write(s.codex_home.join("config.toml"), "model = \"x\"\nmodel_auto_compact_token_limit = 40_000 # mine\n").unwrap();
+        assert_eq!(s.static_threshold(agent), (30_000, false));
+        assert_eq!(s.static_threshold(Agent::from_name("claude").unwrap()), (64_000, false));
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        // a limit above 85k leaves handoff_at alone
+        fs::write(s.codex_home.join("config.toml"), "model_auto_compact_token_limit=200000\n").unwrap();
+        assert_eq!(s.static_threshold(agent), (64_000, false));
+    }
+
+    #[test]
+    fn an_unreadable_codex_limit_keeps_handoff_at_and_says_so_once() {
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        fs::write(s.codex_home.join("config.toml"), "model_auto_compact_token_limit = \"lots\"\n").unwrap();
+        assert_eq!(s.static_threshold(agent), (64_000, true));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("may be unreachable"), "{log}");
+        let (_, again) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!again.contains("may be unreachable"), "{again}");
+    }
+
+    #[test]
+    fn claude_and_agy_keep_the_static_64k_in_the_default_mode() {
+        let (mut s, agent) = ctx_session("claude", 50_000);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        s.context.insert(agent, 64_001);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        for mode in [context_policy::Mode::Static, context_policy::Mode::Adaptive] {
+            let (mut s, agent) = ctx_session("agy", 0); // agy never reports its context
+            s.context_mode = mode;
+            s.context.remove(&agent);
+            let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+            assert!(!fresh && !log.contains("ctx agy"), "{log}");
+        }
+    }
+
+    #[test]
+    fn adaptive_mode_decides_by_the_cost_model_and_logs_the_inputs() {
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx codex: fresh — fills 56.0k base 13.0k record "), "{log}");
+        assert!(log.contains("calls~5") && log.contains("save~") && log.contains("idle 0m (warm)"), "{log}");
+        // a short turn behind a small conversation resumes, and the line says why
+        let (mut s, agent) = ctx_session("codex", 30_000);
+        s.jobs[0].calls = 1;
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("ctx codex: resume — fills 30.0k base 13.0k"), "{log}");
+        // adaptive acts below the static threshold too: 40k, a long turn behind it, cold
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        if age(&mut s, 3 * 3600) { // a machine up for less than that cannot hold an Instant so old (Windows)
+            let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+            assert!(fresh && log.contains("(cold)"), "{log}");
+        }
+        // without a measured base it is the static rule, and says so
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx codex: fresh — no base yet: static 48k"), "{log}");
+        // Claude too
+        let (mut s, agent) = ctx_session("claude", 56_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx claude: fresh"), "{log}");
+    }
+
+    #[test]
+    fn adaptive_mode_keeps_the_guards() {
+        for (status, prompt, why) in [(Status::Cancelled, "fix the failing tests", "previous turn stopped or failed"),
+                                      (Status::Failed("x".into()), "fix the failing tests", "previous turn stopped or failed"),
+                                      (Status::Done, "continue", "owner continues")] {
+            let (mut s, agent) = ctx_session("codex", 120_000);
+            s.context_mode = context_policy::Mode::Adaptive;
+            s.bases.insert(agent, VecDeque::from([13_000]));
+            s.jobs[0].status = status;
+            let (fresh, log) = ctx_next(&mut s, agent, prompt);
+            assert!(!fresh && log.contains(&format!("ctx codex: resume — guard: {why}")), "{log}");
+        }
+        // a fresh start does not follow a fresh start
+        let (mut s, agent) = ctx_session("codex", 120_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        let id = s.jobs.len();
+        s.jobs[id - 1].status = Status::Done;
+        s.jobs[id - 1].elapsed = Some(Duration::from_secs(1));
+        s.threads.insert(agent, "thread-2".into());
+        s.context.insert(agent, 120_000);
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("guard: fresh start last turn"), "{log}");
+    }
+
+    #[test]
+    fn a_pinned_handoff_overrides_adaptive_mode_exactly() {
+        let (mut s, agent) = ctx_session("claude", 90_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        s.handoff_at = 96_000;
+        s.handoff_pinned = true;
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("ctx claude: resume — owner handoff_at 96k"), "{log}");
+    }
+
+    #[test]
+    fn a_pinned_handoff_beats_off_and_a_policy_naming_adaptive_uses_the_cost_model() {
+        // RINGO_CONTEXT=off does not override the owner's pinned number
+        let (mut s, agent) = ctx_session("codex", 70_000);
+        s.context_mode = context_policy::Mode::Off;
+        s.handoff_pinned = true;
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0, "fills 70k > the pinned 64k");
+        // an evaluation arm's policy names adaptive with its own handoff_at: the cost model decides
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 64000, "context": "adaptive"})).unwrap());
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx codex: fresh — fills 56.0k base 13.0k"), "{log}");
+        // without a base, the policy's number is the fallback
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 64000, "context": "adaptive"})).unwrap());
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("no base yet: static 64k"), "{log}");
+        assert!(turn_policy::TurnPolicy::from_json(&serde_json::json!({"context": "sometimes"})).is_err());
+    }
+
+    #[test]
+    fn off_never_starts_an_existing_thread_fresh_but_a_new_one_gets_the_record() {
+        let (mut s, agent) = ctx_session("codex", 1_000_000);
+        s.context_mode = context_policy::Mode::Off;
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        s.threads.remove(&agent);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "next").unwrap();
+        let mut resume = None;
+        let told = s.handoff(id, agent, &mut resume, "next").unwrap().1;
+        assert!(told.contains("told codex the conversation so far"), "{told}");
+    }
+
+    #[test]
+    fn an_unknown_mode_is_the_default_with_one_log_line() {
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        s.context_note = Some("sometimes".into());
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("RINGO_CONTEXT=sometimes"), "{log}");
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").1.contains("RINGO_CONTEXT"));
+    }
+
+    #[test]
+    fn the_shadow_line_appears_only_when_the_verdicts_differ() {
+        // static says fresh at 50k; one call per turn, the cost model says the saving is below its margin: differ
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        s.jobs[0].calls = 1;
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh, "the shadow never changes what the static rule did");
+        assert!(log.contains("ctx codex (shadow): adaptive would resume — fills 50.0k base 13.0k"), "{log}");
+        // both say fresh
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && !log.contains("shadow"), "{log}");
+        // both say resume
+        let (mut s, agent) = ctx_session("codex", 30_000);
+        s.jobs[0].calls = 1;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").1.contains("shadow"));
+        // static resumes at 40k, adaptive would start fresh (cold, long turns): differ
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        if age(&mut s, 3 * 3600) {
+            let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+            assert!(!fresh && log.contains("(shadow): adaptive would fresh"), "{log}");
+        }
+        // a pinned handoff_at is the owner's number: no shadow
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        age(&mut s, 3 * 3600);
+        s.handoff_pinned = true;
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").1.contains("shadow"));
+    }
+
+    /// Makes the first job's turn `secs` older, when this machine's clock can hold such an Instant.
+    fn age(s: &mut Session, secs: u64) -> bool {
+        match s.jobs[0].started.checked_sub(Duration::from_secs(secs)) {
+            Some(t) => { s.jobs[0].started = t; true }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn a_new_conversations_first_context_report_measures_the_base() {
+        let (mut s, agent) = ctx_session("codex", 0);
+        s.threads.remove(&agent);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "hello").unwrap();
+        s.jobs[id - 1].fresh_thread = true;
+        s.jobs[id - 1].status = Status::Done;
+        s.jobs[id - 1].sent_bytes = 8_000; // 2k tokens of what was sent
+        s.tx.send(Event::Note(id, Note::Context(15_000))).unwrap();
+        s.tx.send(Event::Note(id, Note::Context(18_000))).unwrap(); // later calls do not measure
+        s.pump();
+        assert_eq!(s.bases.get(&agent).unwrap(), &VecDeque::from([13_000]));
+        assert_eq!(s.context.get(&agent), Some(&18_000));
+        // a resumed turn does not measure
+        let id = s.new_job(Kind::Agent { agent, write: false }, "again").unwrap();
+        s.jobs[id - 1].status = Status::Done;
+        s.tx.send(Event::Note(id, Note::Context(30_000))).unwrap();
+        s.pump();
+        assert_eq!(s.bases.get(&agent).unwrap().len(), 1);
+        // only the last three are kept, and the floor is 1k
+        for n in [14_000u64, 15_000, 16_000, 500] {
+            let id = s.new_job(Kind::Agent { agent, write: false }, "fresh").unwrap();
+            s.jobs[id - 1].fresh_thread = true;
+            s.jobs[id - 1].status = Status::Done;
+            s.tx.send(Event::Note(id, Note::Context(n))).unwrap();
+            s.pump();
+        }
+        assert_eq!(s.bases.get(&agent).unwrap(), &VecDeque::from([15_000, 16_000, 1_000]));
     }
 }

@@ -30,9 +30,12 @@ def digest(value):
 
 
 def policy(value):
-    if not isinstance(value, dict) or set(value) - POLICY_DEFAULTS.keys():
+    # 'context' is optional and has no default, so a policy without it keeps its digest
+    if not isinstance(value, dict) or set(value) - (POLICY_DEFAULTS.keys() | {'context'}):
         raise ValueError('unknown editable policy field')
     result = {**POLICY_DEFAULTS, **value}
+    if 'context' in result and result['context'] not in ('static', 'adaptive', 'off'):
+        raise ValueError('context must be static, adaptive or off')
     for key in ('instruction', 'handoff_instruction'):
         text = result[key]
         if not isinstance(text, str) or len(text.encode()) > 4096 or any(

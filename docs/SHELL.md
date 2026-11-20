@@ -612,7 +612,8 @@ The update is put where the running `ringo` is when the shell ends or restarts. 
 pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
 terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on as it would have
 without the restart: Ringo hands on how full each conversation is and its own record of it. On its first turn, each
-agent is told the turns it had not heard yet, or, if its conversation is past 64k, starts fresh from the record (see
+agent is told the turns it had not heard yet, or, if its conversation is past its handoff size (48k for Codex, 64k for
+Claude by default), starts fresh from the record (see
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)); a later fresh start
 still begins with the turns before the restart. Until 11/07 the size was not handed on, so a long conversation went
 on after every restart: two turns on 11/04 re-read 98k and 155k tokens at every call. Ringo keeps the three newest versions and any version an open
@@ -781,6 +782,49 @@ the turn ended at its next turn. When an agent's window passes
 64,000 tokens (its latest call's input and output, as Claude's message usage and Codex's `tokenUsage.last` report
 it), its next turn does not resume: it starts fresh from the record of the whole conversation, if the record is at
 most half that size. The turn's log says which of these happened and how big the record is.
+
+For Codex the threshold is lower than 64,000 by default: Ringo runs Codex with an in-turn compaction limit L of
+64,000 (`CODEX_COMPACT_AT`), and a conversation that reaches L is compacted there and reports less afterwards, so a
+handoff at L would almost never fire (a dead zone: one measured thread ran 31 turns with no fresh start). The effective
+threshold is the lower of 64,000 and three quarters of L: 48,000 by default. If you set your own integer
+`model_auto_compact_token_limit` in Codex's `config.toml`, L is that number (30,000 for 40,000); if Ringo cannot read it
+as an integer, it keeps 64,000 and says once per session that the handoff may be unreachable. When a turn policy (or
+`turnrun --handoff-at`) sets `handoff_at`, that number is used exactly, for every agent, whatever `RINGO_CONTEXT` says
+(only a policy that itself names `"context": "adaptive"` hands the decision to the cost model, its number then being the
+fallback until a base is measured). A brokered evaluation run gives Codex no in-turn limit, so the three-quarters rule
+does not apply there.
+Claude's threshold stays 64,000. agy reports no context, so it never hands off.
+
+`RINGO_CONTEXT`, read when the session opens, chooses how the between-turn decision is made for Codex and Claude
+threads that can be resumed:
+
+- unset or `static`: the size test above. Ringo also works out what the adaptive rule below would have done and, only
+  when that differs from what happened, adds one line to the turn's log: `ctx codex (shadow): adaptive would resume —
+  fills 50.0k base 13.0k ...`. It never changes the turn; the lines are evidence for the evaluation.
+- `adaptive` (opt-in): the cost model replaces the size test. With the thread's fills `f`, the agent's fixed base `B`
+  (the first call of a fresh conversation, less what was sent, median of the last three), the record's size `R`
+  (bytes / 4, the exact text a fresh start would send) and `N`, the median model calls of the agent's last five read
+  turns that made any (5 until it has one; Codex counts a call per new token total, Claude per message): the saving per call is `0.75 (f - B) - R`, and the thread starts fresh when that is positive and
+  `N` times it is at least 32,000 tokens (no margin once the idle time passes the assumed cache life: 30 minutes for
+  Codex, 1 hour for Claude). Until a base is measured it is the size test. The constants (0.25 re-read, 32,000 margin,
+  the cache lives) are assumptions from the proposal, not measurements. The log says what it did: `ctx codex: fresh —
+  fills 56.0k base 13.0k record 10.0k calls~5 save~111.2k idle 41m (cold)` (5 × (0.75 × 43.0k − 10.0k)). When the
+  model says fresh but the half-size rule below stops it, the line says so and keeps the inputs.
+  It resumes whatever the numbers say when the previous turn failed or was stopped (`guard: previous turn stopped or
+  failed`), when the owner's message only says to go on (a phrase such as "continue", or three words or fewer), or when
+  the previous turn was itself a fresh start. A pinned `handoff_at` overrides it (`ctx claude: resume — owner handoff_at
+  96k`). The half-size rule above applies in every mode.
+- `off`: an existing thread is never started fresh automatically (a new conversation still gets the record), unless a
+  pinned `handoff_at` says otherwise.
+
+An evaluation arm selects the mode in its turn policy instead (`"context": "static" | "adaptive" | "off"`), so the
+mode is part of the policy's digest; `turnrun` runs scrub `RINGO_CONTEXT` from the environment.
+- anything else: the default mode, with one log line naming the value.
+
+The decision is made once, as a read turn starts, from what the shell already holds: no model call, no timer. The bases
+and call history are kept in memory only, so after `/restart` the adaptive rule uses the size test until a fresh
+conversation measures a base. Adaptive stays opt-in until a matched evaluation shows it pays; no saving is claimed for
+it here.
 
 Ringo's own code writes the record, from what it keeps of each turn, with no model call, and rebuilds it from the
 originals every time, so it is never a summary of a summary:

@@ -67,7 +67,7 @@ QUOTA = re.compile(r'rate.?limit|usage limit|quota|hit your .{0,20}limit|limit r
 CHECK_CLASSES = {0: 'pass', 1: 'treatment_failure', 2: 'quality_failure', 3: 'check_unavailable'}
 CHECK_TIMEOUT = 45 * 60  # a Rust check builds the tree
 RUNNER_GRACE = 120  # past the run's own wall cap, before the driver stops the runner itself
-SCRUB = ('RINGO_CHILD', 'RINGO_HOME', 'CODEX_HOME', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+SCRUB = ('RINGO_CHILD', 'RINGO_HOME', 'CODEX_HOME', 'RINGO_CONTEXT', 'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
          'GEMINI_API_KEY', 'GOOGLE_API_KEY')
 USAGE_KEYS = ('input', 'cache_write', 'cache_read', 'output')
 

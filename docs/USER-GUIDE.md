@@ -351,6 +351,12 @@ after every turn, so a crash loses at most the turn it cut short.
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
 | `/quit` | leave |
 
+Long conversations start fresh from Ringo's record once an agent's window is large (Codex past 48k, Claude past
+64k). Set `RINGO_CONTEXT=adaptive` before starting Ringo to try a cost-based rule instead, `RINGO_CONTEXT=off` to never
+start an existing conversation fresh on its own; unset is the default, which only logs what the adaptive rule would
+have done (`ctx ... (shadow)`). Adaptive is experimental and no saving is claimed for it yet; see
+[One conversation](SHELL.md#one-conversation-and-a-fresh-start-past-64k).
+
 When a newer Ringo is there, the top line says so until you have it: `↑ update ready · /restart` when Ringo has
 built it for you, or `↑ update available · /update` when your copy is one you update yourself, and `/update` then
 says how.

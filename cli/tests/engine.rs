@@ -106,6 +106,7 @@ fn wait(s: &mut Session, id: usize) -> Status {
 fn session(repo: &Path, agent: Agent, program: &Path) -> Session {
     let mut s = Session::new(repo).unwrap();
     s.programs.insert(agent, program.to_path_buf());
+    s.context_mode = ringo_cli::context_policy::Mode::Static; // hermetic: whatever RINGO_CONTEXT the runner exported
     s
 }
 

@@ -528,7 +528,11 @@ impl Parser {
             // reached 14.8M tokens, one making 255 model calls that re-read ~176k cached tokens each, compacting
             // only 3 times (the shell's ledger: 264M tokens for claude and 149M for codex, 96% of it cache reads).
             ("thread/tokenUsage/updated", _) => {
-                self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                let total = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                if total != self.usage && p.pointer("/tokenUsage/last").is_some() {
+                    notes.push(Note::Call); // each model call reports a new total; a repeated one is the same call
+                }
+                self.usage = total;
                 if ["inputTokens", "outputTokens"].iter().all(|k| self.usage.get(k).and_then(Value::as_u64).is_some()) {
                     notes.push(Note::Live(self.thread_tokens()));
                 }
@@ -689,7 +693,14 @@ impl Parser {
                     match self.seen.iter_mut().find(|(seen, _)| seen == id) {
                         Some((_, before)) if t.total() > before.total() => *before = t,
                         Some(_) => {}
-                        None => self.seen.push((id.to_string(), t)),
+                        None => {
+                            self.seen.push((id.to_string(), t));
+                            // one model call per message (its content blocks repeat the id); the turn's own calls
+                            // only, as a subagent's read its own window
+                            if parent.is_none() {
+                                notes.push(Note::Call);
+                            }
+                        }
                     }
                     let mut so_far = Tokens::default();
                     self.seen.iter().for_each(|(_, t)| so_far.add(*t));
@@ -1384,6 +1395,19 @@ mod tests {
         assert!(notes.iter().any(|n| matches!(n, Note::Step(l) if l.contains("run_command refused"))));
         assert!(notes.contains(&Note::Reply("Fixed calc.py.".into())), "the reply is in the conversation");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
+    }
+
+    #[test]
+    fn codex_and_claude_count_one_call_per_model_request() {
+        // the adaptive context policy expects a turn's calls from these: before, only agy and pipelines counted any
+        let upd = |i: u64| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":1}},"last":{{"inputTokens":{i},"outputTokens":1}}}}}}}}"#);
+        let (_, notes) = run(Style::Codex, &[&upd(100), &upd(100), &upd(250)]);
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2, "a repeated total is the same call");
+        let msg = |id: &str, parent: &str, text: &str| format!(r#"{{"type":"assistant","parent_tool_use_id":{parent},"message":{{"id":"{id}","usage":{{"input_tokens":5,"output_tokens":1}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#);
+        let (_, notes) = run(Style::Claude, &[&msg("m1", "null", "a"), &msg("m1", "null", "b"), &msg("m2", "null", "c"),
+                                             &msg("s1", r#""toolu_1""#, "sub")]);
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2,
+                   "one per message, whatever its blocks; a subagent's calls are its own");
     }
 
     #[test]
