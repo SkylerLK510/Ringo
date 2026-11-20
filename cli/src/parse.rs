@@ -153,9 +153,12 @@ pub struct Parser {
     writing: Option<(String, usize)>,
     /// Codex: the turn's id, once its turn/start was answered; its events are the turn's own, another turn's are not.
     turn_id: String,
-    /// Codex: initialize answered; turn/start sent (so a completion before its acknowledgement is not this turn's).
+    /// Codex: initialize answered; this parser sends the turn/start itself (`with_turn`); that request sent; its
+    /// answer received (a completion may name the turn first: its id is adopted, and the answer must then agree).
     init: bool,
+    sends_turn: bool,
     turn_sent: bool,
+    acked: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -327,12 +330,14 @@ impl Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
-                 total: Tokens::default(), turn_id: String::new(), init: false, turn_sent: false }
+                 total: Tokens::default(), turn_id: String::new(), init: false, sends_turn: false, turn_sent: false,
+                 acked: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
     pub fn with_turn(mut self, turn: Value) -> Parser {
         self.turn = Some(turn);
+        self.sends_turn = true;
         self
     }
 
@@ -442,14 +447,19 @@ impl Parser {
                 if self.thread.is_empty() || self.turn.is_some() {
                     return self.fail("codex: the turn was answered before it was asked for".into());
                 }
-                if !self.turn_id.is_empty() {
+                if std::mem::replace(&mut self.acked, true) {
                     return self.fail("codex: the turn was answered twice".into());
                 }
-                if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
-                    self.turn_id = turn.to_string();
-                    return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
+                let turn = m.pointer("/result/turn/id").and_then(Value::as_str).unwrap_or("");
+                if turn.is_empty() {
+                    return self.fail("codex: the turn answer names no turn".into());
                 }
-                return Vec::new();
+                if !self.turn_id.is_empty() && turn != self.turn_id {
+                    // its completion, which came first, named another turn
+                    return self.fail("codex: the turn answer names another turn than its completion".into());
+                }
+                self.turn_id = turn.to_string();
+                return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
             }
             if id.as_u64() != Some(1) {
                 return self.fail(format!("codex: an answer to a request never made (id {id})"));
@@ -579,11 +589,16 @@ impl Parser {
                 }
             }
             ("turn/completed", _) => {
-                // Only the requested turn's own completion counts: one before its acknowledgement, or naming no
-                // turn or another, is an earlier turn's (a resumed thread's) and is ignored.
+                // Only the requested turn's own completion counts. One before this parser even sent its turn/start
+                // (it goes out with the thread answer) is an earlier turn's, a resumed thread's, and is ignored; so is one naming another
+                // turn than the acknowledged one (one naming no turn contradicts nothing and counts, as it always did). Codex may complete a turn before answering its turn/start: that
+                // completion counts, and the turn id it names (if any) must match the answer that follows.
                 let other = s(p.get("turn").unwrap_or(&NULL), "id");
-                if (self.turn_sent && self.turn_id.is_empty()) || (!self.turn_id.is_empty() && other != self.turn_id) {
+                if (self.sends_turn && !self.turn_sent) || (!self.turn_id.is_empty() && !other.is_empty() && other != self.turn_id) {
                     return vec![Note::Log("ignored a completion that is not this turn's".into())];
+                }
+                if self.turn_id.is_empty() && !other.is_empty() && self.completed == 0 {
+                    self.turn_id = other.to_string();
                 }
                 if self.completed > 0 {
                     // a repeat is never counted again: its usage would be charged twice
@@ -1554,6 +1569,57 @@ mod tests {
         p
     }
 
+    /// A parser that sends its own turn/start, with the thread answered and the turn sent but not yet acknowledged.
+    fn codex_sent() -> Parser {
+        let mut p = Parser::new(Style::Codex).with_turn(json!({"id": 3, "method": "turn/start", "params": {}}));
+        p.line(r#"{"id":1,"result":{}}"#);
+        p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+        assert_eq!(p.take_writes().len(), 1, "the turn was sent");
+        p
+    }
+
+    #[test]
+    fn codex_a_completion_before_the_turn_answer_counts_and_must_agree_with_it() {
+        // no turn/start answer at all, and a completion naming no turn: as main always accepted (the fake servers)
+        let mut p = codex_sent();
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"status":"completed"}}}"#);
+        assert_eq!(p.finish(), Ok(()));
+        // a completion naming its turn before the answer: adopted, and an answer naming the same turn is fine
+        let mut p = codex_sent();
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+        assert!(!p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert_eq!(p.finish(), Ok(()));
+        // ... but an answer naming another turn than that completion fails closed
+        let mut p = codex_sent();
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+        assert!(p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(p.finish().is_err());
+    }
+
+    #[test]
+    fn codex_a_completion_before_the_thread_answer_is_ignored() {
+        // (only a parser that sends the turn itself knows when it was requested; a bare one reads stream fragments)
+        for mut p in [Parser::new(Style::Codex).with_turn(json!({"id": 3, "method": "turn/start", "params": {}}))] {
+            p.line(r#"{"id":1,"result":{}}"#);
+            p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+            assert!(!p.completed(), "not this turn's");
+            p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+            p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
+            p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+            p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+            assert_eq!(p.finish(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn codex_a_turn_answer_naming_no_turn_fails() {
+        let mut p = codex_sent();
+        assert!(p.line(r#"{"id":3,"result":{}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(p.finish().is_err());
+    }
+
     #[test]
     fn codex_replayed_or_unrequested_answers_fail_closed() {
         for line in [r#"{"id":2,"result":{"thread":{"id":"OTHER"}}}"#, r#"{"id":3,"result":{"turn":{"id":"V"}}}"#,
@@ -1630,14 +1696,13 @@ mod tests {
         assert!(p.line(done).iter().any(|n| matches!(n, Note::Tokens(_))));
         let again = p.line(done);
         assert!(again.iter().any(|n| matches!(n, Note::Fail(_))) && !again.iter().any(|n| matches!(n, Note::Tokens(_))));
-        // a completion naming no turn, before or after the acknowledgement, is not this turn's
-        let mut p = Parser::new(Style::Codex).with_turn(json!({"id": 3, "method": "turn/start", "params": {}}));
-        p.line(r#"{"id":1,"result":{}}"#);
-        p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
-        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+        // after the acknowledgement, a completion naming another turn is not this turn's; one naming none counts
+        let mut p = codex_sent();
         p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
-        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"status":"completed"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
         assert!(!p.completed());
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"status":"completed"}}}"#);
+        assert!(p.completed());
         // an empty thread, a second initialize, a turn answered before it was asked for
         assert!(Parser::new(Style::Codex).line(r#"{"id":2,"result":{"thread":{}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
         let mut p = Parser::new(Style::Codex);

@@ -31,6 +31,36 @@ const LOG_LINES: usize = 2000; // per job in memory; the full stream is on disk
 /// Past this many tokens in an agent's window, its next turn starts fresh from Ringo's record of the conversation
 /// instead of re-reading all of it at every call (see `Session::handoff`).
 pub const HANDOFF_AT: u64 = 64_000;
+/// The last line of a raw `events.jsonl` that reached `framing::MAX_EVENTS_LOG`: nothing after it was logged.
+const EVENTS_LOG_MARKER: &str = r#"{"ringo":"events.jsonl reached its size cap; later events were not logged"}"#;
+
+/// A turn's raw event log under an aggregate byte budget. The first record that would pass the budget ends the log
+/// with one marker line (room is kept for it), so a capped log never has a silent gap that reads like a whole
+/// stream; nothing is written after it. The turn itself goes on either way.
+struct EventLog<W: Write> {
+    out: Option<W>,
+    logged: u64,
+    cap: u64,
+}
+
+impl<W: Write> EventLog<W> {
+    fn new(out: Option<W>, cap: u64) -> Self {
+        EventLog { out, logged: 0, cap }
+    }
+
+    fn write(&mut self, line: &str) {
+        let Some(out) = self.out.as_mut() else { return };
+        let need = line.len() as u64 + 1;
+        if self.logged + need + EVENTS_LOG_MARKER.len() as u64 + 1 <= self.cap {
+            self.logged += need;
+            let _ = writeln!(out, "{line}");
+        } else {
+            let _ = writeln!(out, "{EVENTS_LOG_MARKER}");
+            let _ = out.flush();
+            self.out = None;
+        }
+    }
+}
 /// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
 /// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
 const RECORD_BYTES: usize = 60_000;
@@ -2635,17 +2665,10 @@ impl Session {
         let stdout = child.stdout.take();
         thread::spawn(move || {
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
-            let mut events = (style != Style::Trace).then(|| fs::OpenOptions::new().create(true).append(true)
-                .open(dir.join("events.jsonl")).ok()).flatten();
-            let mut logged = 0u64;
+            let mut events = EventLog::new((style != Style::Trace).then(|| fs::OpenOptions::new().create(true)
+                .append(true).open(dir.join("events.jsonl")).ok()).flatten(), framing::MAX_EVENTS_LOG);
             let mut handle = |line: &str, parser: &mut Parser| {
-                if let Some(f) = events.as_mut() {
-                    // Aggregate budget for the raw log: past it the log stops growing, the turn does not.
-                    if logged + line.len() as u64 + 1 <= framing::MAX_EVENTS_LOG {
-                        logged += line.len() as u64 + 1;
-                        let _ = writeln!(f, "{line}");
-                    }
-                }
+                events.write(line);
                 for note in parser.line(line) {
                     if matches!(note, Note::Fail(_)) && style != Style::Trace {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
@@ -3906,6 +3929,26 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_event_log_ends_at_its_cap_with_one_marker_and_writes_nothing_after() {
+        use std::{cell::RefCell, rc::Rc};
+        #[derive(Clone, Default)]
+        struct Shared(Rc<RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.borrow_mut().extend_from_slice(b); Ok(b.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let buf = Shared::default();
+        let cap = 40 + EVENTS_LOG_MARKER.len() as u64 + 1;
+        let mut log = EventLog::new(Some(buf.clone()), cap);
+        log.write("first line of twenty"); // 21 bytes with its newline
+        log.write("a record too long to fit the budget left");
+        log.write("tiny"); // would fit, but the log has ended
+        let text = String::from_utf8(buf.0.borrow().clone()).unwrap();
+        assert_eq!(text, format!("first line of twenty\n{EVENTS_LOG_MARKER}\n"));
+        assert!(text.len() as u64 <= cap);
+    }
     use super::*;
 
     #[test]
