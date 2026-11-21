@@ -804,9 +804,13 @@ threads that can be resumed:
 - `adaptive` (opt-in): the cost model replaces the size test. With the thread's fills `f`, the agent's fixed base `B`
   (the first call of a fresh conversation, less what was sent, median of the last three), the record's size `R`
   (bytes / 4, the exact text a fresh start would send) and `N`, the median model calls of the agent's last five read
-  turns that made any (5 until it has one; Codex counts a call per new token total, Claude per message): the saving per call is `0.75 (f - B) - R`, and the thread starts fresh when that is positive and
-  `N` times it is at least 32,000 tokens (no margin once the idle time passes the assumed cache life: 30 minutes for
-  Codex, 1 hour for Claude). Until a base is measured it is the size test (the guards below still come first). The
+  turns that made any (5 until it has one; Codex counts a call per new token total, Claude per message): the saving per call is `0.75 (f - B) - R`, and the thread starts fresh when that is at least `R` (the record costs
+  at most half of the gross saving `0.75 (f - B)`; a start that only just pays throws the conversation away for
+  nothing) and `N` times it is at least 32,000 tokens (no margin once the idle time passes the assumed cache life: 30
+  minutes for Codex, 1 hour for Claude). Worked: f = 30k, N = 5, cold, B = 13k, R = 10k saves 12.75k - 10k = 2.75k, less
+  than R, so the thread resumes; f = 40k, N = 2, cold saves 20.25k - 10k = 10.25k, at least R, so it starts fresh, and
+  warm (2 x 10.25k < 32k) it resumes; f = 56k, N = 5, warm starts fresh. When only this condition fails, the log line
+  ends `: the saving does not cover twice the record`. Until a base is measured it is the size test (the guards below still come first). The
   base includes the first call's own output (usually about a hundred tokens), so it reads slightly high. A Codex call
   is counted only once the turn is known: a resumed thread first replays its previous turn's usage. The constants (0.25 re-read, 32,000 margin,
   the cache lives) are assumptions from the proposal, not measurements. The log says what it did: `ctx codex: fresh —
@@ -841,11 +845,33 @@ originals every time, so it is never a summary of a summary:
   took about a fifth off the record uncut where the echoes dominated;
 - the files it changed, and whether `/undo` took them back; where git cannot say (a folder with no `/undo`, such as
   the home folder, or another turn at work here that ran commands), the files it said it edited;
+- the files the turns read, in one line before the diff: `files read (newest first; re-open what you need, they may
+  have changed since): a, b, c`. Paths only, no contents: the agents' reads and searches are otherwise only counted. It
+  is the union over the turns, newest read first, without the files a turn changed (already listed), at most 40 paths
+  and 3,000 bytes, ending ` and N more (in the whole record)` when cut, and it is left out when nothing was read or
+  the record has no room for it. The whole record gives each turn its own `read:` line with every file it read (each
+  turn remembers its last 200);
 - the change the turns made, as `git diff` from before the first to after the last, in those files only.
 
 The turns go in newest first, to about 60,000 characters (about 15,000 tokens); an older turn past that is named
-only. The record uncut is `record.md` in the turn's job folder, and the turn is told where it is. Inside a long
-turn, each agent's own compaction still applies.
+only. The record uncut is `record.md` in the turn's job folder, and the turn is told where it is; whenever anything
+in the inline record is cut, the whole record stays linked (except for agy outside read mode, which cannot open the
+job folder). Inside a long turn, each agent's own compaction still
+applies.
+
+A rich tier spends part of what a fresh start saves on detail the lean record cuts. Whether to start fresh is decided on
+the lean record (the size test, the half-size guard, the cost model and the shadow line all see its size); only then,
+when a conversation that is being replaced starts fresh (and when `/restart` hands a record on), older turns kept in the brief form above are given
+their whole form (reply to 6,000 characters, last five steps), newest first, each only if its extra bytes fit in what
+is left of the cap, a turn that does not fit being skipped for an older one. The cap is `4 x 3/8 x (f - B)` bytes
+(`B` the measured base, or half of `f` before one is measured): the cost model counts `0.75 (f - B)` tokens saved per
+call, and the record may spend at most half of that. On a fresh start the cap is taken less what the text sent adds
+around the record (its opening sentence, the pointer to the whole record, any handoff instruction), so all of it stays
+within `3/8 (f - B)` tokens and could not undo the decision. At f = 48k and B = 13k that is 52,500 bytes. Turns from
+before a `/restart` keep the room the lean record leaves them, and the rich tier gets only what is left of the cap. The cap never takes the record past its 60,000 bytes, never
+drops the diff or the files-read line, and leaves the whole record as it was. A brand-new conversation, and the record
+of turns an agent missed, get the lean form. How the richer record changes the answers is not measured, and no saving
+or quality gain is claimed for it.
 
 Measured before release, in a pilot of 4 three-turn coding tasks for each agent with hidden checks, against
 resuming as before, with the threshold at 12k so that later turns started fresh (all 8 of Codex's later turns, 3 of

@@ -55,6 +55,11 @@ token cost model at the start of each read turn, `static` (the default) logs a `
 have decided differently, and `off` never starts an existing thread fresh. None of these adds a model call. See
 [One conversation](SHELL.md#one-conversation-and-a-fresh-start-past-64k).
 
+The record a fresh start sends names the files the turns read (one line of paths, no contents) and, for a conversation
+that is being replaced, keeps older replies and steps in their whole form up to a byte cap of half the cost model's
+saving (`4 x 3/8 x (f - B)` bytes), never past the record's 60,000 bytes. The cost model also resumes when the saving
+does not cover twice the record. The effect on quality or cost is not measured.
+
 Within a running turn, Codex now receives
 `model_auto_compact_token_limit=64000`; Claude receives
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=100000`, its minimum supported window. Previously

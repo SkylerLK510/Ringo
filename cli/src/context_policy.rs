@@ -132,11 +132,16 @@ pub fn decide(s: &Signals, fallback_threshold: u64) -> Verdict {
     // s = (1 - RHO) * (fills - base) - record, in whole tokens
     let saving = (s.fills.saturating_sub(base) * RHO_PERCENT_KEPT / 100) as i64 - record as i64;
     let margin = if cold { 0 } else { MARGIN };
-    let fresh = saving > 0 && (n as i128) * (saving as i128) >= margin as i128;
+    let pays = saving > 0 && (n as i128) * (saving as i128) >= margin as i128;
+    // The record must cost at most half of the gross saving (`saving` is net of it): a start that barely pays,
+    // with a record as large as what it saves, throws a conversation away for nothing.
+    let covers = saving >= record as i64;
+    let fresh = pays && covers;
     let idle = idle_note(cold);
+    let why = if pays && !covers { ": the saving does not cover twice the record" } else { "" };
     Verdict {
         action: if fresh { Action::Fresh } else { Action::Resume },
-        reason: format!("fills {} base {} record {} calls~{n} save~{}{idle}", fmt_k(s.fills), fmt_k(base), fmt_k(record),
+        reason: format!("fills {} base {} record {} calls~{n} save~{}{idle}{why}", fmt_k(s.fills), fmt_k(base), fmt_k(record),
                         fmt_signed_k(saving.saturating_mul(n as i64))),
         saving: Some(saving),
     }
@@ -180,12 +185,41 @@ mod tests {
         let v = decide(&warm(56_000, 5), 48_000);
         assert_eq!((v.action, v.saving), (Action::Fresh, Some(22_250)));
         assert!(v.reason.contains("calls~5") && v.reason.contains("save~111.2k") && v.reason.contains("(warm)"), "{}", v.reason);
+        // f=30k, N=5, cold-or-warm: saves 12.75k - 10k = 2.75k, which does not cover the 10k record
         assert_eq!(decide(&warm(30_000, 5), 48_000).action, Action::Resume);
         assert_eq!(decide(&warm(60_000, 1), 48_000).action, Action::Resume);
         let cold = Signals { idle_s: Some(41 * 60), ..warm(30_000, 5) };
         let v = decide(&cold, 48_000);
+        assert_eq!((v.action, v.saving), (Action::Resume, Some(2_750)), "2.75k < the 10k record");
+        assert!(v.reason.contains("idle 41m (cold)"), "{}", v.reason);
+        let cold = Signals { idle_s: Some(41 * 60), ..warm(56_000, 1) };
+        let v = decide(&cold, 48_000);
         assert_eq!(v.action, Action::Fresh);
         assert!(v.reason.contains("idle 41m (cold)"), "{}", v.reason);
+    }
+
+    #[test]
+    fn the_saving_must_cover_twice_the_record() {
+        // f=40k N=2 cold: 20.25k gross - 10k = 10.25k >= 10k (margin 0, cold) -> fresh
+        let cold = |fills, calls| Signals { idle_s: Some(41 * 60), ..warm(fills, calls) };
+        let v = decide(&cold(40_000, 2), 48_000);
+        assert_eq!((v.action, v.saving), (Action::Fresh, Some(10_250)));
+        assert!(!v.reason.contains("does not cover"), "{}", v.reason);
+        // the same warm: 2 x 10.25k < 32k -> resume, for the old reason (the margin), not the new one
+        let v = decide(&warm(40_000, 2), 48_000);
+        assert_eq!(v.action, Action::Resume);
+        assert!(!v.reason.contains("does not cover"), "{}", v.reason);
+        // f=30k N=5 cold: the saving is positive and pays cold, but is 2.75k against a 10k record
+        let v = decide(&cold(30_000, 5), 48_000);
+        assert_eq!(v.action, Action::Resume);
+        assert!(v.reason.contains("fills 30.0k base 13.0k record 10.0k calls~5 save~13.8k"), "{}", v.reason);
+        assert!(v.reason.ends_with(": the saving does not cover twice the record"), "{}", v.reason);
+        // exactly twice is enough; a byte less is not
+        let at = |record| Signals { record: Some(record), ..cold(40_000, 1) };
+        assert_eq!(decide(&at(10_125), 48_000).action, Action::Fresh); // 20_250 - 10_125 = 10_125
+        assert_eq!(decide(&at(10_126), 48_000).action, Action::Resume);
+        // an empty record always covers itself
+        assert_eq!(decide(&Signals { record: Some(0), ..cold(40_000, 1) }, 48_000).action, Action::Fresh);
     }
 
     #[test]

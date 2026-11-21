@@ -82,6 +82,8 @@ pub enum Note {
     Call,
     /// The agent is editing this file (as the agent reported it, usually an absolute path).
     Touched(String),
+    /// The agent read this file (as the agent reported it, usually an absolute path): the working set of the turn.
+    Read(String),
     /// The agent ran a shell command, which may have written files it does not report (see `Session::end_with`).
     Ran,
     /// The agent called one of the owner's connectors (an MCP tool): the conversation's next turn keeps them.
@@ -472,6 +474,11 @@ impl Parser {
                     notes.push(Note::Step(format!("{mark}$ {}{how}", short(bare_command(s(item, "command")), 300))));
                     notes.push(Note::Ran);
                 }
+                // The files a command that went through read: the turn's working set.
+                if how.is_empty() {
+                    notes.extend(actions.iter().filter(|a| s(a, "type") == "read" && !s(a, "path").is_empty())
+                        .map(|a| Note::Read(s(a, "path").to_string())));
+                }
             }
             ("item/started" | "item/completed", "fileChange") => {
                 let changes = item.get("changes").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -819,6 +826,12 @@ impl Parser {
         let mut notes = vec![Note::Activity { node: parent.clone(), text: format!("{name} {}", short(target, 70)) }];
         if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
             notes.push(Note::Touched(s(input, "file_path").to_string()));
+        }
+        if matches!(name, "Read" | "NotebookRead") {
+            let path = if s(input, "file_path").is_empty() { s(input, "notebook_path") } else { s(input, "file_path") };
+            if !path.is_empty() {
+                notes.push(Note::Read(path.to_string()));
+            }
         }
         if name == "Bash" { // a subagent's command writes the same folder
             notes.push(Note::Ran);
@@ -1178,6 +1191,7 @@ mod tests {
         let notes: Vec<Note> = codex.iter().flat_map(|l| Parser::new(Style::Codex).line(l)).collect();
         assert_eq!(notes, [
             Note::Looked { kind: "read", text: "read a.rs".into() }, // only looked: no Ran
+            Note::Read("/w/a.rs".into()), // and the file it read is the working set
             Note::Step("$ cargo test".into()),
             Note::Ran,
             Note::Step("Edit a.rs · +1 −1\n- 1\n+ 2".into()),
@@ -1194,6 +1208,26 @@ mod tests {
         assert_eq!(step(change("add", "notes\n@@ -1 +1 @@\n-x\n", "completed")),
                    [Note::Step("Write q.sql · 3 lines\n+ notes\n+ @@ -1 +1 @@\n+ -x".into())]);
         assert_eq!(step(change("update", "", "failed")), [Note::Step("✗ edit".into())]);
+    }
+
+    #[test]
+    fn the_files_a_turn_read_are_noted() {
+        // Codex: a read action that went through names its file; a failed command's does not; a command without a path
+        let read = |code: i64, path: &str| format!(
+            r#"{{"method":"item/completed","params":{{"item":{{"type":"commandExecution","command":"sed -n 1,9p a.rs","exitCode":{code},"status":"completed","commandActions":[{{"type":"read","command":"sed -n 1,9p a.rs","name":"a.rs","path":"{path}"}}]}}}}}}"#);
+        let notes = |line: String| Parser::new(Style::Codex).line(&line);
+        assert!(notes(read(0, "/w/a.rs")).contains(&Note::Read("/w/a.rs".into())));
+        assert!(!notes(read(1, "/w/a.rs")).iter().any(|n| matches!(n, Note::Read(_))), "a failed command read nothing we know");
+        assert!(!notes(read(0, "")).iter().any(|n| matches!(n, Note::Read(_))), "no path, no file");
+        // Claude: Read and NotebookRead name their file; an edit is Touched, not Read
+        let call = |name: &str, input: &str| format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"{name}","input":{input}}}]}},"parent_tool_use_id":null}}"#);
+        let (r, n, e) = (call("Read", r#"{"file_path":"/w/src/a.rs"}"#), call("NotebookRead", r#"{"notebook_path":"/w/n.ipynb"}"#),
+                         call("Edit", r#"{"file_path":"/w/src/b.rs"}"#));
+        let claude = run(Style::Claude, &[r.as_str(), n.as_str(), e.as_str()]).1;
+        let read_notes: Vec<&Note> = claude.iter().filter(|n| matches!(n, Note::Read(_))).collect();
+        assert_eq!(read_notes, [&Note::Read("/w/src/a.rs".into()), &Note::Read("/w/n.ipynb".into())]);
+        assert!(claude.contains(&Note::Touched("/w/src/b.rs".into())));
     }
 
     #[test]
