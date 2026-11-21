@@ -48,9 +48,10 @@ Between turns it starts a fresh native conversation only when the inline record
 is estimated to be at most half the previous context. This does not interrupt or
 bound a long agent turn already in progress.
 
-For Codex the effective between-turn threshold is the lower of that and three quarters of its in-turn compaction
-limit: 48,000 by default, or three quarters of your own `model_auto_compact_token_limit`. A turn policy's `handoff_at`
-is used exactly. `RINGO_CONTEXT=adaptive` (opt-in, not yet evaluated, no saving claimed) replaces the size test with a
+For Codex that is also its in-turn compaction limit, so by default a resumed Codex thread is not started fresh
+between turns. An earlier build used 48,000 for Codex; an offline replay of the owner's traces (an estimate) found it
+cut raw input by about 3% but raised credit-weighted cost, since a fresh start trades cached carry for an uncached
+record. A turn policy's `handoff_at` is used exactly. `RINGO_CONTEXT=adaptive` (opt-in, not yet evaluated, no saving claimed) replaces the size test with a
 token cost model at the start of each read turn, `static` (the default) logs a `ctx ... (shadow)` line when it would
 have decided differently, and `off` never starts an existing thread fresh. None of these adds a model call. See
 [One conversation](SHELL.md#one-conversation-and-a-fresh-start-past-64k).

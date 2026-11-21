@@ -612,8 +612,7 @@ The update is put where the running `ringo` is when the shell ends or restarts. 
 pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
 terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on as it would have
 without the restart: Ringo hands on how full each conversation is and its own record of it. On its first turn, each
-agent is told the turns it had not heard yet, or, if its conversation is past its handoff size (48k for Codex, 64k for
-Claude by default), starts fresh from the record (see
+agent is told the turns it had not heard yet, or, if its conversation is past its handoff size (64k by default), starts fresh from the record (see
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)); a later fresh start
 still begins with the turns before the restart. Until 11/07 the size was not handed on, so a long conversation went
 on after every restart: two turns on 11/04 re-read 98k and 155k tokens at every call. Ringo keeps the three newest versions and any version an open
@@ -783,17 +782,19 @@ the turn ended at its next turn. When an agent's window passes
 it), its next turn does not resume: it starts fresh from the record of the whole conversation, if the record is at
 most half that size. The turn's log says which of these happened and how big the record is.
 
-For Codex the threshold is lower than 64,000 by default: Ringo runs Codex with an in-turn compaction limit L of
-64,000 (`CODEX_COMPACT_AT`), and a conversation that reaches L is compacted there and reports less afterwards, so a
-handoff at L would almost never fire (a dead zone: one measured thread ran 31 turns with no fresh start). The effective
-threshold is the lower of 64,000 and three quarters of L: 48,000 by default. If you set your own integer
-`model_auto_compact_token_limit` in Codex's `config.toml`, L is that number (30,000 for 40,000); if Ringo cannot read it
-as an integer, it keeps 64,000 and says once per session that the handoff may be unreachable. When a turn policy (or
+For Codex, 64,000 is also its in-turn compaction limit (`CODEX_COMPACT_AT`): a conversation that reaches it is
+compacted there and reports less afterwards, so in the default mode a resumed Codex thread is not started fresh
+between turns (one measured thread ran 31 turns with no fresh start). That is deliberate. An earlier build lowered
+Codex's threshold to 48,000 (three quarters of the limit); an offline replay of the owner's own traces (53 turns, about
+1,040 calls; an estimate, not a measurement) found that it cut raw input by about 3% while raising credit-weighted cost
+by 0.3% to 1.9%, because a fresh start replaces carry that Codex re-reads from cache (2.5 credits per million on
+GPT-6.1 Sol) with an uncached record (50 per million). So the default keeps the thread until a matched evaluation shows
+a rule that saves credits too; `RINGO_CONTEXT=adaptive` and a turn policy's `handoff_at` remain for that evaluation.
+When a turn policy (or
 `turnrun --handoff-at`) sets `handoff_at`, that number is used exactly, for every agent, whatever `RINGO_CONTEXT` says
 (only a policy that itself names `"context": "adaptive"` hands the decision to the cost model, its number then being the
-fallback until a base is measured). A brokered evaluation run gives Codex no in-turn limit, so the three-quarters rule
-does not apply there.
-Claude's threshold stays 64,000. agy reports no context, so it never hands off.
+fallback until a base is measured).
+Claude's threshold is 64,000 too. agy reports no context, so it never hands off.
 
 `RINGO_CONTEXT`, read when the session opens, chooses how the between-turn decision is made for Codex and Claude
 threads that can be resumed:

@@ -702,7 +702,6 @@ pub struct Session {
     /// The context mode came from the turn policy (an evaluation arm), not from RINGO_CONTEXT.
     context_from_policy: bool,
     /// Whether the log already said that the Codex handoff may be unreachable (once per session).
-    unreachable_said: bool,
     /// Each agent's fixed base, as its last three fresh conversations measured it.
     bases: HashMap<Agent, VecDeque<u64>>,
     turn_policy: turn_policy::TurnPolicy,
@@ -1166,7 +1165,7 @@ impl Session {
                      selected_task: None, selected_task_error: None, max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(), thread_models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
-                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, handoff_pinned: false, context_mode, context_note, context_from_policy: false, unreachable_said: false,
+                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, handoff_pinned: false, context_mode, context_note, context_from_policy: false,
                      bases: HashMap::new(), turn_policy: Default::default(), separate: false,
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
@@ -1564,35 +1563,14 @@ impl Session {
             .any(|l| l.trim_start().strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))))
     }
 
-    /// The in-turn compaction limit Codex runs with: Ringo's `CODEX_COMPACT_AT`, or the owner's own integer in
-    /// config.toml (None when they set it to something that is not an integer).
-    fn codex_limit(&self) -> Option<u64> {
-        const KEY: &str = "model_auto_compact_token_limit";
-        if !self.codex_sets(KEY) {
-            return Some(CODEX_COMPACT_AT);
-        }
-        let text = fs::read(self.codex_home.join("config.toml")).ok().map(|b| String::from_utf8_lossy(&b).into_owned())?;
-        let value = text.lines().find_map(|l| l.trim_start().strip_prefix(KEY).and_then(|r| r.trim_start().strip_prefix('=')))?;
-        value.split('#').next()?.trim().replace('_', "").parse().ok()
-    }
-
-    /// The between-turn size past which `agent`'s next turn starts fresh from the record, and whether that number
-    /// could not be made sound. An owner's pinned `handoff_at` is used exactly. For Codex otherwise, a conversation
-    /// that reaches the in-turn limit L is compacted there (its fills drop), so a handoff at or above L would never
-    /// fire: the threshold is the lower of `handoff_at` and 3/4 of L.
-    fn static_threshold(&self, agent: Agent) -> (u64, bool) {
-        // a brokered trial's Codex is given no in-turn limit (see the launch), so it has no dead zone to avoid
-        #[cfg(feature = "turnrun")]
-        let brokered = self.trial_broker.is_some();
-        #[cfg(not(feature = "turnrun"))]
-        let brokered = false;
-        if self.handoff_pinned || agent.spec().adapter != Adapter::Codex || brokered {
-            return (self.handoff_at, false);
-        }
-        match self.codex_limit() {
-            Some(limit) => (self.handoff_at.min(limit / 4 * 3), false),
-            None => (self.handoff_at, true),
-        }
+    /// The between-turn size past which `agent`'s next turn starts fresh from the record: `handoff_at`, for every
+    /// agent, as before the cost model. For Codex that is at its in-turn compaction limit, so in the default mode it
+    /// does not start a resumed thread fresh between turns: a fresh start turns cached carry (0.05x in plan credits)
+    /// into an uncached record, and the offline replay of the owner's traces found an earlier Codex threshold (48k)
+    /// cutting raw input by about 3% while raising credit-weighted cost. A turn policy's `handoff_at` sets an earlier
+    /// one; `RINGO_CONTEXT=adaptive` uses the cost model.
+    fn static_threshold(&self, _agent: Agent) -> u64 {
+        self.handoff_at
     }
 
     fn codex_told_to_use_ringo(&self) -> bool {
@@ -1725,15 +1703,10 @@ impl Session {
     /// a summary. The record uncut goes in the job's folder.
     fn handoff(&mut self, id: usize, agent: Agent, resume: &mut Option<String>, prompt: &str) -> Option<(String, String)> {
         let fills = self.context.get(&agent).copied().unwrap_or(0);
-        let (threshold, unreadable) = self.static_threshold(agent);
+        let threshold = self.static_threshold(agent);
         let mut notes: Vec<String> = Vec::new();
         if let Some(bad) = self.context_note.take() {
             notes.push(format!("RINGO_CONTEXT={bad} is not static, adaptive or off: the default mode is used"));
-        }
-        if unreadable && !self.unreachable_said {
-            self.unreachable_said = true;
-            notes.push(format!("model_auto_compact_token_limit in codex's config.toml is not a number Ringo can read: \
-                                the handoff at {} may be unreachable", fmt_k(self.handoff_at)));
         }
         let (mode, pinned) = (self.context_mode, self.handoff_pinned);
         let eligible = matches!(agent.spec().adapter, Adapter::Codex | Adapter::Claude);
@@ -4651,7 +4624,7 @@ mod tests {
 
     #[test]
     fn a_fresh_start_of_a_thread_in_use_carries_the_older_replies_whole_as_the_cap_allows() {
-        for (mode, fills, base) in [(context_policy::Mode::Static, 50_000, None),
+        for (mode, fills, base) in [(context_policy::Mode::Static, 70_000, None),
                                     (context_policy::Mode::Adaptive, 56_000, Some(13_000))] {
             let (mut s, agent) = ctx_session("codex", fills);
             s.context_mode = mode;
@@ -4931,51 +4904,35 @@ mod tests {
     }
 
     #[test]
-    fn codex_in_the_default_mode_starts_fresh_at_50k_and_not_at_40k() {
+    fn codex_in_the_default_mode_resumes_below_handoff_at_as_before_the_cost_model() {
+        // 50k is past the 48k an earlier build used, and under handoff_at: the thread is resumed
         let (mut s, agent) = ctx_session("codex", 50_000);
-        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
-        assert!(fresh, "{log}");
-        assert!(!log.contains("ctx codex"), "no shadow line when the verdicts agree: {log}");
-        let (mut s, agent) = ctx_session("codex", 40_000);
+        assert_eq!(s.static_threshold(agent), HANDOFF_AT);
         assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        // the owner's own in-turn limit does not move it either
+        let (mut s, agent) = ctx_session("codex", 35_000);
+        fs::write(s.codex_home.join("config.toml"), "model_auto_compact_token_limit = 40_000\n").unwrap();
+        assert_eq!(s.static_threshold(agent), HANDOFF_AT);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        // past handoff_at it starts fresh, as it always did
+        let (mut s, agent) = ctx_session("codex", HANDOFF_AT + 1);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
     }
 
     #[test]
     fn a_pinned_policy_handoff_is_used_exactly() {
         let (mut s, agent) = ctx_session("codex", 50_000);
-        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 64000})).unwrap());
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 48000})).unwrap());
         assert!(s.handoff_pinned);
-        assert_eq!(s.static_threshold(agent), (64_000, false));
-        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0, "50k is under the owner's 64k");
-        s.context.insert(agent, 64_001);
-        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        assert_eq!(s.static_threshold(agent), 48_000);
+        s.context.insert(agent, 40_000);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0, "40k is under the owner's 48k");
+        s.context.insert(agent, 50_000);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0, "50k is past the owner's 48k");
         // a policy without handoff_at pins nothing
         s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"instruction": "x"})).unwrap());
         assert!(!s.handoff_pinned);
-        assert_eq!(s.static_threshold(agent), (48_000, false));
-    }
-
-    #[test]
-    fn the_owners_own_codex_limit_sets_the_threshold_to_three_quarters_of_it() {
-        let (mut s, agent) = ctx_session("codex", 35_000);
-        fs::write(s.codex_home.join("config.toml"), "model = \"x\"\nmodel_auto_compact_token_limit = 40_000 # mine\n").unwrap();
-        assert_eq!(s.static_threshold(agent), (30_000, false));
-        assert_eq!(s.static_threshold(Agent::from_name("claude").unwrap()), (64_000, false));
-        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
-        // a limit above 85k leaves handoff_at alone
-        fs::write(s.codex_home.join("config.toml"), "model_auto_compact_token_limit=200000\n").unwrap();
-        assert_eq!(s.static_threshold(agent), (64_000, false));
-    }
-
-    #[test]
-    fn an_unreadable_codex_limit_keeps_handoff_at_and_says_so_once() {
-        let (mut s, agent) = ctx_session("codex", 50_000);
-        fs::write(s.codex_home.join("config.toml"), "model_auto_compact_token_limit = \"lots\"\n").unwrap();
-        assert_eq!(s.static_threshold(agent), (64_000, true));
-        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
-        assert!(!fresh && log.contains("may be unreachable"), "{log}");
-        let (_, again) = ctx_next(&mut s, agent, "fix the failing tests");
-        assert!(!again.contains("may be unreachable"), "{again}");
+        assert_eq!(s.static_threshold(agent), HANDOFF_AT);
     }
 
     #[test]
@@ -5017,10 +4974,10 @@ mod tests {
             assert!(fresh && log.contains("(cold)"), "{log}");
         }
         // without a measured base it is the static rule, and says so
-        let (mut s, agent) = ctx_session("codex", 50_000);
+        let (mut s, agent) = ctx_session("codex", 70_000);
         s.context_mode = context_policy::Mode::Adaptive;
         let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
-        assert!(fresh && log.contains("ctx codex: fresh — no base yet: static 48k"), "{log}");
+        assert!(fresh && log.contains("ctx codex: fresh — no base yet: static 64k"), "{log}");
         // Claude too
         let (mut s, agent) = ctx_session("claude", 56_000);
         s.context_mode = context_policy::Mode::Adaptive;
@@ -5101,7 +5058,7 @@ mod tests {
 
     #[test]
     fn an_unknown_mode_is_the_default_with_one_log_line() {
-        let (mut s, agent) = ctx_session("codex", 50_000);
+        let (mut s, agent) = ctx_session("codex", 70_000);
         s.context_note = Some("sometimes".into());
         let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
         assert!(fresh && log.contains("RINGO_CONTEXT=sometimes"), "{log}");
@@ -5110,15 +5067,14 @@ mod tests {
 
     #[test]
     fn the_shadow_line_appears_only_when_the_verdicts_differ() {
-        // static says fresh at 50k; one call per turn, the cost model says the saving is below its margin: differ
+        // static resumes at 50k (under 64k); five calls per turn, warm, the cost model says fresh: differ
         let (mut s, agent) = ctx_session("codex", 50_000);
         s.bases.insert(agent, VecDeque::from([13_000]));
-        s.jobs[0].calls = 1;
         let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
-        assert!(fresh, "the shadow never changes what the static rule did");
-        assert!(log.contains("ctx codex (shadow): adaptive would resume — fills 50.0k base 13.0k"), "{log}");
+        assert!(!fresh, "the shadow never changes what the static rule did");
+        assert!(log.contains("ctx codex (shadow): adaptive would fresh — fills 50.0k base 13.0k"), "{log}");
         // both say fresh
-        let (mut s, agent) = ctx_session("codex", 56_000);
+        let (mut s, agent) = ctx_session("codex", 70_000);
         s.bases.insert(agent, VecDeque::from([13_000]));
         let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
         assert!(fresh && !log.contains("shadow"), "{log}");
