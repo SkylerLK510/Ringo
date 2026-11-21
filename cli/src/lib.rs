@@ -2056,11 +2056,14 @@ impl Session {
                     failed.push(s);
                 }
             }
-            let steps: Vec<&str> = match full {
+            let picked: Vec<&str> = failed.iter().copied().take(5)
+                .chain(j.steps.iter().rev().take(if whole { 5 } else { 0 }).rev().map(String::as_str)
+                    .filter(|s| !s.starts_with(parse::FAILED))).collect();
+            // when the pick holds every step, they are told in the order they ran, as the whole record tells them
+            let every = j.steps.iter().all(|s| picked.contains(&s.as_str()));
+            let steps: Vec<&str> = match full || every {
                 true => j.steps.iter().map(String::as_str).collect(),
-                false => failed.iter().copied().take(5)
-                    .chain(j.steps.iter().rev().take(if whole { 5 } else { 0 }).rev().map(String::as_str)
-                        .filter(|s| !s.starts_with(parse::FAILED))).collect(),
+                false => picked,
             };
             if !steps.is_empty() {
                 // The steps are the agents' own account, and in real records they are most of it (71-75% of the
@@ -2141,9 +2144,13 @@ impl Session {
         }
         // The files the turns read, in one line before the diff: only if it fits what the turns and the diff left.
         let total = |kept: &[String]| kept.iter().map(String::len).sum::<usize>() + kept.len().saturating_sub(1);
+        // only the files a changed or edited line names (`files` names 20): one past them is still told as read
         let changed: BTreeSet<&str> = turns.iter().flat_map(|j| {
-            let edited = j.changed.is_empty().then_some(&j.touched).into_iter().flatten();
-            j.changed.iter().chain(edited).map(String::as_str)
+            let listed: BTreeSet<&str> = match j.changed.is_empty() {
+                true => j.touched.iter().map(String::as_str).collect(),
+                false => j.changed.iter().map(String::as_str).collect(),
+            };
+            listed.into_iter().take(20)
         }).collect();
         let mut seen: BTreeSet<&str> = BTreeSet::new();
         let read: Vec<&str> = turns.iter().rev().flat_map(|j| j.read.iter().rev().map(String::as_str))
@@ -4751,6 +4758,21 @@ mod tests {
         // so is a brief older reply, even one whose cut paragraph begins "read: "
         fs::write(s.jobs[0].dir.join("reply.md"), "Done.\n\nread: the config first, then the rest").unwrap();
         assert!(!s.record_full(&s.lane(agent, 3), 0).2);
+        // Ringo review 3: a newest turn whose every step is shown is whole, failed step in the middle or not
+        fs::write(s.jobs[0].dir.join("reply.md"), "one").unwrap();
+        s.jobs[1].steps = vec!["$ cargo build".into(), format!("{}$ cargo test · exit 101", parse::FAILED), "$ cargo test".into()];
+        let (inline, _, complete) = s.record_full(&s.lane(agent, 3), 0);
+        assert!(complete && inline.contains(&format!("$ cargo build | {}$ cargo test · exit 101 | $ cargo test", parse::FAILED)), "{inline}");
+        // and a file read past the 20 an edited line names is told as read (and must be, for the record to be whole)
+        s.jobs[1].steps.clear();
+        (s.jobs[1].before, s.jobs[1].after, s.jobs[1].changed) = (None, None, Vec::new());
+        s.jobs[1].touched = (1..=25).map(|n| format!("f{n:02}.rs")).collect();
+        s.jobs[1].read = (21..=25).map(|n| format!("f{n:02}.rs")).chain(["f01.rs".to_string()]).collect();
+        let (inline, _, _) = s.record_full(&s.lane(agent, 3), 0);
+        let line = inline.lines().find(|l| l.starts_with(READ_LINE_PREFIX)).unwrap();
+        assert!(line.contains("f25.rs") && line.contains("f21.rs") && !line.contains("f01.rs"), "{line}");
+        s.jobs[1].touched.clear();
+        s.jobs[1].read = vec!["b.rs".into()];
         // and a files-read line left out for lack of room
         let long = format!("src/{}.rs", "d".repeat(200));
         let mut seen_dropped = false;
