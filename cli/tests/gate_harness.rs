@@ -375,7 +375,7 @@ fn root() -> PathBuf {
 }
 
 fn python(mode: &str, cases: &[Value]) -> Vec<String> {
-    let mut child = Command::new("python3")
+    let mut child = Command::new(ringo_cli::python())
         .arg("-c")
         .arg(DRIVER)
         .arg(root())
@@ -509,7 +509,7 @@ fn sha_bytes(data: &[u8]) -> String {
     match std::str::from_utf8(data) {
         Ok(s) => h::sha(s),
         Err(_) => {
-            let out = Command::new("python3")
+            let out = Command::new(ringo_cli::python())
                 .args(["-c", "import hashlib,sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())"])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -1766,7 +1766,7 @@ fn corpus_files(stdlib_every: usize) -> Vec<PathBuf> {
     let listed = Command::new("git").args(["ls-files"]).current_dir(root()).output().unwrap();
     let mut files: Vec<PathBuf> =
         String::from_utf8(listed.stdout).unwrap().lines().map(|l| root().join(l)).filter(|p| p.is_file()).collect();
-    let stdlib = Command::new("python3").args(["-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"]).output().unwrap();
+    let stdlib = Command::new(ringo_cli::python()).args(["-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"]).output().unwrap();
     let stdlib = PathBuf::from(String::from_utf8(stdlib.stdout).unwrap().trim());
     let mut found = vec![];
     let mut stack = vec![stdlib];
@@ -2146,7 +2146,7 @@ fn run_plan_matches_python_on_scripted_call_sequences() {
 
 /// The Python interpreter's own path, so both runtimes start the same stand-in programs.
 fn python_exe() -> String {
-    let out = Command::new("python3").args(["-c", "import sys; print(sys.executable)"]).output().unwrap();
+    let out = Command::new(ringo_cli::python()).args(["-c", "import sys; print(sys.executable)"]).output().unwrap();
     String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
@@ -2394,7 +2394,7 @@ fn cli_help_errors_and_refusals_match_ringo_py() {
     let run = |python: bool, argv: &[String], columns: &str| -> String {
         let _ = fs::remove_file(work.join("f.json"));
         let mut cmd = if python {
-            let mut c = Command::new("python3");
+            let mut c = Command::new(ringo_cli::python());
             c.arg(root().join("ringo.py"));
             c
         } else {
@@ -2439,7 +2439,7 @@ fn interrupted_run(python: bool, base: &Path) -> (Option<i32>, Value) {
     let pids = dir.join("pids");
     let backend = format!("{} -c {} {}", python_exe(), shell_quote(HANG), shell_quote(&pids.to_string_lossy()));
     let mut cmd = if python {
-        let mut c = Command::new("python3");
+        let mut c = Command::new(ringo_cli::python());
         c.arg(root().join("ringo.py"));
         c
     } else {

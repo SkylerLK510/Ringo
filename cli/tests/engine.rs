@@ -205,7 +205,7 @@ fn agents_get_no_api_keys_and_cannot_start_ringo() {
     assert!(env.lines().any(|l| l == "RINGO_CHILD=1"));
     let ringo = Command::new(env!("CARGO_BIN_EXE_ringo")).arg("--help").env("RINGO_CHILD", "1").output().unwrap();
     assert_eq!(ringo.status.code(), Some(2));
-    let python = Command::new("python3").arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../ringo.py"))
+    let python = Command::new(ringo_cli::python()).arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../ringo.py"))
         .arg("--help").env("RINGO_CHILD", "1").output().unwrap();
     assert_eq!(python.status.code(), Some(2), "ringo.py refuses too");
 }

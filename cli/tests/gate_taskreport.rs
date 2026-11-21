@@ -43,7 +43,7 @@ fn fixtures() -> Vec<Value> {
 fn reports_match_python_on_accounting_edge_cases() {
     let cases = fixtures();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
-    let mut child = Command::new("python3").args(["-c", r#"
+    let mut child = Command::new(ringo_cli::python()).args(["-c", r#"
 import json, sys
 sys.path.insert(0, sys.argv[1])
 import taskreport

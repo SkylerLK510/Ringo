@@ -53,6 +53,12 @@ python3 -m unittest discover -s tests -q
 cargo test --manifest-path cli/Cargo.toml --locked --all-features --no-fail-fast
 ```
 
+The Rust parity gates compare the Rust runtime with Python's own behaviour, which changes between patch releases
+(for example, Python 3.14.4's json scanner and argparse error texts differ from 3.14.7 and later). They run the
+interpreter named by `RINGO_PYTHON`, else `python3`; CI's Rust jobs use the latest Python 3.14. If your `python3` is
+older, point `RINGO_PYTHON` at a current 3.14 (for example one installed with `uv python install 3.14`) for the cargo
+run.
+
 CI runs Python on macOS, Linux and Windows with Python 3.11/3.14; Rust on all three
 platforms; and a separate Linux containment job. Docker-dependent tests can skip when
 their pinned images are absent. Native replay and scenario coverage also need the

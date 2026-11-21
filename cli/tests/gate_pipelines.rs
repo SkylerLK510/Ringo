@@ -78,7 +78,7 @@ fn root() -> PathBuf {
 /// Each case's `json.dumps` line from the Python module.
 fn python(cases: &[(String, Vec<Value>)]) -> Vec<String> {
     let input: Vec<Value> = cases.iter().map(|(op, args)| json!([op, args])).collect();
-    let mut child = Command::new("python3")
+    let mut child = Command::new(ringo_cli::python())
         .arg("-I")
         .arg("-c")
         .arg(DRIVER)
@@ -537,7 +537,7 @@ def runs(p):
 cands = sorted({c for c in s if any(x.isascii() and x.isalpha() for x in c.lower() + c.upper() + c.casefold())})
 print(json.dumps([runs(r'\w+'), runs(r'\s+'), runs(r'\d+'), cands]))
 "#;
-    let out = Command::new("python3").arg("-I").arg("-c").arg(script).output().unwrap();
+    let out = Command::new(ringo_cli::python()).arg("-I").arg("-c").arg(script).output().unwrap();
     assert!(out.status.success());
     let want = pyjson::loads(&String::from_utf8(out.stdout).unwrap()).unwrap();
     let runs = |p: &str| -> Value {
@@ -986,7 +986,7 @@ fn explicit_plans() -> Vec<Value> {
 /// Whether Python's json.loads accepts each document.
 fn python_parses(docs: &[String]) -> Vec<bool> {
     let script = "import json, sys\nfor d in json.load(sys.stdin):\n    try:\n        json.loads(d); print(1)\n    except ValueError:\n        print(0)\n";
-    let mut child = Command::new("python3").args(["-I", "-c", script]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    let mut child = Command::new(ringo_cli::python()).args(["-I", "-c", script]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
     let text = pyjson::dumps(&json!(docs));
     let mut stdin = child.stdin.take().unwrap();
     let writer = std::thread::spawn(move || stdin.write_all(text.as_bytes()));
@@ -1101,7 +1101,7 @@ fn plan_files_match_python() {
 /// Text corpora for the sweeps: repository files, every commit's message and patch, and the Python standard library.
 fn corpus() -> Vec<String> {
     let mut out = Vec::new();
-    let stdlib = Command::new("python3").args(["-I", "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"]).output().unwrap();
+    let stdlib = Command::new(ringo_cli::python()).args(["-I", "-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"]).output().unwrap();
     let stdlib = PathBuf::from(String::from_utf8(stdlib.stdout).unwrap().trim());
     let mut stack = vec![root(), stdlib];
     while let Some(dir) = stack.pop() {
