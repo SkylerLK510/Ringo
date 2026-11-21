@@ -251,7 +251,8 @@ fn run_set(set: Set) -> Run {
         session.set_turn_policy(policy);
     }
     if let Some(n) = set.handoff_at {
-        session.handoff_at = n; // Phase 3 probes the handoff threshold through this flag
+        session.handoff_at = n;
+        session.handoff_pinned = true; // Phase 3 probes the handoff threshold through this flag
     }
     let Some(program) = &set.program else {
         return Err((json!({"outcome": "refused",

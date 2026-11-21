@@ -41,7 +41,9 @@ add a dark mode switch to the settings page
 - The agent remembers the conversation, so you can follow up with "now add a test for it" or "why did you do that?".
   `/clear` starts a new conversation.
 - A long conversation costs more with every call, because the agent reads all of it again each time. Once it passes
-  64,000 tokens, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
+  48,000 tokens for Codex (the lower of 64,000 and three quarters of your own `model_auto_compact_token_limit` if you
+  set one) or 64,000 for
+  Claude, the next turn starts fresh from Ringo's own record of it instead: your messages word for word, each
   reply, the steps taken, the files changed and the change itself. No extra call writes it, and the turn's log says
   when it happens. Within one turn, Codex also compacts at a 64,000-token context threshold; Claude uses its
   minimum 100,000-token window, minus its own output reserve and compaction headroom. Your explicit native
@@ -350,6 +352,12 @@ after every turn, so a crash loses at most the turn it cut short.
 | `/usage` | what you have used, and how much of your plans is left |
 | `/theme NAME` | colours: siamese, siamese-light, pink, midnight or mono |
 | `/quit` | leave |
+
+Long conversations start fresh from Ringo's record once an agent's window is large (Codex past 48k, Claude past
+64k). Set `RINGO_CONTEXT=adaptive` before starting Ringo to try a cost-based rule instead, `RINGO_CONTEXT=off` to never
+start an existing conversation fresh on its own; unset is the default, which only logs what the adaptive rule would
+have done (`ctx ... (shadow)`). Adaptive is experimental and no saving is claimed for it yet; see
+[One conversation](SHELL.md#one-conversation-and-a-fresh-start-past-64k).
 
 When a newer Ringo is there, the top line says so until you have it: `↑ update ready · /restart` when Ringo has
 built it for you, or `↑ update available · /update` when your copy is one you update yourself, and `/update` then

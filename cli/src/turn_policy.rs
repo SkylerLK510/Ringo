@@ -6,13 +6,15 @@ pub struct TurnPolicy {
     pub(crate) instruction: String,
     pub(crate) handoff_instruction: String,
     pub(crate) handoff_at: Option<u64>,
+    /// The context mode an evaluation arm runs (`static`, `adaptive`, `off`); None leaves RINGO_CONTEXT's.
+    pub(crate) context: Option<crate::context_policy::Mode>,
 }
 
 impl TurnPolicy {
     pub fn from_json(value: &Value) -> Result<Self, String> {
         let obj = value.as_object().ok_or("policy must be an object")?;
         for key in obj.keys() {
-            if !["instruction", "handoff_instruction", "handoff_at"].contains(&key.as_str()) {
+            if !["instruction", "handoff_instruction", "handoff_at", "context"].contains(&key.as_str()) {
                 return Err(format!("{key} is outside the editable policy"));
             }
         }
@@ -29,7 +31,16 @@ impl TurnPolicy {
             Some(value) => Some(value.as_u64().filter(|n| (16_000..=128_000).contains(n))
                 .ok_or("handoff_at must be an integer from 16000 through 128000")?),
         };
-        Ok(Self { instruction: text("instruction")?, handoff_instruction: text("handoff_instruction")?, handoff_at })
+        let context = match obj.get("context") {
+            None => None,
+            Some(value) => match value.as_str() {
+                Some("static") => Some(crate::context_policy::Mode::Static),
+                Some("adaptive") => Some(crate::context_policy::Mode::Adaptive),
+                Some("off") => Some(crate::context_policy::Mode::Off),
+                _ => return Err("context must be \"static\", \"adaptive\" or \"off\"".into()),
+            },
+        };
+        Ok(Self { instruction: text("instruction")?, handoff_instruction: text("handoff_instruction")?, handoff_at, context })
     }
 }
 

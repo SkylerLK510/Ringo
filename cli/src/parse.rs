@@ -82,6 +82,8 @@ pub enum Note {
     Call,
     /// The agent is editing this file (as the agent reported it, usually an absolute path).
     Touched(String),
+    /// The agent read this file (as the agent reported it, usually an absolute path): the working set of the turn.
+    Read(String),
     /// The agent ran a shell command, which may have written files it does not report (see `Session::end_with`).
     Ran,
     /// The agent called one of the owner's connectors (an MCP tool): the conversation's next turn keeps them.
@@ -130,6 +132,9 @@ pub struct Parser {
     /// usage, so each id counts once. The sum is 93% of the turn's own count on a real 452.9k-token turn (a message's
     /// output tokens are reported before it is written).
     seen: Vec<(String, Tokens)>,
+    /// Codex: this turn's id once its turn/start is answered. A resumed thread first replays the previous turn's
+    /// usage (tagged with that turn's id), which is no model call of this turn.
+    turn_now: String,
     /// Claude reported a compaction (`/compact`), whose result may carry no text.
     compacted: bool,
     /// agy's model calls' counts so far (`step_update` usage): the running turn's own total, told live.
@@ -320,7 +325,7 @@ impl Parser {
 
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
+                 seen: Vec::new(), turn_now: String::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
                  total: Tokens::default() }
     }
@@ -420,6 +425,7 @@ impl Parser {
                 return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
             }
             if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
+                self.turn_now = turn.to_string();
                 return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
             }
             return Vec::new();
@@ -467,6 +473,11 @@ impl Parser {
                     let mark = if how.is_empty() { "" } else { FAILED };
                     notes.push(Note::Step(format!("{mark}$ {}{how}", short(bare_command(s(item, "command")), 300))));
                     notes.push(Note::Ran);
+                }
+                // The files a command that went through read: the turn's working set.
+                if how.is_empty() {
+                    notes.extend(actions.iter().filter(|a| s(a, "type") == "read" && !s(a, "path").is_empty())
+                        .map(|a| Note::Read(s(a, "path").to_string())));
                 }
             }
             ("item/started" | "item/completed", "fileChange") => {
@@ -528,7 +539,15 @@ impl Parser {
             // reached 14.8M tokens, one making 255 model calls that re-read ~176k cached tokens each, compacting
             // only 3 times (the shell's ledger: 264M tokens for claude and 149M for codex, 96% of it cache reads).
             ("thread/tokenUsage/updated", _) => {
-                self.usage = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                let total = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                // each model call of this turn reports a new total; a repeated one is the same call, and one before
+                // the turn is known, or tagged with another turn, is a resumed thread's replay of its last turn
+                let tagged = p.get("turnId").and_then(Value::as_str);
+                if total != self.usage && p.pointer("/tokenUsage/last").is_some() && !self.turn_now.is_empty()
+                    && tagged.is_none_or(|t| t == self.turn_now) {
+                    notes.push(Note::Call);
+                }
+                self.usage = total;
                 if ["inputTokens", "outputTokens"].iter().all(|k| self.usage.get(k).and_then(Value::as_u64).is_some()) {
                     notes.push(Note::Live(self.thread_tokens()));
                 }
@@ -689,7 +708,14 @@ impl Parser {
                     match self.seen.iter_mut().find(|(seen, _)| seen == id) {
                         Some((_, before)) if t.total() > before.total() => *before = t,
                         Some(_) => {}
-                        None => self.seen.push((id.to_string(), t)),
+                        None => {
+                            self.seen.push((id.to_string(), t));
+                            // one model call per message (its content blocks repeat the id); the turn's own calls
+                            // only, as a subagent's read its own window
+                            if parent.is_none() {
+                                notes.push(Note::Call);
+                            }
+                        }
                     }
                     let mut so_far = Tokens::default();
                     self.seen.iter().for_each(|(_, t)| so_far.add(*t));
@@ -800,6 +826,12 @@ impl Parser {
         let mut notes = vec![Note::Activity { node: parent.clone(), text: format!("{name} {}", short(target, 70)) }];
         if matches!(name, "Edit" | "Write" | "MultiEdit" | "NotebookEdit") {
             notes.push(Note::Touched(s(input, "file_path").to_string()));
+        }
+        if matches!(name, "Read" | "NotebookRead") {
+            let path = if s(input, "file_path").is_empty() { s(input, "notebook_path") } else { s(input, "file_path") };
+            if !path.is_empty() {
+                notes.push(Note::Read(path.to_string()));
+            }
         }
         if name == "Bash" { // a subagent's command writes the same folder
             notes.push(Note::Ran);
@@ -1159,6 +1191,7 @@ mod tests {
         let notes: Vec<Note> = codex.iter().flat_map(|l| Parser::new(Style::Codex).line(l)).collect();
         assert_eq!(notes, [
             Note::Looked { kind: "read", text: "read a.rs".into() }, // only looked: no Ran
+            Note::Read("/w/a.rs".into()), // and the file it read is the working set
             Note::Step("$ cargo test".into()),
             Note::Ran,
             Note::Step("Edit a.rs · +1 −1\n- 1\n+ 2".into()),
@@ -1175,6 +1208,26 @@ mod tests {
         assert_eq!(step(change("add", "notes\n@@ -1 +1 @@\n-x\n", "completed")),
                    [Note::Step("Write q.sql · 3 lines\n+ notes\n+ @@ -1 +1 @@\n+ -x".into())]);
         assert_eq!(step(change("update", "", "failed")), [Note::Step("✗ edit".into())]);
+    }
+
+    #[test]
+    fn the_files_a_turn_read_are_noted() {
+        // Codex: a read action that went through names its file; a failed command's does not; a command without a path
+        let read = |code: i64, path: &str| format!(
+            r#"{{"method":"item/completed","params":{{"item":{{"type":"commandExecution","command":"sed -n 1,9p a.rs","exitCode":{code},"status":"completed","commandActions":[{{"type":"read","command":"sed -n 1,9p a.rs","name":"a.rs","path":"{path}"}}]}}}}}}"#);
+        let notes = |line: String| Parser::new(Style::Codex).line(&line);
+        assert!(notes(read(0, "/w/a.rs")).contains(&Note::Read("/w/a.rs".into())));
+        assert!(!notes(read(1, "/w/a.rs")).iter().any(|n| matches!(n, Note::Read(_))), "a failed command read nothing we know");
+        assert!(!notes(read(0, "")).iter().any(|n| matches!(n, Note::Read(_))), "no path, no file");
+        // Claude: Read and NotebookRead name their file; an edit is Touched, not Read
+        let call = |name: &str, input: &str| format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","id":"t","name":"{name}","input":{input}}}]}},"parent_tool_use_id":null}}"#);
+        let (r, n, e) = (call("Read", r#"{"file_path":"/w/src/a.rs"}"#), call("NotebookRead", r#"{"notebook_path":"/w/n.ipynb"}"#),
+                         call("Edit", r#"{"file_path":"/w/src/b.rs"}"#));
+        let claude = run(Style::Claude, &[r.as_str(), n.as_str(), e.as_str()]).1;
+        let read_notes: Vec<&Note> = claude.iter().filter(|n| matches!(n, Note::Read(_))).collect();
+        assert_eq!(read_notes, [&Note::Read("/w/src/a.rs".into()), &Note::Read("/w/n.ipynb".into())]);
+        assert!(claude.contains(&Note::Touched("/w/src/b.rs".into())));
     }
 
     #[test]
@@ -1384,6 +1437,22 @@ mod tests {
         assert!(notes.iter().any(|n| matches!(n, Note::Step(l) if l.contains("run_command refused"))));
         assert!(notes.contains(&Note::Reply("Fixed calc.py.".into())), "the reply is in the conversation");
         assert!(notes.contains(&Note::Tokens(Tokens { input: 37365, cache_read: 0, cache_write: 0, output: 827 })));
+    }
+
+    #[test]
+    fn codex_and_claude_count_one_call_per_model_request() {
+        // the adaptive context policy expects a turn's calls from these: before, only agy and pipelines counted any
+        let upd = |i: u64| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":1}},"last":{{"inputTokens":{i},"outputTokens":1}}}}}}}}"#);
+        let replay = r#"{"method":"thread/tokenUsage/updated","params":{"turnId":"OLD","tokenUsage":{"total":{"inputTokens":50,"outputTokens":1},"last":{"inputTokens":50,"outputTokens":1}}}}"#;
+        let answer = r#"{"id":3,"result":{"turn":{"id":"U"}}}"#;
+        let (_, notes) = run(Style::Codex, &[replay, answer, &upd(100), &upd(100), &upd(250)]);
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2,
+                   "a resumed thread's replay before the turn is none; a repeated total is the same call");
+        let msg = |id: &str, parent: &str, text: &str| format!(r#"{{"type":"assistant","parent_tool_use_id":{parent},"message":{{"id":"{id}","usage":{{"input_tokens":5,"output_tokens":1}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#);
+        let (_, notes) = run(Style::Claude, &[&msg("m1", "null", "a"), &msg("m1", "null", "b"), &msg("m2", "null", "c"),
+                                             &msg("s1", r#""toolu_1""#, "sub")]);
+        assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2,
+                   "one per message, whatever its blocks; a subagent's calls are its own");
     }
 
     #[test]

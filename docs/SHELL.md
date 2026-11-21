@@ -612,7 +612,8 @@ The update is put where the running `ringo` is when the shell ends or restarts. 
 pipelines it starts, stay on its own version. `/restart` (once no job runs) starts the new version in the same
 terminal, and what the screen showed comes back as plain text. Each agent's conversation goes on as it would have
 without the restart: Ringo hands on how full each conversation is and its own record of it. On its first turn, each
-agent is told the turns it had not heard yet, or, if its conversation is past 64k, starts fresh from the record (see
+agent is told the turns it had not heard yet, or, if its conversation is past its handoff size (48k for Codex, 64k for
+Claude by default), starts fresh from the record (see
 [One conversation, and a fresh start past 64k](#one-conversation-and-a-fresh-start-past-64k)); a later fresh start
 still begins with the turns before the restart. Until 11/07 the size was not handed on, so a long conversation went
 on after every restart: two turns on 11/04 re-read 98k and 155k tokens at every call. Ringo keeps the three newest versions and any version an open
@@ -782,6 +783,55 @@ the turn ended at its next turn. When an agent's window passes
 it), its next turn does not resume: it starts fresh from the record of the whole conversation, if the record is at
 most half that size. The turn's log says which of these happened and how big the record is.
 
+For Codex the threshold is lower than 64,000 by default: Ringo runs Codex with an in-turn compaction limit L of
+64,000 (`CODEX_COMPACT_AT`), and a conversation that reaches L is compacted there and reports less afterwards, so a
+handoff at L would almost never fire (a dead zone: one measured thread ran 31 turns with no fresh start). The effective
+threshold is the lower of 64,000 and three quarters of L: 48,000 by default. If you set your own integer
+`model_auto_compact_token_limit` in Codex's `config.toml`, L is that number (30,000 for 40,000); if Ringo cannot read it
+as an integer, it keeps 64,000 and says once per session that the handoff may be unreachable. When a turn policy (or
+`turnrun --handoff-at`) sets `handoff_at`, that number is used exactly, for every agent, whatever `RINGO_CONTEXT` says
+(only a policy that itself names `"context": "adaptive"` hands the decision to the cost model, its number then being the
+fallback until a base is measured). A brokered evaluation run gives Codex no in-turn limit, so the three-quarters rule
+does not apply there.
+Claude's threshold stays 64,000. agy reports no context, so it never hands off.
+
+`RINGO_CONTEXT`, read when the session opens, chooses how the between-turn decision is made for Codex and Claude
+threads that can be resumed:
+
+- unset or `static`: the size test above. Ringo also works out what the adaptive rule below would have done and, only
+  when that differs from what happened, adds one line to the turn's log: `ctx codex (shadow): adaptive would resume —
+  fills 50.0k base 13.0k ...`. It never changes the turn; the lines are evidence for the evaluation.
+- `adaptive` (opt-in): the cost model replaces the size test. With the thread's fills `f`, the agent's fixed base `B`
+  (the first call of a fresh conversation, less what was sent, median of the last three), the record's size `R`
+  (bytes / 4, the exact text a fresh start would send) and `N`, the median model calls of the agent's last five read
+  turns that made any (5 until it has one; Codex counts a call per new token total, Claude per message): the saving per call is `0.75 (f - B) - R`, and the thread starts fresh when that is at least `R` (the record costs
+  at most half of the gross saving `0.75 (f - B)`; a start that only just pays throws the conversation away for
+  nothing) and `N` times it is at least 32,000 tokens (no margin once the idle time passes the assumed cache life: 30
+  minutes for Codex, 1 hour for Claude). Worked: f = 30k, N = 5, cold, B = 13k, R = 10k saves 12.75k - 10k = 2.75k, less
+  than R, so the thread resumes; f = 40k, N = 2, cold saves 20.25k - 10k = 10.25k, at least R, so it starts fresh, and
+  warm (2 x 10.25k < 32k) it resumes; f = 56k, N = 5, warm starts fresh. When only this condition fails, the log line
+  ends `: the saving does not cover twice the record`. Until a base is measured it is the size test (the guards below still come first). The
+  base includes the first call's own output (usually about a hundred tokens), so it reads slightly high. A Codex call
+  is counted only once the turn is known: a resumed thread first replays its previous turn's usage. The constants (0.25 re-read, 32,000 margin,
+  the cache lives) are assumptions from the proposal, not measurements. The log says what it did: `ctx codex: fresh —
+  fills 56.0k base 13.0k record 10.0k calls~5 save~111.2k idle 41m (cold)` (5 × (0.75 × 43.0k − 10.0k)). When the
+  model says fresh but the half-size rule below stops it, the line says so and keeps the inputs.
+  It resumes whatever the numbers say when the previous turn failed or was stopped (`guard: previous turn stopped or
+  failed`), when the owner's message only says to go on (a phrase such as "continue", or three words or fewer), or when
+  the previous turn was itself a fresh start. A pinned `handoff_at` overrides it (`ctx claude: resume — owner handoff_at
+  96k`). The half-size rule above applies in every mode.
+- `off`: an existing thread is never started fresh automatically (a new conversation still gets the record), unless a
+  pinned `handoff_at` says otherwise.
+
+An evaluation arm selects the mode in its turn policy instead (`"context": "static" | "adaptive" | "off"`), so the
+mode is part of the policy's digest; `turnrun` runs scrub `RINGO_CONTEXT` from the environment.
+- anything else: the default mode, with one log line naming the value.
+
+The decision is made once, as a read turn starts, from what the shell already holds: no model call, no timer. The bases
+and call history are kept in memory only, so after `/restart` the adaptive rule uses the size test until a fresh
+conversation measures a base. Adaptive stays opt-in until a matched evaluation shows it pays; no saving is claimed for
+it here.
+
 Ringo's own code writes the record, from what it keeps of each turn, with no model call, and rebuilds it from the
 originals every time, so it is never a summary of a summary:
 
@@ -795,11 +845,40 @@ originals every time, so it is never a summary of a summary:
   took about a fifth off the record uncut where the echoes dominated;
 - the files it changed, and whether `/undo` took them back; where git cannot say (a folder with no `/undo`, such as
   the home folder, or another turn at work here that ran commands), the files it said it edited;
+- the files the turns read, in one line before the diff: `files read (newest first; re-open what you need, they may
+  have changed since): a, b, c`. Paths only, no contents: the agents' reads and searches are otherwise only counted. It
+  is the union over the turns, newest read first, without the files a turn changed (already listed), at most 40 paths
+  and 3,000 bytes, ending ` and N more (in the whole record)` when cut, and it is left out when nothing was read or
+  the record has no room for it. The whole record gives each turn its own `read:` line with every file it read (each
+  turn remembers its last 200);
 - the change the turns made, as `git diff` from before the first to after the last, in those files only.
 
 The turns go in newest first, to about 60,000 characters (about 15,000 tokens); an older turn past that is named
-only. The record uncut is `record.md` in the turn's job folder, and the turn is told where it is. Inside a long
-turn, each agent's own compaction still applies.
+only. The record uncut is `record.md` in the turn's job folder, and the turn is told where it is; whenever anything
+in the inline record is cut, the whole record stays linked (except for agy outside read mode, which cannot open the
+job folder). Inside a long turn, each agent's own compaction still
+applies.
+
+A rich tier spends part of what a fresh start saves on detail the lean record cuts. Whether to start fresh is decided on
+the lean record (the size test, the half-size guard, the cost model and the shadow line all see its size); only then,
+when a conversation that is being replaced starts fresh, older turns kept in the brief form above are given
+their whole form (reply to 6,000 characters, last five steps), newest first, each only if its extra bytes fit in what
+is left of the cap, a turn that does not fit being skipped for an older one. The cap is `4 x 3/8 x (f - B)` bytes
+(`B` the measured base, or half of `f` before one is measured): the cost model counts `0.75 (f - B)` tokens saved per
+call, and the record may spend at most half of that. On a fresh start the cap is taken less what the text sent adds
+around the record (its opening sentence, the pointer to the whole record, any handoff instruction), so all of it stays
+within `3/8 (f - B)` tokens. When the cost model made the decision, the cap is also kept to what leaves `N` times the
+saving at the 32,000 margin (`0.75 (f - B) - ceil(32,000 / N)` tokens; no margin when cold), so the text sent is fresh by
+the same rule (f = 50k, B = 13k, N = 2, warm: 11,750 tokens, not 13,875). At f = 48k and B = 13k that is 52,500 bytes. Turns from
+before a `/restart` keep the room the lean record leaves them, and the rich tier gets only what is left of the cap; the
+record `/restart` hands on is the lean one (with the path of the uncut one), so the next shell's oldest carried turns
+keep their room. A record is "cut" (and links the whole record) by what it leaves out, as the record is built: a turn left
+out or shown short of its whole form, a files-read line that does not name every file read (or was left out for lack
+of room), a cut diff, or turns from before a restart that did not all fit. Its files-read line alone (one line inline,
+a `read:` line per turn in the whole record) is not a cut. The cap never takes the record past its 60,000 bytes, never
+drops the diff or the files-read line, and leaves the whole record as it was. A brand-new conversation, and the record
+of turns an agent missed, get the lean form. How the richer record changes the answers is not measured, and no saving
+or quality gain is claimed for it.
 
 Measured before release, in a pilot of 4 three-turn coding tasks for each agent with hidden checks, against
 resuming as before, with the threshold at 12k so that later turns started fresh (all 8 of Codex's later turns, 3 of
