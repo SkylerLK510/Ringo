@@ -25,7 +25,7 @@ fn root() -> PathBuf {
 fn python_exe() -> &'static str {
     static EXE: OnceLock<String> = OnceLock::new();
     EXE.get_or_init(|| {
-        let out = Command::new("python3").args(["-c", "import sys; print(sys.executable)"]).output().expect("python3");
+        let out = Command::new(ringo_cli::python()).args(["-c", "import sys; print(sys.executable)"]).output().expect("python3");
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     })
 }
@@ -994,6 +994,10 @@ fn run_case(case: &Case) -> (Seen, Seen) {
         ("LANG".into(), "en_US.UTF-8".into()),
         // Python on macOS adds this one to its own environment; giving it to both keeps the environments equal
         ("__CF_USER_TEXT_ENCODING".into(), format!("0x{:X}:0x0:0x0", unsafe { libc::getuid() })),
+        // Where the locale LANG names is not installed, Python coerces its own locale and adds LC_CTYPE=C.UTF-8 to
+        // its environment (PEP 538), which only the Python side would hand on; turning that off for both keeps the
+        // environments equal on such machines (seen on WSL without en_US.UTF-8)
+        ("PYTHONCOERCECLOCALE".into(), "0".into()),
         ("HOME".into(), home.to_string_lossy().into()),
         ("TMPDIR".into(), tmp.to_string_lossy().into()),
         ("RINGO_GATE_REQUEST".into(), request.to_string_lossy().into()),

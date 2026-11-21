@@ -2,6 +2,7 @@
 //! agent edits in private git worktrees until the owner applies them. The terminal shell (`ringo`) and, later,
 //! the IDE drive a `Session` and render its jobs.
 
+pub mod context_policy;
 pub mod evidence;
 pub mod framing;
 pub mod gateway;
@@ -64,6 +65,13 @@ impl<W: Write> EventLog<W> {
 /// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
 /// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
 const RECORD_BYTES: usize = 60_000;
+/// Files a job remembers it read (the working set the record names), the oldest dropped.
+const READ_FILES: usize = 200;
+/// The inline record's one line of files read: at most this many paths and bytes (the rest are in the whole record).
+const READ_LINE_PATHS: usize = 40;
+const READ_LINE_BYTES: usize = 3_000;
+/// How the inline record's line of files read opens.
+const READ_LINE_PREFIX: &str = "files read (newest first; re-open what you need, they may have changed since): ";
 /// How much of one step's text a record keeps (`Session::record`): the head says what ran; the step's whole text is
 /// in the job's events file either way.
 const STEP_CHARS: usize = 160;
@@ -518,6 +526,9 @@ pub struct Job {
     pub unchanged: bool,
     /// Files the job edited, relative to its working folder.
     pub touched: BTreeSet<String>,
+    /// Files the job read (`Note::Read`), relative to its working folder like `touched`, oldest read first: a file
+    /// read again moves to the end. At most `READ_FILES`, the oldest dropped.
+    pub read: Vec<String>,
     /// A turn in the owner's folder that could edit it: the folder's files as git trees before and after it (see
     /// `snapshot`), the files that differ, and whether /undo put them back.
     pub before: Option<String>,
@@ -575,6 +586,13 @@ pub struct Job {
     /// The native conversation state a fresh handoff replaced this turn. Restored when the turn fails before any
     /// provider call, so a refused launch leaves the conversation available for retry.
     fresh_rollback: Option<(String, Option<Tokens>, Option<u64>)>,
+    /// A read turn that began a new native conversation (no thread was resumed), and the bytes of the text sent to
+    /// it: its first context report, less this text, measures the agent's fixed base (`Session::bases`).
+    fresh_thread: bool,
+    sent_bytes: u64,
+    measured: bool,
+    /// The turn began from Ringo's record (a handoff), which the next turn's dwell guard reads.
+    started_fresh: bool,
 }
 
 impl Job {
@@ -706,6 +724,16 @@ pub struct Session {
     heard: HashMap<Agent, BTreeSet<usize>>,
     /// Past this, an agent's next turn starts fresh from Ringo's record instead (tests lower it).
     pub handoff_at: u64,
+    /// Whether the turn policy (or turnrun) set `handoff_at`: the owner's number is then used exactly, for every agent.
+    pub handoff_pinned: bool,
+    /// `RINGO_CONTEXT`, read once when the session opens (tests set the field).
+    pub context_mode: context_policy::Mode,
+    /// A line for the first read turn's log: the variable's value was not a mode.
+    context_note: Option<String>,
+    /// The context mode came from the turn policy (an evaluation arm), not from RINGO_CONTEXT.
+    context_from_policy: bool,
+    /// Each agent's fixed base, as its last three fresh conversations measured it.
+    bases: HashMap<Agent, VecDeque<u64>>,
     turn_policy: turn_policy::TurnPolicy,
     /// Evaluation-only transport to a controller-owned isolated native broker.
     #[cfg(feature = "turnrun")]
@@ -798,6 +826,41 @@ fn newest(record: &str, room: usize) -> String {
         .find(|&i| record.is_char_boundary(i)).unwrap_or(record.len());
     let kept = record[at..].split_once('\n').map_or("", |(_, rest)| rest);
     format!("{marker}{kept}")
+}
+
+/// The inline record's line of files the turns read, newest first (`files` are in that order, none repeated): at most
+/// `READ_LINE_PATHS` of them and `max` bytes in all, stopping before the path that would cross either, and ending
+/// with how many more are in the whole record when some are cut. Empty when nothing fits.
+fn read_line(files: &[&str], max: usize) -> (String, usize) {
+    let prefix = READ_LINE_PREFIX;
+    let tail = |more: usize| if more == 0 { String::new() } else { format!(" and {more} more (in the whole record)") };
+    let mut shown = String::new();
+    let mut count = 0;
+    for f in files.iter().take(READ_LINE_PATHS) {
+        let next = format!("{shown}{}{f}", if count == 0 { "" } else { ", " });
+        // the line, its newline and the tail it would then need
+        if prefix.len() + next.len() + tail(files.len() - count - 1).len() + 1 > max {
+            break;
+        }
+        shown = next;
+        count += 1;
+    }
+    match count {
+        0 => (String::new(), 0),
+        _ => (format!("{prefix}{shown}{}\n", tail(files.len() - count)), count),
+    }
+}
+
+/// How many bytes of detail a fresh start's record may add to its lean form (see `Session::record_with`).
+///
+/// The cost model counts `0.75 * (fills - base)` tokens saved on every call by a fresh start. The record may spend at
+/// most half of that (`3/8 * (fills - base)` tokens, 4 bytes each). The decision is made on the lean record and the
+/// handoff takes this cap less the text it adds around the record, so the whole text sent stays within it and cannot
+/// trip the half-size guard (`about * 2 <= fills`) or the cost model's cover condition. When the cost model decided,
+/// the handoff also keeps the cap to `context_policy::record_room` (its margin), so the text sent is fresh by the same
+/// rule. With no measured base, half of the conversation is assumed to be the fixed base.
+fn record_cap(fills: u64, base: Option<u64>) -> usize {
+    4 * (fills.saturating_sub(base.unwrap_or(fills / 2)) * 3 / 8) as usize
 }
 
 /// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
@@ -1126,12 +1189,14 @@ impl Session {
             },
         };
         let at_home = !home.as_os_str().is_empty() && home.starts_with(&repo);
+        let (context_mode, context_note) = context_policy::Mode::parse(std::env::var("RINGO_CONTEXT").ok().as_deref());
         let codex_home = std::env::var_os("CODEX_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".codex"));
         Ok(Session { repo, git: project.is_some(), index, branch, store, no_undo, at_home, codex_home, home: home.clone(), peers: Vec::new(), asker: std::env::current_exe().unwrap_or_default(), dir, jobs: Vec::new(),
                      selected_task: None, selected_task_error: None, max_jobs: 3,
                      backend: "codex-chatgpt".into(), models: HashMap::new(), thread_models: HashMap::new(),
                      ringo_home: ringo_home(), pipeline: None, programs, hold: None, threads: HashMap::new(), told: HashMap::new(), before: HashMap::new(), source: None, about: String::new(), reached_before: HashSet::new(),
-                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, turn_policy: Default::default(), separate: false,
+                     context: HashMap::new(), heard: HashMap::new(), handoff_at: HANDOFF_AT, handoff_pinned: false, context_mode, context_note, context_from_policy: false,
+                     bases: HashMap::new(), turn_policy: Default::default(), separate: false,
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
@@ -1181,6 +1246,12 @@ impl Session {
     /// Select an experimental policy explicitly. Normal sessions retain the exact default behavior.
     pub fn set_turn_policy(&mut self, policy: turn_policy::TurnPolicy) {
         self.handoff_at = policy.handoff_at.unwrap_or(HANDOFF_AT);
+        self.handoff_pinned = policy.handoff_at.is_some();
+        if let Some(mode) = policy.context {
+            // a policy names its context mode so a matched evaluation records and pins it (RINGO_CONTEXT does not)
+            self.context_mode = mode;
+            self.context_from_policy = true;
+        }
         self.turn_policy = policy;
     }
 
@@ -1288,7 +1359,9 @@ impl Session {
     pub fn carry_record(&self) -> Vec<(String, u64, String)> {
         Agent::all().into_iter().filter_map(|agent| {
             let fills = self.context.get(&agent).copied().unwrap_or(0);
-            let (record, whole) = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1));
+            // lean: the next shell gives the turns before the restart only the room its own record leaves, and the
+            // owner's earlier words are worth more there than later paragraphs (the uncut file is linked below)
+            let (record, whole) = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1), 0);
             let file = self.dir.join(format!("record-{}.md", agent.name()));
             let record = match record.is_empty() || fs::write(&file, whole).is_err() {
                 true => record,
@@ -1520,6 +1593,16 @@ impl Session {
             .any(|l| l.trim_start().strip_prefix(key).is_some_and(|rest| rest.trim_start().starts_with('='))))
     }
 
+    /// The between-turn size past which `agent`'s next turn starts fresh from the record: `handoff_at`, for every
+    /// agent, as before the cost model. For Codex that is at its in-turn compaction limit, so in the default mode it
+    /// does not start a resumed thread fresh between turns: a fresh start turns cached carry (0.05x in plan credits)
+    /// into an uncached record, and the offline replay of the owner's traces found an earlier Codex threshold (48k)
+    /// cutting raw input by about 3% while raising credit-weighted cost. A turn policy's `handoff_at` sets an earlier
+    /// one; `RINGO_CONTEXT=adaptive` uses the cost model.
+    fn static_threshold(&self, _agent: Agent) -> u64 {
+        self.handoff_at
+    }
+
     fn codex_told_to_use_ringo(&self) -> bool {
         let read = |name: &str| fs::read(self.codex_home.join(name)).map(|b| String::from_utf8_lossy(&b).to_lowercase());
         let own = read("config.toml").is_ok_and(|t| t.lines().any(|l| l.trim_start().starts_with("developer_instructions")));
@@ -1650,10 +1733,24 @@ impl Session {
     /// a summary. The record uncut goes in the job's folder.
     fn handoff(&mut self, id: usize, agent: Agent, resume: &mut Option<String>, prompt: &str) -> Option<(String, String)> {
         let fills = self.context.get(&agent).copied().unwrap_or(0);
+        let threshold = self.static_threshold(agent);
+        let mut notes: Vec<String> = Vec::new();
+        if let Some(bad) = self.context_note.take() {
+            notes.push(format!("RINGO_CONTEXT={bad} is not static, adaptive or off: the default mode is used"));
+        }
+        let (mode, pinned) = (self.context_mode, self.handoff_pinned);
+        let eligible = matches!(agent.spec().adapter, Adapter::Codex | Adapter::Claude);
         let lane = self.lane(agent, id);
         let unheard = self.unheard(agent, &lane);
-        // a fresh start that would save too little resumes, told what the others did since, as any other turn
-        let picked = [resume.is_none() || fills > self.handoff_at, false].into_iter().find_map(|fresh| {
+        // The agent's measured base (what the cost model uses too), and what a conversation being replaced lets its
+        // record add: a brand-new conversation saves nothing, so its record stays lean.
+        let base = self.base_median(agent);
+        let mut cap = if resume.is_some() { record_cap(fills, base) } else { 0 };
+        // The text a start from the record would send (`fresh`), or the turns the agent missed (not), before the
+        // guard that a fresh start must be at most half the conversation it replaces. `rich` is the detail cap its
+        // record may fill (0: the lean record); the fourth field is what the text adds around the record, counting
+        // the pointer to the whole record even when this build needs none (a richer one may).
+        let build = |fresh: bool, rich: usize| -> Option<(bool, String, u64, usize, String, String, Vec<usize>)> {
             let turns = if fresh { &lane[..] } else { &unheard[..] };
             let restarted = fresh && self.carried(agent).is_some();
             let span = match (turns.first(), turns.last()) {
@@ -1667,19 +1764,20 @@ impl Session {
                 (true, false) => format!("the turns before the restart and {span}"),
                 _ => span,
             };
-            let (record, whole) = if fresh { self.fresh_record(agent, turns) } else { self.record(turns) };
+            let (record, whole, complete) = if fresh { self.fresh_record_full(agent, turns, rich) } else { self.record_full(turns, 0) };
             let head = match fresh {
                 true => "Ringo's record of this conversation so far, which you start fresh from",
                 false => "While you were away, other agents took turns in this conversation. Ringo's record of them",
             };
             // A complete inline record needs no second read. A cut one keeps a recovery path; agy can only open
             // that path in read mode, where --add-dir grants the job folder (never in an edits turn).
-            let whole_at = if whole.trim_end() == record.trim_end()
+            let pointer = format!(" The whole record, uncut, is in {}. Read only the parts needed to recover a missing \
+                                   constraint or detail.", self.jobs[id - 1].dir.join("record.md").display());
+            let whole_at = if complete
                 || (agent.spec().adapter == Adapter::Agy && self.mode != Mode::Read) {
                 String::new()
             } else {
-                format!(" The whole record, uncut, is in {}. Read only the parts needed to recover a missing \
-                         constraint or detail.", self.jobs[id - 1].dir.join("record.md").display())
+                pointer.clone()
             };
             let mut text = format!("{head} (the owner's words are exact; the replies and steps are the agents' own account \
                                 and can be wrong; the files here are the truth).{whole_at}\n\n{}\n\n", record.trim_end());
@@ -1687,9 +1785,109 @@ impl Session {
                 text = format!("{}\n\n{text}", self.turn_policy.handoff_instruction);
             }
             let about = text.len() as u64 / 4; // the owner's message goes either way
+            let wrap = text.len() - record.trim_end().len() + if whole_at.is_empty() { pointer.len() } else { 0 };
             let ids: Vec<usize> = turns.iter().map(|j| j.id).collect();
-            (!fresh || resume.is_none() || about * 2 <= fills).then_some((fresh, text, about, span, whole, ids))
+            Some((fresh, text, about, wrap, span, whole, ids))
+        };
+        let mut fresh_built = None;
+        let mut verdict: Option<context_policy::Verdict> = None;
+        let mut shadow = false;
+        let want = if resume.is_none() {
+            true
+        } else if pinned && !(mode == context_policy::Mode::Adaptive && self.context_from_policy) {
+            // the owner's pinned number, exactly, whatever RINGO_CONTEXT says (a policy that also names adaptive
+            // asks for the cost model, with its number as the fallback)
+            if mode == context_policy::Mode::Adaptive {
+                verdict = Some(context_policy::Verdict {
+                    action: if fills > threshold { context_policy::Action::Fresh } else { context_policy::Action::Resume },
+                    reason: format!("owner handoff_at {}k", self.handoff_at / 1000), saving: None });
+            }
+            fills > threshold
+        } else if mode == context_policy::Mode::Off {
+            false
+        } else if !eligible {
+            fills > threshold
+        } else {
+            {
+                {
+                    let mine: Vec<&&Job> = lane.iter().filter(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)).collect();
+                    let last = mine.last();
+                    // a turn that made no call (it failed first) says nothing about how long turns run
+                    let mut calls: Vec<u64> = mine.iter().rev().filter(|j| j.calls > 0).take(5).map(|j| j.calls as u64).collect();
+                    calls.sort_unstable();
+                    let calls = calls.get(calls.len() / 2).copied();
+                    let idle_s = last.and_then(|j| j.elapsed.map(|e| j.started.elapsed().saturating_sub(e).as_secs()));
+                    let ttl_s = if agent.spec().adapter == Adapter::Claude { context_policy::CLAUDE_TTL_S } else { context_policy::CODEX_TTL_S };
+                    // The record is built (every turn of the lane rendered, and a git diff) only when it can matter:
+                    // the size test would start fresh, or the cost model could. Otherwise its size is not needed.
+                    let cold = idle_s.is_some_and(|i| i > ttl_s);
+                    if fills > threshold || context_policy::could_start_fresh(fills, base, calls, cold) {
+                        fresh_built = build(true, 0);
+                    }
+                    let signals = context_policy::Signals {
+                        fills,
+                        base,
+                        // not built only when even an empty record could not pay (or the size test decides)
+                        record: fresh_built.as_ref().map(|b| b.2).or((base.is_none()).then_some(0)),
+                        calls,
+                        idle_s,
+                        ttl_s,
+                        previous_ended_badly: last.is_some_and(|j| matches!(j.status, Status::Failed(_) | Status::Cancelled)),
+                        continuation: context_policy::is_continuation(prompt),
+                        fresh_last_turn: last.is_some_and(|j| j.started_fresh),
+                    };
+                    let v = context_policy::decide(&signals, threshold);
+                    let adaptive = mode == context_policy::Mode::Adaptive;
+                    // a fresh start the cost model chose gets no more detail than keeps it fresh by the same rule
+                    if adaptive && v.saving.is_some() && let Some(base) = base {
+                        cap = cap.min(4 * context_policy::record_room(fills, base, calls, cold) as usize);
+                    }
+                    shadow = !adaptive;
+                    let action = v.action;
+                    verdict = Some(v);
+                    if adaptive { action == context_policy::Action::Fresh } else { fills > threshold }
+                }
+            }
+        };
+        // the half-size guard below applies to any fresh start, so a verdict is compared after it, like the rule's
+        let fits = fresh_built.as_ref().is_some_and(|b| b.2 * 2 <= fills);
+        let picked = [want, false].into_iter().find_map(|fresh| {
+            let built = if fresh { fresh_built.take().or_else(|| build(true, 0)) } else { build(false, 0) }?;
+            (!fresh || resume.is_none() || built.2 * 2 <= fills).then_some(built)
         });
+        // Decided on the lean record, a fresh start of a conversation in use then carries the detail its saving pays
+        // for: the record rebuilt with the cap less what the text adds around it, so the whole text sent stays within
+        // `record_cap` (3/8 of fills less base, in tokens) and can neither undo the decision nor trip the half-size
+        // guard, which the verdict and shadow lines above saw on the lean size.
+        let mut picked = picked;
+        if resume.is_some() && let Some((true, _, about, wrap, ..)) = picked.as_ref() && cap > *wrap {
+            let lean = *about;
+            if let Some(rich) = build(true, cap - wrap).filter(|r| r.2 >= lean && r.2 * 4 <= cap as u64 && r.2 * 2 <= fills) {
+                picked = Some(rich);
+            }
+        }
+        if resume.is_some() && let Some(v) = verdict {
+            let did_fresh = matches!(picked, Some((true, ..)));
+            let who = agent.name();
+            if shadow {
+                // only when it would have done otherwise than the static rule did
+                let would = v.action == context_policy::Action::Fresh && fits;
+                if would != did_fresh {
+                    let word = if would { "fresh" } else { "resume" };
+                    notes.push(format!("ctx {who} (shadow): adaptive would {word} — {}", v.reason));
+                }
+            } else if v.action == context_policy::Action::Fresh && !did_fresh {
+                notes.push(format!("ctx {who}: resume — the record is over half of {}; {}", fmt_k(fills), v.reason));
+            } else {
+                notes.push(format!("ctx {who}: {} — {}", v.action.word(), v.reason));
+            }
+        }
+        if matches!(picked, Some((true, ..))) {
+            self.jobs[id - 1].started_fresh = true;
+        }
+        for note in notes {
+            self.jobs[id - 1].push_log(note);
+        }
         let busy = self.in_flight(id, agent);
         let heard = self.heard.entry(agent).or_default();
         match &picked {
@@ -1698,7 +1896,7 @@ impl Session {
             None if resume.is_none() => heard.clear(), // a new conversation, with nothing to tell it
             None => {}
         }
-        let Some((fresh, text, about, span, whole, _)) = picked else {
+        let Some((fresh, text, about, _, span, whole, _)) = picked else {
             return busy.map(|busy| (format!("{busy}The owner's new message:\n{prompt}"),
                                     format!("told {} which turns are still at work here", agent.name())));
         };
@@ -1750,6 +1948,14 @@ impl Session {
         }
     }
 
+    /// The median of the agent's last measured bases (what its first call of a new conversation read beyond the
+    /// message), or None before one is measured.
+    fn base_median(&self, agent: Agent) -> Option<u64> {
+        let mut bases: Vec<u64> = self.bases.get(&agent).map(|b| b.iter().copied().collect()).unwrap_or_default();
+        bases.sort_unstable();
+        bases.get(bases.len() / 2).copied()
+    }
+
     /// The turns before a /restart that `agent`'s fresh start begins with: the record of its conversation there, or,
     /// from a shell that handed on no records, the turns it had yet to be told (its own were never recorded).
     fn carried(&self, agent: Agent) -> Option<&String> {
@@ -1758,23 +1964,59 @@ impl Session {
 
     /// Ringo's record for `agent`'s fresh start: the turns before a /restart that its conversation held, if any, then
     /// `turns`, as `record` gives them; the older turns are cut first.
-    fn fresh_record(&self, agent: Agent, turns: &[&Job]) -> (String, String) {
-        let (record, whole) = self.record(turns);
-        let Some(before) = self.carried(agent) else { return (record, whole) };
+    fn fresh_record(&self, agent: Agent, turns: &[&Job], cap: usize) -> (String, String) {
+        let (record, whole, _) = self.fresh_record_full(agent, turns, cap);
+        (record, whole)
+    }
+
+    /// `fresh_record`, and whether the inline record holds everything the whole one does (no pointer needed).
+    fn fresh_record_full(&self, agent: Agent, turns: &[&Job], cap: usize) -> (String, String, bool) {
+        let Some(before) = self.carried(agent) else { return self.record_full(turns, cap) };
+        let (lean, whole, lean_complete) = self.record_full(turns, 0);
         let separator = "\n\n(Ringo restarted here; the turns since are numbered from #1 again)\n\n";
         let join = |a: &str, b: &str| match (a.is_empty(), b.is_empty()) {
             (true, _) => b.to_string(),
             (_, true) => a.trim_end().to_string(),
             _ => format!("{}{separator}{b}", a.trim_end()),
         };
-        (join(&newest(before, RECORD_BYTES.saturating_sub(record.len() + separator.len())), &record), join(before, &whole))
+        // The turns before the restart keep the room the lean record leaves them (the owner's earlier words are
+        // worth more than the later paragraphs of newer replies); the rich tier gets only what is left of the cap.
+        let kept = newest(before, RECORD_BYTES.saturating_sub(lean.len() + separator.len()));
+        let reserved = if kept.trim_end().is_empty() { 0 } else { kept.trim_end().len() + separator.len() };
+        let rich = cap.min(RECORD_BYTES - 128).saturating_sub(reserved);
+        let (record, complete) = if rich > lean.len() {
+            let (record, _, complete) = self.record_full(turns, rich);
+            (record, complete)
+        } else {
+            (lean, lean_complete)
+        };
+        let complete = complete && kept.trim_end() == before.trim_end();
+        (join(&kept, &record), join(before, &whole), complete)
     }
 
     /// Ringo's record of `turns`, oldest first, and the same uncut: each turn's message from the owner, word for
     /// word; the agent's reply (the newest whole, older ones' first paragraph); its failed steps and its last ones;
-    /// the files it changed; then the change the turns made, as a diff. Newest first into RECORD_BYTES; an older turn
-    /// past it is left to the whole record.
+    /// the files it changed and, in the whole record, the files it read; then the files the turns read (one line,
+    /// newest first, without the ones already listed as changed) and the change the turns made, as a diff. Newest
+    /// first into RECORD_BYTES; an older turn past it is left to the whole record.
     fn record(&self, turns: &[&Job]) -> (String, String) {
+        self.record_with(turns, 0)
+    }
+
+    /// `record` with a rich tier: when the lean record (as `record` gives it) is smaller than `cap` bytes, kept older
+    /// turns are given their whole form (the reply to 6000 characters and the last steps), newest first, each if its
+    /// extra bytes fit in what is left of `min(cap, RECORD_BYTES - 128)`; a turn that does not fit is skipped and an
+    /// older one tried. Turns already whole are never touched, the diff and the files-read line stay, and the record
+    /// never passes RECORD_BYTES. The whole record is the same for any cap; cap 0 is exactly `record`.
+    fn record_with(&self, turns: &[&Job], cap: usize) -> (String, String) {
+        let (record, whole, _) = self.record_full(turns, cap);
+        (record, whole)
+    }
+
+    /// `record_with`, and whether the inline record holds everything the whole one does: no turn left out or shown
+    /// short of its whole form, the files-read line naming every file read, and the diff uncut. Decided from what was
+    /// built, not by comparing the texts (the files read are one line inline and a line per turn in the whole record).
+    fn record_full(&self, turns: &[&Job], cap: usize) -> (String, String, bool) {
         let cut = |text: &str, n: usize| match text.char_indices().nth(n) {
             Some((at, _)) => format!("{}… (cut; the whole is in the record)", &text[..at]),
             None => text.to_string(),
@@ -1817,11 +2059,14 @@ impl Session {
                     failed.push(s);
                 }
             }
-            let steps: Vec<&str> = match full {
+            let picked: Vec<&str> = failed.iter().copied().take(5)
+                .chain(j.steps.iter().rev().take(if whole { 5 } else { 0 }).rev().map(String::as_str)
+                    .filter(|s| !s.starts_with(parse::FAILED))).collect();
+            // when the pick holds every step, they are told in the order they ran, as the whole record tells them
+            let every = j.steps.iter().all(|s| picked.contains(&s.as_str()));
+            let steps: Vec<&str> = match full || every {
                 true => j.steps.iter().map(String::as_str).collect(),
-                false => failed.iter().copied().take(5)
-                    .chain(j.steps.iter().rev().take(if whole { 5 } else { 0 }).rev().map(String::as_str)
-                        .filter(|s| !s.starts_with(parse::FAILED))).collect(),
+                false => picked,
             };
             if !steps.is_empty() {
                 // The steps are the agents' own account, and in real records they are most of it (71-75% of the
@@ -1849,12 +2094,18 @@ impl Session {
                 // or another turn at work here at the same time ran commands; the files it said it edited
                 part += &format!("edited (as it reported): {}\n", files(&j.touched));
             }
+            // the files it read: all of them, in the whole record only (the inline record has one line for all turns)
+            if full && !j.read.is_empty() {
+                part += &format!("read: {}\n", j.read.join(", "));
+            }
             part
         };
+        let is_whole = |i: usize, j: &Job| i + 1 == turns.len() || j.talk || j.asked_by.is_some();
         let mut kept = Vec::new();
+        let mut kept_turn: Vec<Option<usize>> = Vec::new(); // the turn each kept piece renders (None: a notice)
         let mut used = 0;
         for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, i + 1 == turns.len() || j.talk || j.asked_by.is_some(), false);
+            let part = render(j, is_whole(i, j), false);
             // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
             // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
             let part = record_head(&part, RECORD_BYTES - 128);
@@ -1862,13 +2113,17 @@ impl Session {
                 let omitted = format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1);
                 used += omitted.len() + 1;
                 kept.push(omitted);
+                kept_turn.push(None);
                 break;
             }
             used += part.len() + usize::from(!kept.is_empty());
             kept.push(part);
+            kept_turn.push(Some(i));
         }
         kept.reverse();
+        kept_turn.reverse();
         let mut whole: Vec<String> = turns.iter().map(|j| render(j, true, true)).collect();
+        let mut diff_cut = false;
         // The change the turns made: from before the first to after the one that ended last (agents work side by
         // side, so that need not be the last in the list), in their files only.
         // ceiling: a file one of these turns changed that a turn left out of them (its agent's own) changed too
@@ -1883,13 +2138,61 @@ impl Session {
                 let label = "The change these turns made, as git shows it:\n";
                 let room = RECORD_BYTES.saturating_sub(used + label.len() + 1).min(16_000);
                 let shown = record_head(&diff, room);
+                diff_cut = shown.len() != diff.len();
                 if !shown.is_empty() {
                     kept.push(format!("{label}{shown}"));
                 }
                 whole.push(format!("{label}{diff}"));
             }
         }
-        (kept.join("\n"), whole.join("\n"))
+        // The files the turns read, in one line before the diff: only if it fits what the turns and the diff left.
+        let total = |kept: &[String]| kept.iter().map(String::len).sum::<usize>() + kept.len().saturating_sub(1);
+        // only the files a changed or edited line names (`files` names 20): one past them is still told as read
+        let changed: BTreeSet<&str> = turns.iter().flat_map(|j| {
+            let listed: BTreeSet<&str> = match j.changed.is_empty() {
+                true => j.touched.iter().map(String::as_str).collect(),
+                false => j.changed.iter().map(String::as_str).collect(),
+            };
+            listed.into_iter().take(20)
+        }).collect();
+        let mut seen: BTreeSet<&str> = BTreeSet::new();
+        let read: Vec<&str> = turns.iter().rev().flat_map(|j| j.read.iter().rev().map(String::as_str))
+            .filter(|f| !changed.contains(f) && seen.insert(f)).collect();
+        let (line, named) = read_line(&read, READ_LINE_BYTES.min(RECORD_BYTES.saturating_sub(total(&kept) + 1)));
+        let mut complete = named == read.len();
+        if !line.is_empty() {
+            let at = kept.len() - usize::from(kept.last().is_some_and(|k| k.starts_with("The change these turns made")));
+            kept.insert(at, line);
+            kept_turn.insert(at, None);
+        }
+        // The rich tier: the saving pays for the replies and steps the lean record cut.
+        let mut room = cap.min(RECORD_BYTES - 128).saturating_sub(total(&kept));
+        for (at, i) in kept_turn.iter().enumerate().rev() {
+            let Some(i) = *i else { continue };
+            if room == 0 {
+                break;
+            }
+            let j = turns[i];
+            if is_whole(i, j) {
+                continue;
+            }
+            let richer = record_head(&render(j, true, false), RECORD_BYTES - 128);
+            if let Some(extra) = richer.len().checked_sub(kept[at].len()).filter(|extra| *extra <= room) {
+                room -= extra;
+                kept[at] = richer;
+            }
+        }
+        // complete: every turn kept, each as its whole form shows it (less the files-read line the whole form ends
+        // with, which the inline line covers)
+        complete &= !diff_cut && kept_turn.iter().flatten().count() == turns.len();
+        for (at, i) in kept_turn.iter().enumerate() {
+            let Some(i) = *i else { continue };
+            let full = &whole[i];
+            let reads = format!("read: {}\n", turns[i].read.join(", "));
+            let bare = if turns[i].read.is_empty() { full.as_str() } else { full.strip_suffix(&reads).unwrap_or(full) };
+            complete &= kept[at] == bare;
+        }
+        (kept.join("\n"), whole.join("\n"), complete)
     }
 
     fn new_job(&mut self, kind: Kind, title: &str) -> Result<usize, String> {
@@ -1905,12 +2208,13 @@ impl Session {
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(), tier: self.tier,
                              elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0, warned: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
-                             touched: BTreeSet::new(), before: None, after: None, changed: Vec::new(), undone: false,
+                             touched: BTreeSet::new(), read: Vec::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
                              cancel: Arc::new(AtomicBool::new(false)), steered: Vec::new(), gate: Arc::default(),
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
-                              task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None });
+                              task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
+                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false });
         Ok(id)
     }
 
@@ -2095,6 +2399,11 @@ impl Session {
         }
         // `sent` is what the agent gets; the owner's message (`prompt`) stays the job's title, prompt.txt and what
         // decides the turn's settings
+        if !write && prompt.trim() != "/compact" {
+            let job = &mut self.jobs[id - 1];
+            job.fresh_thread = resume.is_none();
+            job.sent_bytes = sent.len() as u64;
+        }
         let (mut input, mut turn) = (Some(sent.clone()), None);
         let style = match spec.adapter {
             #[cfg(feature = "turnrun")]
@@ -3135,6 +3444,15 @@ impl Session {
                         Note::Context(n) => {
                             if let Kind::Agent { agent, write: false } = job.kind {
                                 self.context.insert(agent, n);
+                                // the first call of a new conversation read the fixed base plus what was sent
+                                if job.fresh_thread && !job.measured && n > 0 {
+                                    job.measured = true;
+                                    let bases = self.bases.entry(agent).or_default();
+                                    bases.push_back(n.saturating_sub(job.sent_bytes / 4).max(1_000));
+                                    while bases.len() > 3 {
+                                        bases.pop_front();
+                                    }
+                                }
                             }
                         }
                         Note::Call => job.calls += 1,
@@ -3144,6 +3462,17 @@ impl Session {
                             let rel = path.strip_prefix(&cwd).or_else(|_| path.strip_prefix(cwd.canonicalize().unwrap_or_default()))
                                 .unwrap_or(path);
                             job.touched.insert(rel.to_string_lossy().into_owned());
+                        }
+                        Note::Read(path) => {
+                            let cwd = job.worktree.clone().unwrap_or_else(|| self.repo.clone());
+                            let path = Path::new(&path);
+                            let rel = path.strip_prefix(&cwd).or_else(|_| path.strip_prefix(cwd.canonicalize().unwrap_or_default()))
+                                .unwrap_or(path).to_string_lossy().into_owned();
+                            job.read.retain(|r| *r != rel);
+                            job.read.push(rel);
+                            if job.read.len() > READ_FILES {
+                                job.read.remove(0);
+                            }
                         }
                         Note::Ran => job.ran = true,
                         Note::Connector => job.reached = true,
@@ -4147,7 +4476,7 @@ mod tests {
             job.talk = true;
             fs::write(job.dir.join("reply.md"), "result🌍".repeat(1000)).unwrap();
         }
-        let (inline, whole) = s.fresh_record(agent, &s.lane(agent, s.jobs.len() + 1));
+        let (inline, whole) = s.fresh_record(agent, &s.lane(agent, s.jobs.len() + 1), 0);
         assert!(inline.len() <= RECORD_BYTES, "{} bytes", inline.len());
         assert!(inline.contains("constraint-199:") && inline.contains("earlier turns"));
         assert!(whole.contains("constraint-0:") && whole.contains("constraint-199:"));
@@ -4186,7 +4515,7 @@ mod tests {
         s.before.insert(agent, "old constraint\n".repeat(20_000));
         s.told.insert(agent, "old unheard constraint\n".repeat(20_000));
         for _ in 0..25 {
-            let (inline, _) = s.fresh_record(agent, &s.lane(agent, 2));
+            let (inline, _) = s.fresh_record(agent, &s.lane(agent, 2), usize::MAX);
             assert!(inline.len() <= RECORD_BYTES, "fresh: {} bytes", inline.len());
             assert!(inline.contains("keep this exact constraint"));
             for (_, record) in s.carry() { assert!(record.len() <= RECORD_BYTES, "carry: {}", record.len()); }
@@ -4194,6 +4523,378 @@ mod tests {
             for (_, _, record) in &records { assert!(record.len() <= RECORD_BYTES, "saved: {}", record.len()); }
             s.resume(&[], &[], &records);
         }
+    }
+
+    /// A lane of finished turns (oldest first) with the given replies, as `record` sees them.
+    fn reply_turns(s: &mut Session, replies: &[String]) {
+        for (n, reply) in replies.iter().enumerate() {
+            let id = record_turn(s, &format!("task-{}", n + 1));
+            fs::write(s.jobs[id - 1].dir.join("reply.md"), reply).unwrap();
+        }
+    }
+
+    fn two_paragraphs(tag: &str, second: usize) -> String {
+        format!("{tag} first paragraph.\n\n{tag} {} {tag}-LAST-PARAGRAPH", "x".repeat(second))
+    }
+
+    #[test]
+    fn the_record_names_the_files_the_turns_read_newest_first() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        reply_turns(&mut s, &["one".into(), "two".into(), "three".into()]);
+        s.jobs[0].read = vec!["old.rs".into(), "shared.rs".into(), "edited.rs".into()];
+        s.jobs[1].read = vec!["mid.rs".into()];
+        s.jobs[2].read = vec!["shared.rs".into(), "new.rs".into()];
+        s.jobs[1].changed = vec!["edited.rs".into()];
+        let turns = s.lane(agent, 4);
+        let (inline, whole) = s.record(&turns);
+        let prefix = "files read (newest first; re-open what you need, they may have changed since): ";
+        // newest turn first, and within a turn the newest read first; a file read again counts where it was read last;
+        // a changed file is listed with its turn, not here
+        assert!(inline.contains(&format!("\n{prefix}new.rs, shared.rs, mid.rs, old.rs\n")), "{inline}");
+        assert!(!inline.contains("read: "), "the inline record has no per-turn line: {inline}");
+        // each turn of the whole record says what it read, oldest first, nothing left out
+        assert!(whole.contains("read: old.rs, shared.rs, edited.rs\n") && whole.contains("read: mid.rs\n")
+                && whole.contains("read: shared.rs, new.rs\n"), "{whole}");
+        assert!(!whole.contains("files read ("), "{whole}");
+        // nothing read, nothing said
+        let (mut lean, agent) = (record_session(), agent);
+        reply_turns(&mut lean, &["one".into()]);
+        let (inline, whole) = lean.record(&lean.lane(agent, 2));
+        assert!(!inline.contains("files read") && !whole.contains("read:"), "{inline}");
+    }
+
+    #[test]
+    fn the_files_read_line_is_bounded_in_paths_and_bytes() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        reply_turns(&mut s, &["one".into()]);
+        // 40 paths at most, the newest first, and how many more are in the whole record
+        s.jobs[0].read = (0..100).map(|n| format!("f{n:03}.rs")).collect();
+        let (inline, whole) = s.record(&s.lane(agent, 2));
+        let line = inline.lines().find(|l| l.starts_with("files read (")).unwrap();
+        assert!(line.contains(": f099.rs, f098.rs, ") && line.contains("f060.rs") && !line.contains("f059.rs"), "{line}");
+        assert!(line.ends_with(" and 60 more (in the whole record)"), "{line}");
+        assert!(whole.contains("f000.rs, f001.rs") && whole.contains("f099.rs\n"));
+        // 3_000 bytes at most, stopping before the path that would cross it
+        s.jobs[0].read = (0..100).map(|n| format!("dir/{}-{n:03}.rs", "d".repeat(90))).collect();
+        let (inline, _) = s.record(&s.lane(agent, 2));
+        let line = inline.lines().find(|l| l.starts_with("files read (")).unwrap();
+        assert!(line.len() <= 3_000, "{} bytes", line.len());
+        let shown = line.matches(".rs").count();
+        assert!((20..40).contains(&shown), "{shown} paths");
+        assert!(line.ends_with(&format!(" and {} more (in the whole record)", 100 - shown)), "{line}");
+        assert!(line.contains(&format!("-{:03}.rs", 100 - shown)) && !line.contains(&format!("-{:03}.rs", 99 - shown)), "{line}");
+        // a record with no room left for it goes without it, and stays inside its budget: ten whole turns sized so
+        // the space left runs from a few hundred bytes down to the 128 the turns leave free, less than this line
+        let long = format!("src/{}.rs", "d".repeat(200));
+        let (mut absent, mut present) = (0, 0);
+        let mut s = record_session(); // one session: many made at once can run out of folder names
+        reply_turns(&mut s, &vec![String::new(); 10]);
+        for j in s.jobs.iter_mut() {
+            j.talk = true;
+            j.read = vec![long.clone()];
+        }
+        for k in (5_850..5_990).step_by(3) {
+            for j in &s.jobs {
+                fs::write(j.dir.join("reply.md"), "x".repeat(k)).unwrap();
+            }
+            let (inline, _) = s.record(&s.lane(agent, 11));
+            assert!(inline.len() <= RECORD_BYTES, "{k}: {} bytes", inline.len());
+            if !inline.contains("#1 · the owner") {
+                break; // past here the oldest turn itself is left to the whole record
+            }
+            if inline.contains("files read (") { present += 1 } else { absent += 1 }
+        }
+        assert!(absent > 0 && present > 0, "absent {absent}, present {present}");
+    }
+
+    #[test]
+    fn a_job_remembers_what_it_read_oldest_first_and_at_most_200() {
+        let (mut s, agent) = ctx_session("codex", 0);
+        let id = ctx_turn(&mut s, agent, Status::Running, 0);
+        let repo = s.repo.clone();
+        let send = |s: &Session, path: String| s.tx.send(Event::Note(id, Note::Read(path))).unwrap();
+        for n in 0..205 {
+            send(&s, repo.join(format!("src/f{n}.rs")).to_string_lossy().into_owned());
+        }
+        send(&s, repo.join("src/f100.rs").to_string_lossy().into_owned()); // read again: moves to the end
+        send(&s, "/elsewhere/g.rs".into()); // outside the folder: as given
+        s.pump();
+        let read = &s.jobs[id - 1].read;
+        // relative paths keep the platform's separator, as an edited file's do
+        let rel = |n: usize| Path::new("src").join(format!("f{n}.rs")).to_string_lossy().into_owned();
+        assert_eq!(read.len(), 200);
+        assert_eq!(&read[..2], [rel(6), rel(7)], "the oldest five are dropped");
+        assert_eq!(&read[198..], [rel(100), "/elsewhere/g.rs".to_string()]);
+        assert_eq!(read.iter().filter(|r| **r == rel(100)).count(), 1);
+    }
+
+    #[test]
+    fn a_cap_of_zero_is_the_lean_record_exactly() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        reply_turns(&mut s, &[two_paragraphs("a", 800), two_paragraphs("b", 800), two_paragraphs("c", 800)]);
+        let turns = s.lane(agent, 4);
+        let (lean, whole) = s.record(&turns);
+        assert_eq!(s.record_with(&turns, 0), (lean.clone(), whole.clone()));
+        // today's lean form, written out: older replies keep their first paragraph, the newest is whole
+        let expected = format!("#1 · the owner to codex: task-1\ncodex: a first paragraph.\n\n\
+                                #2 · the owner to codex: task-2\ncodex: b first paragraph.\n\n\
+                                #3 · the owner to codex: task-3\ncodex: {}\n", two_paragraphs("c", 800));
+        assert_eq!(lean, expected);
+        assert!(!lean.contains("a-LAST-PARAGRAPH") && whole.contains("a-LAST-PARAGRAPH"));
+        assert_eq!(s.fresh_record(agent, &turns, 0), (lean, whole));
+    }
+
+    #[test]
+    fn a_cap_gives_older_replies_their_whole_form_newest_first_while_it_fits() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        // turn 2 has a long second paragraph, turn 1 a short one, turn 3 is the newest (whole already)
+        reply_turns(&mut s, &[two_paragraphs("a", 300), two_paragraphs("b", 2_000), two_paragraphs("c", 10)]);
+        let turns = s.lane(agent, 4);
+        let (lean, whole) = s.record(&turns);
+        let (rich, rich_whole) = s.record_with(&turns, 1_000_000);
+        assert!(rich.contains("a-LAST-PARAGRAPH") && rich.contains("b-LAST-PARAGRAPH") && rich.contains("c-LAST-PARAGRAPH"), "{rich}");
+        assert_eq!(rich_whole, whole, "the whole record does not depend on the cap");
+        // the order of the turns and the newest turn are as they were
+        assert!(rich.starts_with("#1 · ") && rich.find("#2 · ") < rich.find("#3 · "));
+        assert!(rich.ends_with(lean.rsplit_once("#3 · ").unwrap().1), "{rich}");
+        // a cap that has room for the short upgrade only: the newest brief turn (#2) does not fit, #1 does
+        let cap = lean.len() + 400;
+        let small = s.record_with(&turns, cap).0;
+        assert!(small.contains("a-LAST-PARAGRAPH") && !small.contains("b-LAST-PARAGRAPH"), "{small}");
+        assert!(small.len() <= cap && small.len() > lean.len());
+        // room for the long one, not both: the newest that fits is upgraded, the older stays brief
+        let cap = lean.len() + 2_100;
+        let small = s.record_with(&turns, cap).0;
+        assert!(small.contains("b-LAST-PARAGRAPH") && !small.contains("a-LAST-PARAGRAPH"), "{small}");
+        assert!(small.len() <= cap);
+        // a cap the lean record already fills adds nothing
+        assert_eq!(s.record_with(&turns, lean.len()).0, lean);
+        assert_eq!(s.record_with(&turns, lean.len() / 2).0, lean);
+    }
+
+    #[test]
+    fn the_rich_tier_never_passes_the_inline_budget_and_keeps_the_diff_and_the_files_read() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        fs::write(s.repo.join("big.txt"), "old\n").unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let before = git(&s.repo, &["write-tree"]).unwrap();
+        fs::write(s.repo.join("big.txt"), format!("{}\nEND-OF-DIFF\n", "diff-line\n".repeat(3_000))).unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let after = git(&s.repo, &["write-tree"]).unwrap();
+        // a few turns that fit lean but not all whole, with replies near their 6000-character form
+        let replies: Vec<String> = (0..30).map(|n| two_paragraphs(&format!("t{n}"), 5_000)).collect();
+        reply_turns(&mut s, &replies);
+        s.jobs[0].before = Some(before);
+        s.jobs[29].after = Some(after);
+        s.jobs[0].changed = vec!["big.txt".into()];
+        s.jobs[5].read = vec!["src/a.rs".into(), "big.txt".into()];
+        let turns = s.lane(agent, 31);
+        let lean = s.record(&turns).0;
+        for cap in [0, 1_000, 20_000, 40_000, RECORD_BYTES - 128, RECORD_BYTES, usize::MAX] {
+            let rich = s.record_with(&turns, cap).0;
+            assert!(rich.len() <= RECORD_BYTES && rich.len() >= lean.len(), "cap {cap}: {} bytes", rich.len());
+            assert!(rich.len() <= lean.len().max(cap.min(RECORD_BYTES - 128)), "cap {cap}: {} bytes", rich.len());
+            assert!(rich.contains("diff-line") && rich.contains("The change these turns made, as git shows it:"), "cap {cap}");
+            assert!(rich.contains("files read (newest first; re-open what you need, they may have changed since): src/a.rs\n"), "cap {cap}");
+            assert!(rich.find("files read (") < rich.find("The change these turns made"), "the line comes before the diff");
+            assert!(rich.contains("#30 · "), "cap {cap}: the newest turn stays");
+        }
+        let rich = s.record_with(&turns, usize::MAX).0;
+        assert!(rich.matches("-LAST-PARAGRAPH").count() > lean.matches("-LAST-PARAGRAPH").count());
+    }
+
+    #[test]
+    fn the_cap_follows_the_cost_models_saving() {
+        assert_eq!(record_cap(48_000, Some(13_000)), 4 * 13_125);
+        assert_eq!(record_cap(48_000, None), 4 * 9_000, "an unknown base is half the conversation");
+        assert_eq!(record_cap(10_000, Some(13_000)), 0, "no saving, no detail");
+        assert_eq!(record_cap(0, None), 0);
+        // half of the 0.75 x (fills - base) tokens a fresh start saves, in bytes
+        let (fills, base) = (60_000u64, 13_000u64);
+        assert!(record_cap(fills, Some(base)) as u64 / 4 * 2 <= (fills - base) * 3 / 4);
+    }
+
+    #[test]
+    fn a_fresh_start_of_a_thread_in_use_carries_the_older_replies_whole_as_the_cap_allows() {
+        for (mode, fills, base) in [(context_policy::Mode::Static, 70_000, None),
+                                    (context_policy::Mode::Adaptive, 56_000, Some(13_000))] {
+            let (mut s, agent) = ctx_session("codex", fills);
+            s.context_mode = mode;
+            if let Some(base) = base {
+                s.bases.insert(agent, VecDeque::from([base]));
+            }
+            fs::write(s.jobs[0].dir.join("reply.md"), two_paragraphs("old", 2_000)).unwrap();
+            ctx_turn(&mut s, agent, Status::Done, 5);
+            s.jobs[0].read = vec!["src/old.rs".into()];
+            let id = s.new_job(Kind::Agent { agent, write: false }, "fix the failing tests").unwrap();
+            let mut resume = s.threads.get(&agent).cloned();
+            let (text, note) = s.handoff(id, agent, &mut resume, "fix the failing tests").unwrap();
+            assert!(resume.is_none() && note.starts_with("handoff: codex starts fresh"), "{mode:?}: {note}");
+            assert!(text.contains("old-LAST-PARAGRAPH"), "{mode:?}: the older reply is whole: {text}");
+            assert!(text.contains("files read (newest first;") && text.contains("src/old.rs"), "{mode:?}: {text}");
+            // a cap of 0 (a brand-new conversation) gets the lean record
+            let (mut s, agent) = ctx_session("codex", fills);
+            fs::write(s.jobs[0].dir.join("reply.md"), two_paragraphs("old", 2_000)).unwrap();
+            ctx_turn(&mut s, agent, Status::Done, 5);
+            s.threads.remove(&agent);
+            let id = s.new_job(Kind::Agent { agent, write: false }, "fix the failing tests").unwrap();
+            let mut resume = None;
+            let text = s.handoff(id, agent, &mut resume, "fix the failing tests").unwrap().0;
+            assert!(text.contains("old first paragraph.") && !text.contains("old-LAST-PARAGRAPH"), "{mode:?}: {text}");
+        }
+        // a restart hands on the lean record and where the uncut one is (Ringo review: a rich one would cost the
+        // next shell's oldest carried turns their room)
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        fs::write(s.jobs[0].dir.join("reply.md"), two_paragraphs("old", 2_000)).unwrap();
+        ctx_turn(&mut s, agent, Status::Done, 5);
+        let records = s.carry_record();
+        assert!(records.iter().any(|(name, fills, record)| name == "codex" && *fills == 50_000
+            && record.contains("old first paragraph.") && !record.contains("old-LAST-PARAGRAPH")
+            && record.contains("(these turns uncut: ")), "{records:?}");
+    }
+
+    #[test]
+    fn a_rich_record_never_undoes_the_fresh_start_the_lean_one_decided() {
+        // Review finding: a record filled to the cap, plus the text around it, read as over half the saving, so the
+        // cost model kept a conversation the lean record would have replaced. Now the decision is on the lean record
+        // and the detail is added after it, within the cap less the text around the record.
+        // With 2 calls a turn, warm, the margin binds too (Ringo review): 2 x saving must stay >= 32k.
+        for calls in [5u32, 2] {
+        let (fills, base) = (48_000u64, 13_000u64);
+        let (mut s, agent) = ctx_session("codex", fills);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([base]));
+        s.jobs[0].calls = calls;
+        for n in 0..30 {
+            let id = ctx_turn(&mut s, agent, Status::Done, calls);
+            fs::write(s.jobs[id - 1].dir.join("reply.md"), two_paragraphs(&format!("t{n}"), 3_000)).unwrap();
+        }
+        let id = s.new_job(Kind::Agent { agent, write: false }, "fix the failing tests").unwrap();
+        let mut resume = s.threads.get(&agent).cloned();
+        let (text, note) = s.handoff(id, agent, &mut resume, "fix the failing tests").unwrap();
+        let log: Vec<String> = s.jobs[id - 1].log.iter().cloned().collect();
+        assert!(resume.is_none() && note.starts_with("handoff: codex starts fresh"), "{note} {log:?}");
+        assert!(log.iter().any(|l| l.starts_with("ctx codex: fresh")), "{log:?}");
+        assert!(text.contains("t29-LAST-PARAGRAPH"), "the newest older reply is whole");
+        assert!(!text.contains("t0-LAST-PARAGRAPH"), "the cap stops the detail before the oldest");
+        // everything sent but the owner's message stays within the cap, so the decision holds on the rich size too
+        let sent = text.len() - "The owner's new message:\nfix the failing tests".len();
+        assert!(sent <= record_cap(fills, Some(base)), "{sent} bytes over {}", record_cap(fills, Some(base)));
+        let room = context_policy::record_room(fills, base, Some(calls as u64), false);
+        assert!(sent as u64 / 4 <= room, "calls {calls}: {} tokens over a room of {room}", sent / 4);
+        let rich = context_policy::Signals { fills, base: Some(base), record: Some(sent as u64 / 4), calls: Some(calls as u64),
+            idle_s: Some(0), ttl_s: context_policy::CODEX_TTL_S, previous_ended_badly: false, continuation: false,
+            fresh_last_turn: false };
+        assert_eq!(context_policy::decide(&rich, 48_000).action, context_policy::Action::Fresh, "calls {calls}: the text sent is fresh by the same rule");
+        }
+    }
+
+    #[test]
+    fn a_record_is_cut_by_what_it_leaves_out_not_by_its_files_read_lines() {
+        // Ringo reviews: the files-read line (inline) and the per-turn read lines (whole) made every record look cut,
+        // so a complete one carried the pointer and agy would read the same turns again; matching line texts instead
+        // missed a dropped files-read line, a carried record's own line, and reply lines that begin "read: ".
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        reply_turns(&mut s, &["one".into(), "two".into()]);
+        s.jobs[0].read = vec!["a.rs".into()];
+        s.jobs[1].read = vec!["b.rs".into()];
+        let turns = s.lane(agent, 3);
+        let (inline, whole, complete) = s.record_full(&turns, 0);
+        assert!(inline.contains(READ_LINE_PREFIX) && whole.contains("read: a.rs"));
+        assert!(complete, "{inline}\n---\n{whole}");
+        // with the change shown after the files read, too
+        fs::write(s.repo.join("x.txt"), "old\n").unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let before = git(&s.repo, &["write-tree"]).unwrap();
+        fs::write(s.repo.join("x.txt"), "new\n").unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let after = git(&s.repo, &["write-tree"]).unwrap();
+        (s.jobs[1].before, s.jobs[1].after, s.jobs[1].changed) = (Some(before), Some(after), vec!["x.txt".into()]);
+        let (inline, _, complete) = s.record_full(&s.lane(agent, 3), 0);
+        assert!(inline.contains("The change these turns made") && inline.contains(READ_LINE_PREFIX) && complete);
+        // a record carried over a restart, its own files-read line and all, is complete when nothing new is cut
+        s.before.insert(agent, inline.clone());
+        let (_, _, complete) = s.fresh_record_full(agent, &s.lane(agent, 3), 0);
+        assert!(complete, "the carried record's files-read line is no cut");
+        s.before.remove(&agent);
+        // a cut files-read line is a cut
+        s.jobs[0].read = (0..100).map(|n| format!("f{n}.rs")).collect();
+        assert!(!s.record_full(&s.lane(agent, 3), 0).2);
+        s.jobs[0].read = vec!["a.rs".into()];
+        // so is a brief older reply, even one whose cut paragraph begins "read: "
+        fs::write(s.jobs[0].dir.join("reply.md"), "Done.\n\nread: the config first, then the rest").unwrap();
+        assert!(!s.record_full(&s.lane(agent, 3), 0).2);
+        // Ringo review 3: a newest turn whose every step is shown is whole, failed step in the middle or not
+        fs::write(s.jobs[0].dir.join("reply.md"), "one").unwrap();
+        s.jobs[1].steps = vec!["$ cargo build".into(), format!("{}$ cargo test · exit 101", parse::FAILED), "$ cargo test".into()];
+        let (inline, _, complete) = s.record_full(&s.lane(agent, 3), 0);
+        assert!(complete && inline.contains(&format!("$ cargo build | {}$ cargo test · exit 101 | $ cargo test", parse::FAILED)), "{inline}");
+        // and a file read past the 20 an edited line names is told as read (and must be, for the record to be whole)
+        s.jobs[1].steps.clear();
+        (s.jobs[1].before, s.jobs[1].after, s.jobs[1].changed) = (None, None, Vec::new());
+        s.jobs[1].touched = (1..=25).map(|n| format!("f{n:02}.rs")).collect();
+        s.jobs[1].read = (21..=25).map(|n| format!("f{n:02}.rs")).chain(["f01.rs".to_string()]).collect();
+        let (inline, _, complete) = s.record_full(&s.lane(agent, 3), 0);
+        let line = inline.lines().find(|l| l.starts_with(READ_LINE_PREFIX)).unwrap();
+        assert!(line.contains("f25.rs") && line.contains("f21.rs") && !line.contains("f01.rs"), "{line}");
+        assert!(complete, "every file read is named, on the edited line or the files-read line");
+        s.jobs[1].touched.clear();
+        s.jobs[1].read = vec!["b.rs".into()];
+        // and a files-read line left out for lack of room
+        let long = format!("src/{}.rs", "d".repeat(200));
+        let mut seen_dropped = false;
+        let mut s = record_session(); // one session: many made at once can run out of folder names
+        reply_turns(&mut s, &vec![String::new(); 10]);
+        for j in s.jobs.iter_mut() {
+            j.talk = true;
+            j.read = vec![long.clone()];
+        }
+        for k in (5_850..5_990).step_by(3) {
+            for j in &s.jobs {
+                fs::write(j.dir.join("reply.md"), "x".repeat(k)).unwrap();
+            }
+            let (inline, _, complete) = s.record_full(&s.lane(agent, 11), 0);
+            if !inline.contains("#1 · the owner") {
+                break;
+            }
+            if !inline.contains(READ_LINE_PREFIX) {
+                seen_dropped = true;
+                assert!(!complete, "{k}: a dropped files-read line is a cut");
+            } else {
+                assert!(complete, "{k}");
+            }
+        }
+        assert!(seen_dropped);
+    }
+
+    #[test]
+    fn a_rich_record_keeps_every_turn_from_before_a_restart_the_lean_one_kept() {
+        // Review finding: the rich tier took the room the turns before a /restart had (the owner's earlier words).
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        let replies: Vec<String> = (0..20).map(|n| two_paragraphs(&format!("r{n}"), 3_000)).collect();
+        reply_turns(&mut s, &replies);
+        s.before.insert(agent, (0..3_000).map(|n| format!("PRE-RESTART owner line {n}\n")).collect());
+        let turns = s.lane(agent, 21);
+        let count = |text: &str| text.matches("PRE-RESTART").count();
+        let (lean, _) = s.fresh_record(agent, &turns, 0);
+        for cap in [record_cap(50_000, None), record_cap(100_000, Some(13_000)), usize::MAX] {
+            let (rich, _) = s.fresh_record(agent, &turns, cap);
+            assert_eq!(count(&rich), count(&lean), "cap {cap}");
+            assert!(rich.len() <= RECORD_BYTES, "cap {cap}: {} bytes", rich.len());
+        }
+        assert!(count(&lean) > 0);
+        // with room to spare after the carried turns, the detail is still added
+        s.before.insert(agent, "PRE-RESTART a short earlier turn\n".into());
+        let turns = s.lane(agent, 21);
+        let (rich, _) = s.fresh_record(agent, &turns, record_cap(100_000, Some(13_000)));
+        assert!(count(&rich) == 1 && rich.contains("r18-LAST-PARAGRAPH"), "{rich}");
     }
 
     #[test]
@@ -4260,5 +4961,275 @@ mod tests {
         assert!(store.is_absolute() && store.join("HEAD").is_file(), "{}", store.display());
         let _ = fs::remove_dir_all(&relative);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    // --- the boundary context policy (see context_policy.rs) ---
+
+    /// A session with `agent`'s one finished read turn behind it, a thread to resume and `fills` in its window.
+    fn ctx_session(name: &str, fills: u64) -> (Session, Agent) {
+        let mut s = record_session();
+        s.context_mode = context_policy::Mode::Static;
+        s.codex_home = s.dir.join("codex-home");
+        fs::create_dir_all(&s.codex_home).unwrap();
+        let agent = Agent::from_name(name).unwrap();
+        ctx_turn(&mut s, agent, Status::Done, 5);
+        s.context.insert(agent, fills);
+        s.threads.insert(agent, "thread-1".into());
+        (s, agent)
+    }
+
+    fn ctx_turn(s: &mut Session, agent: Agent, status: Status, calls: u32) -> usize {
+        let id = s.new_job(Kind::Agent { agent, write: false }, "the earlier turn").unwrap();
+        fs::write(s.jobs[id - 1].dir.join("reply.md"), "an earlier reply").unwrap();
+        let job = &mut s.jobs[id - 1];
+        job.status = status;
+        job.calls = calls;
+        job.elapsed = Some(Duration::from_secs(1));
+        id
+    }
+
+    /// Runs the handoff of a new turn: whether the thread started fresh, and the job's log.
+    fn ctx_next(s: &mut Session, agent: Agent, prompt: &str) -> (bool, String) {
+        let jobs = s.jobs.len();
+        let id = s.new_job(Kind::Agent { agent, write: false }, prompt).unwrap();
+        let mut resume = s.threads.get(&agent).cloned();
+        let _ = s.handoff(id, agent, &mut resume, prompt);
+        assert_eq!(s.jobs.len(), jobs + 1, "the decision starts no job and calls no model");
+        let job = &mut s.jobs[id - 1]; // it ends, a turn behind the next
+        (job.status, job.calls, job.elapsed) = (Status::Done, 5, Some(Duration::from_secs(1)));
+        (resume.is_none(), s.jobs[id - 1].log.iter().cloned().collect::<Vec<_>>().join("\n"))
+    }
+
+    #[test]
+    fn codex_in_the_default_mode_resumes_below_handoff_at_as_before_the_cost_model() {
+        // 50k is past the 48k an earlier build used, and under handoff_at: the thread is resumed
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        assert_eq!(s.static_threshold(agent), HANDOFF_AT);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        // the owner's own in-turn limit does not move it either
+        let (mut s, agent) = ctx_session("codex", 35_000);
+        fs::write(s.codex_home.join("config.toml"), "model_auto_compact_token_limit = 40_000\n").unwrap();
+        assert_eq!(s.static_threshold(agent), HANDOFF_AT);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        // past handoff_at it starts fresh, as it always did
+        let (mut s, agent) = ctx_session("codex", HANDOFF_AT + 1);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+    }
+
+    #[test]
+    fn a_pinned_policy_handoff_is_used_exactly() {
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 48000})).unwrap());
+        assert!(s.handoff_pinned);
+        assert_eq!(s.static_threshold(agent), 48_000);
+        s.context.insert(agent, 40_000);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0, "40k is under the owner's 48k");
+        s.context.insert(agent, 50_000);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0, "50k is past the owner's 48k");
+        // a policy without handoff_at pins nothing
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"instruction": "x"})).unwrap());
+        assert!(!s.handoff_pinned);
+        assert_eq!(s.static_threshold(agent), HANDOFF_AT);
+    }
+
+    #[test]
+    fn claude_and_agy_keep_the_static_64k_in_the_default_mode() {
+        let (mut s, agent) = ctx_session("claude", 50_000);
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        s.context.insert(agent, 64_001);
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        for mode in [context_policy::Mode::Static, context_policy::Mode::Adaptive] {
+            let (mut s, agent) = ctx_session("agy", 0); // agy never reports its context
+            s.context_mode = mode;
+            s.context.remove(&agent);
+            let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+            assert!(!fresh && !log.contains("ctx agy"), "{log}");
+        }
+    }
+
+    #[test]
+    fn adaptive_mode_decides_by_the_cost_model_and_logs_the_inputs() {
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx codex: fresh — fills 56.0k base 13.0k record "), "{log}");
+        assert!(log.contains("calls~5") && log.contains("save~") && log.contains("idle 0m (warm)"), "{log}");
+        // a short turn behind a small conversation resumes, and the line says why
+        let (mut s, agent) = ctx_session("codex", 30_000);
+        s.jobs[0].calls = 1;
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("ctx codex: resume — fills 30.0k base 13.0k"), "{log}");
+        // adaptive acts below the static threshold too: 40k, a long turn behind it, cold
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        if age(&mut s, 3 * 3600) { // a machine up for less than that cannot hold an Instant so old (Windows)
+            let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+            assert!(fresh && log.contains("(cold)"), "{log}");
+        }
+        // without a measured base it is the static rule, and says so
+        let (mut s, agent) = ctx_session("codex", 70_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx codex: fresh — no base yet: static 64k"), "{log}");
+        // Claude too
+        let (mut s, agent) = ctx_session("claude", 56_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx claude: fresh"), "{log}");
+    }
+
+    #[test]
+    fn adaptive_mode_keeps_the_guards() {
+        for (status, prompt, why) in [(Status::Cancelled, "fix the failing tests", "previous turn stopped or failed"),
+                                      (Status::Failed("x".into()), "fix the failing tests", "previous turn stopped or failed"),
+                                      (Status::Done, "continue", "owner continues")] {
+            let (mut s, agent) = ctx_session("codex", 120_000);
+            s.context_mode = context_policy::Mode::Adaptive;
+            s.bases.insert(agent, VecDeque::from([13_000]));
+            s.jobs[0].status = status;
+            let (fresh, log) = ctx_next(&mut s, agent, prompt);
+            assert!(!fresh && log.contains(&format!("ctx codex: resume — guard: {why}")), "{log}");
+        }
+        // a fresh start does not follow a fresh start
+        let (mut s, agent) = ctx_session("codex", 120_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0);
+        let id = s.jobs.len();
+        s.jobs[id - 1].status = Status::Done;
+        s.jobs[id - 1].elapsed = Some(Duration::from_secs(1));
+        s.threads.insert(agent, "thread-2".into());
+        s.context.insert(agent, 120_000);
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("guard: fresh start last turn"), "{log}");
+    }
+
+    #[test]
+    fn a_pinned_handoff_overrides_adaptive_mode_exactly() {
+        let (mut s, agent) = ctx_session("claude", 90_000);
+        s.context_mode = context_policy::Mode::Adaptive;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        s.handoff_at = 96_000;
+        s.handoff_pinned = true;
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("ctx claude: resume — owner handoff_at 96k"), "{log}");
+    }
+
+    #[test]
+    fn a_pinned_handoff_beats_off_and_a_policy_naming_adaptive_uses_the_cost_model() {
+        // RINGO_CONTEXT=off does not override the owner's pinned number
+        let (mut s, agent) = ctx_session("codex", 70_000);
+        s.context_mode = context_policy::Mode::Off;
+        s.handoff_pinned = true;
+        assert!(ctx_next(&mut s, agent, "fix the failing tests").0, "fills 70k > the pinned 64k");
+        // an evaluation arm's policy names adaptive with its own handoff_at: the cost model decides
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 64000, "context": "adaptive"})).unwrap());
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("ctx codex: fresh — fills 56.0k base 13.0k"), "{log}");
+        // without a base, the policy's number is the fallback
+        let (mut s, agent) = ctx_session("codex", 56_000);
+        s.set_turn_policy(turn_policy::TurnPolicy::from_json(&serde_json::json!({"handoff_at": 64000, "context": "adaptive"})).unwrap());
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh && log.contains("no base yet: static 64k"), "{log}");
+        assert!(turn_policy::TurnPolicy::from_json(&serde_json::json!({"context": "sometimes"})).is_err());
+    }
+
+    #[test]
+    fn off_never_starts_an_existing_thread_fresh_but_a_new_one_gets_the_record() {
+        let (mut s, agent) = ctx_session("codex", 1_000_000);
+        s.context_mode = context_policy::Mode::Off;
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").0);
+        s.threads.remove(&agent);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "next").unwrap();
+        let mut resume = None;
+        let told = s.handoff(id, agent, &mut resume, "next").unwrap().1;
+        assert!(told.contains("told codex the conversation so far"), "{told}");
+    }
+
+    #[test]
+    fn an_unknown_mode_is_the_default_with_one_log_line() {
+        let (mut s, agent) = ctx_session("codex", 70_000);
+        s.context_note = Some("sometimes".into());
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && log.contains("RINGO_CONTEXT=sometimes"), "{log}");
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").1.contains("RINGO_CONTEXT"));
+    }
+
+    #[test]
+    fn the_shadow_line_appears_only_when_the_verdicts_differ() {
+        // static resumes at 50k (under 64k); five calls per turn, warm, the cost model says fresh: differ
+        let (mut s, agent) = ctx_session("codex", 50_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(!fresh, "the shadow never changes what the static rule did");
+        assert!(log.contains("ctx codex (shadow): adaptive would fresh — fills 50.0k base 13.0k"), "{log}");
+        // both say fresh
+        let (mut s, agent) = ctx_session("codex", 70_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+        assert!(fresh && !log.contains("shadow"), "{log}");
+        // both say resume
+        let (mut s, agent) = ctx_session("codex", 30_000);
+        s.jobs[0].calls = 1;
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").1.contains("shadow"));
+        // static resumes at 40k, adaptive would start fresh (cold, long turns): differ
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        if age(&mut s, 3 * 3600) {
+            let (fresh, log) = ctx_next(&mut s, agent, "fix the failing tests");
+            assert!(!fresh && log.contains("(shadow): adaptive would fresh"), "{log}");
+        }
+        // a pinned handoff_at is the owner's number: no shadow
+        let (mut s, agent) = ctx_session("codex", 40_000);
+        s.bases.insert(agent, VecDeque::from([13_000]));
+        age(&mut s, 3 * 3600);
+        s.handoff_pinned = true;
+        assert!(!ctx_next(&mut s, agent, "fix the failing tests").1.contains("shadow"));
+    }
+
+    /// Makes the first job's turn `secs` older, when this machine's clock can hold such an Instant.
+    fn age(s: &mut Session, secs: u64) -> bool {
+        match s.jobs[0].started.checked_sub(Duration::from_secs(secs)) {
+            Some(t) => { s.jobs[0].started = t; true }
+            None => false,
+        }
+    }
+
+    #[test]
+    fn a_new_conversations_first_context_report_measures_the_base() {
+        let (mut s, agent) = ctx_session("codex", 0);
+        s.threads.remove(&agent);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "hello").unwrap();
+        s.jobs[id - 1].fresh_thread = true;
+        s.jobs[id - 1].status = Status::Done;
+        s.jobs[id - 1].sent_bytes = 8_000; // 2k tokens of what was sent
+        s.tx.send(Event::Note(id, Note::Context(15_000))).unwrap();
+        s.tx.send(Event::Note(id, Note::Context(18_000))).unwrap(); // later calls do not measure
+        s.pump();
+        assert_eq!(s.bases.get(&agent).unwrap(), &VecDeque::from([13_000]));
+        assert_eq!(s.context.get(&agent), Some(&18_000));
+        // a resumed turn does not measure
+        let id = s.new_job(Kind::Agent { agent, write: false }, "again").unwrap();
+        s.jobs[id - 1].status = Status::Done;
+        s.tx.send(Event::Note(id, Note::Context(30_000))).unwrap();
+        s.pump();
+        assert_eq!(s.bases.get(&agent).unwrap().len(), 1);
+        // only the last three are kept, and the floor is 1k
+        for n in [14_000u64, 15_000, 16_000, 500] {
+            let id = s.new_job(Kind::Agent { agent, write: false }, "fresh").unwrap();
+            s.jobs[id - 1].fresh_thread = true;
+            s.jobs[id - 1].status = Status::Done;
+            s.tx.send(Event::Note(id, Note::Context(n))).unwrap();
+            s.pump();
+        }
+        assert_eq!(s.bases.get(&agent).unwrap(), &VecDeque::from([15_000, 16_000, 1_000]));
     }
 }

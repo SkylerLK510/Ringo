@@ -37,7 +37,7 @@ fn root() -> PathBuf {
 }
 
 fn python(cases: &[Value]) -> Vec<String> {
-    let mut child = Command::new("python3")
+    let mut child = Command::new(ringo_cli::python())
         .args(["-c", DRIVER])
         .arg(root())
         .stdin(Stdio::piped())

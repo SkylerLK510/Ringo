@@ -228,6 +228,16 @@ class CampaignTest(unittest.TestCase):
                 rrsi.policy({'instruction': text})
         self.assertEqual(rrsi.policy({'instruction': 'line\n\t世界'})['instruction'], 'line\n\t世界')
 
+    def test_context_mode_is_optional_and_matches_rust(self):
+        # absent: the digest of an existing policy is unchanged; present: one of the three modes Rust accepts
+        self.assertNotIn('context', rrsi.policy({}))
+        self.assertEqual(rrsi.digest(rrsi.policy({})), rrsi.digest(rrsi.policy({'handoff_at': 64000})))
+        for mode in ('static', 'adaptive', 'off'):
+            self.assertEqual(rrsi.policy({'context': mode})['context'], mode)
+        for bad in ('sometimes', None, 1):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                rrsi.policy({'context': bad})
+
 
 if __name__ == '__main__':
     unittest.main()

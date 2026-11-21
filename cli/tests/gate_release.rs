@@ -45,7 +45,7 @@ fn only_the_staged_releases_own_binary_runs_pinned() {
          print(releases.stage(Path({home:?}), Path({state:?}), native=binary, gate=report))",
         home = home().to_str().unwrap(), built = built.to_str().unwrap(), tmp = tmp.to_str().unwrap(),
         state = state.to_str().unwrap());
-    let out = Command::new("python3").arg("-c").arg(&stage).output().unwrap();
+    let out = Command::new(ringo_cli::python()).arg("-c").arg(&stage).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let rid = String::from_utf8(out.stdout).unwrap().trim().to_string();
     let bundle = state.canonicalize().unwrap().join("bundles").join(&rid);
@@ -54,7 +54,7 @@ fn only_the_staged_releases_own_binary_runs_pinned() {
         "approval": null, "quality_claim": null, "runtime": "native"});
 
     // the real chain: ringo.py verifies the bundle, then runs its binary, which runs the pipeline natively
-    let out = Command::new("python3").arg(home().join("ringo.py"))
+    let out = Command::new(ringo_cli::python()).arg(home().join("ringo.py"))
         .args(["release", "preview", "--release", &rid, "--", "design", "--help"])
         .env("RINGO_RELEASE_HOME", &state).env_remove("RINGO_CHILD").env_remove("RINGO_PINNED").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -95,7 +95,7 @@ fn only_the_staged_releases_own_binary_runs_pinned() {
                'active': {{'release': {rid:?}, 'approval': aid}}, 'previous': None}}) + b'\\n')\n\
              print(aid)",
             home = home().to_str().unwrap(), state = state.to_str().unwrap(), release = release, rid = rid);
-        let out = Command::new("python3").arg("-c").arg(&script).output().unwrap();
+        let out = Command::new(ringo_cli::python()).arg("-c").arg(&script).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     };
@@ -105,7 +105,7 @@ fn only_the_staged_releases_own_binary_runs_pinned() {
     let ok = run(&pinned_binary, &["design", "--help"], &state, Some(&active));
     assert!(ok.status.success(), "{}", String::from_utf8_lossy(&ok.stderr));
     // the real chain for an active release: ringo.py checks its approval, then runs the bundled binary
-    let out = Command::new("python3").arg(home().join("ringo.py")).args(["design", "--help"])
+    let out = Command::new(ringo_cli::python()).arg(home().join("ringo.py")).args(["design", "--help"])
         .env("RINGO_RELEASE_HOME", &state).env_remove("RINGO_CHILD").env_remove("RINGO_PINNED").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stdout).contains("usage: ringo.py design"));

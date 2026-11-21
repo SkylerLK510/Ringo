@@ -104,7 +104,7 @@ main()
 
 fn oracle(calls: &[(&str, Value)]) -> Vec<Value> {
     let input = Value::Array(calls.iter().map(|(n, a)| json!([n, a])).collect());
-    let mut child = Command::new("python3")
+    let mut child = Command::new(ringo_cli::python())
         .args(["-P", "-c", ORACLE])
         .arg(root())
         .stdin(Stdio::piped())
@@ -894,7 +894,7 @@ fn deep_sources_raise_where_the_python_runtime_raises() {
 }
 
 fn corpus() -> Vec<PathBuf> {
-    let stdlib = Command::new("python3")
+    let stdlib = Command::new(ringo_cli::python())
         .args(["-c", "import sysconfig; print(sysconfig.get_paths()['stdlib'])"])
         .output()
         .unwrap();
