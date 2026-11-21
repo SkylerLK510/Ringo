@@ -48,8 +48,8 @@ Between turns it starts a fresh native conversation only when the inline record
 is estimated to be at most half the previous context. This does not interrupt or
 bound a long agent turn already in progress.
 
-For Codex that is also its in-turn compaction limit, so by default a resumed Codex thread is not started fresh
-between turns. An earlier build used 48,000 for Codex; an offline replay of the owner's traces (an estimate) found it
+For Codex that is also its in-turn compaction limit, so by default a resumed Codex thread is rarely started fresh
+between turns (only when a large tool result overshoots the limit before Codex compacts). An earlier build used 48,000 for Codex; an offline replay of the owner's traces (an estimate) found it
 cut raw input by about 3% but raised credit-weighted cost, since a fresh start trades cached carry for an uncached
 record. A turn policy's `handoff_at` is used exactly. `RINGO_CONTEXT=adaptive` (opt-in, not yet evaluated, no saving claimed) replaces the size test with a
 token cost model at the start of each read turn, `static` (the default) logs a `ctx ... (shadow)` line when it would

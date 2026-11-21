@@ -783,8 +783,8 @@ it), its next turn does not resume: it starts fresh from the record of the whole
 most half that size. The turn's log says which of these happened and how big the record is.
 
 For Codex, 64,000 is also its in-turn compaction limit (`CODEX_COMPACT_AT`): a conversation that reaches it is
-compacted there and reports less afterwards, so in the default mode a resumed Codex thread is not started fresh
-between turns (one measured thread ran 31 turns with no fresh start). That is deliberate. An earlier build lowered
+compacted there and reports less afterwards, so in the default mode a resumed Codex thread is rarely started fresh
+between turns (only when a large tool result overshoots the limit before Codex compacts) (one measured thread ran 31 turns with no fresh start). That is deliberate. An earlier build lowered
 Codex's threshold to 48,000 (three quarters of the limit); an offline replay of the owner's own traces (53 turns, about
 1,040 calls; an estimate, not a measurement) found that it cut raw input by about 3% while raising credit-weighted cost
 by 0.3% to 1.9%, because a fresh start replaces carry that Codex re-reads from cache (2.5 credits per million on

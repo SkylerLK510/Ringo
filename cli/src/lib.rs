@@ -701,7 +701,6 @@ pub struct Session {
     context_note: Option<String>,
     /// The context mode came from the turn policy (an evaluation arm), not from RINGO_CONTEXT.
     context_from_policy: bool,
-    /// Whether the log already said that the Codex handoff may be unreachable (once per session).
     /// Each agent's fixed base, as its last three fresh conversations measured it.
     bases: HashMap<Agent, VecDeque<u64>>,
     turn_policy: turn_policy::TurnPolicy,
