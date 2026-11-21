@@ -51,6 +51,17 @@ pub const MARGIN: u64 = 32_000;
 /// Calls per turn assumed when the agent has no finished read turn here yet (the measured median in PROPOSAL.md).
 pub const DEFAULT_CALLS: u64 = 5;
 
+/// The most tokens a fresh start's record may take once the cost model has said fresh on the lean record, so that the
+/// text actually sent would still be fresh by the same rule: at most half of the gross saving `0.75 (fills - base)`
+/// (the saving then covers twice the record) and at most the gross saving less `ceil(margin / N)` (N times the saving
+/// still meets the margin; no margin when cold). A record within it keeps every condition of `decide` true.
+pub fn record_room(fills: u64, base: u64, calls: Option<u64>, cold: bool) -> u64 {
+    let gross = fills.saturating_sub(base) * RHO_PERCENT_KEPT / 100;
+    let n = calls.unwrap_or(DEFAULT_CALLS).max(1);
+    let margin = if cold { 0 } else { MARGIN };
+    (gross / 2).min(gross.saturating_sub(margin.div_ceil(n)))
+}
+
 /// Whether the cost model could say fresh at all, with an empty record (its best case): when not, the record need
 /// not be built to know the answer is resume. Guards and the no-base fallback do not need the record either.
 pub fn could_start_fresh(fills: u64, base: Option<u64>, calls: Option<u64>, cold: bool) -> bool {
@@ -196,6 +207,23 @@ mod tests {
         let v = decide(&cold, 48_000);
         assert_eq!(v.action, Action::Fresh);
         assert!(v.reason.contains("idle 41m (cold)"), "{}", v.reason);
+    }
+
+    #[test]
+    fn a_record_within_the_room_stays_fresh_by_the_same_rule() {
+        // Ringo review: f 50k, B 13k, N 2, warm: half the gross saving (13,875) would leave 2 x 13,875 < 32k
+        assert_eq!(record_room(50_000, 13_000, Some(2), false), 27_750 - 16_000);
+        assert_eq!(record_room(50_000, 13_000, Some(5), false), 13_875, "the margin binds less with more calls");
+        assert_eq!(record_room(50_000, 13_000, Some(2), true), 13_875, "cold: no margin");
+        assert_eq!(record_room(30_000, 13_000, Some(1), false), 0, "a start that only pays with no record gets none");
+        for (f, n, cold) in [(50_000, 2, false), (48_000, 5, false), (90_000, 1, false), (40_000, 2, true), (64_000, 3, false)] {
+            let room = record_room(f, 13_000, Some(n), cold);
+            let lean = Signals { record: Some(0), calls: Some(n), idle_s: Some(if cold { 7_200 } else { 60 }), ..warm(f, n) };
+            if decide(&lean, 48_000).action == Action::Fresh && room > 0 {
+                let rich = Signals { record: Some(room), ..lean };
+                assert_eq!(decide(&rich, 48_000).action, Action::Fresh, "f {f} n {n} cold {cold} room {room}");
+            }
+        }
     }
 
     #[test]

@@ -39,6 +39,8 @@ const READ_FILES: usize = 200;
 /// The inline record's one line of files read: at most this many paths and bytes (the rest are in the whole record).
 const READ_LINE_PATHS: usize = 40;
 const READ_LINE_BYTES: usize = 3_000;
+/// How the inline record's line of files read opens.
+const READ_LINE_PREFIX: &str = "files read (newest first; re-open what you need, they may have changed since): ";
 /// How much of one step's text a record keeps (`Session::record`): the head says what ran; the step's whole text is
 /// in the job's events file either way.
 const STEP_CHARS: usize = 160;
@@ -801,7 +803,7 @@ fn newest(record: &str, room: usize) -> String {
 /// `READ_LINE_PATHS` of them and `max` bytes in all, stopping before the path that would cross either, and ending
 /// with how many more are in the whole record when some are cut. Empty when nothing fits.
 fn read_line(files: &[&str], max: usize) -> String {
-    let prefix = "files read (newest first; re-open what you need, they may have changed since): ";
+    let prefix = READ_LINE_PREFIX;
     let tail = |more: usize| if more == 0 { String::new() } else { format!(" and {more} more (in the whole record)") };
     let mut shown = String::new();
     let mut count = 0;
@@ -829,6 +831,17 @@ fn read_line(files: &[&str], max: usize) -> String {
 /// base, half of the conversation is assumed to be the fixed base.
 fn record_cap(fills: u64, base: Option<u64>) -> usize {
     4 * (fills.saturating_sub(base.unwrap_or(fills / 2)) * 3 / 8) as usize
+}
+
+/// Whether an inline record holds all of its whole record: the same text once the files read are set aside (one line
+/// inline, a line per turn in the whole record), unless the inline line itself was cut. A complete record needs no
+/// pointer to the whole one (agy would read the same turns again).
+fn uncut(record: &str, whole: &str) -> bool {
+    // blank lines are only the joins between parts, and the files-read part brings its own
+    let inline = record.lines().filter(|l| !l.is_empty())
+        .filter(|l| !(l.starts_with(READ_LINE_PREFIX) && !l.ends_with(" more (in the whole record)")));
+    let whole = whole.lines().filter(|l| !l.is_empty()).filter(|l| !l.starts_with("read: "));
+    inline.eq(whole)
 }
 
 /// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
@@ -1327,8 +1340,9 @@ impl Session {
     pub fn carry_record(&self) -> Vec<(String, u64, String)> {
         Agent::all().into_iter().filter_map(|agent| {
             let fills = self.context.get(&agent).copied().unwrap_or(0);
-            let cap = record_cap(fills, self.base_median(agent));
-            let (record, whole) = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1), cap);
+            // lean: the next shell gives the turns before the restart only the room its own record leaves, and the
+            // owner's earlier words are worth more there than later paragraphs (the uncut file is linked below)
+            let (record, whole) = self.fresh_record(agent, &self.lane(agent, self.jobs.len() + 1), 0);
             let file = self.dir.join(format!("record-{}.md", agent.name()));
             let record = match record.is_empty() || fs::write(&file, whole).is_err() {
                 true => record,
@@ -1738,7 +1752,7 @@ impl Session {
         // The agent's measured base (what the cost model uses too), and what a conversation being replaced lets its
         // record add: a brand-new conversation saves nothing, so its record stays lean.
         let base = self.base_median(agent);
-        let cap = if resume.is_some() { record_cap(fills, base) } else { 0 };
+        let mut cap = if resume.is_some() { record_cap(fills, base) } else { 0 };
         // The text a start from the record would send (`fresh`), or the turns the agent missed (not), before the
         // guard that a fresh start must be at most half the conversation it replaces. `rich` is the detail cap its
         // record may fill (0: the lean record); the fourth field is what the text adds around the record, counting
@@ -1766,7 +1780,7 @@ impl Session {
             // that path in read mode, where --add-dir grants the job folder (never in an edits turn).
             let pointer = format!(" The whole record, uncut, is in {}. Read only the parts needed to recover a missing \
                                    constraint or detail.", self.jobs[id - 1].dir.join("record.md").display());
-            let whole_at = if whole.trim_end() == record.trim_end()
+            let whole_at = if uncut(&record, &whole)
                 || (agent.spec().adapter == Adapter::Agy && self.mode != Mode::Read) {
                 String::new()
             } else {
@@ -1831,6 +1845,10 @@ impl Session {
                     };
                     let v = context_policy::decide(&signals, threshold);
                     let adaptive = mode == context_policy::Mode::Adaptive;
+                    // a fresh start the cost model chose gets no more detail than keeps it fresh by the same rule
+                    if adaptive && v.saving.is_some() && let Some(base) = base {
+                        cap = cap.min(4 * context_policy::record_room(fills, base, calls, cold) as usize);
+                    }
                     shadow = !adaptive;
                     let action = v.action;
                     verdict = Some(v);
@@ -4624,12 +4642,15 @@ mod tests {
             let text = s.handoff(id, agent, &mut resume, "fix the failing tests").unwrap().0;
             assert!(text.contains("old first paragraph.") && !text.contains("old-LAST-PARAGRAPH"), "{mode:?}: {text}");
         }
-        // a restart hands on the same detail
+        // a restart hands on the lean record and where the uncut one is (Ringo review: a rich one would cost the
+        // next shell's oldest carried turns their room)
         let (mut s, agent) = ctx_session("codex", 50_000);
         fs::write(s.jobs[0].dir.join("reply.md"), two_paragraphs("old", 2_000)).unwrap();
         ctx_turn(&mut s, agent, Status::Done, 5);
         let records = s.carry_record();
-        assert!(records.iter().any(|(name, fills, record)| name == "codex" && *fills == 50_000 && record.contains("old-LAST-PARAGRAPH")), "{records:?}");
+        assert!(records.iter().any(|(name, fills, record)| name == "codex" && *fills == 50_000
+            && record.contains("old first paragraph.") && !record.contains("old-LAST-PARAGRAPH")
+            && record.contains("(these turns uncut: ")), "{records:?}");
     }
 
     #[test]
@@ -4637,12 +4658,15 @@ mod tests {
         // Review finding: a record filled to the cap, plus the text around it, read as over half the saving, so the
         // cost model kept a conversation the lean record would have replaced. Now the decision is on the lean record
         // and the detail is added after it, within the cap less the text around the record.
+        // With 2 calls a turn, warm, the margin binds too (Ringo review): 2 x saving must stay >= 32k.
+        for calls in [5u32, 2] {
         let (fills, base) = (48_000u64, 13_000u64);
         let (mut s, agent) = ctx_session("codex", fills);
         s.context_mode = context_policy::Mode::Adaptive;
         s.bases.insert(agent, VecDeque::from([base]));
+        s.jobs[0].calls = calls;
         for n in 0..30 {
-            let id = ctx_turn(&mut s, agent, Status::Done, 5);
+            let id = ctx_turn(&mut s, agent, Status::Done, calls);
             fs::write(s.jobs[id - 1].dir.join("reply.md"), two_paragraphs(&format!("t{n}"), 3_000)).unwrap();
         }
         let id = s.new_job(Kind::Agent { agent, write: false }, "fix the failing tests").unwrap();
@@ -4656,7 +4680,47 @@ mod tests {
         // everything sent but the owner's message stays within the cap, so the decision holds on the rich size too
         let sent = text.len() - "The owner's new message:\nfix the failing tests".len();
         assert!(sent <= record_cap(fills, Some(base)), "{sent} bytes over {}", record_cap(fills, Some(base)));
-        assert!((sent as u64 / 4) * 2 <= (fills - base) * 3 / 4, "the saving still covers twice the record");
+        let room = context_policy::record_room(fills, base, Some(calls as u64), false);
+        assert!(sent as u64 / 4 <= room, "calls {calls}: {} tokens over a room of {room}", sent / 4);
+        let rich = context_policy::Signals { fills, base: Some(base), record: Some(sent as u64 / 4), calls: Some(calls as u64),
+            idle_s: Some(0), ttl_s: context_policy::CODEX_TTL_S, previous_ended_badly: false, continuation: false,
+            fresh_last_turn: false };
+        assert_eq!(context_policy::decide(&rich, 48_000).action, context_policy::Action::Fresh, "calls {calls}: the text sent is fresh by the same rule");
+        }
+    }
+
+    #[test]
+    fn a_record_that_differs_from_the_whole_only_by_the_files_read_is_not_cut() {
+        // Ringo review: the files-read line (inline) and the per-turn read lines (whole) made every record look cut, so
+        // a complete one carried the pointer and agy would read the same turns again.
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        reply_turns(&mut s, &["one".into(), "two".into()]);
+        s.jobs[0].read = vec!["a.rs".into()];
+        s.jobs[1].read = vec!["b.rs".into()];
+        let (inline, whole) = s.record_with(&s.lane(agent, 3), 0);
+        assert!(inline.contains(READ_LINE_PREFIX) && whole.contains("read: a.rs"));
+        assert!(uncut(&inline, &whole), "{inline}\n---\n{whole}");
+        // with the change shown after the files read, too
+        fs::write(s.repo.join("x.txt"), "old\n").unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let before = git(&s.repo, &["write-tree"]).unwrap();
+        fs::write(s.repo.join("x.txt"), "new\n").unwrap();
+        git(&s.repo, &["add", "-A"]).unwrap();
+        let after = git(&s.repo, &["write-tree"]).unwrap();
+        (s.jobs[1].before, s.jobs[1].after, s.jobs[1].changed) = (Some(before), Some(after), vec!["x.txt".into()]);
+        let (inline, whole) = s.record(&s.lane(agent, 3));
+        assert!(inline.contains("The change these turns made") && inline.contains(READ_LINE_PREFIX));
+        assert!(uncut(&inline, &whole), "{inline}\n---\n{whole}");
+        // a cut line is a cut
+        s.jobs[0].read = (0..100).map(|n| format!("f{n}.rs")).collect();
+        let (inline, whole) = s.record(&s.lane(agent, 3));
+        assert!(!uncut(&inline, &whole));
+        // so is a brief older reply
+        s.jobs[0].read.clear();
+        fs::write(s.jobs[0].dir.join("reply.md"), two_paragraphs("one", 100)).unwrap();
+        let (inline, whole) = s.record(&s.lane(agent, 3));
+        assert!(!uncut(&inline, &whole));
     }
 
     #[test]

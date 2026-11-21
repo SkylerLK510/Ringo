@@ -861,14 +861,20 @@ applies.
 
 A rich tier spends part of what a fresh start saves on detail the lean record cuts. Whether to start fresh is decided on
 the lean record (the size test, the half-size guard, the cost model and the shadow line all see its size); only then,
-when a conversation that is being replaced starts fresh (and when `/restart` hands a record on), older turns kept in the brief form above are given
+when a conversation that is being replaced starts fresh, older turns kept in the brief form above are given
 their whole form (reply to 6,000 characters, last five steps), newest first, each only if its extra bytes fit in what
 is left of the cap, a turn that does not fit being skipped for an older one. The cap is `4 x 3/8 x (f - B)` bytes
 (`B` the measured base, or half of `f` before one is measured): the cost model counts `0.75 (f - B)` tokens saved per
 call, and the record may spend at most half of that. On a fresh start the cap is taken less what the text sent adds
 around the record (its opening sentence, the pointer to the whole record, any handoff instruction), so all of it stays
-within `3/8 (f - B)` tokens and could not undo the decision. At f = 48k and B = 13k that is 52,500 bytes. Turns from
-before a `/restart` keep the room the lean record leaves them, and the rich tier gets only what is left of the cap. The cap never takes the record past its 60,000 bytes, never
+within `3/8 (f - B)` tokens. When the cost model made the decision, the cap is also kept to what leaves `N` times the
+saving at the 32,000 margin (`0.75 (f - B) - ceil(32,000 / N)` tokens; no margin when cold), so the text sent is fresh by
+the same rule (f = 50k, B = 13k, N = 2, warm: 11,750 tokens, not 13,875). At f = 48k and B = 13k that is 52,500 bytes. Turns from
+before a `/restart` keep the room the lean record leaves them, and the rich tier gets only what is left of the cap; the
+record `/restart` hands on is the lean one (with the path of the uncut one), so the next shell's oldest carried turns
+keep their room. A record is "cut" (and links the whole record) by what it leaves out, not by its files-read line: the
+inline line and the whole record's per-turn `read:` lines are set aside when the two are compared, unless the line
+itself was cut. The cap never takes the record past its 60,000 bytes, never
 drops the diff or the files-read line, and leaves the whole record as it was. A brand-new conversation, and the record
 of turns an agent missed, get the lean form. How the richer record changes the answers is not measured, and no saving
 or quality gain is claimed for it.
