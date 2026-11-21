@@ -920,6 +920,106 @@ def turn(text, **usage):
                                              {'type': 'turn.completed', 'usage': usage}])
 
 
+class WeightedUsageTest(unittest.TestCase):
+    """The ledger's tags and cost weights (W): offline, no model calls."""
+    SOL = {'input': 1_000_000, 'cache_read': 2_000_000, 'cache_write': 0, 'output': 100_000}
+
+    @staticmethod
+    def attempt(run, backend, usage, model=None, status='ok', n=1):
+        rec = {'step': 's', 'attempt': n, 'status': status, 'usage': usage}
+        if backend is not None:
+            rec['backend'] = backend
+        if model is not None:
+            rec['model'] = model
+        run.reserve()
+        run.record(rec)
+
+    def test_attempt_usage_names_surface_billing_and_batch(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d) / 't')
+            usage = dict(self.SOL)
+            self.attempt(run, 'codex-chatgpt@gpt-6.1-sol', usage, 'gpt-6.1-sol')
+            self.assertEqual(usage, self.SOL, "the caller's dict is not mutated")
+            self.attempt(run, None, dict(self.SOL), n=2)
+            self.attempt(run, 'codex-chatgpt', None, n=3)
+            recs = [json.loads(line) for line in (Path(d) / 't' / 'trace.jsonl').read_text().splitlines()]
+            self.assertEqual({k: recs[0]['usage'][k] for k in ('surface', 'billing', 'batch')},
+                             {'surface': 'cli:codex', 'billing': 'subscription', 'batch': False})
+            self.assertEqual(recs[1]['usage'], self.SOL, 'a record without a backend is untouched')
+            self.assertIsNone(recs[2]['usage'], 'usage that is None stays None')
+
+    def test_surface_and_billing_of_every_backend_form(self):
+        table = {'claude': ('cli:claude', 'subscription'), 'claude@opus': ('cli:claude', 'subscription'),
+                 'claude:my-claude -p': ('cli:claude', 'unknown'), 'codex': ('cli:codex', 'unknown'),
+                 'codex-chatgpt': ('cli:codex', 'subscription'), 'codex-chatgpt@gpt-6.1-sol/high': ('cli:codex', 'subscription'),
+                 'codex-search': ('cli:codex', 'subscription'), 'codex:codex exec --json': ('cli:codex', 'unknown'),
+                 'ollama:q@x': ('local:ollama', 'local'), 'mytool': ('plain', 'unknown'), '': ('plain', 'unknown'),
+                 'Claude': ('plain', 'unknown')}
+        for name, want in table.items():
+            self.assertEqual((harness.surface(name), harness.billing(name)), want, name)
+
+    def run_of(self, *attempts):
+        run = harness.Run()
+        for n, (backend, usage, model) in enumerate(attempts, 1):
+            self.attempt(run, backend, usage, model, n=n)
+        return run.summary()['weighted']
+
+    def test_weighted_codex_credits(self):
+        sol = self.run_of(('codex-chatgpt@gpt-6.1-sol', self.SOL, 'gpt-6.1-sol'))
+        self.assertEqual((sol['unit'], sol['value'], sol['unknown_models']), ('codex_credits', 80.0, []))  # 50 + 5 + 25
+        luna = self.run_of(('codex@gpt-6-luna', self.SOL, 'gpt-6-luna'))
+        self.assertEqual((luna['unit'], luna['value']), ('codex_credits', 4.25))  # 2.5 + 0.5 + 1.25
+
+    def test_weighted_claude_tokens(self):
+        usage = {'input': 1000, 'cache_read': 10000, 'cache_write': 2000, 'output': 500}
+        w = self.run_of(('claude', usage, None))
+        self.assertEqual((w['unit'], w['value']), ('claude_weighted_tokens', 8000.0))  # 1000 + 500 + 4000 + 2500
+
+    def test_unknown_codex_model_is_null_and_named(self):
+        w = self.run_of(('codex', self.SOL, None))
+        self.assertEqual((w['value'], w['unknown_models']), (None, ['(not named)']))
+        w = self.run_of(('codex', self.SOL, 'gpt-7'), ('codex', self.SOL, 'gpt-6-luna'))
+        self.assertEqual((w['unit'], w['value'], w['unknown_models']), ('codex_credits', None, ['gpt-7']))
+
+    def test_providers_are_never_summed(self):
+        w = self.run_of(('claude', self.SOL, None), ('codex', self.SOL, 'gpt-6.1-sol'))
+        self.assertEqual((w['unit'], w['value']), ('mixed', None))
+        self.assertEqual(w['by_unit'], {'codex_credits': 80.0, 'claude_weighted_tokens': 1_600_000.0})
+
+    def test_untokened_or_unweighted_calls(self):
+        w = self.run_of(('codex', None, 'gpt-6.1-sol'))
+        self.assertEqual((w['unit'], w['value']), ('codex_credits', None))
+        w = self.run_of(('claude', self.SOL, None), ('mytool', self.SOL, None))
+        self.assertEqual((w['unit'], w['value'], w['unweighted_calls']), ('claude_weighted_tokens', 1_600_000.0, 1))
+        self.assertEqual(self.run_of(('mytool', self.SOL, None))['unit'], None)
+
+    def test_task_report_only_gains_keys(self):
+        import taskreport
+        backend = {'name': 'claude', 'argv': ['claude'], 'style': 'plain'}
+        with tempfile.TemporaryDirectory() as d:
+            run = harness.Run(Path(d) / 't')
+            p = pl.load_plan(None, 'review')
+            harness.run_plan(p, 'M', backend, run, call_fn=lambda *a, **k: (REVIEW, dict(self.SOL)))
+            report = run.task_report('done')
+            records = [json.loads(line) for line in (run.trace / 'trace.jsonl').read_text().splitlines()]
+        self.assertIn('weighted', report['consumption'])
+        self.assertTrue(all(r['raw_usage'].get('surface') == 'cli:claude' for r in report['consumption']['requests']))
+        added = ('surface', 'billing', 'batch')
+        for r in records:
+            if isinstance(r.get('usage'), dict):
+                r['usage'] = {k: v for k, v in r['usage'].items() if k not in added}
+        summary = {k: v for k, v in run.summary(elapsed_s=report['outcome']['elapsed_seconds']).items() if k != 'weighted'}
+        expected = taskreport.build(records, summary=summary, blockers=list(run.blockers), final_state='done', trace=run.trace,
+                                    max_tokens=run.max_tokens, overshoot_calls=None,
+                                    cost_usd=round(run.cost, 6) if not run.unpriced else None,
+                                    task_id=run.trace.name, started=round(run.started, 3))
+        del report['consumption']['weighted']
+        for row in report['consumption']['requests']:
+            for k in added:
+                row['raw_usage'].pop(k, None)
+        self.assertEqual(report, expected)
+
+
 class ModelMetricsTest(unittest.TestCase):
     """What a run records for comparing models: which model and effort it asked for, the reasoning tokens Codex
     reports, and the task's time."""

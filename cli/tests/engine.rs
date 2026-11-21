@@ -87,8 +87,17 @@ fn repo(name: &str) -> PathBuf {
 }
 
 fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
+    // This process never opens the executable for writing: a child another test thread forks while a write
+    // descriptor is open inherits it until its own exec, and exec'ing the script meanwhile fails with "Text file
+    // busy" (ETXTBSY). The text goes to a side file, and a separate `cp` process makes the executable.
     let path = dir.join(format!("fake-{name}"));
-    fs::write(&path, script).unwrap();
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let text = std::env::temp_dir().join(format!("ringo-fake-{}-{n}-{name}", std::process::id()));
+    fs::write(&text, script).unwrap();
+    let copied = Command::new("cp").arg(&text).arg(&path).status().unwrap();
+    let _ = fs::remove_file(&text);
+    assert!(copied.success(), "cp {} {}", text.display(), path.display());
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }
@@ -2416,6 +2425,82 @@ fn a_pipeline_call_without_counts_is_marked_in_the_usage_record() {
     assert_eq!((rows[1]["unknown"].as_bool(), rows[1]["uncounted_calls"].as_u64()), (Some(true), Some(2)));
     assert!(rows[1].get("input").is_none(), "{}", rows[1]);
     assert_eq!(s.jobs[0].tokens.total(), 940);
+}
+
+#[test]
+fn the_usage_record_names_its_surface_billing_and_calls() {
+    let r = repo("usage-surface");
+    let state = root().join("usage-surface-state");
+    let _ = fs::remove_dir_all(&state);
+    // Claude: two assistant messages (two model calls), then the turn's result
+    let claude = fake(&root(), "claude-surface", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-s\",\"apiKeySource\":\"none\",\"model\":\"claude-test-1\"}'\n\
+        echo '{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m1\",\"content\":[],\"usage\":{\"input_tokens\":5,\"output_tokens\":1}}}'\n\
+        echo '{\"type\":\"assistant\",\"parent_tool_use_id\":null,\"message\":{\"id\":\"m2\",\"content\":[],\"usage\":{\"input_tokens\":7,\"cache_read_input_tokens\":100,\"output_tokens\":1}}}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"model_usage_since_last_result\":{\"claude-test-1\":{\"inputTokens\":12,\"cacheReadInputTokens\":100,\"outputTokens\":2}}}'\n");
+    let codex = fake(&root(), "codex-surface", &codex_script("", &codex_done("done", (10, 4, 2))));
+    let tool = fake(&root(), "ledgertool", "#!/bin/sh\ncat >/dev/null\necho done\n");
+    let added = ringo_cli::add_custom_agent(&state, serde_json::json!({"name": "ledgertool"})).unwrap();
+    let home = root().join("fake-surface-home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(home.join("ringo.py"), "import json, sys, pathlib\n\
+        a = sys.argv[1:]\n\
+        val = lambda k: a[a.index(k) + 1]\n\
+        t = pathlib.Path(val('--trace')); t.mkdir(parents=True, exist_ok=True)\n\
+        u = {'input': 900, 'cache_write': 0, 'cache_read': 0, 'output': 40}\n\
+        (t / 'trace.jsonl').write_text(json.dumps({'step': 'a', 'status': 'ok', 'usage': u}) + '\\n' + json.dumps({'step': 'b', 'status': 'ok', 'usage': u}) + '\\n')\n\
+        pathlib.Path(val('--out')).write_text('answer\\n')\n").unwrap();
+    let mut s = Session::with_state(&r, &state).unwrap();
+    s.context_mode = ringo_cli::context_policy::Mode::Static;
+    s.programs.insert(agent("claude"), claude);
+    s.programs.insert(agent("codex"), codex);
+    s.programs.insert(added, tool);
+    s.ringo_home = home;
+    said(&mut s, "claude", "work");
+    said(&mut s, "codex", "work");
+    let id = s.launch_agent(added, true, "do it").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let id = s.ask("one?").unwrap();
+    assert_eq!(wait(&mut s, id), Status::Done);
+    let rows = usage_rows(&state);
+    let by = |agent: &str| rows.iter().find(|r| r["agent"] == agent).unwrap_or_else(|| panic!("{agent}: {rows:?}"));
+    let who = |agent: &str| (by(agent)["surface"].as_str().unwrap().to_string(), by(agent)["billing"].as_str().unwrap().to_string(),
+                              by(agent)["calls"].as_u64());
+    assert_eq!(who("claude"), ("cli:claude".into(), "subscription".into(), Some(2)));
+    assert_eq!(by("codex")["surface"], "cli:codex");
+    assert_eq!(by("codex")["billing"], "subscription");
+    assert_eq!(who("ringo"), ("pipeline".into(), "unknown".into(), Some(2)));
+    assert_eq!(who("ledgertool"), ("plain".into(), "unknown".into(), None));
+    assert!(by("ledgertool").get("calls").is_none(), "a plain agent reports no calls: absent, never zero");
+    assert_eq!((by("claude")["input"].as_u64(), by("claude")["output"].as_u64()), (Some(12), Some(2)), "the counts are as they were");
+}
+
+#[test]
+fn old_and_new_usage_rows_read_alike() {
+    let r = repo("usage-old-new");
+    let state = root().join("usage-old-new-state");
+    let _ = fs::remove_dir_all(&state);
+    let s = Session::with_state(&r, &state).unwrap();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let rows = [
+        serde_json::json!({"at":now - 100,"agent":"codex","tier":"standard","job":"/old","input":10,"cache_read":20,"cache_write":0,"output":5}),
+        serde_json::json!({"at":now - 90,"agent":"codex","tier":"standard","job":"/new","input":1,"cache_read":2,"cache_write":3,"output":4,
+            "surface":"cli:codex","billing":"subscription","calls":3,"ctx_base":13022,"ctx_fixed":100,"ctx_carry":50,"ctx_growth":25,
+            "record_inline_bytes":900,"record_whole_bytes":4000}),
+        serde_json::json!({"at":now - 80,"agent":"claude","tier":"standard","job":"/unk","unknown":true,"surface":"cli:claude","billing":"subscription"}),
+    ];
+    fs::write(state.join("usage.jsonl"), rows.iter().map(|r| r.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+    let (windows, first) = s.used_windows(&[86_400]);
+    assert_eq!(first, Some(now - 100));
+    let codex = windows[0].get("codex").unwrap();
+    assert_eq!((codex.input, codex.cache_read, codex.cache_write, codex.output), (11, 22, 3, 9), "the sums over both kinds of row");
+    assert_eq!(windows[0].get("claude").map(|t| t.total()), Some(0), "an unknown row adds no tokens");
+    let old = s.job_usage(std::path::Path::new("/old"));
+    let new = s.job_usage(std::path::Path::new("/new"));
+    assert!(old.recorded && new.recorded && !old.unknown && !new.unknown);
+    assert_eq!((new.tokens.input, new.tokens.cache_read, new.tokens.cache_write, new.tokens.output), (1, 2, 3, 4));
+    let unknown = s.job_usage(std::path::Path::new("/unk"));
+    assert!(unknown.recorded && unknown.unknown);
 }
 
 #[test]

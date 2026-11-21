@@ -257,6 +257,60 @@ def empty_listing(item):
 TOKEN_KEYS = ('input', 'cache_write', 'cache_read', 'output')
 PAID_STATUSES = ('ok', 'malformed', 'error')  # every attempt is paid for, a failed one too
 
+# Cost weights (W), integers over a per-unit divisor so Python and the Rust mirror agree exactly. See
+# docs/TOKEN-USAGE.md "Cost-weighted usage (W) and the ledger".
+WEIGHT_KEYS = ('input', 'cache_read', 'cache_write', 'output')
+WEIGHT_UNITS = {'codex_credits': 4_000_000, 'claude_weighted_tokens': 20}   # divisor; dict order = report order
+CODEX_CREDITS = {   # quarter-credits per million tokens; docs/EXPERIMENTS.md "Cost" (lines 24-25)
+    'gpt-6.1-sol': {'input': 200, 'cache_read': 10, 'cache_write': 200, 'output': 1000},  # 50 / 2.5 / 50 / 250
+    'gpt-6-luna': {'input': 10, 'cache_read': 1, 'cache_write': 10, 'output': 50},        # 2.5 / 0.25 / 2.5 / 12.5
+}
+CLAUDE_WEIGHTS = {'input': 20, 'cache_read': 1, 'cache_write': 40, 'output': 100}  # twentieths: 1 / 0.05 / 2.0 / 5
+WEIGHT_LIMIT = 1 << 127   # a sum at or past this is unknown (Rust's i128 bound), in both runtimes
+
+
+def surface(backend):
+    """Which provider surface a backend spec runs on."""
+    base = preset(backend)[0]
+    if base == 'claude' or backend.startswith('claude:'):
+        return 'cli:claude'
+    if base in ('codex', 'codex-chatgpt', 'codex-search') or backend.startswith('codex:'):
+        return 'cli:codex'
+    if backend.startswith('ollama:'):
+        return 'local:ollama'
+    return 'plain'
+
+
+def billing(backend):
+    """How a backend spec is billed, as far as Ringo can tell."""
+    base = preset(backend)[0]
+    if base in ('claude', 'codex-chatgpt', 'codex-search'):  # presets that strip API keys
+        return 'subscription'
+    if backend.startswith('ollama:'):
+        return 'local'
+    return 'unknown'  # the `codex` preset keeps API keys if set; claude:/codex:/plain commands are the person's own
+
+
+def weigh(where, model, usage):
+    """(unit or None for a surface without weights, integer units or None when unknown, unknown-model label or None)."""
+    if where == 'cli:claude':
+        unit, rates, unknown = 'claude_weighted_tokens', CLAUDE_WEIGHTS, None
+    elif where == 'cli:codex':
+        unit = 'codex_credits'
+        rates = CODEX_CREDITS.get(model) if isinstance(model, str) else None
+        unknown = None if rates else (model if isinstance(model, str) and model else '(not named)')
+    else:
+        return None, None, None
+    if rates is None or not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in WEIGHT_KEYS):
+        return unit, None, unknown
+    units = sum(rates[k] * usage[k] for k in WEIGHT_KEYS)
+    return unit, (units if units < WEIGHT_LIMIT else None), unknown
+
+
+def weights_table():
+    return {'keys': list(WEIGHT_KEYS), 'units': WEIGHT_UNITS, 'codex_credits': CODEX_CREDITS, 'claude': CLAUDE_WEIGHTS,
+            'limit': str(WEIGHT_LIMIT)}
+
 
 def output_rate(usage, seconds):
     """Reported output tokens / wall time, including startup and reasoning; not decode speed."""
@@ -698,6 +752,7 @@ class Run:
         self.clock_started, self.completed, self.progress = time.monotonic(), 0, None
         self.admission_refusals, self.incidents = 0, 0
         self.tokens = dict.fromkeys(TOKEN_KEYS, 0)
+        self.weight_units, self.weight_unknown_models, self.unweighted_calls = {}, set(), 0
         self.reasoning = None  # output tokens spent on reasoning, summed over the calls that report it (Codex)
         self.finished = {}  # kind -> [{'seconds', 'tokens'}] of successful calls, for soft-limit comparisons
         self.incident_dir = None
@@ -756,6 +811,9 @@ class Run:
         tagged with its overshoot."""
         with self.lock:
             rec = dict(rec)
+            if isinstance(rec.get('usage'), dict) and isinstance(rec.get('backend'), str):
+                rec['usage'] = {**rec['usage'], 'surface': surface(rec['backend']), 'billing': billing(rec['backend']),
+                                'batch': False}
             if 'seconds' in rec:
                 rec['output_tokens_per_second'] = output_rate(rec.get('usage'), rec['seconds'])
             usage = rec.get('usage') if isinstance(rec.get('usage'), dict) else None  # malformed usage is unknown
@@ -782,6 +840,17 @@ class Run:
                     if recorded > self.max_tokens:
                         rec['budget_overshoot_tokens'] = recorded - self.max_tokens
                         self.budget_overshoot_calls += 1
+                if isinstance(rec.get('backend'), str):
+                    unit, units, unknown = weigh(surface(rec['backend']), rec.get('model'), usage)
+                else:
+                    unit = None
+                if unit is None:
+                    self.unweighted_calls += 1
+                else:
+                    if unknown is not None:
+                        self.weight_unknown_models.add(unknown)
+                    old = self.weight_units.get(unit, 0)
+                    self.weight_units[unit] = None if old is None or units is None or old + units >= WEIGHT_LIMIT else old + units
             if self.blocker_threshold is not None and rec.get('status') in ('error', 'fatal'):
                 self._blocker(rec, raw)
             if self.trace:
@@ -927,12 +996,20 @@ class Run:
         with self.lock:
             elapsed = time.monotonic() - self.clock_started if elapsed_s is None else elapsed_s
             known = self.calls > 0 and self.completed == self.calls and not self.untokened
+            seen = [u for u in WEIGHT_UNITS if u in self.weight_units]
+            by_unit = {u: None if self.weight_units[u] is None else round(float(self.weight_units[u]) / WEIGHT_UNITS[u], 6)
+                       for u in seen}
             return {'calls': self.calls, 'cost_usd': round(self.cost, 6), 'unpriced_calls': self.unpriced,
                     'untokened_calls': self.untokened, 'admission_refusals': self.admission_refusals,
                     'incidents': self.incidents, **self.tokens,
                     **({} if self.reasoning is None else {'reasoning_output': self.reasoning}),
                     'unfinished_calls': max(0, self.calls - self.completed), 'elapsed_s': elapsed,
-                    'output_tokens_per_second': output_rate(self.tokens, elapsed) if known else None}
+                    'output_tokens_per_second': output_rate(self.tokens, elapsed) if known else None,
+                    'weighted': {'unit': seen[0] if len(seen) == 1 else ('mixed' if seen else None),
+                                 'value': by_unit[seen[0]] if len(seen) == 1 else None,
+                                 'unknown_models': sorted(self.weight_unknown_models),
+                                 'unweighted_calls': self.unweighted_calls,
+                                 'by_unit': by_unit}}
 
 
 def outside_repo(path, what):

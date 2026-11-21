@@ -16,7 +16,7 @@ use super::{pyjson, Error, Exc, Result};
 use serde_json::{Map, Value};
 use std::cmp::Ordering;
 use super::{pipelines, terminal};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,85 @@ pub const EMPTY_LISTINGS: [((&str, &str), &str); 2] = [
 pub const TOKEN_KEYS: [&str; 4] = ["input", "cache_write", "cache_read", "output"];
 /// Every attempt is paid for, a failed one too.
 pub const PAID_STATUSES: [&str; 3] = ["ok", "malformed", "error"];
+
+// Cost weights (W): integers over a per-unit divisor, mirroring harness.py exactly.
+pub const WEIGHT_KEYS: [&str; 4] = ["input", "cache_read", "cache_write", "output"];
+/// (unit, divisor), in report order.
+pub const WEIGHT_UNITS: [(&str, i128); 2] = [("codex_credits", 4_000_000), ("claude_weighted_tokens", 20)];
+/// Quarter-credits per million tokens, in WEIGHT_KEYS order (docs/EXPERIMENTS.md "Cost").
+pub const CODEX_CREDITS: [(&str, [i128; 4]); 2] = [("gpt-6.1-sol", [200, 10, 200, 1000]), ("gpt-6-luna", [10, 1, 10, 50])];
+/// Twentieths: 1 / 0.05 / 2.0 / 5.
+pub const CLAUDE_WEIGHTS: [i128; 4] = [20, 1, 40, 100];
+// A sum at or past 2^127 is unknown in both runtimes: Python compares against WEIGHT_LIMIT, here checked
+// arithmetic on i128 (whose bound is 2^127 - 1) returns None.
+
+/// Which provider surface a backend spec runs on.
+pub fn surface(backend: &str) -> &'static str {
+    let base = preset(backend).0;
+    if base == "claude" || backend.starts_with("claude:") {
+        "cli:claude"
+    } else if ["codex", "codex-chatgpt", "codex-search"].contains(&base) || backend.starts_with("codex:") {
+        "cli:codex"
+    } else if backend.starts_with("ollama:") {
+        "local:ollama"
+    } else {
+        "plain"
+    }
+}
+
+/// How a backend spec is billed, as far as Ringo can tell.
+pub fn billing(backend: &str) -> &'static str {
+    let base = preset(backend).0;
+    if ["claude", "codex-chatgpt", "codex-search"].contains(&base) {
+        "subscription"
+    } else if backend.starts_with("ollama:") {
+        "local"
+    } else {
+        "unknown"
+    }
+}
+
+/// (unit or None for a surface without weights, integer units or None when unknown, unknown-model label or None).
+pub fn weigh(surface: &str, model: Option<&Value>, usage: Option<&Value>) -> (Option<&'static str>, Option<i128>, Option<String>) {
+    let (unit, rates, unknown): (&'static str, Option<[i128; 4]>, Option<String>) = match surface {
+        "cli:claude" => ("claude_weighted_tokens", Some(CLAUDE_WEIGHTS), None),
+        "cli:codex" => {
+            let name = match model {
+                Some(Value::String(s)) => Some(s.as_str()),
+                _ => None,
+            };
+            let rates = name.and_then(|n| CODEX_CREDITS.iter().find(|(m, _)| *m == n).map(|(_, r)| *r));
+            let unknown = if rates.is_some() { None } else { Some(name.filter(|n| !n.is_empty()).unwrap_or("(not named)").to_string()) };
+            ("codex_credits", rates, unknown)
+        }
+        _ => return (None, None, None),
+    };
+    let counts = match usage {
+        Some(Value::Object(m)) => {
+            let c: Vec<Option<i128>> = WEIGHT_KEYS.iter().map(|k| nonneg_int(m.get(*k))).collect();
+            if c.iter().all(Option::is_some) { Some(c.into_iter().flatten().collect::<Vec<i128>>()) } else { None }
+        }
+        _ => None,
+    };
+    let (Some(rates), Some(counts)) = (rates, counts) else { return (Some(unit), None, unknown) };
+    let mut units: Option<i128> = Some(0);
+    for (r, c) in rates.iter().zip(counts) {
+        units = units.and_then(|u| r.checked_mul(c).and_then(|x| u.checked_add(x)));
+    }
+    (Some(unit), units, unknown)
+}
+
+/// The whole weights table, for the parity test.
+pub fn weights_table() -> Value {
+    let rates = |r: &[i128; 4]| Value::Object(WEIGHT_KEYS.iter().zip(r).map(|(k, v)| ((*k).to_string(), Value::from(v.to_string().parse::<i64>().unwrap_or(0)))).collect());
+    let mut m = Map::new();
+    m.insert("keys".into(), Value::Array(WEIGHT_KEYS.iter().map(|k| Value::String((*k).into())).collect()));
+    m.insert("units".into(), Value::Object(WEIGHT_UNITS.iter().map(|(u, d)| ((*u).to_string(), Value::from(*d as i64))).collect()));
+    m.insert("codex_credits".into(), Value::Object(CODEX_CREDITS.iter().map(|(n, r)| ((*n).to_string(), rates(r))).collect()));
+    m.insert("claude".into(), rates(&CLAUDE_WEIGHTS));
+    m.insert("limit".into(), Value::String((1u128 << 127).to_string()));
+    Value::Object(m)
+}
 
 // ---------------------------------------------------------------------------------------------------------------
 // Python numbers
@@ -860,6 +939,10 @@ struct Totals {
     max_tokens: Option<Num>,
     blocker_threshold: Option<i128>,
     budget_overshoot_calls: i64,
+    /// Weighted units per unit name; None once any call's weight was unknown.
+    weight_units: HashMap<&'static str, Option<i128>>,
+    weight_unknown_models: BTreeSet<String>,
+    unweighted_calls: i64,
     /// One compact entry per repeated-failure signature past the threshold (measurement only).
     blockers: Vec<Value>,
     _blocker_counts: HashMap<String, i64>,
@@ -955,6 +1038,9 @@ impl Run {
                 max_tokens,
                 blocker_threshold,
                 budget_overshoot_calls: 0,
+                weight_units: HashMap::new(),
+                weight_unknown_models: BTreeSet::new(),
+                unweighted_calls: 0,
                 blockers: vec![],
                 _blocker_counts: HashMap::new(),
             }),
@@ -1021,6 +1107,13 @@ impl Run {
     /// unpriced_calls. As in Python, a failure part way leaves the totals it already changed.
     pub fn record(&self, rec: &Map<String, Value>, reply: Option<&str>, raw: Option<&str>) -> Result<()> {
         let mut rec = rec.clone();
+        if let (Some(Value::Object(u)), Some(Value::String(b))) = (rec.get("usage"), rec.get("backend")) {
+            let mut tagged = u.clone();
+            tagged.insert("surface".into(), Value::String(surface(b).into()));
+            tagged.insert("billing".into(), Value::String(billing(b).into()));
+            tagged.insert("batch".into(), Value::Bool(false));
+            rec.insert("usage".into(), Value::Object(tagged));
+        }
         if rec.contains_key("seconds") {
             rec.insert("output_tokens_per_second".into(), terminal::rate(rec.get("usage"), rec.get("seconds")));
         }
@@ -1054,6 +1147,7 @@ impl Run {
                     None => t.unpriced += 1,
                 },
             }
+            let has_fields = fields.is_some(); // `fields` borrows `rec`, which the overshoot below may change
             if t.max_tokens.is_some() {
                 let recorded = py_sum(&t.tokens.iter().cloned().map(Ok).collect::<Vec<Operand>>())?;
                 if matches!(recorded.py_cmp(t.max_tokens.clone().expect("checked above")), Some(Ordering::Greater)) {
@@ -1063,6 +1157,24 @@ impl Run {
                     };
                     rec.insert("budget_overshoot_tokens".into(), over.to_value());
                     t.budget_overshoot_calls += 1;
+                }
+            }
+            let (unit, units, unknown) = match rec.get("backend") {
+                Some(Value::String(b)) => weigh(surface(b), rec.get("model"), if has_fields { rec.get("usage") } else { None }),
+                _ => (None, None, None),
+            };
+            match unit {
+                None => t.unweighted_calls += 1,
+                Some(unit) => {
+                    if let Some(u) = unknown {
+                        t.weight_unknown_models.insert(u);
+                    }
+                    let old = t.weight_units.get(unit).copied().unwrap_or(Some(0));
+                    let next = match (old, units) {
+                        (Some(o), Some(n)) => o.checked_add(n),
+                        _ => None,
+                    };
+                    t.weight_units.insert(unit, next);
                 }
             }
         }
@@ -1315,6 +1427,27 @@ fn summary_of(t: &Totals, elapsed: f64) -> Map<String, Value> {
     let known = t.calls > 0 && t.completed == t.calls && t.untokened == 0;
     let rate = if known { terminal::rate(Some(&Value::Object(m.clone())), Some(&pyjson::float_value(elapsed))) } else { Value::Null };
     m.insert("output_tokens_per_second".into(), rate);
+    let seen: Vec<&(&str, i128)> = WEIGHT_UNITS.iter().filter(|(u, _)| t.weight_units.contains_key(u)).collect();
+    let mut by_unit = Map::new();
+    for (u, divisor) in &seen {
+        let v = match t.weight_units[u] {
+            None => Value::Null,
+            Some(n) => pyjson::float_value(py::round(n as f64 / *divisor as f64, 6)),
+        };
+        by_unit.insert((*u).to_string(), v);
+    }
+    let mut weighted = Map::new();
+    let (unit, value) = match seen.as_slice() {
+        [] => (Value::Null, Value::Null),
+        [(u, _)] => (Value::String((*u).into()), by_unit[*u].clone()),
+        _ => (Value::String("mixed".into()), Value::Null),
+    };
+    weighted.insert("unit".into(), unit);
+    weighted.insert("value".into(), value);
+    weighted.insert("unknown_models".into(), Value::Array(t.weight_unknown_models.iter().map(|m| Value::String(m.clone())).collect()));
+    weighted.insert("unweighted_calls".into(), Value::from(t.unweighted_calls));
+    weighted.insert("by_unit".into(), Value::Object(by_unit));
+    m.insert("weighted".into(), Value::Object(weighted));
     m
 }
 

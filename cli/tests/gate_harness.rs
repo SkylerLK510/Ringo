@@ -188,6 +188,14 @@ def pure(fn, a):
         return harness.checker_pass(a[0], {'name': 'checker'} if a[1] else None)
     if fn == 'total_tokens':
         return harness.total_tokens(a[0])
+    if fn == 'surface':
+        return harness.surface(a[0])
+    if fn == 'billing':
+        return harness.billing(a[0])
+    if fn == 'weigh':
+        return list(harness.weigh(a[0], a[1], a[2]))
+    if fn == 'weights_table':
+        return harness.weights_table()
     if fn == 'stop_reason':
         cls, limit, watched = a
         exc = {'Stopped': lambda: backends.Stopped(['x'], 1.0), 'TimeoutExpired': lambda: subprocess.TimeoutExpired(['x'], 1.0),
@@ -1225,6 +1233,81 @@ fn run_trace_state_and_summary_match_python() {
     fs::remove_dir_all(&base).unwrap();
 }
 
+/// Scripts of attempts on every kind of backend: the usage tags, the `weighted` block and the task report's copy of
+/// it. Its own seed, so `script_cases` keeps the random stream it always had.
+fn weighted_cases(base: &Path) -> Vec<Value> {
+    let mut rng = Rng(0x00c0_ffee_1ed9_e701);
+    let backends = ["\"x\"", "\"claude\"", "\"claude@opus\"", "\"codex\"", "\"codex-chatgpt\"", "\"codex-chatgpt@gpt-6.1-sol\"",
+                    "\"codex@gpt-6-luna/low\"", "\"codex:codex exec --json\"", "\"ollama:q\"", "5"];
+    let models = [None, Some("null"), Some("\"gpt-6.1-sol\""), Some("\"gpt-6-luna\""), Some("\"gpt-7\""), Some("\"\"")];
+    let mut cases = vec![];
+    for k in 0..200 {
+        let mut ops: Vec<String> = vec![if rng.chance(70) { r#"{"op": "new", "trace": "t"}"#.into() } else { r#"{"op": "new", "trace": null}"#.into() }];
+        for attempt in 1..=rng.below(8) + 1 {
+            ops.push(r#"{"op": "reserve"}"#.into());
+            let backend = rng.pick(&backends);
+            let model = rng.pick(&models).map_or(String::new(), |m| format!(", \"model\": {m}"));
+            let usage = if rng.chance(15) { "null" } else { rng.pick(USAGES) };
+            let fixed = rng.pick(&[
+                r#"{"input": 1000000, "cache_write": 0, "cache_read": 2000000, "output": 100000}"#,
+                r#"{"input": 1000, "cache_write": 2000, "cache_read": 10000, "output": 500}"#,
+            ]);
+            let usage = if rng.chance(40) { fixed } else { usage };
+            let status = rng.pick(&["\"ok\"", "\"ok\"", "\"error\"", "\"malformed\""]);
+            ops.push(format!(r#"{{"op": "record", "rec": {{"step": "s", "attempt": {attempt}, "backend": {backend}, "status": "started"{model}}}}}"#));
+            ops.push(format!(r#"{{"op": "record", "rec": {{"step": "s", "attempt": {attempt}, "backend": {backend}, "status": {status}, "usage": {usage}{model}}}}}"#));
+        }
+        ops.push(r#"{"op": "summary"}"#.into());
+        ops.push(r#"{"op": "task_report", "status": "done"}"#.into());
+        let text = format!(r#"{{"base": {}, "ops": [{}]}}"#, pyjson::quote(&base.join(format!("w{k}")).to_string_lossy()), ops.join(", "));
+        cases.push(v(&text));
+    }
+    // fixed cases: one unit, two units, an unknown Codex model, no backend, and a sum past the limit
+    let u = r#"{"input": 1000000, "cache_write": 0, "cache_read": 2000000, "output": 100000}"#;
+    let huge = r#"{"input": 850705917302346158658436518579420529, "cache_write": 0, "cache_read": 0, "output": 0}"#;
+    let rec = |backend: &str, model: &str, usage: &str, n: u32| format!(
+        r#"{{"op": "reserve"}}, {{"op": "record", "rec": {{"step": "s", "attempt": {n}, "backend": {backend}{model}, "status": "ok", "usage": {usage}}}}}"#);
+    for (i, ops) in [
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {}, {{"op": "summary"}}, {{"op": "task_report", "status": "done"}}]"#,
+                rec("\"codex-chatgpt@gpt-6.1-sol\"", ", \"model\": \"gpt-6.1-sol\"", u, 1), rec("\"codex@gpt-6-luna/low\"", ", \"model\": \"gpt-6-luna\"", u, 2)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {}, {{"op": "summary"}}, {{"op": "task_report", "status": "done"}}]"#,
+                rec("\"claude\"", "", u, 1), rec("\"codex\"", ", \"model\": \"gpt-6.1-sol\"", u, 2)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {}, {{"op": "summary"}}, {{"op": "task_report", "status": "done"}}]"#,
+                rec("\"codex\"", ", \"model\": \"gpt-7\"", u, 1), rec("\"codex\"", "", u, 2)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {{"op": "summary"}}]"#, rec("\"codex\"", ", \"model\": \"gpt-6-luna\"", huge, 1)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {}, {{"op": "summary"}}, {{"op": "task_report", "status": "done"}}]"#,
+                rec("\"claude\"", "", u, 1), rec("\"ollama:q\"", "", u, 2)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {{"op": "summary"}}]"#, rec("\"codex\"", ", \"model\": \"gpt-6.1-sol\"", u, 1)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {{"op": "summary"}}]"#, rec("\"codex\"", ", \"model\": \"gpt-6-luna\"", u, 1)),
+        format!(r#"[{{"op": "new", "trace": "t"}}, {}, {{"op": "summary"}}]"#,
+                rec("\"claude\"", "", r#"{"input": 1000, "cache_write": 2000, "cache_read": 10000, "output": 500}"#, 1)),
+    ].iter().enumerate() {
+        cases.push(v(&format!(r#"{{"base": {}, "ops": {ops}}}"#, pyjson::quote(&base.join(format!("wf{i}")).to_string_lossy()))));
+    }
+    cases
+}
+
+#[test]
+fn weighted_summary_and_tags_match_python() {
+    let base = scratch("weighted");
+    let cases = weighted_cases(&base);
+    let py = python("script", &cases);
+    remove_incident_temps(&py);
+    reset(&base);
+    let rs: Vec<String> = cases.iter().map(rust_script).collect();
+    remove_incident_temps(&rs);
+    let py: Vec<String> = py.iter().map(|l| normalise_script(l)).collect();
+    let rs: Vec<String> = rs.iter().map(|l| normalise_script(l)).collect();
+    compare("weighted scripts", &cases, &py, &rs);
+    for needle in [r#"\"surface\": \"cli:codex\""#, r#"\"surface\": \"cli:claude\""#, r#"\"billing\": \"subscription\""#,
+                   r#"\"batch\": false"#, r#""unit": "codex_credits""#, r#""unit": "claude_weighted_tokens""#, r#""unit": "mixed""#,
+                   r#""unknown_models": ["(not named)""#, r#""unknown_models": ["gpt-7""#, r#""value": 80.0"#, r#""value": 4.25"#,
+                   r#""value": 8000.0"#, r#""unweighted_calls": 1"#] {
+        assert!(py.iter().any(|l| l.contains(needle)), "no case covers {needle}");
+    }
+    fs::remove_dir_all(&base).unwrap();
+}
+
 #[test]
 fn two_writers_cannot_claim_the_same_empty_trace() {
     let base = scratch("claim");
@@ -1488,6 +1571,13 @@ fn rust_pure(fn_name: &str, a: &Value, roots: &[PathBuf]) -> Value {
             h::checker_pass(&a[0], a[1].as_bool().unwrap().then_some(&b)).map(|_| Value::Null)
         }
         "total_tokens" => h::total_tokens(Some(&a[0])).map(|t| t.map_or(Value::Null, Num::to_value)),
+        "surface" => Ok(json!(h::surface(s(0)))),
+        "billing" => Ok(json!(h::billing(s(0)))),
+        "weigh" => {
+            let (unit, units, unknown) = h::weigh(s(0), Some(&a[1]), Some(&a[2]));
+            Ok(json!([unit, units.map_or(Value::Null, |u| Num::Int(u).to_value()), unknown]))
+        }
+        "weights_table" => Ok(h::weights_table()),
         "stop_reason" => {
             let exc = match s(0) {
                 "Stopped" => Exc::Stopped,
@@ -1593,6 +1683,25 @@ fn small_helpers_match_python() {
     ] {
         cases.push(json!(["total_tokens", [v(u)]]));
     }
+    // The ledger's weights: every backend form, then each surface x model x usage, then the whole table.
+    for name in ["claude", "codex", "codex-chatgpt", "codex-search", "ollama:", "ollama:qwen3", "claude:x", "codex:x", "", "Claude",
+                 "codex-chatgpt@gpt-x/xhigh", "claude@opus", "codex@m", "codex-search@/low", "codex:x@m", "x@codex-chatgpt",
+                 "ollama:q@x", "codex:codex exec --json", "codex@gpt-6-luna/low", "mytool"] {
+        cases.push(json!(["surface", [name]]));
+        cases.push(json!(["billing", [name]]));
+    }
+    let huge = r#"{"input": 850705917302346158658436518579420529, "cache_write": 0, "cache_read": 0, "output": 0}"#;
+    let edge = r#"{"input": 170141183460469231731687303715884105728, "cache_write": 0, "cache_read": 0, "output": 0}"#;
+    let sums = r#"{"input": 400000000000000000000000000000000000, "cache_write": 400000000000000000000000000000000000, "cache_read": 0, "output": 0}"#;
+    let counts = r#"{"input": 1000000, "cache_write": 0, "cache_read": 2000000, "output": 100000}"#;
+    for surface in ["cli:codex", "cli:claude", "cli:agy", "plain"] {
+        for model in ["null", "\"gpt-6.1-sol\"", "\"gpt-6-luna\"", "\"gpt-7\"", "\"\"", "5"] {
+            for usage in USAGES.iter().chain([&counts, &huge, &edge, &sums]) {
+                cases.push(json!(["weigh", [surface, v(model), v(usage)]]));
+            }
+        }
+    }
+    cases.push(json!(["weights_table", []]));
     for cls in ["Stopped", "TimeoutExpired", "JudgeError", "ValueError"] {
         for limit in ["null", "true", "false", "1", "0", "\"\""] {
             for watched in [true, false] {

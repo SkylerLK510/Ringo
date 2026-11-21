@@ -80,6 +80,8 @@ pub enum Note {
     Context(u64),
     /// One model call finished (Ringo pipelines report these).
     Call,
+    /// One model call's input side: what it read, cached or not; the fixed/carry/growth split.
+    CallInput(u64),
     /// The agent is editing this file (as the agent reported it, usually an absolute path).
     Touched(String),
     /// The agent read this file (as the agent reported it, usually an absolute path): the working set of the turn.
@@ -597,6 +599,7 @@ impl Parser {
                 if total != self.usage && p.pointer("/tokenUsage/last").is_some() && !self.turn_id.is_empty()
                     && tagged.is_none_or(|t| t == self.turn_id) {
                     notes.push(Note::Call);
+                    notes.push(Note::CallInput(p.pointer("/tokenUsage/last").map_or(0, |last| u(last, "inputTokens"))));
                 }
                 self.usage = total;
                 notes.push(Note::Live(self.thread_tokens()));
@@ -778,6 +781,7 @@ impl Parser {
                             // only, as a subagent's read its own window
                             if parent.is_none() {
                                 notes.push(Note::Call);
+                                notes.push(Note::CallInput(t.input + t.cache_read + t.cache_write));
                             }
                         }
                     }
@@ -1518,6 +1522,23 @@ mod tests {
                                              &msg("s1", r#""toolu_1""#, "sub")]);
         assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2,
                    "one per message, whatever its blocks; a subagent's calls are its own");
+    }
+
+    #[test]
+    fn each_call_reports_its_input_side_once() {
+        let upd = |i: u64, last: u64| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":1}},"last":{{"inputTokens":{last},"outputTokens":1}}}}}}}}"#);
+        let replay = r#"{"method":"thread/tokenUsage/updated","params":{"turnId":"OLD","tokenUsage":{"total":{"inputTokens":50,"outputTokens":1},"last":{"inputTokens":50,"outputTokens":1}}}}"#;
+        let thread = r#"{"id":2,"result":{"thread":{"id":"T"}}}"#;
+        let answer = r#"{"id":3,"result":{"turn":{"id":"U"}}}"#;
+        let inputs = |notes: &[Note]| notes.iter().filter_map(|n| if let Note::CallInput(x) = n { Some(*x) } else { None }).collect::<Vec<u64>>();
+        let calls = |notes: &[Note]| notes.iter().filter(|n| matches!(n, Note::Call)).count();
+        let (_, notes) = run(Style::Codex, &[thread, &upd(40, 40), replay, answer, &upd(100, 100), &upd(100, 100), &upd(250, 150)]);
+        assert_eq!(inputs(&notes), [100, 150], "two distinct totals; a repeat, a replay and an update before the turn answer give none");
+        assert_eq!(inputs(&notes).len(), calls(&notes));
+        let msg = |id: &str, parent: &str, cr: u64| format!(r#"{{"type":"assistant","parent_tool_use_id":{parent},"message":{{"id":"{id}","usage":{{"input_tokens":5,"cache_read_input_tokens":{cr},"cache_creation_input_tokens":20,"output_tokens":1}},"content":[{{"type":"text","text":"x"}}]}}}}"#);
+        let (_, notes) = run(Style::Claude, &[&msg("m1", "null", 100), &msg("m1", "null", 100), &msg("s1", r#""toolu_1""#, 7)]);
+        assert_eq!(inputs(&notes), [125], "5 + 100 + 20 once for the message; a subagent's call is its own");
+        assert_eq!(inputs(&notes).len(), calls(&notes));
     }
 
     #[test]
