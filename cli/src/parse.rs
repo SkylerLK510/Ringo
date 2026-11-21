@@ -134,7 +134,6 @@ pub struct Parser {
     seen: Vec<(String, Tokens)>,
     /// Codex: this turn's id once its turn/start is answered. A resumed thread first replays the previous turn's
     /// usage (tagged with that turn's id), which is no model call of this turn.
-    turn_now: String,
     /// Claude reported a compaction (`/compact`), whose result may carry no text.
     compacted: bool,
     /// agy's model calls' counts so far (`step_update` usage): the running turn's own total, told live.
@@ -156,6 +155,14 @@ pub struct Parser {
     heard: bool,
     /// Claude: the tool call whose input is being written (tool, characters so far), shown before the call is whole.
     writing: Option<(String, usize)>,
+    /// Codex: the turn's id, once its turn/start was answered; its events are the turn's own, another turn's are not.
+    turn_id: String,
+    /// Codex: initialize answered; this parser sends the turn/start itself (`with_turn`); that request sent; its
+    /// answer received (a completion may name the turn first: its id is adopted, and the answer must then agree).
+    init: bool,
+    sends_turn: bool,
+    turn_sent: bool,
+    acked: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -325,14 +332,16 @@ impl Parser {
 
     pub fn new(style: Style) -> Parser {
         Parser { style, reply: String::new(), failure: None, completed: 0, subagents: Vec::new(), calls: Vec::new(),
-                 seen: Vec::new(), turn_now: String::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
+                 seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
-                 total: Tokens::default() }
+                 total: Tokens::default(), turn_id: String::new(), init: false, sends_turn: false, turn_sent: false,
+                 acked: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
     pub fn with_turn(mut self, turn: Value) -> Parser {
         self.turn = Some(turn);
+        self.sends_turn = true;
         self
     }
 
@@ -388,6 +397,11 @@ impl Parser {
         }
     }
 
+    /// A framing violation: the stream cannot be trusted past this point. Fails the turn closed.
+    pub fn violation(&mut self, reason: String) -> Vec<Note> {
+        self.fail(reason)
+    }
+
     fn fail(&mut self, reason: String) -> Vec<Note> {
         self.failure.get_or_insert(reason.clone());
         vec![Note::Fail(reason)]
@@ -415,18 +429,47 @@ impl Parser {
             if let Some(e) = m.get("error") {
                 return self.fail(format!("codex: {}", short(e.get("message").and_then(Value::as_str).unwrap_or("an error"), 200)));
             }
+            // Ringo asks three things (1 initialize, 2 the thread, 3 the turn), each once: an answer that repeats, or
+            // that answers a request never made, is a replay or a confused stream, and the turn fails closed.
             if id.as_u64() == Some(2) {
+                if !self.thread.is_empty() {
+                    return self.fail("codex: the thread was answered twice".into());
+                }
                 self.thread = m.pointer("/result/thread/id").and_then(Value::as_str).unwrap_or("").to_string();
+                if self.thread.is_empty() {
+                    return self.fail("codex: the thread answer names no thread".into());
+                }
                 if let Some(mut turn) = self.turn.take() {
                     turn["params"]["threadId"] = self.thread.clone().into();
                     self.writes.push(turn.to_string());
+                    self.turn_sent = true;
                 }
                 let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
                 return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
             }
-            if let Some(turn) = m.pointer("/result/turn/id").and_then(Value::as_str) {
-                self.turn_now = turn.to_string();
+            if id.as_u64() == Some(3) {
+                if self.thread.is_empty() || self.turn.is_some() {
+                    return self.fail("codex: the turn was answered before it was asked for".into());
+                }
+                if std::mem::replace(&mut self.acked, true) {
+                    return self.fail("codex: the turn was answered twice".into());
+                }
+                let turn = m.pointer("/result/turn/id").and_then(Value::as_str).unwrap_or("");
+                if turn.is_empty() {
+                    return self.fail("codex: the turn answer names no turn".into());
+                }
+                if !self.turn_id.is_empty() && turn != self.turn_id {
+                    // its completion, which came first, named another turn
+                    return self.fail("codex: the turn answer names another turn than its completion".into());
+                }
+                self.turn_id = turn.to_string();
                 return vec![Note::Turn { thread: self.thread.clone(), turn: turn.to_string() }];
+            }
+            if id.as_u64() != Some(1) {
+                return self.fail(format!("codex: an answer to a request never made (id {id})"));
+            }
+            if std::mem::replace(&mut self.init, true) {
+                return self.fail("codex: initialize was answered twice".into());
             }
             return Vec::new();
         }
@@ -538,24 +581,45 @@ impl Parser {
             // turn/completed), so a long turn was invisible while it grew — measured 2026-11-14: real codex jobs
             // reached 14.8M tokens, one making 255 model calls that re-read ~176k cached tokens each, compacting
             // only 3 times (the shell's ledger: 264M tokens for claude and 149M for codex, 96% of it cache reads).
+            // Counter rule: a total counts only when its input and output are whole numbers that have not gone down
+            // since the last one accepted (the thread's totals are cumulative, compaction included). Anything else
+            // is ignored with a note: the last good count stays, and a missing count stays unknown, not zero.
             ("thread/tokenUsage/updated", _) => {
                 let total = p.pointer("/tokenUsage/total").cloned().unwrap_or_default();
+                let whole = ["inputTokens", "outputTokens"].iter().all(|k| total.get(k).and_then(Value::as_u64).is_some());
+                let behind = ["inputTokens", "outputTokens"].iter().any(|k| u(&total, k) < u(&self.usage, k));
+                if !whole || behind {
+                    return vec![Note::Log("ignored a token count that is malformed or went down".into())];
+                }
                 // each model call of this turn reports a new total; a repeated one is the same call, and one before
                 // the turn is known, or tagged with another turn, is a resumed thread's replay of its last turn
                 let tagged = p.get("turnId").and_then(Value::as_str);
-                if total != self.usage && p.pointer("/tokenUsage/last").is_some() && !self.turn_now.is_empty()
-                    && tagged.is_none_or(|t| t == self.turn_now) {
+                if total != self.usage && p.pointer("/tokenUsage/last").is_some() && !self.turn_id.is_empty()
+                    && tagged.is_none_or(|t| t == self.turn_id) {
                     notes.push(Note::Call);
                 }
                 self.usage = total;
-                if ["inputTokens", "outputTokens"].iter().all(|k| self.usage.get(k).and_then(Value::as_u64).is_some()) {
-                    notes.push(Note::Live(self.thread_tokens()));
-                }
+                notes.push(Note::Live(self.thread_tokens()));
                 if let Some(last) = p.pointer("/tokenUsage/last") { // the latest call alone; its input counts the cached part
                     notes.push(Note::Context(u(last, "inputTokens") + u(last, "outputTokens")));
                 }
             }
             ("turn/completed", _) => {
+                // Only the requested turn's own completion counts. One before this parser even sent its turn/start
+                // (it goes out with the thread answer) is an earlier turn's, a resumed thread's, and is ignored; so is one naming another
+                // turn than the acknowledged one (one naming no turn contradicts nothing and counts, as it always did). Codex may complete a turn before answering its turn/start: that
+                // completion counts, and the turn id it names (if any) must match the answer that follows.
+                let other = s(p.get("turn").unwrap_or(&NULL), "id");
+                if (self.sends_turn && !self.turn_sent) || (!self.turn_id.is_empty() && !other.is_empty() && other != self.turn_id) {
+                    return vec![Note::Log("ignored a completion that is not this turn's".into())];
+                }
+                if self.turn_id.is_empty() && !other.is_empty() && self.completed == 0 {
+                    self.turn_id = other.to_string();
+                }
+                if self.completed > 0 {
+                    // a repeat is never counted again: its usage would be charged twice
+                    return self.fail("codex: more than one turn/completed".into());
+                }
                 self.completed += 1;
                 let turn = p.get("turn").unwrap_or(&NULL);
                 if s(turn, "status") == "failed" {
@@ -1444,8 +1508,9 @@ mod tests {
         // the adaptive context policy expects a turn's calls from these: before, only agy and pipelines counted any
         let upd = |i: u64| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":1}},"last":{{"inputTokens":{i},"outputTokens":1}}}}}}}}"#);
         let replay = r#"{"method":"thread/tokenUsage/updated","params":{"turnId":"OLD","tokenUsage":{"total":{"inputTokens":50,"outputTokens":1},"last":{"inputTokens":50,"outputTokens":1}}}}"#;
+        let thread = r#"{"id":2,"result":{"thread":{"id":"T"}}}"#;
         let answer = r#"{"id":3,"result":{"turn":{"id":"U"}}}"#;
-        let (_, notes) = run(Style::Codex, &[replay, answer, &upd(100), &upd(100), &upd(250)]);
+        let (_, notes) = run(Style::Codex, &[thread, replay, answer, &upd(100), &upd(100), &upd(250)]);
         assert_eq!(notes.iter().filter(|n| matches!(n, Note::Call)).count(), 2,
                    "a resumed thread's replay before the turn is none; a repeated total is the same call");
         let msg = |id: &str, parent: &str, text: &str| format!(r#"{{"type":"assistant","parent_tool_use_id":{parent},"message":{{"id":"{id}","usage":{{"input_tokens":5,"output_tokens":1}},"content":[{{"type":"text","text":"{text}"}}]}}}}"#);
@@ -1561,6 +1626,156 @@ mod tests {
         assert_eq!(p.finish(), Ok(()));
         assert!(notes.contains(&Note::Call));
         assert!(notes.contains(&Note::Tokens(Tokens { input: 2444, cache_write: 0, cache_read: 0, output: 1324 })));
+    }
+
+    fn codex_open() -> Parser {
+        let mut p = Parser::new(Style::Codex);
+        p.line(r#"{"id":1,"result":{}}"#);
+        p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+        p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
+        p
+    }
+
+    /// A parser that sends its own turn/start, with the thread answered and the turn sent but not yet acknowledged.
+    fn codex_sent() -> Parser {
+        let mut p = Parser::new(Style::Codex).with_turn(json!({"id": 3, "method": "turn/start", "params": {}}));
+        p.line(r#"{"id":1,"result":{}}"#);
+        p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+        assert_eq!(p.take_writes().len(), 1, "the turn was sent");
+        p
+    }
+
+    #[test]
+    fn codex_a_completion_before_the_turn_answer_counts_and_must_agree_with_it() {
+        // no turn/start answer at all, and a completion naming no turn: as main always accepted (the fake servers)
+        let mut p = codex_sent();
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"status":"completed"}}}"#);
+        assert_eq!(p.finish(), Ok(()));
+        // a completion naming its turn before the answer: adopted, and an answer naming the same turn is fine
+        let mut p = codex_sent();
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+        assert!(!p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert_eq!(p.finish(), Ok(()));
+        // ... but an answer naming another turn than that completion fails closed
+        let mut p = codex_sent();
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+        assert!(p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(p.finish().is_err());
+    }
+
+    #[test]
+    fn codex_a_completion_before_the_thread_answer_is_ignored() {
+        // (only a parser that sends the turn itself knows when it was requested; a bare one reads stream fragments)
+        for mut p in [Parser::new(Style::Codex).with_turn(json!({"id": 3, "method": "turn/start", "params": {}}))] {
+            p.line(r#"{"id":1,"result":{}}"#);
+            p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+            assert!(!p.completed(), "not this turn's");
+            p.line(r#"{"id":2,"result":{"thread":{"id":"T"}}}"#);
+            p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
+            p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+            p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+            assert_eq!(p.finish(), Ok(()));
+        }
+    }
+
+    #[test]
+    fn codex_a_turn_answer_naming_no_turn_fails() {
+        let mut p = codex_sent();
+        assert!(p.line(r#"{"id":3,"result":{}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(p.finish().is_err());
+    }
+
+    #[test]
+    fn codex_replayed_or_unrequested_answers_fail_closed() {
+        for line in [r#"{"id":2,"result":{"thread":{"id":"OTHER"}}}"#, r#"{"id":3,"result":{"turn":{"id":"V"}}}"#,
+                     r#"{"id":9,"result":{}}"#] {
+            let mut p = codex_open();
+            assert!(p.line(line).iter().any(|n| matches!(n, Note::Fail(_))), "{line}");
+            assert!(p.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn codex_another_turns_or_threads_events_do_not_complete_or_count_this_one() {
+        let mut p = codex_open();
+        p.line(r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"CHILD","tokenUsage":{"total":{"inputTokens":9,"outputTokens":9}}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"CHILD","turn":{"id":"X","status":"completed"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"failed"}}}"#);
+        assert!(p.finish().is_err(), "no completion of its own yet");
+        assert!(!p.completed());
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+        assert_eq!(p.finish(), Ok(()));
+    }
+
+    #[test]
+    fn codex_duplicate_completion_fails() {
+        let mut p = codex_open();
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        let done = r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#;
+        p.line(done);
+        p.line(done);
+        assert!(p.finish().is_err());
+    }
+
+    #[test]
+    fn codex_counters_that_are_malformed_or_go_down_are_ignored_and_known_usage_survives() {
+        let mut p = codex_open();
+        let upd = |i: &str, o: &str| format!(r#"{{"method":"thread/tokenUsage/updated","params":{{"threadId":"T","tokenUsage":{{"total":{{"inputTokens":{i},"outputTokens":{o}}}}}}}}}"#);
+        assert!(p.line(&upd("100", "10")).iter().any(|n| matches!(n, Note::Live(_))));
+        for bad in [upd("-5", "10"), upd("50", "10"), upd("100", "\"x\""), upd("100", "9")] {
+            let notes = p.line(&bad);
+            assert!(!notes.iter().any(|n| matches!(n, Note::Live(_) | Note::Fail(_))), "{bad}");
+        }
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"ok"}}}"#);
+        let notes = p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#);
+        assert!(notes.contains(&Note::Tokens(Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 })));
+    }
+
+    #[test]
+    fn codex_server_requests_are_refused_never_served_and_error_or_eof_is_not_success() {
+        let mut p = codex_open();
+        p.line(r#"{"id":"abc","method":"item/tool/call","params":{"threadId":"T","tool":"shell"}}"#);
+        assert_eq!(p.take_writes().len(), 1, "refused at once");
+        p.line(r#"{"method":"item/completed","params":{"threadId":"T","item":{"type":"agentMessage","text":"text but no completion"}}}"#);
+        assert!(p.finish().is_err(), "text without a completion is not success");
+        let mut q = codex_open();
+        assert!(q.line(r#"{"id":4,"error":{"message":"boom"}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+    }
+
+    #[test]
+    fn a_framing_violation_fails_the_turn_and_keeps_known_usage() {
+        let mut p = codex_open();
+        p.line(r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"T","tokenUsage":{"total":{"inputTokens":7,"outputTokens":3}}}}"#);
+        assert!(p.violation("too long".into()).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(p.finish().is_err());
+        assert!(p.leftover().contains(&Note::Tokens(Tokens { input: 7, cache_read: 0, cache_write: 0, output: 3 })));
+    }
+
+    #[test]
+    fn codex_review_findings_stay_fixed() {
+        // a repeated completion fails without emitting a second count
+        let mut p = codex_open();
+        p.line(r#"{"method":"thread/tokenUsage/updated","params":{"threadId":"T","tokenUsage":{"total":{"inputTokens":5,"outputTokens":1}}}}"#);
+        let done = r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"completed"}}}"#;
+        assert!(p.line(done).iter().any(|n| matches!(n, Note::Tokens(_))));
+        let again = p.line(done);
+        assert!(again.iter().any(|n| matches!(n, Note::Fail(_))) && !again.iter().any(|n| matches!(n, Note::Tokens(_))));
+        // after the acknowledgement, a completion naming another turn is not this turn's; one naming none counts
+        let mut p = codex_sent();
+        p.line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#);
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"OLD","status":"completed"}}}"#);
+        assert!(!p.completed());
+        p.line(r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"status":"completed"}}}"#);
+        assert!(p.completed());
+        // an empty thread, a second initialize, a turn answered before it was asked for
+        assert!(Parser::new(Style::Codex).line(r#"{"id":2,"result":{"thread":{}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        let mut p = Parser::new(Style::Codex);
+        p.line(r#"{"id":1,"result":{}}"#);
+        assert!(p.line(r#"{"id":1,"result":{}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
+        assert!(Parser::new(Style::Codex).line(r#"{"id":3,"result":{"turn":{"id":"U"}}}"#).iter().any(|n| matches!(n, Note::Fail(_))));
     }
 
     #[test]
