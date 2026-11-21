@@ -3,6 +3,7 @@
 //! the IDE drive a `Session` and render its jobs.
 
 pub mod evidence;
+pub mod framing;
 pub mod gateway;
 pub mod parse;
 pub mod routing;
@@ -30,6 +31,36 @@ const LOG_LINES: usize = 2000; // per job in memory; the full stream is on disk
 /// Past this many tokens in an agent's window, its next turn starts fresh from Ringo's record of the conversation
 /// instead of re-reading all of it at every call (see `Session::handoff`).
 pub const HANDOFF_AT: u64 = 64_000;
+/// The last line of a raw `events.jsonl` that reached `framing::MAX_EVENTS_LOG`: nothing after it was logged.
+const EVENTS_LOG_MARKER: &str = r#"{"ringo":"events.jsonl reached its size cap; later events were not logged"}"#;
+
+/// A turn's raw event log under an aggregate byte budget. The first record that would pass the budget ends the log
+/// with one marker line (room is kept for it), so a capped log never has a silent gap that reads like a whole
+/// stream; nothing is written after it. The turn itself goes on either way.
+struct EventLog<W: Write> {
+    out: Option<W>,
+    logged: u64,
+    cap: u64,
+}
+
+impl<W: Write> EventLog<W> {
+    fn new(out: Option<W>, cap: u64) -> Self {
+        EventLog { out, logged: 0, cap }
+    }
+
+    fn write(&mut self, line: &str) {
+        let Some(out) = self.out.as_mut() else { return };
+        let need = line.len() as u64 + 1;
+        if self.logged + need + EVENTS_LOG_MARKER.len() as u64 + 1 <= self.cap {
+            self.logged += need;
+            let _ = writeln!(out, "{line}");
+        } else {
+            let _ = writeln!(out, "{EVENTS_LOG_MARKER}");
+            let _ = out.flush();
+            self.out = None;
+        }
+    }
+}
 /// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
 /// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
 const RECORD_BYTES: usize = 60_000;
@@ -2634,12 +2665,10 @@ impl Session {
         let stdout = child.stdout.take();
         thread::spawn(move || {
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
-            let mut events = (style != Style::Trace).then(|| fs::OpenOptions::new().create(true).append(true)
-                .open(dir.join("events.jsonl")).ok()).flatten();
+            let mut events = EventLog::new((style != Style::Trace).then(|| fs::OpenOptions::new().create(true)
+                .append(true).open(dir.join("events.jsonl")).ok()).flatten(), framing::MAX_EVENTS_LOG);
             let mut handle = |line: &str, parser: &mut Parser| {
-                if let Some(f) = events.as_mut() {
-                    let _ = writeln!(f, "{line}");
-                }
+                events.write(line);
                 for note in parser.line(line) {
                     if matches!(note, Note::Fail(_)) && style != Style::Trace {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
@@ -2662,11 +2691,39 @@ impl Session {
                 }
             };
             if let Some(out) = stdout {
-                let mut reader = BufReader::new(out);
-                let mut buf = Vec::new();
-                while reader.read_until(b'\n', &mut buf).map(|n| n > 0).unwrap_or(false) {
-                    handle(String::from_utf8_lossy(&buf).trim_end(), &mut parser);
-                    buf.clear();
+                // Bounded framing: a frame over the cap or not UTF-8 fails the turn closed (the child is stopped), and
+                // the pipe is still drained so nothing blocks on it. A cut final frame goes to the parser, which
+                // rejects it unless it is whole JSON.
+                let mut frames = framing::FrameReader::new(BufReader::new(out), framing::MAX_FRAME);
+                if style == Style::Plain {
+                    frames = frames.lossy(); // free text speaks no protocol: still capped, never refused for its bytes
+                }
+                let mut violated = false;
+                while let Some(frame) = frames.next_frame() {
+                    match frame {
+                        framing::Frame::Line { text, .. } if !violated => handle(text.trim_end(), &mut parser),
+                        framing::Frame::Line { .. } => {}
+                        framing::Frame::Oversized { bytes } if !violated => {
+                            violated = true;
+                            let reason = format!("an output line over the {}-byte limit ({bytes} bytes seen before it was cut off)", framing::MAX_FRAME);
+                            for note in parser.violation(reason) {
+                                if style != Style::Trace {
+                                    stop_group(pid, Duration::from_secs(3), false);
+                                }
+                                let _ = tx.send(Event::Note(id, note));
+                            }
+                        }
+                        framing::Frame::InvalidUtf8 if !violated => {
+                            violated = true;
+                            for note in parser.violation("a protocol frame that is not valid UTF-8".into()) {
+                                if style != Style::Trace {
+                                    stop_group(pid, Duration::from_secs(3), false);
+                                }
+                                let _ = tx.send(Event::Note(id, note));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             } else if let Some(trace) = trace {
                 // A Ringo pipeline appends to its trace as it goes: poll for new whole lines.
@@ -3872,6 +3929,26 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_event_log_ends_at_its_cap_with_one_marker_and_writes_nothing_after() {
+        use std::{cell::RefCell, rc::Rc};
+        #[derive(Clone, Default)]
+        struct Shared(Rc<RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.borrow_mut().extend_from_slice(b); Ok(b.len()) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let buf = Shared::default();
+        let cap = 40 + EVENTS_LOG_MARKER.len() as u64 + 1;
+        let mut log = EventLog::new(Some(buf.clone()), cap);
+        log.write("first line of twenty"); // 21 bytes with its newline
+        log.write("a record too long to fit the budget left");
+        log.write("tiny"); // would fit, but the log has ended
+        let text = String::from_utf8(buf.0.borrow().clone()).unwrap();
+        assert_eq!(text, format!("first line of twenty\n{EVENTS_LOG_MARKER}\n"));
+        assert!(text.len() as u64 <= cap);
+    }
     use super::*;
 
     #[test]
@@ -3930,6 +4007,27 @@ mod tests {
         assert!(error.contains("true"), "{error}");
         assert!(matches!(s.jobs[id - 1].status, Status::Failed(_)));
         assert!(!s.jobs[id - 1].running());
+    }
+
+    /// An agent that writes a newline-free frame past the cap is stopped and the turn fails closed, with bounded memory.
+    #[cfg(unix)]
+    #[test]
+    fn an_oversized_frame_fails_the_turn_closed() {
+        let mut s = record_session();
+        let agent = Agent::from_name("claude").unwrap();
+        let id = s.new_job(Kind::Agent { agent, write: false }, "a runaway stream").unwrap();
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "head -c 20000000 /dev/zero | tr '\\0' a; sleep 30"]);
+        s.spawn(id, cmd, Parser::new(Style::Claude), None, None).unwrap();
+        let start = Instant::now();
+        while s.jobs[id - 1].running() && start.elapsed() < Duration::from_secs(20) {
+            s.pump();
+            thread::sleep(Duration::from_millis(20));
+        }
+        match &s.jobs[id - 1].status {
+            Status::Failed(why) => assert!(why.contains("output line over the"), "{why}"),
+            other => panic!("expected a failed job, got {other:?}"),
+        }
     }
 
     #[test]

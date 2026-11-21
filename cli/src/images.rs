@@ -10,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const PREFIX: &str = "[image:";
 const MAX_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_IMAGES: usize = 8;
+/// The most image bytes one Claude message may carry. Claude's stream echoes each message back on stdout
+/// (`--replay-user-messages`) as one line, with the images in base64 (4 bytes for every 3), and a stdout line over
+/// `framing::MAX_FRAME` fails the turn; 1 MiB stays free for the message's text and JSON. Codex is sent paths.
+const MAX_CLAUDE_TOTAL: u64 = (crate::framing::MAX_FRAME as u64 - (1 << 20)) / 4 * 3;
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub fn has_images(text: &str) -> bool {
@@ -144,12 +148,18 @@ pub fn content(adapter: Adapter, text: &str, message: &str) -> Result<Value, Str
         return Err("send at most 8 images in one message".into());
     }
     let mut blocks = vec![json!({"type": "text", "text": text})];
+    let mut total = 0u64;
     for path in paths {
         let path = Path::new(path);
         if !path.is_absolute() {
             return Err("image attachment paths must be absolute; use /attach PATH".into());
         }
         let (bytes, mime, _) = read(path)?;
+        total += bytes.len() as u64;
+        if adapter != Adapter::Codex && total > MAX_CLAUDE_TOTAL {
+            return Err(format!("the images in one message to @claude may total at most {} MiB (its stream echoes \
+                                them back); send fewer or smaller images", MAX_CLAUDE_TOTAL >> 20));
+        }
         blocks.push(match adapter {
             Adapter::Codex => json!({"type": "localImage", "path": path}),
             _ => json!({"type": "image", "source": {"type": "base64", "media_type": mime, "data": STANDARD.encode(bytes)}}),
@@ -280,6 +290,25 @@ mod tests {
             2
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn images_to_claude_stay_small_enough_for_the_echoed_stream_line() {
+        // the echo of a message at the cap, its base64 and 1 MiB of text, still fits one stream frame
+        assert!(MAX_CLAUDE_TOTAL.div_ceil(3) * 4 + (1 << 20) <= crate::framing::MAX_FRAME as u64);
+        let dir = dir();
+        let mut paths = Vec::new();
+        for n in 0..2 {
+            let path = dir.join(format!("big-{n}.png"));
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.resize((MAX_CLAUDE_TOTAL / 2 + 1) as usize, 0);
+            fs::write(&path, bytes).unwrap();
+            paths.push(marker(&path));
+        }
+        let message = paths.join(" ");
+        assert!(content(Adapter::Claude, "look", &message).unwrap_err().contains("@claude may total at most 11 MiB"));
+        assert!(content(Adapter::Codex, "look", &message).is_ok(), "codex is sent paths, never the bytes");
+        assert!(content(Adapter::Claude, "look", &paths[0]).is_ok(), "one of them alone fits");
     }
 
     #[test]
