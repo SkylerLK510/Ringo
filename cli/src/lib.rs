@@ -4552,10 +4552,12 @@ mod tests {
         send(&s, "/elsewhere/g.rs".into()); // outside the folder: as given
         s.pump();
         let read = &s.jobs[id - 1].read;
+        // relative paths keep the platform's separator, as an edited file's do
+        let rel = |n: usize| Path::new("src").join(format!("f{n}.rs")).to_string_lossy().into_owned();
         assert_eq!(read.len(), 200);
-        assert_eq!(&read[..2], ["src/f6.rs", "src/f7.rs"], "the oldest five are dropped");
-        assert_eq!(&read[198..], ["src/f100.rs", "/elsewhere/g.rs"]);
-        assert_eq!(read.iter().filter(|r| *r == "src/f100.rs").count(), 1);
+        assert_eq!(&read[..2], [rel(6), rel(7)], "the oldest five are dropped");
+        assert_eq!(&read[198..], [rel(100), "/elsewhere/g.rs".to_string()]);
+        assert_eq!(read.iter().filter(|r| **r == rel(100)).count(), 1);
     }
 
     #[test]
