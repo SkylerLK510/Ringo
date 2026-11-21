@@ -872,9 +872,10 @@ saving at the 32,000 margin (`0.75 (f - B) - ceil(32,000 / N)` tokens; no margin
 the same rule (f = 50k, B = 13k, N = 2, warm: 11,750 tokens, not 13,875). At f = 48k and B = 13k that is 52,500 bytes. Turns from
 before a `/restart` keep the room the lean record leaves them, and the rich tier gets only what is left of the cap; the
 record `/restart` hands on is the lean one (with the path of the uncut one), so the next shell's oldest carried turns
-keep their room. A record is "cut" (and links the whole record) by what it leaves out, not by its files-read line: the
-inline line and the whole record's per-turn `read:` lines are set aside when the two are compared, unless the line
-itself was cut. The cap never takes the record past its 60,000 bytes, never
+keep their room. A record is "cut" (and links the whole record) by what it leaves out, as the record is built: a turn left
+out or shown short of its whole form, a files-read line that does not name every file read (or was left out for lack
+of room), a cut diff, or turns from before a restart that did not all fit. Its files-read line alone (one line inline,
+a `read:` line per turn in the whole record) is not a cut. The cap never takes the record past its 60,000 bytes, never
 drops the diff or the files-read line, and leaves the whole record as it was. A brand-new conversation, and the record
 of turns an agent missed, get the lean form. How the richer record changes the answers is not measured, and no saving
 or quality gain is claimed for it.
