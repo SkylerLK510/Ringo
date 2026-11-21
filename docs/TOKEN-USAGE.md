@@ -108,7 +108,9 @@ the ledger gets its surface from the agent's name and its calls are unknown; a p
 paid attempt in its `trace/trace.jsonl` when that exists (`--no-traces` keeps the line, `--trace DIR` adds a trace).
 `attribute` re-splits the shell's saved events with the shell's own call rule and lists why each report that another
 counting would take for a call was not one (`before_turn`, `other_turn`, `behind_or_malformed`, `no_last`, `repeat`).
-It measures consumption; it makes no claim about what any change saves.
+A job counts for the agent its usage row names, so an owner's own agent on the same protocol (a specialist, with its
+own base) is left out and counted as such; a job without a row falls back to its protocol. `--base` is one agent's
+base, so it needs `--agent`. It measures consumption; it makes no claim about what any change saves.
 
 ## Codex call overhead
 

@@ -163,7 +163,7 @@ class ReportTest(unittest.TestCase):
         with mock.patch.object(backends, 'run_isolated', boom), mock.patch.object(subprocess, 'run', boom), \
                 mock.patch.object(subprocess, 'Popen', boom):
             self.assertEqual(run('report', '--usage', self.usage(), '--json')[0], 0)
-            self.assertEqual(run('attribute', '--shell', str(self.d / 'shell'), '--base', '1000')[0], 0)
+            self.assertEqual(run('attribute', '--shell', str(self.d / 'shell'), '--agent', 'codex', '--base', '1000')[0], 0)
         boom.assert_not_called()
 
 
@@ -243,6 +243,24 @@ class AttributeTest(unittest.TestCase):
         # a measured base in usage.jsonl is used
         (self.d / 'usage.jsonl').write_text(lines({'agent': 'codex', 'ctx_base': 7}, {'agent': 'codex', 'ctx_base': 9}, {'agent': 'claude', 'ctx_base': 1}))
         self.assertEqual(self.attribute('--agent', 'codex')[1]['agents']['codex']['base'], 9)
+
+    def test_attribute_counts_a_job_for_the_agent_its_usage_row_names(self):
+        _, upd = codex_events()
+        turn = lines({'id': 1, 'result': {}}, {'id': 2, 'result': {'thread': {'id': 'T'}}}, {'id': 3, 'result': {'turn': {'id': 'U'}}},
+                     upd(100, 12_000))
+        for n in (1, 2, 3):
+            self.events(n, turn)
+        jobs = self.d / 'shell' / '1' / 'jobs'
+        # job 1 is codex's, job 2 an owner's own specialist on the codex protocol, job 3 has no row
+        (self.d / 'usage.jsonl').write_text(lines({'agent': 'codex', 'job': str(jobs / '1')},
+                                                  {'agent': 'billing', 'job': str(jobs / '2')}))
+        a = self.attribute('--agent', 'codex', '--base', '10000')[1]['agents']['codex']
+        self.assertEqual((a['jobs'], a['calls'], a['other_agents_left_out'], a['without_usage_row']), (2, 2, 1, 1))
+
+    def test_one_base_needs_one_agent(self):
+        code, doc, err = self.attribute('--base', '10000')
+        self.assertEqual((code, doc), (2, None))
+        self.assertIn('--agent', err)
 
     def test_attribute_text_output(self):
         _, upd = codex_events()

@@ -362,15 +362,44 @@ def measured_base(usage_file, agent):
     return bases[len(bases) // 2] if bases else None
 
 
+def job_agents(usage_file):
+    """{job folder: the agent that ran it} from usage.jsonl rows that name both."""
+    agents = {}
+    try:
+        for line in Path(usage_file).read_text(encoding='utf-8', errors='replace').splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict) and isinstance(row.get('job'), str) and isinstance(row.get('agent'), str):
+                agents[os.path.normpath(row['job'])] = row['agent']
+    except OSError:
+        pass
+    return agents
+
+
 def attribute(args):
+    if args.base is not None and not args.agent:
+        raise Usage('--base is one agent\'s base: name the agent with --agent')
     state = Path(args.state or state_root())
     shell = Path(args.shell) if args.shell else state / 'shell'
     agents = [args.agent] if args.agent else ['codex', 'claude']
     files = {a: [] for a in agents}
+    # A job counts for the agent its usage row names: an owner's own agent on the codex or claude protocol (a
+    # specialist) has its own base and is left out. A job without a row falls back to its protocol.
+    owners = job_agents(state / 'usage.jsonl')
+    others, unrowed = {a: 0 for a in agents}, {a: 0 for a in agents}
     for path in sorted(glob.glob(str(shell / '*' / 'jobs' / '*' / 'events.jsonl'))):
         kind = classify(path)
-        if kind in files:
-            files[kind].append(path)
+        if kind not in files:
+            continue
+        owner = owners.get(os.path.normpath(os.path.dirname(path)))
+        if owner is None:
+            unrowed[kind] += 1
+        elif owner != kind:
+            others[kind] += 1
+            continue
+        files[kind].append(path)
     out = {'shell': str(shell), 'agents': {}}
     for agent in agents:
         base = args.base if args.base is not None else measured_base(state / 'usage.jsonl', agent)
@@ -392,7 +421,8 @@ def attribute(args):
             total += sum(contexts)
             for k, n in zip(CTX_KEYS, split(contexts, base)):
                 parts[k] += n
-        out['agents'][agent] = {'base': base, 'event_files': len(files[agent]), 'jobs': jobs, 'calls': calls, 'total': total,
+        out['agents'][agent] = {'base': base, 'event_files': len(files[agent]), 'other_agents_left_out': others[agent],
+                                'without_usage_row': unrowed[agent], 'jobs': jobs, 'calls': calls, 'total': total,
                                 **parts, 'shares': {k: round(v / total, 4) if total else None for k, v in parts.items()},
                                 'surplus': sum(parts.values()) - total, 'skipped': skipped,
                                 'decompose_calls': decompose,
@@ -412,6 +442,9 @@ def attribute_text(doc):
         if a['skipped']:
             lines.append('  not counted as calls: ' + ', '.join(f'{k} {v}' for k, v in sorted(a['skipped'].items())))
         lines.append(f"  identity: {a['identity']}")
+        if a['other_agents_left_out'] or a['without_usage_row']:
+            lines.append(f"  jobs left out as another agent's (same protocol): {a['other_agents_left_out']}; "
+                         f"counted by protocol for want of a usage row: {a['without_usage_row']}")
     return '\n'.join(lines)
 
 
