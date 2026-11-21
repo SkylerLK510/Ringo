@@ -4768,9 +4768,10 @@ mod tests {
         (s.jobs[1].before, s.jobs[1].after, s.jobs[1].changed) = (None, None, Vec::new());
         s.jobs[1].touched = (1..=25).map(|n| format!("f{n:02}.rs")).collect();
         s.jobs[1].read = (21..=25).map(|n| format!("f{n:02}.rs")).chain(["f01.rs".to_string()]).collect();
-        let (inline, _, _) = s.record_full(&s.lane(agent, 3), 0);
+        let (inline, _, complete) = s.record_full(&s.lane(agent, 3), 0);
         let line = inline.lines().find(|l| l.starts_with(READ_LINE_PREFIX)).unwrap();
         assert!(line.contains("f25.rs") && line.contains("f21.rs") && !line.contains("f01.rs"), "{line}");
+        assert!(complete, "every file read is named, on the edited line or the files-read line");
         s.jobs[1].touched.clear();
         s.jobs[1].read = vec!["b.rs".into()];
         // and a files-read line left out for lack of room
