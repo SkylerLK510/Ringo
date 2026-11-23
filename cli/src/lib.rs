@@ -2,6 +2,7 @@
 //! agent edits in private git worktrees until the owner applies them. The terminal shell (`ringo`) and, later,
 //! the IDE drive a `Session` and render its jobs.
 
+pub mod awake;
 pub mod context_policy;
 pub mod evidence;
 pub mod framing;
@@ -67,6 +68,8 @@ impl<W: Write> EventLog<W> {
 /// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
 /// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
 const RECORD_BYTES: usize = 60_000;
+/// The most of the owner's first message the inline record pins at its top when a long session leaves turn #1 out.
+const OWNER_PIN_BYTES: usize = 2_000;
 /// Files a job remembers it read (the working set the record names), the oldest dropped.
 const READ_FILES: usize = 200;
 /// The inline record's one line of files read: at most this many paths and bytes (the rest are in the whole record).
@@ -600,10 +603,18 @@ pub struct Job {
     fresh_thread: bool,
     sent_bytes: u64,
     measured: bool,
+    /// What this turn's own first call measured as the agent's fixed base (set with `measured`): the usage row's
+    /// `ctx_first_base`, which `ledger.py base` groups by CLI version.
+    first_base: Option<u64>,
     /// The turn began from Ringo's record (a handoff), which the next turn's dwell guard reads.
     started_fresh: bool,
     /// Each model call's input side, in order (`Note::CallInput`): the fixed/carry/growth split of the usage record.
     call_inputs: Vec<u64>,
+    /// The agent CLI's version, as it told it (Codex's initialize answer, Claude's system/init): the usage row's `cli_version`.
+    cli_version: Option<String>,
+    /// The wall-clock time the job started: `started` is monotonic and does not run while the computer sleeps, so
+    /// the two clocks disagree by the length of a sleep (see `awake::slept_secs`).
+    wall_start: SystemTime,
     /// A turn that started fresh from Ringo's record: the inline handoff text and record.md, in bytes.
     record_bytes: Option<(u64, Option<u64>)>,
 }
@@ -804,6 +815,8 @@ pub struct Session {
     pub routed: VecDeque<(usize, String)>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
+    /// Holds the computer awake while a model call runs (`awake`); off in tests and with RINGO_KEEP_AWAKE=0.
+    awake: Option<awake::KeepAwake<awake::System>>,
 }
 
 /// Tokens as a log line says them: 12.3k.
@@ -886,6 +899,22 @@ fn read_line(files: &[&str], max: usize) -> (String, usize) {
 /// rule. With no measured base, half of the conversation is assumed to be the fixed base.
 fn record_cap(fills: u64, base: Option<u64>) -> usize {
     4 * (fills.saturating_sub(base.unwrap_or(fills / 2)) * 3 / 8) as usize
+}
+
+/// Add one row to a JSON-lines file as a single locked write. Several shells (and a shell and its detached
+/// pipelines) share one `usage.jsonl`; `writeln!` on an unbuffered file is two writes (the text, then the newline) and
+/// a long row can be split by the OS, so two writers could interleave and leave one unreadable line that every
+/// reader then skips. The row is formatted whole (newline included), written with one `write_all` under an exclusive
+/// advisory lock (`File::lock`: flock on Unix, LockFileEx on Windows) and unlocked. A failed write is dropped: a
+/// usage row is a record, never a reason to fail a job.
+fn append_row(path: &Path, record: &serde_json::Value) {
+    let line = format!("{record}\n");
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    if f.lock().is_err() {
+        return;
+    }
+    let _ = f.write_all(line.as_bytes());
+    let _ = f.unlock();
 }
 
 /// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
@@ -1226,7 +1255,9 @@ impl Session {
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, codex_limits: None, always_ask, allowed: BTreeSet::new(),
-                     routed: VecDeque::new(), tx, rx })
+                     routed: VecDeque::new(), tx, rx,
+                     awake: (!cfg!(test) && !awake::disabled(std::env::var("RINGO_KEEP_AWAKE").ok().as_deref()))
+                         .then(|| awake::KeepAwake::new(awake::System::new(is_wsl()))) })
     }
 
     pub fn running(&self) -> usize {
@@ -2133,24 +2164,52 @@ impl Session {
             part
         };
         let is_whole = |i: usize, j: &Job| i + 1 == turns.len() || j.talk || j.asked_by.is_some();
-        let mut kept = Vec::new();
-        let mut kept_turn: Vec<Option<usize>> = Vec::new(); // the turn each kept piece renders (None: a notice)
-        let mut used = 0;
-        for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, is_whole(i, j), false);
-            // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
-            // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
-            let part = record_head(&part, RECORD_BYTES - 128);
-            if used + part.len() + usize::from(!kept.is_empty()) > RECORD_BYTES - 128 && !kept.is_empty() {
-                let omitted = format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1);
-                used += omitted.len() + 1;
-                kept.push(omitted);
-                kept_turn.push(None);
-                break;
+        // Fill the inline record newest first within `limit`. With `pinned` the first turn is not a candidate (its
+        // owner words are pinned by the caller), so the omission notice names #2 to #k. Returns the pieces, the turn
+        // each renders (None: a notice), the bytes used, and whether a turn was left out.
+        let fill = |limit: usize, pinned: bool| {
+            let mut kept: Vec<String> = Vec::new();
+            let mut kept_turn: Vec<Option<usize>> = Vec::new();
+            let mut used = 0;
+            let mut left_out = false;
+            for (i, j) in turns.iter().enumerate().rev() {
+                if pinned && i == 0 {
+                    break;
+                }
+                let part = render(j, is_whole(i, j), false);
+                // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
+                // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
+                let part = record_head(&part, RECORD_BYTES - 128);
+                if used + part.len() + usize::from(!kept.is_empty()) > limit && !kept.is_empty() {
+                    let first = if pinned { turns[1].id } else { turns[0].id };
+                    let count = if pinned { i } else { i + 1 };
+                    let omitted = format!("(#{first} to #{}, {count} earlier turns, are in the whole record)\n", j.id);
+                    used += omitted.len() + 1;
+                    kept.push(omitted);
+                    kept_turn.push(None);
+                    left_out = true;
+                    break;
+                }
+                used += part.len() + usize::from(!kept.is_empty());
+                kept.push(part);
+                kept_turn.push(Some(i));
             }
-            used += part.len() + usize::from(!kept.is_empty());
-            kept.push(part);
-            kept_turn.push(Some(i));
+            (kept, kept_turn, used, left_out)
+        };
+        let (mut kept, mut kept_turn, mut used, left_out) = fill(RECORD_BYTES - 128, false);
+        if left_out && turns.len() > 1 {
+            // The first turn is the owner's original request and the newest-first fill leaves it out first, so a long
+            // session lost the very words everything after it builds on. Pin those words (to OWNER_PIN_BYTES) at the
+            // top and fill the rest in what is left. A session that fits whole never gets here, so it is unchanged.
+            let who = match turns[0].kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
+            let words = record_head(&format!("#{} · the owner to {who}: {}\n", turns[0].id, turns[0].title_full.trim()), OWNER_PIN_BYTES);
+            let pin = format!("{words}(the rest of #{} is in the whole record)\n", turns[0].id);
+            let (mut k, mut kt, u, _) = fill((RECORD_BYTES - 128).saturating_sub(pin.len() + 1), true);
+            k.push(pin.clone());
+            kt.push(None);
+            used = u + pin.len() + 1;
+            kept = k;
+            kept_turn = kt;
         }
         kept.reverse();
         kept_turn.reverse();
@@ -2246,8 +2305,8 @@ impl Session {
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
-                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false,
-                              call_inputs: Vec::new(), record_bytes: None,
+                              fresh_thread: false, sent_bytes: 0, measured: false, first_base: None, started_fresh: false,
+                              call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now(), cli_version: None,
                               limit: None, rate_limits: None, resume_lost: false });
         Ok(id)
     }
@@ -3210,6 +3269,13 @@ impl Session {
         let base = match self.jobs[id - 1].kind { Kind::Agent { agent, .. } => self.base_median(agent), _ => None };
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
+        // The monotonic clock stops while the computer sleeps and the wall clock does not: a turn whose wall time ran
+        // more than 60 s past its own elapsed time had the computer asleep under it, and a connection that broke then
+        // is the sleep's doing, not the backend's.
+        let slept = job.wall_start.elapsed().ok().and_then(|wall| awake::slept_secs(job.started.elapsed(), wall));
+        if let Some(secs) = slept {
+            job.push_log(format!("the computer slept for ~{} min during this turn", (secs + 30) / 60));
+        }
         job.activity = match &status {
             Status::Done => parse::short(&reply, 80),
             Status::Failed(reason) => reason.clone(),
@@ -3273,6 +3339,15 @@ impl Session {
                     record["record_whole_bytes"] = whole.into();
                 }
             }
+            if let Some(base) = job.first_base {
+                record["ctx_first_base"] = base.into();
+            }
+            if let Some(version) = &job.cli_version {
+                record["cli_version"] = version.as_str().into(); // what `ledger.py base` groups by
+            }
+            if let Some(secs) = slept {
+                record["host_slept_s"] = secs.into();
+            }
             if job.uncounted > 0 {
                 record["uncounted_calls"] = job.uncounted.into(); // the counts below are of its other calls alone
             }
@@ -3287,9 +3362,7 @@ impl Session {
                     record[key] = n.into();
                 },
             }
-            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.root.join("usage.jsonl")) {
-                let _ = writeln!(f, "{record}");
-            }
+            append_row(&self.root.join("usage.jsonl"), &record);
         }
         // A turn that failed before its agent counted a token, took a step or said a word never took its message
         // in: what its start marked as told goes back, so the agent's next turn is told it again. Before, only a
@@ -3385,8 +3458,19 @@ impl Session {
     }
 
     /// Folds pending events into the jobs; true when anything changed.
+    /// Hold the computer awake while a backend process runs and the owner is not the one being waited on.
+    fn keep_awake(&mut self) {
+        let wanted = self.jobs.iter().any(|j| j.running() && j.pid.is_some() && j.asks.is_empty());
+        if let Some(line) = self.awake.as_mut().and_then(|a| a.tick(wanted, Instant::now())) {
+            if let Some(job) = self.jobs.iter_mut().rev().find(|j| j.running()) {
+                job.push_log(line);
+            }
+        }
+    }
+
     pub fn pump(&mut self) -> bool {
         let mut changed = self.take_asks();
+        self.keep_awake();
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -3470,6 +3554,7 @@ impl Session {
                             }
                         }
                         Note::Model(model) => job.model = Some(model),
+                        Note::CliVersion(version) => job.cli_version = Some(version),
                         Note::Uncounted => job.uncounted += 1,
                         Note::Tokens(t) | Note::TokensSoFar(t) => {
                             // A resumed Codex or agy turn reports its conversation's usage so far (Codex 16,829
@@ -3581,7 +3666,9 @@ impl Session {
                                 if job.fresh_thread && !job.measured && n > 0 {
                                     job.measured = true;
                                     let bases = self.bases.entry(agent).or_default();
-                                    bases.push_back(n.saturating_sub(job.sent_bytes / 4).max(1_000));
+                                    let base = n.saturating_sub(job.sent_bytes / 4).max(1_000);
+                                    job.first_base = Some(base);
+                                    bases.push_back(base);
                                     while bases.len() > 3 {
                                         bases.pop_front();
                                     }
@@ -3654,6 +3741,14 @@ impl Session {
     pub fn used_since(&self, secs: u64) -> (BTreeMap<String, Tokens>, Option<u64>) {
         let (mut windows, first) = self.used_windows(&[secs]);
         (windows.remove(0), first)
+    }
+
+    /// How many non-blank lines of `usage.jsonl` are not a readable JSON row (a torn or hand-edited line). Every
+    /// reader skips them, so /usage says how many there were rather than silently under-counting.
+    pub fn unreadable_usage_rows(&self) -> usize {
+        fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines()
+            .filter(|l| !l.trim().is_empty() && !serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v.is_object()))
+            .count()
     }
 
     /// The same counts for each of several windows in one read of `usage.jsonl`: /usage asks for a day and a week,
@@ -4687,6 +4782,43 @@ mod tests {
     }
 
     #[test]
+    fn a_long_session_keeps_the_owners_first_request_and_names_the_range_it_omitted() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..60 {
+            let task = if n == 0 { format!("ORIGINAL-REQUEST {}", "x".repeat(5000)) } else { format!("turn-{n}: {}", "界".repeat(700)) };
+            let id = record_turn(&mut s, &task);
+            s.jobs[id - 1].talk = true;
+            fs::write(s.jobs[id - 1].dir.join("reply.md"), "r".repeat(3000)).unwrap();
+        }
+        let (inline, whole) = s.fresh_record(agent, &s.lane(agent, s.jobs.len() + 1), 0);
+        assert!(inline.len() <= RECORD_BYTES, "{} bytes", inline.len());
+        assert!(inline.contains("#1 · the owner to codex: ORIGINAL-REQUEST"), "turn #1 is pinned");
+        let pin_end = inline.find("\n(#2 to #").expect("the notice follows the pin, naming #2 to #k");
+        assert!(inline[..pin_end].len() <= OWNER_PIN_BYTES + 64, "the pin is bounded");
+        assert!(inline[..pin_end].contains("(the rest of #1 is in the whole record)"));
+        let k: usize = inline[pin_end..].split("to #").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        assert!(inline.contains(&format!("#{}", k + 1)) && !inline.contains(&format!("#{k} · the owner")));
+        assert!(inline.contains(&format!(", {} earlier turns", k - 1)), "the count is #2..=#k: {}", &inline[pin_end..pin_end + 80]);
+        assert!(inline.contains("turn-59:"));
+        assert!(whole.contains(&"x".repeat(5000)), "the whole record keeps all of it");
+    }
+
+    #[test]
+    fn a_short_session_record_has_no_pin_and_is_unchanged() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..3 {
+            let id = record_turn(&mut s, &format!("small task {n}"));
+            s.jobs[id - 1].talk = true;
+        }
+        let (inline, _) = s.fresh_record(agent, &s.lane(agent, 4), 0);
+        assert!(inline.starts_with("#1 · the owner to codex: small task 0\n"));
+        assert_eq!(inline.matches("#1 ·").count(), 1, "told once, not pinned again");
+        assert!(!inline.contains("earlier turns"));
+    }
+
+    #[test]
     fn unicode_diffs_and_repeated_restarts_share_the_record_budget() {
         let mut s = record_session();
         let agent = Agent::from_name("codex").unwrap();
@@ -5053,7 +5185,8 @@ mod tests {
                 fs::write(j.dir.join("reply.md"), "x".repeat(k)).unwrap();
             }
             let (inline, _, complete) = s.record_full(&s.lane(agent, 11), 0);
-            if !inline.contains("#1 · the owner") {
+            // a turn left out ends the scan (turn #1 stays in the record, pinned, so it no longer says so)
+            if inline.contains("earlier turns, are in the whole record") || inline.contains("(the rest of #1 is") {
                 break;
             }
             if !inline.contains(READ_LINE_PREFIX) {
@@ -5474,11 +5607,79 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_usage_rows_never_interleave_and_unreadable_ones_are_counted() {
+        let (s, _) = ledger_session("codex", 0);
+        let path = s.root.join("usage.jsonl");
+        let _ = fs::remove_file(&path);
+        let writers: Vec<_> = (0..8).map(|w| {
+            let path = path.clone();
+            thread::spawn(move || for n in 0..50 {
+                // a long row (past one pipe-sized write) is the one a plain writeln! could split
+                append_row(&path, &serde_json::json!({"at": n, "agent": format!("w{w}"), "pad": "x".repeat(6000)}));
+            })
+        }).collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 400);
+        assert!(text.ends_with('\n'));
+        assert_eq!(s.unreadable_usage_rows(), 0, "every row is whole");
+        // a torn line and a blank line: the torn one is counted, the blank one is not
+        fs::write(&path, format!("{text}{{\"at\": 1, \"agent\"\n\n[1]\n")).unwrap();
+        assert_eq!(s.unreadable_usage_rows(), 2);
+    }
+
+    #[test]
     fn attribution_matches_decompose_definitions() {
         assert_eq!(attribute(&[12_000, 15_000, 9_000], 10_000), Some((29_000, 4_000, 3_000)));
         // a first call below the base: fixed and growth share the difference (decompose.py's surplus)
         assert_eq!(attribute(&[8_000, 20_000], 10_000), Some((18_000, 0, 12_000)));
         assert_eq!(attribute(&[], 1), None);
+    }
+
+    #[test]
+    fn a_row_names_the_cli_version_and_the_base_its_first_call_measured() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "version").unwrap();
+        s.jobs[id - 1].fresh_thread = true;
+        s.jobs[id - 1].sent_bytes = 4_000; // ~1,000 tokens sent
+        s.tx.send(Event::Note(id, Note::CliVersion("0.170.0".into()))).unwrap();
+        s.tx.send(Event::Note(id, Note::Context(14_000))).unwrap();
+        s.pump();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!((row["cli_version"].as_str(), row["ctx_first_base"].as_u64()), (Some("0.170.0"), Some(13_000)));
+        // a resumed turn measures no base and, if its CLI said nothing, names no version: old rows read the same
+        let id = s.new_job(Kind::Agent { agent, write: false }, "resumed").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert!(row.get("cli_version").is_none() && row.get("ctx_first_base").is_none());
+    }
+
+    #[test]
+    fn a_turn_the_computer_slept_through_says_so_in_its_row_and_log() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        let tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        let id = s.new_job(Kind::Agent { agent, write: false }, "slept").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        // the wall clock ran 1,900 s while the monotonic one ran about none
+        s.jobs[id - 1].wall_start = SystemTime::now() - Duration::from_secs(1900);
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!(row["host_slept_s"].as_u64().map(|n| n / 60), Some(31));
+        assert!(s.jobs[id - 1].log.iter().any(|l| l.contains("the computer slept for ~32 min")), "{:?}", s.jobs[id - 1].log);
+        // an ordinary turn has no such field
+        let id = s.new_job(Kind::Agent { agent, write: false }, "awake").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        s.end_with(id, Status::Done, "done".into());
+        assert!(last_usage_row(&s).get("host_slept_s").is_none());
     }
 
     #[test]
