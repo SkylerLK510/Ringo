@@ -562,6 +562,8 @@ pub struct Job {
     reached: bool,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
+    /// Codex: what the output thread sees of its retries, and the stall the runner stopped the turn for.
+    retry: Arc<Mutex<RetryWatch>>,
     /// The limit the turn ran into (a usage or rate limit, a busy provider), with when it starts over when the agent
     /// said: the failure names it, and the usage record keeps it.
     pub limit: Option<limits::Limit>,
@@ -676,6 +678,16 @@ pub struct JobUsage {
     pub unknown: bool,
     pub uncounted_calls: u64,
     pub tokens: Tokens,
+}
+
+/// Codex's retries as the output thread sees them (since when, the last error), shared with the runner so a turn
+/// that keeps retrying and then goes quiet is still stopped (`Session::check_retry_stalls`); `stalled` is the message
+/// the output thread ends the job with.
+#[derive(Default)]
+struct RetryWatch {
+    since: Option<Instant>,
+    last: String,
+    stalled: Option<String>,
 }
 
 /// How many of the owner's lines went to a running turn, and whether its stdin has closed: the sender and the reader
@@ -909,12 +921,35 @@ fn record_cap(fills: u64, base: Option<u64>) -> usize {
 /// usage row is a record, never a reason to fail a job.
 fn append_row(path: &Path, record: &serde_json::Value) {
     let line = format!("{record}\n");
-    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) else { return };
-    if f.lock().is_err() {
-        return;
-    }
+    // Read and append together: on Windows LockFileEx needs read or write access, which an append-only handle may
+    // not give `File::lock`. If the lock still cannot be had, the row is written unlocked rather than dropped: a
+    // row that might interleave with another is better kept than lost (readers count and skip an unreadable one).
+    let Ok(mut f) = fs::OpenOptions::new().create(true).read(true).append(true).open(path) else { return };
+    let locked = f.lock().is_ok();
     let _ = f.write_all(line.as_bytes());
-    let _ = f.unlock();
+    if locked {
+        let _ = f.unlock();
+    }
+}
+
+/// Every row of a usage file, each line read on its own: the bytes are split on `\n` and a line that is not UTF-8
+/// is read lossily, so one bad byte costs that line alone and never the whole record (`read_to_string` failed the
+/// whole file). The rows that are JSON objects, and how many non-blank lines were not. One reader for the totals,
+/// the limits, a job's row and the unreadable-row count.
+fn read_usage_rows(path: &Path) -> (Vec<serde_json::Value>, usize) {
+    let bytes = fs::read(path).unwrap_or_default();
+    let (mut rows, mut bad) = (Vec::new(), 0);
+    for line in bytes.split(|b| *b == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        if text.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) if v.is_object() => rows.push(v),
+            _ => bad += 1,
+        }
+    }
+    (rows, bad)
 }
 
 /// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
@@ -2307,7 +2342,7 @@ impl Session {
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
                               fresh_thread: false, sent_bytes: 0, measured: false, first_base: None, started_fresh: false,
                               call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now(), cli_version: None,
-                              limit: None, rate_limits: None, resume_lost: false });
+                              limit: None, rate_limits: None, resume_lost: false, retry: Arc::default() });
         Ok(id)
     }
 
@@ -2611,10 +2646,14 @@ impl Session {
                                                "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
                 input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
                                      serde_json::json!({"id": 2, "method": method, "params": thread})));
-                // The tier's effort goes with every turn as well as in `-c` above: turn/start takes `effort` ("Override
-                // the reasoning effort for this turn and subsequent turns", codex-cli 0.170.0's schema), and a
-                // resumed thread may keep the effort it was started with instead of the launch's setting (T3 Code
-                // sends it on each turn for that reason). The standard tier sets none: Codex's own choice stands.
+                // The effort goes with every turn, as well as in `-c` above. turn/start takes `effort` ("Override the
+                // reasoning effort for this turn and subsequent turns", codex-cli 0.170.0's schema), and it sticks:
+                // checked live, after a turn with effort `high` a new app-server process that resumed the thread
+                // reported `reasoningEffort: high`, launched with `-c model_reasoning_effort="low"`. So the launch's
+                // `-c` never applied to a resumed thread, and a turn that sent none left the thread on whatever an
+                // earlier turn (a deeper tier's) had set. The tier's effort goes here when it has one; the standard
+                // tier sends the owner's own (config.toml), else the model's default (models_cache.json), once the
+                // thread's model is known (`Parser::with_effort_default`), else none, and says so in the job's log.
                 let mut params = serde_json::json!({"input": content});
                 if let Some(effort) = self.tier.effort() {
                     params["effort"] = effort.into();
@@ -2774,23 +2813,28 @@ impl Session {
                             self.jobs[id - 1].push_log(note.clone());
                         }
                         if done.imported.is_empty() {
-                            return file;
+                            return Some(file);
                         }
                         let expanded = dir.join("project.md");
                         match fs::write(&expanded, &done.text) {
                             Ok(()) => {
                                 let names: Vec<String> = done.imported.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
                                 self.jobs[id - 1].push_log(format!("{}'s @imports are expanded for this turn: {}", file.file_name().unwrap_or_default().to_string_lossy(), names.join(", ")));
-                                expanded
+                                Some(expanded)
                             }
                             Err(e) => {
                                 self.jobs[id - 1].push_log(format!("{}'s @imports are left as written: {e}", file.display()));
-                                file
+                                Some(file)
                             }
                         }
                     }
-                    Err(_) => file,
+                    // never the raw path: a document that resolves outside the repository (or cannot be read) adds nothing
+                    Err(e) => {
+                        self.jobs[id - 1].push_log(format!("the project's {} is left out of this turn: {e}", file.file_name().unwrap_or_default().to_string_lossy()));
+                        None
+                    }
                 });
+                let doc = doc.flatten();
                 let rules = match fs::read(self.rules_path()) {
                     Ok(bytes) => Some(bytes).filter(|b| !b.trim_ascii().is_empty()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -2892,10 +2936,19 @@ impl Session {
         };
         cmd.current_dir(&cwd);
         agent_env(&mut cmd);
+        // Codex: a turn whose tier names no effort sends the thread's own (see `limits::codex_default_effort`)
+        let effort_default = turn.as_ref().is_some_and(|t| t["params"].get("effort").is_none()).then(|| {
+            let (home, chosen) = (self.codex_home.clone(), chosen_model.clone());
+            move |model: Option<&str>| limits::codex_default_effort(&home, model.or(chosen.as_deref()))
+        });
         let parser = match turn {
             Some(turn) => Parser::new(style).with_turn(turn),
             None => Parser::new(style),
         };
+        let parser = match effort_default {
+            Some(default) => parser.with_effort_default(default),
+            None => parser,
+        }.resuming(resume.is_some());
         if let Err(e) = self.spawn(id, cmd, parser, input, None) {
             // the agent never got this turn's handoff, so its next turn is told those turns again
             self.roll_back_turn(id, agent, heard, untold);
@@ -3117,6 +3170,7 @@ impl Session {
         }
         let (tx, cancel, pid) = (self.tx.clone(), self.jobs[id - 1].cancel.clone(), child.id());
         let gate = self.jobs[id - 1].gate.clone();
+        let watch = self.jobs[id - 1].retry.clone();
         let stdout = child.stdout.take();
         thread::spawn(move || {
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
@@ -3129,6 +3183,10 @@ impl Session {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
                     }
                     let _ = tx.send(Event::Note(id, note));
+                }
+                if style == Style::Codex {
+                    let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                    (w.since, w.last) = parser.retry_state().map_or((None, String::new()), |(s, l)| (Some(s), l));
                 }
                 for line in parser.take_writes() {
                     if let Some(pipe) = &closer {
@@ -3215,12 +3273,11 @@ impl Session {
                 let _ = tx.send(Event::Note(id, note));
             }
             let exit = child.wait();
-            // Claude may say the session it was asked to resume is gone on its stderr alone, and exit with no result.
-            if style == Style::Claude && fs::read_to_string(dir.join("stderr.txt")).is_ok_and(|e| parse::mentions_lost_session(&e)) {
-                let _ = tx.send(Event::Note(id, Note::ResumeLost));
-            }
+            let stalled = watch.lock().unwrap_or_else(|e| e.into_inner()).stalled.clone();
             let status = if cancel.load(Ordering::SeqCst) {
                 Status::Cancelled
+            } else if let Some(reason) = stalled {
+                Status::Failed(reason)
             } else if let Err(reason) = parser.finish() {
                 Status::Failed(reason)
             } else {
@@ -3237,6 +3294,12 @@ impl Session {
             };
             if style != Style::Trace && !parser.reply().is_empty() {
                 let _ = fs::write(dir.join("reply.md"), parser.reply());
+            }
+            // Claude may say the session it was asked to resume is gone on its stderr alone, and exit with no result:
+            // only a failed turn that resumed one is told so.
+            if style == Style::Claude && parser.was_resumed() && matches!(status, Status::Failed(_))
+                && fs::read_to_string(dir.join("stderr.txt")).is_ok_and(|e| parse::mentions_lost_session(&e)) {
+                let _ = tx.send(Event::Note(id, Note::ResumeLost));
             }
             let _ = tx.send(Event::Ended(id, status));
         });
@@ -3468,9 +3531,35 @@ impl Session {
         }
     }
 
+    /// Stops a Codex turn that has been retrying for `CODEX_RETRY_STALL` with no progress at `now`, with its last
+    /// error as the failure. The parser counts the same ten minutes when another retry error arrives; this is the
+    /// look from outside for the turn that retries and then says nothing more. `now` is a parameter so a test can say
+    /// what time it is.
+    pub fn check_retry_stalls(&mut self, now: Instant) {
+        for job in self.jobs.iter_mut().filter(|j| j.running()) {
+            let Some(pid) = job.pid else { continue };
+            let stalled = {
+                let mut w = job.retry.lock().unwrap_or_else(|e| e.into_inner());
+                match w.since {
+                    Some(since) if w.stalled.is_none() && now.saturating_duration_since(since) >= limits::CODEX_RETRY_STALL => {
+                        let message = limits::retry_stall_message(&w.last);
+                        w.stalled = Some(message.clone());
+                        Some(message)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(message) = stalled {
+                job.push_log(format!("stopping: {message}"));
+                stop_group(pid, Duration::from_secs(3), false);
+            }
+        }
+    }
+
     pub fn pump(&mut self) -> bool {
         let mut changed = self.take_asks();
         self.keep_awake();
+        self.check_retry_stalls(Instant::now());
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -3746,9 +3835,7 @@ impl Session {
     /// How many non-blank lines of `usage.jsonl` are not a readable JSON row (a torn or hand-edited line). Every
     /// reader skips them, so /usage says how many there were rather than silently under-counting.
     pub fn unreadable_usage_rows(&self) -> usize {
-        fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines()
-            .filter(|l| !l.trim().is_empty() && !serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v.is_object()))
-            .count()
+        read_usage_rows(&self.root.join("usage.jsonl")).1
     }
 
     /// The same counts for each of several windows in one read of `usage.jsonl`: /usage asks for a day and a week,
@@ -3757,8 +3844,7 @@ impl Session {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut by: Vec<BTreeMap<String, Tokens>> = secs.iter().map(|_| BTreeMap::new()).collect();
         let mut first = None;
-        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
             let at = r["at"].as_u64().unwrap_or(0);
             first = first.or(Some(at));
             let age = now.saturating_sub(at);
@@ -3779,8 +3865,7 @@ impl Session {
     pub fn limits_hit_since(&self, secs: u64) -> Vec<(String, String, u64, Option<u64>)> {
         let now = limits::unix_now();
         let mut last: BTreeMap<String, (String, u64, Option<u64>)> = BTreeMap::new();
-        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
             let (Some(kind), at) = (r.pointer("/limit/kind").and_then(|k| k.as_str()), r["at"].as_u64().unwrap_or(0)) else { continue };
             if now.saturating_sub(at) <= secs && last.get(r["agent"].as_str().unwrap_or("?")).is_none_or(|(_, before, _)| *before <= at) {
                 last.insert(r["agent"].as_str().unwrap_or("?").to_string(), (kind.to_string(), at, r.pointer("/limit/resets_at").and_then(|v| v.as_u64())));
@@ -3800,8 +3885,7 @@ impl Session {
     pub fn job_usage(&self, dir: &Path) -> JobUsage {
         let wanted = dir.to_string_lossy();
         let mut found = None;
-        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
             if r["job"].as_str() != Some(wanted.as_ref()) {
                 continue;
             }
@@ -5628,6 +5712,21 @@ mod tests {
         // a torn line and a blank line: the torn one is counted, the blank one is not
         fs::write(&path, format!("{text}{{\"at\": 1, \"agent\"\n\n[1]\n")).unwrap();
         assert_eq!(s.unreadable_usage_rows(), 2);
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_costs_that_line_alone() {
+        let (s, _) = ledger_session("codex", 0);
+        let path = s.root.join("usage.jsonl");
+        let now = limits::unix_now();
+        let mut bytes = format!("{{\"at\":{now},\"agent\":\"codex\",\"input\":5,\"output\":1}}\n").into_bytes();
+        bytes.extend_from_slice(b"{\"at\":1,\"agent\":\"x\xff\xfe\"}\n"); // lossy: still a row, with replacement characters
+        bytes.extend_from_slice(b"\xff\xfe not json\n");
+        bytes.extend_from_slice(format!("{{\"at\":{now},\"agent\":\"codex\",\"input\":2,\"output\":1,\"limit\":{{\"kind\":\"usage\"}}}}\n").as_bytes());
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(s.unreadable_usage_rows(), 1);
+        assert_eq!(s.used_since(60).0["codex"].total(), 9, "both good rows count");
+        assert_eq!(s.limits_hit_since(60).len(), 1);
     }
 
     #[test]

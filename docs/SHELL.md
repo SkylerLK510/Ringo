@@ -119,7 +119,10 @@ How the instructions reach the model, each turn:
   importing file's folder; links out of the repository and `~/` paths are refused). A line that is only an import is
   replaced by the file's text; an import inside a line leaves the line and adds the file after the document under
   `## Imported from PATH`. Imports nest five files deep, a file is taken in once (cycles add nothing), at most 64 KiB is
-  added (the job's log says when an import is left as written), and a missing file stays as written. The turn is given
+  added (the job's log says when an import is left as written; an import is read at most up to what is left of that
+  budget, never whole), and a missing file stays as written. The project file itself is held to the same rule: a
+  `CLAUDE.md` or `AGENTS.md` that links to a file outside the repository (a cloned repository can contain one) is
+  left out of the turn with one log line, never sent. The turn is given
   an expanded copy in its own folder; your files are not changed.
 - **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
   turns they stand in for any `developer_instructions` in your Codex settings.
@@ -944,9 +947,15 @@ before this one ended may not be known yet.
 | `deep` | `--effort xhigh` | `"xhigh"` | `--effort high` | |
 | `ultra` | `--effort xhigh` | `"xhigh"` | `--effort high` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
 
-Codex gets the effort twice: `-c model_reasoning_effort` at launch, and `effort` on each `turn/start` (codex-cli 0.170.0's
-schema: "Override the reasoning effort for this turn and subsequent turns"), since a resumed thread may keep the effort
-it started with instead of the launch setting. `standard` sends neither.
+Codex gets the effort twice: `-c model_reasoning_effort` at launch, and `effort` on every `turn/start` (codex-cli 0.170.0's
+schema: "Override the reasoning effort for this turn and subsequent turns"). The second is the one that holds: checked
+live (codex-cli 0.170.0), after a turn with effort `high` a new app-server process that resumed the thread reported
+`reasoningEffort: high` although it was launched with `-c model_reasoning_effort="low"`, so the launch setting never
+applied to a resumed thread, and a turn that sent no effort ran on whatever an earlier turn had set. So `standard`
+sends one too: your own `model_reasoning_effort` from `$CODEX_HOME/config.toml` (default `~/.codex`; a top-level key,
+not one under a profile) when you set it, else the thread's model's `default_reasoning_level` from
+`$CODEX_HOME/models_cache.json` (the model is the one the thread answers with, or the one you chose), else nothing,
+and the job's log says it could not tell.
 
 A tier changes no prompt: effort is a model setting, not text. The shell starts in `standard` every time, so a tier
 that spends more is never left on from an earlier day. `deep` is xhigh, not high, because an owner's own settings can
@@ -1068,9 +1077,13 @@ read when the shell opens and again after a turn when the last read is ten minut
   endpoint is called. Nothing reroutes the turn: it only names what happened. The job keeps it and its usage row gains
   `"limit": {"kind": "usage|rate|overloaded", "resets_at": <unix seconds or null>}` (a turn that hit a limit leaves a
   row with zero counts, so the record has it). Codex that keeps reporting `willRetry` errors for 10 minutes with no
-  other event between them is stopped with "Codex kept retrying for 10 min: <last error>". If a read of Codex's plan
+  other event between them is stopped with "Codex kept retrying for 10 min: <last error>"; the shell also checks this
+  on its own timer, so a Codex that retries once and then goes quiet is stopped too. The saved-conversation reset
+  ("No conversation found with session ID") applies only to a resumed turn that failed, never to a successful reply
+  that quotes the phrase. If a read of Codex's plan
   fails, `/usage` shows the snapshot its last turn's live updates built, as it does for Claude.
-- **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder. Each finished job that used tokens
+- **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder (each line read on its own, as bytes:
+  one line that is not UTF-8 costs that line alone, and is counted among the unreadable rows). Each finished job that used tokens
   appends one line: when, which agent (or `ringo` for a pipeline), and its input, cache-read, cache-write and output
   counts; and what they are counts of: the tier, the model when the agent names it, a pipeline's command, and the
   job's folder (a pipeline's trace there names each call's model and effort). A job that finished without reporting
@@ -1091,7 +1104,8 @@ read when the shell opens and again after a turn when the last read is ten minut
   On WSL it is a `powershell.exe` that calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` and waits on
   its stdin (Windows sleep, which logind inside WSL cannot stop); on Linux `systemd-inhibit --what=sleep ... cat`, if
   installed; on macOS `caffeinate -i -w <ringo pid>`. `RINGO_KEEP_AWAKE=0` turns it off. A missing tool or a failed
-  start is one line in the job's log and nothing else. The hold/release rule is unit-tested with a fake spawner; the
+  start is one line in the job's log and nothing else, and so is a helper that exits by itself while a call runs
+  ("could not keep the computer awake: powershell.exe exited"): it is checked on each tick and not started again that session. The hold/release rule is unit-tested with a fake spawner; the
   real inhibitors have not been run in tests (needs a live check on a WSL host).
 - **Plans:** asked of each set-up agent in the background, about a second each:
   - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given

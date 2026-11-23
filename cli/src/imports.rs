@@ -14,6 +14,7 @@
 //! `CLAUDE.md` importing what it was itself read from, adds nothing), and what is added stops at `MAX_ADDED` bytes.
 //! The text is bytes throughout, as the file may not be UTF-8.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// How many files deep imports are followed.
@@ -39,11 +40,20 @@ struct State {
 
 /// `file`'s text with its imports expanded. `root` is the repository (any folder `file` is in); nothing outside it
 /// is read.
+///
+/// The document itself is held to the same rule as what it imports: a `CLAUDE.md` that is a link to a file outside the
+/// repository (a cloned repository can contain one) is refused with `PermissionDenied`, and nothing is read from it.
 pub fn expand(file: &Path, root: &Path) -> std::io::Result<Expanded> {
-    let bytes = std::fs::read(file)?;
-    let mut state = State { root: root.canonicalize()?, included: file.canonicalize().into_iter().collect(), added: 0, notes: Vec::new() };
+    let root = root.canonicalize()?;
+    let canonical = file.canonicalize()?;
+    if !canonical.starts_with(&root) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                                       format!("{} resolves outside the repository", file.display())));
+    }
+    let bytes = std::fs::read(&canonical)?;
+    let mut state = State { root, included: vec![canonical.clone()], added: 0, notes: Vec::new() };
     let first = state.included.len(); // the document itself is not an import
-    let text = expand_text(&bytes, file.parent().unwrap_or(Path::new(".")), 0, &mut state);
+    let text = expand_text(&bytes, canonical.parent().unwrap_or(Path::new(".")), 0, &mut state);
     Ok(Expanded { text, imported: state.included.split_off(first), notes: state.notes })
 }
 
@@ -104,8 +114,11 @@ fn include(file: &Path, depth: usize, state: &mut State) -> Option<Vec<u8>> {
     if state.included.iter().any(|f| f == file) {
         return None;
     }
-    let bytes = std::fs::read(file).ok()?;
-    if state.added + bytes.len() > MAX_ADDED {
+    // At most what is left of the budget, and one byte more to tell it is over: a huge file is never read whole.
+    let room = MAX_ADDED.saturating_sub(state.added) as u64;
+    let mut bytes = Vec::new();
+    std::fs::File::open(file).ok()?.take(room + 1).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 > room {
         if state.notes.is_empty() {
             let shown = file.strip_prefix(&state.root).unwrap_or(file).display();
             state.notes.push(format!("@import {shown} is left as written: the imports would add more than {} KiB", MAX_ADDED / 1024));
@@ -155,7 +168,7 @@ fn expand_text(bytes: &[u8], folder: &Path, depth: usize, state: &mut State) -> 
             out.extend_from_slice(line);
             for (_, _, file) in found {
                 if let Some(text) = include(&file, depth, state) {
-                    after.push((file.strip_prefix(&state.root).unwrap_or(&file).display().to_string(), text));
+                    after.push((file.strip_prefix(&state.root).unwrap_or(&file).display().to_string().replace('\\', "/"), text));
                 }
             }
         }
@@ -233,6 +246,7 @@ mod tests {
         assert!(deep.contains("level 4\n") && deep.ends_with("level 4\n@d5.md\n"), "{deep}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn nothing_outside_the_repository_is_read() {
         let r = repo("outside");
@@ -246,6 +260,43 @@ mod tests {
         let got = text(&r, "CLAUDE.md");
         assert!(!got.contains("SECRET"), "{got}");
         assert!(got.contains("@link.md\n@dir/secret.md\n") && got.contains("@~/.bashrc\n") && got.ends_with("fine\n"), "{got}");
+    }
+
+    #[test]
+    fn a_path_that_climbs_out_or_names_another_folder_is_not_read() {
+        // portable: no links, just paths
+        let r = repo("climb");
+        let outside = repo("climb-secret");
+        fs::write(outside.join("secret.md"), "SECRET\n").unwrap();
+        fs::write(r.join("CLAUDE.md"), format!("@../{}/secret.md\n@{}\n", outside.file_name().unwrap().to_string_lossy(),
+                                               outside.join("secret.md").display())).unwrap();
+        assert!(!text(&r, "CLAUDE.md").contains("SECRET"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_project_file_that_is_a_link_out_of_the_repository_is_refused_whole() {
+        let r = repo("doc-link");
+        let outside = repo("doc-link-secret");
+        fs::write(outside.join("secret.md"), "SECRET\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret.md"), r.join("CLAUDE.md")).unwrap();
+        let err = expand(&r.join("CLAUDE.md"), &r).err().expect("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        // a link that stays inside the repository is fine
+        fs::write(r.join("AGENTS.md"), "inside\n").unwrap();
+        fs::remove_file(r.join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink(r.join("AGENTS.md"), r.join("CLAUDE.md")).unwrap();
+        assert_eq!(text(&r, "CLAUDE.md"), "inside\n");
+    }
+
+    #[test]
+    fn a_huge_import_is_not_read_whole() {
+        let r = repo("huge");
+        let big = fs::File::create(r.join("big.md")).unwrap();
+        big.set_len(MAX_ADDED as u64 * 40).unwrap(); // sparse: a read of all of it would be 2.5 MB of zeros
+        fs::write(r.join("CLAUDE.md"), "@big.md\n").unwrap();
+        let got = expand(&r.join("CLAUDE.md"), &r).unwrap();
+        assert!(got.imported.is_empty() && got.text == b"@big.md\n" && got.notes.len() == 1);
     }
 
     #[test]

@@ -14,6 +14,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// minutes (`provider-core/src/server/failure.ts`).
 pub const CODEX_RETRY_STALL: Duration = Duration::from_secs(600);
 
+/// What the owner is told when Codex's retries ran out the stall cap: the cap, and the last error it reported.
+pub fn retry_stall_message(last: &str) -> String {
+    format!("Codex kept retrying for {} min: {last}", CODEX_RETRY_STALL.as_secs() / 60)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LimitKind {
     /// The plan's own usage is used up (a window at 100%, a quota): it starts over at a known time.
@@ -252,6 +257,42 @@ pub fn agy_limit(text: &str, now: u64) -> Option<Limit> {
     Some(Limit { agent: "agy", kind, resets_at, message: crate::parse::short(text, 200) })
 }
 
+/// The reasoning effort a Codex thread would run with when the tier names none, so it can be sent on every
+/// `turn/start`: `effort` there "overrides this turn and subsequent turns", and a thread that is resumed reports the
+/// last one sent, whatever `-c model_reasoning_effort` the process was launched with (codex-cli 0.170.0, checked live:
+/// after a turn with effort `high`, a new app-server process that resumed the thread reported `reasoningEffort:
+/// high`, launched with `-c model_reasoning_effort="low"`). So a turn that sends none leaves the thread on whatever
+/// the last turn set, the tier's included. In order: the owner's own `model_reasoning_effort` in `config.toml`, else
+/// the thread's model's `default_reasoning_level` in `models_cache.json` (both in `codex_home`), else None.
+/// `model` is the one the thread answered with, or the one chosen.
+pub fn codex_default_effort(codex_home: &std::path::Path, model: Option<&str>) -> Option<String> {
+    if let Ok(text) = std::fs::read(codex_home.join("config.toml")) {
+        if let Some(effort) = toml_top_level_string(&String::from_utf8_lossy(&text), "model_reasoning_effort") {
+            return Some(effort);
+        }
+    }
+    let cache: Value = serde_json::from_slice(&std::fs::read(codex_home.join("models_cache.json")).ok()?).ok()?;
+    let model = model?;
+    cache["models"].as_array()?.iter().find(|m| m["slug"].as_str() == Some(model))
+        .and_then(|m| m["default_reasoning_level"].as_str()).filter(|l| !l.is_empty()).map(str::to_string)
+}
+
+/// A string value set at the top of a TOML file (before the first `[table]`), as `key = "value"`; the settings the
+/// owner keeps under a profile or a table are not the thread's default.
+fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            return None;
+        }
+        let Some(rest) = line.strip_prefix(key).map(str::trim_start).and_then(|r| r.strip_prefix('=')) else { continue };
+        let value = rest.trim().split('#').next().unwrap_or("").trim();
+        let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))?;
+        return (!value.is_empty()).then(|| value.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +377,29 @@ mod tests {
         assert_eq!(agy_limit("Error 500, Message: boom, Status: INTERNAL", NOW), None);
         assert_eq!(go_duration_secs("1h2m3.5s"), Some(3723.5));
         assert_eq!(go_duration_secs("soon"), None);
+    }
+
+    #[test]
+    fn the_default_effort_is_the_owners_then_the_models() {
+        let dir = std::env::temp_dir().join(format!("ringo-effort-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cache = r#"{"models":[{"slug":"gpt-6-luna","default_reasoning_level":"medium"},{"slug":"gpt-6-sol","default_reasoning_level":"high"}]}"#;
+        // nothing to go by: none
+        assert_eq!(codex_default_effort(&dir, Some("gpt-6-luna")), None);
+        // the model's own default, from the models cache; a model it does not list, or none known, gives none
+        std::fs::write(dir.join("models_cache.json"), cache).unwrap();
+        assert_eq!(codex_default_effort(&dir, Some("gpt-6-sol")).as_deref(), Some("high"));
+        assert_eq!(codex_default_effort(&dir, Some("unknown")), None);
+        assert_eq!(codex_default_effort(&dir, None), None);
+        // the owner's own setting wins, with or without a model; one under a table or a profile is not the default
+        std::fs::write(dir.join("config.toml"), "# mine\nmodel_reasoning_effort = \"low\"  # quiet\n[profiles.deep]\nmodel_reasoning_effort = \"xhigh\"\n").unwrap();
+        assert_eq!(codex_default_effort(&dir, None).as_deref(), Some("low"));
+        assert_eq!(codex_default_effort(&dir, Some("gpt-6-sol")).as_deref(), Some("low"));
+        std::fs::write(dir.join("config.toml"), "model = \"x\"\n[profiles.deep]\nmodel_reasoning_effort = \"xhigh\"\n").unwrap();
+        assert_eq!(codex_default_effort(&dir, Some("gpt-6-luna")).as_deref(), Some("medium"));
+        // a broken cache is none, not a failure
+        std::fs::write(dir.join("models_cache.json"), "{").unwrap();
+        assert_eq!(codex_default_effort(&dir, Some("gpt-6-luna")), None);
     }
 }

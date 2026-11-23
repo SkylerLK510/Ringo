@@ -33,7 +33,12 @@ const WINDOWS_HOLD_SCRIPT: &str = "$t = Add-Type -Name Power -Namespace Ringo -P
     [void]$t::SetThreadExecutionState([uint32]2147483649); [void][Console]::In.ReadToEnd()";
 
 /// A live hold: dropping it releases the inhibitor.
-pub trait Hold {}
+pub trait Hold {
+    /// The tool's name once its process has exited on its own (so nothing is held any more); None while it runs.
+    fn exited(&mut self) -> Option<String> {
+        None
+    }
+}
 
 /// Makes holds. `Err` is the one log line to give; the hold is then not tried again this session.
 pub trait Spawner {
@@ -63,6 +68,14 @@ impl<S: Spawner> KeepAwake<S> {
     /// One look at whether a call is running (`wanted`) at `now`. Returns a log line when something happened worth
     /// saying (the hold failed; the hold ended is not worth a line).
     pub fn tick(&mut self, wanted: bool, now: Instant) -> Option<String> {
+        // A helper that died by itself (powershell killed, systemd-inhibit refused) holds nothing, whatever the hold
+        // says: look at it each tick, say so once, and do not start another this session (no respawn loop).
+        if let Some(tool) = self.hold.as_mut().and_then(|h| h.exited()) {
+            self.hold = None;
+            self.idle_since = None;
+            self.gave_up = true;
+            return Some(format!("could not keep the computer awake: {tool} exited"));
+        }
         if wanted {
             self.idle_since = None;
             if self.hold.is_none() && !self.gave_up {
@@ -87,9 +100,13 @@ impl<S: Spawner> KeepAwake<S> {
 
 /// A real inhibitor process; dropping it closes its stdin (the release for powershell and cat) and then kills it
 /// (the release for caffeinate, which has no stdin to wait on).
-struct Process(Child);
+struct Process(Child, String);
 
-impl Hold for Process {}
+impl Hold for Process {
+    fn exited(&mut self) -> Option<String> {
+        matches!(self.0.try_wait(), Ok(Some(_)) | Err(_)).then(|| self.1.clone())
+    }
+}
 
 impl Drop for Process {
     fn drop(&mut self) {
@@ -136,7 +153,7 @@ impl Spawner for System {
             .stdin(if stdin { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::null()).stderr(Stdio::null())
             .spawn().map_err(|e| format!("{program}: {e}"))?;
-        Ok(Box::new(Process(child)))
+        Ok(Box::new(Process(child, program)))
     }
 }
 
@@ -162,6 +179,7 @@ mod tests {
     struct Log {
         spawned: usize,
         released: usize,
+        dead: bool,
     }
 
     struct Fake {
@@ -171,7 +189,12 @@ mod tests {
 
     struct Live(Rc<RefCell<Log>>);
 
-    impl Hold for Live {}
+    impl Hold for Live {
+        fn exited(&mut self) -> Option<String> {
+            // the fake helper dies when the test says so
+            self.0.borrow().dead.then(|| "powershell.exe".to_string())
+        }
+    }
 
     impl Drop for Live {
         fn drop(&mut self) {
@@ -229,6 +252,23 @@ mod tests {
         assert_eq!((log.borrow().spawned, log.borrow().released), (1, 1));
         k.tick(true, t0 + Duration::from_secs(200));
         assert_eq!(log.borrow().spawned, 2, "a new turn after the release holds again");
+    }
+
+    #[test]
+    fn a_helper_that_dies_is_one_log_line_and_not_respawned() {
+        let (mut k, log) = machine(false);
+        let t0 = Instant::now();
+        assert_eq!(k.tick(true, t0), None);
+        assert!(k.held());
+        log.borrow_mut().dead = true; // the helper exits on its own while a call is wanted
+        let line = k.tick(true, t0 + Duration::from_secs(1)).expect("one line");
+        assert_eq!(line, "could not keep the computer awake: powershell.exe exited");
+        assert!(!k.held());
+        assert_eq!(log.borrow().released, 1, "the dead hold is dropped");
+        // no respawn loop, no second line
+        assert_eq!(k.tick(true, t0 + Duration::from_secs(2)), None);
+        assert_eq!(k.tick(true, t0 + Duration::from_secs(90)), None);
+        assert_eq!(log.borrow().spawned, 1);
     }
 
     #[test]

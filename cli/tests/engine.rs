@@ -1171,6 +1171,7 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
         echo '{{\"event\":\"init\",\"conversation_id\":\"c-t\",\"init\":{{\"cwd\":\"x\"}}}}'\n\
         echo '{{\"event\":\"result\",\"result\":{{\"status\":\"SUCCESS\",\"response\":\"done\",\"usage\":{{\"input_tokens\":1,\"output_tokens\":1}}}}}}'\n"));
     let mut s = Session::with_state(&r, &state).unwrap();
+    s.codex_home = root().join("codex-home-golden"); // none: no config.toml or models cache of the owner's
     for (name, program) in [("claude", &claude), ("codex", &codex), ("agy", &agy)] {
         s.programs.insert(agent(name), program.clone());
     }
@@ -1191,7 +1192,7 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
     // turn/start carries the tier's effort too (a resumed thread may ignore the launch's -c); none for standard
     let turn_effort = || serde_json::from_str::<serde_json::Value>(
         &fs::read_to_string(format!("{}.turn", codex.display())).unwrap()).unwrap()["params"]["effort"].clone();
-    assert!(turn_effort().is_null(), "standard sends no effort");
+    assert!(turn_effort().is_null(), "standard with nothing to go by sends none");
     let (c, x, a) = effort(&mut s, ringo_cli::Tier::Quick);
     assert!(has(&c, &["--effort", "low"]) && has(&x, &["-c", "model_reasoning_effort=\"low\""]) && has(&a, &["--effort", "low"]),
             "{c}\n{x}\n{a}");
@@ -2955,4 +2956,60 @@ fn a_claude_md_import_reaches_claude_expanded() {
     said(&mut s, "claude", "again");
     let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
     assert!(argv.lines().any(|a| a == r.join("AGENTS.md").to_string_lossy()), "{argv}");
+}
+
+/// A Codex turn that reports one `willRetry` error and then says nothing more sends no second error for the
+/// parser to count ten minutes from, so the runner looks from outside: past the cap with no progress it stops the
+/// turn, and the job fails with the last error. The time is the test's own.
+#[test]
+fn a_codex_turn_that_retries_and_goes_quiet_is_stopped_from_outside() {
+    let r = repo("retry-stall");
+    let events = r#"echo '{"method":"error","params":{"threadId":"t-1","turnId":"u","willRetry":true,"error":{"message":"stream disconnected"}}}'
+sleep 60"#;
+    let codex = fake(&root(), "codex-retry-stall", &codex_script("", events));
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "work").unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    while !s.job(id).unwrap().log.iter().any(|l| l.starts_with("retrying:")) {
+        assert!(Instant::now() < until, "the retry was never seen");
+        s.pump();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    s.check_retry_stalls(Instant::now() + Duration::from_secs(300));
+    assert!(s.job(id).unwrap().running(), "five minutes is not the cap");
+    s.check_retry_stalls(Instant::now() + Duration::from_secs(601));
+    assert_eq!(wait(&mut s, id), Status::Failed("Codex kept retrying for 10 min: stream disconnected".into()));
+}
+
+/// A thread keeps the effort of the last `turn/start` that sent one (codex-cli 0.170.0, checked live: after a turn
+/// with `high`, a new process resuming the thread reported `high` whatever `-c model_reasoning_effort` it was launched
+/// with), so the standard tier sends one too: the owner's own setting, else the thread's model's default, else none
+/// (and the job's log says so).
+#[test]
+fn the_standard_tier_sends_the_owners_effort_or_the_models_default() {
+    let r = repo("standard-effort");
+    let answer_with_model = codex_script("", &codex_done("ok", (1, 0, 1)))
+        .replace(r#"{"thread":{"id":"t-1"}}"#, r#"{"thread":{"id":"t-1"},"model":"gpt-6-sol"}"#);
+    let codex = fake(&root(), "codex-standard-effort", &answer_with_model);
+    let turn_effort = |home: &str, setup: &dyn Fn(&Path)| -> (serde_json::Value, bool) {
+        let dir = root().join(format!("codex-home-effort-{home}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        setup(&dir);
+        let mut s = session(&r, agent("codex"), &codex);
+        s.codex_home = dir;
+        let id = s.launch_agent(agent("codex"), false, "go").unwrap();
+        assert_eq!(wait(&mut s, id), Status::Done);
+        let turn: serde_json::Value = serde_json::from_str(&fs::read_to_string(format!("{}.turn", codex.display())).unwrap()).unwrap();
+        let said = s.job(id).unwrap().log.iter().any(|l| l.contains("could not tell which reasoning effort"));
+        (turn["params"]["effort"].clone(), said)
+    };
+    let cache = r#"{"models":[{"slug":"gpt-6-luna","default_reasoning_level":"medium"},{"slug":"gpt-6-sol","default_reasoning_level":"high"}]}"#;
+    // the owner's own setting first
+    assert_eq!(turn_effort("config", &|d| { fs::write(d.join("config.toml"), "model_reasoning_effort = \"low\"\n").unwrap();
+                                             fs::write(d.join("models_cache.json"), cache).unwrap(); }), ("low".into(), false));
+    // else the model the thread answered with
+    assert_eq!(turn_effort("cache", &|d| fs::write(d.join("models_cache.json"), cache).unwrap()), ("high".into(), false));
+    // else nothing, said once in the log
+    assert_eq!(turn_effort("none", &|_| {}), (serde_json::Value::Null, true));
 }

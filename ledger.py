@@ -308,6 +308,8 @@ def claude_calls(lines):
         message = event.get('message')
         if not isinstance(message, dict) or not isinstance(message.get('id'), str) or not isinstance(message.get('usage'), dict):
             continue
+        if message.get('model') == '<synthetic>':
+            continue  # a notice Claude Code wrote itself, not an API call (the Rust parser skips it the same way)
         if message['id'] in seen:
             continue
         seen.add(message['id'])

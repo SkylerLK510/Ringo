@@ -242,6 +242,18 @@ class AttributeTest(unittest.TestCase):
         self.assertEqual((code, a['calls'], a['total']), (0, 2, 125 + 201))
         self.assertEqual((a['fixed'], a['carry'], a['growth']), (200, 50, 76))
 
+    def test_attribute_claude_skips_a_synthetic_notice(self):
+        def msg(i, model, **use):
+            return {'type': 'assistant', 'parent_tool_use_id': None,
+                    'message': {'id': i, 'model': model, 'usage': use, 'content': []}}
+        # "<synthetic>" is a notice Claude Code wrote itself: no call, no context, and its id is not marked seen
+        self.events(2, lines({'type': 'system', 'subtype': 'init'}, msg('n1', '<synthetic>', input_tokens=0, cache_read_input_tokens=0),
+                             msg('m1', 'claude-x', input_tokens=5, cache_read_input_tokens=100, cache_creation_input_tokens=20),
+                             msg('m1', '<synthetic>', input_tokens=1)))
+        code, doc, _ = self.attribute('--agent', 'claude', '--base', '100')
+        a = doc['agents']['claude']
+        self.assertEqual((code, a['calls'], a['total']), (0, 1, 125))
+
     def test_attribute_needs_a_base(self):
         _, upd = codex_events()
         self.events(1, lines({'id': 1, 'result': {}}))

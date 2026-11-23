@@ -194,10 +194,17 @@ pub struct Parser {
     clock: Clock,
     /// Codex: when its `willRetry` errors began with no progress between them (`limits::CODEX_RETRY_STALL`).
     retrying: Option<std::time::Instant>,
+    /// Codex: the last `willRetry` error's text, for the stall message.
+    retry_last: String,
     /// Codex: its rate-limit snapshot so far, merged from live updates.
     rate_limits: Value,
     /// The limit this turn ran into, as far as it is known.
     limit: Option<Limit>,
+    /// Codex: what effort to send when the turn's request names none (given the model the thread answered with):
+    /// see `limits::codex_default_effort`.
+    effort_default: Option<Box<dyn Fn(Option<&str>) -> Option<String> + Send>>,
+    /// The turn resumed a saved conversation (only then can its store be the thing that is gone).
+    resumed: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -370,7 +377,7 @@ impl Parser {
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
                  total: Tokens::default(), turn_id: String::new(), init: false, sends_turn: false, turn_sent: false,
-                 acked: false, clock: Clock::now(), retrying: None, rate_limits: Value::Null, limit: None }
+                 acked: false, clock: Clock::now(), retrying: None, retry_last: String::new(), rate_limits: Value::Null, limit: None, effort_default: None, resumed: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -378,6 +385,30 @@ impl Parser {
         self.turn = Some(turn);
         self.sends_turn = true;
         self
+    }
+
+    /// Codex: since when it has been reporting `willRetry` errors with no progress between them, and the last of
+    /// them. The runner checks this on a timer (`Session::check_retry_stalls`), since a Codex that goes quiet sends
+    /// no further error for the parser to count from.
+    pub fn retry_state(&self) -> Option<(std::time::Instant, String)> {
+        self.retrying.map(|since| (since, self.retry_last.clone()))
+    }
+
+    /// Codex: the effort to send in the turn/start when the request has none, given the thread's model. A thread
+    /// keeps the last effort sent, so a turn that sends none runs on whatever an earlier turn set.
+    pub fn with_effort_default(mut self, default: impl Fn(Option<&str>) -> Option<String> + Send + 'static) -> Parser {
+        self.effort_default = Some(Box::new(default));
+        self
+    }
+
+    /// Says the turn resumes a saved conversation, which is what "No conversation found" can be about.
+    pub fn resuming(mut self, resumed: bool) -> Parser {
+        self.resumed = resumed;
+        self
+    }
+
+    pub fn was_resumed(&self) -> bool {
+        self.resumed
     }
 
     pub fn style(&self) -> Style {
@@ -481,13 +512,22 @@ impl Parser {
                 if self.thread.is_empty() {
                     return self.fail("codex: the thread answer names no thread".into());
                 }
+                let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
+                let mut told = Vec::new();
                 if let Some(mut turn) = self.turn.take() {
                     turn["params"]["threadId"] = self.thread.clone().into();
+                    if turn["params"].get("effort").is_none() && let Some(default) = &self.effort_default {
+                        match default(model) {
+                            Some(effort) => turn["params"]["effort"] = effort.into(),
+                            None => told.push(Note::Log("could not tell which reasoning effort this thread would use, so \
+                                                         none is sent: it keeps the one an earlier turn set".into())),
+                        }
+                    }
                     self.writes.push(turn.to_string());
                     self.turn_sent = true;
                 }
-                let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
-                return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
+                return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten()
+                    .chain(told).collect();
             }
             if id.as_u64() == Some(3) {
                 if self.thread.is_empty() || self.turn.is_some() {
@@ -692,8 +732,9 @@ impl Parser {
             ("error", _) if p.get("willRetry").and_then(Value::as_bool) == Some(true) => {
                 let why = short(p.pointer("/error/message").and_then(Value::as_str).unwrap_or(""), 200);
                 let since = *self.retrying.get_or_insert(self.clock.mono);
+                self.retry_last = why.clone();
                 if self.clock.mono.saturating_duration_since(since) >= limits::CODEX_RETRY_STALL {
-                    return self.fail(format!("Codex kept retrying for {} min: {why}", limits::CODEX_RETRY_STALL.as_secs() / 60));
+                    return self.fail(limits::retry_stall_message(&why));
                 }
                 notes.push(Note::Log(format!("retrying: {why}")));
             }
@@ -964,8 +1005,12 @@ impl Parser {
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
                 }
-                // a resumed session Claude no longer has (its error is in `errors`, or in the result's text)
-                if mentions_lost_session(&format!("{} {}", self.reply, e.get("errors").map(Value::to_string).unwrap_or_default())) {
+                // A resumed session Claude no longer has (its error is in `errors`, or in the result's text). Only an error
+                // result of a turn that resumed counts: a successful reply that quotes the phrase (a log, this very
+                // code) must not make Ringo forget a conversation that is fine.
+                let failed = e.get("is_error") == Some(&Value::Bool(true)) || subtype != "success";
+                if failed && self.resumed
+                    && mentions_lost_session(&format!("{} {}", self.reply, e.get("errors").map(Value::to_string).unwrap_or_default())) {
                     notes.push(Note::ResumeLost);
                 }
                 if self.compacted && self.reply.trim().is_empty() {
@@ -2132,8 +2177,18 @@ mod tests {
     #[test]
     fn a_lost_claude_session_is_told() {
         let gone = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: s-1"]}"#;
-        let (p, notes) = run(Style::Claude, &[gone]);
+        let resumed = |lines: &[&str]| {
+            let mut p = Parser::new(Style::Claude).resuming(true);
+            let notes: Vec<Note> = lines.iter().flat_map(|l| p.line(l)).collect();
+            (p, notes)
+        };
+        let (p, notes) = resumed(&[gone]);
         assert!(notes.contains(&Note::ResumeLost) && p.finish().is_err());
+        // not a resumed turn: the phrase cannot be about a store it never opened
+        assert!(!run(Style::Claude, &[gone]).1.contains(&Note::ResumeLost));
+        // a successful reply that quotes the phrase (a log, this code) leaves the session alone
+        let quoted = r#"{"type":"result","subtype":"success","is_error":false,"result":"the log says: No conversation found with session ID: s-1"}"#;
+        assert!(!resumed(&[quoted]).1.contains(&Note::ResumeLost));
         assert!(!run(Style::Claude, &[CLAUDE[6]]).1.contains(&Note::ResumeLost));
         assert!(mentions_lost_session("Error: No conversation found with session ID: abc") && !mentions_lost_session("fine"));
     }
