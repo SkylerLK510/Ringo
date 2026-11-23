@@ -65,6 +65,8 @@ impl<W: Write> EventLog<W> {
 /// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
 /// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
 const RECORD_BYTES: usize = 60_000;
+/// The most of the owner's first message the inline record pins at its top when a long session leaves turn #1 out.
+const OWNER_PIN_BYTES: usize = 2_000;
 /// Files a job remembers it read (the working set the record names), the oldest dropped.
 const READ_FILES: usize = 200;
 /// The inline record's one line of files read: at most this many paths and bytes (the rest are in the whole record).
@@ -2122,24 +2124,51 @@ impl Session {
             part
         };
         let is_whole = |i: usize, j: &Job| i + 1 == turns.len() || j.talk || j.asked_by.is_some();
-        let mut kept = Vec::new();
-        let mut kept_turn: Vec<Option<usize>> = Vec::new(); // the turn each kept piece renders (None: a notice)
-        let mut used = 0;
-        for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, is_whole(i, j), false);
-            // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
-            // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
-            let part = record_head(&part, RECORD_BYTES - 128);
-            if used + part.len() + usize::from(!kept.is_empty()) > RECORD_BYTES - 128 && !kept.is_empty() {
-                let omitted = format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1);
-                used += omitted.len() + 1;
-                kept.push(omitted);
-                kept_turn.push(None);
-                break;
+        // Fill the inline record newest first within `limit`. With `pinned` the first turn is not a candidate (its
+        // owner words are pinned by the caller), so the omission notice names #2 to #k. Returns the pieces, the turn
+        // each renders (None: a notice), the bytes used, and whether a turn was left out.
+        let fill = |limit: usize, pinned: bool| {
+            let mut kept: Vec<String> = Vec::new();
+            let mut kept_turn: Vec<Option<usize>> = Vec::new();
+            let mut used = 0;
+            let mut left_out = false;
+            for (i, j) in turns.iter().enumerate().rev() {
+                if pinned && i == 0 {
+                    break;
+                }
+                let part = render(j, is_whole(i, j), false);
+                // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
+                // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
+                let part = record_head(&part, RECORD_BYTES - 128);
+                if used + part.len() + usize::from(!kept.is_empty()) > limit && !kept.is_empty() {
+                    let first = if pinned { turns[1].id } else { turns[0].id };
+                    let count = if pinned { i } else { i + 1 };
+                    let omitted = format!("(#{first} to #{}, {count} earlier turns, are in the whole record)\n", j.id);
+                    used += omitted.len() + 1;
+                    kept.push(omitted);
+                    kept_turn.push(None);
+                    left_out = true;
+                    break;
+                }
+                used += part.len() + usize::from(!kept.is_empty());
+                kept.push(part);
+                kept_turn.push(Some(i));
             }
-            used += part.len() + usize::from(!kept.is_empty());
-            kept.push(part);
-            kept_turn.push(Some(i));
+            (kept, kept_turn, used, left_out)
+        };
+        let (mut kept, mut kept_turn, mut used, left_out) = fill(RECORD_BYTES - 128, false);
+        if left_out && turns.len() > 1 {
+            // The first turn is the owner's original request and the newest-first fill leaves it out first, so a long
+            // session lost the very words everything after it builds on. Pin those words (to OWNER_PIN_BYTES) at the
+            // top and fill the rest in what is left. A session that fits whole never gets here, so it is unchanged.
+            let who = match turns[0].kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
+            let pin = record_head(&format!("#{} · the owner to {who}: {}\n", turns[0].id, turns[0].title_full.trim()), OWNER_PIN_BYTES);
+            let (mut k, mut kt, u, _) = fill((RECORD_BYTES - 128).saturating_sub(pin.len() + 1), true);
+            k.push(pin.clone());
+            kt.push(None);
+            used = u + pin.len() + 1;
+            kept = k;
+            kept_turn = kt;
         }
         kept.reverse();
         kept_turn.reverse();
@@ -4546,6 +4575,42 @@ mod tests {
         assert!(inline.starts_with("#1 · the owner to codex: constraint-0:"));
         assert!(inline.contains("(cut; the whole is in the record)"));
         assert!(whole.contains("END-OF-FAILURE") && whole.contains("file-4999-"));
+    }
+
+    #[test]
+    fn a_long_session_keeps_the_owners_first_request_and_names_the_range_it_omitted() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..60 {
+            let task = if n == 0 { format!("ORIGINAL-REQUEST {}", "x".repeat(5000)) } else { format!("turn-{n}: {}", "界".repeat(700)) };
+            let id = record_turn(&mut s, &task);
+            s.jobs[id - 1].talk = true;
+            fs::write(s.jobs[id - 1].dir.join("reply.md"), "r".repeat(3000)).unwrap();
+        }
+        let (inline, whole) = s.fresh_record(agent, &s.lane(agent, s.jobs.len() + 1), 0);
+        assert!(inline.len() <= RECORD_BYTES, "{} bytes", inline.len());
+        assert!(inline.contains("#1 · the owner to codex: ORIGINAL-REQUEST"), "turn #1 is pinned");
+        let pin_end = inline.find("\n(#2 to #").expect("the notice follows the pin, naming #2 to #k");
+        assert!(inline[..pin_end].len() <= OWNER_PIN_BYTES, "the pin is bounded");
+        let k: usize = inline[pin_end..].split("to #").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        assert!(inline.contains(&format!("#{}", k + 1)) && !inline.contains(&format!("#{k} · the owner")));
+        assert!(inline.contains(&format!(", {} earlier turns", k - 1)), "the count is #2..=#k: {}", &inline[pin_end..pin_end + 80]);
+        assert!(inline.contains("turn-59:"));
+        assert!(whole.contains(&"x".repeat(5000)), "the whole record keeps all of it");
+    }
+
+    #[test]
+    fn a_short_session_record_has_no_pin_and_is_unchanged() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..3 {
+            let id = record_turn(&mut s, &format!("small task {n}"));
+            s.jobs[id - 1].talk = true;
+        }
+        let (inline, _) = s.fresh_record(agent, &s.lane(agent, 4), 0);
+        assert!(inline.starts_with("#1 · the owner to codex: small task 0\n"));
+        assert_eq!(inline.matches("#1 ·").count(), 1, "told once, not pinned again");
+        assert!(!inline.contains("earlier turns"));
     }
 
     #[test]
