@@ -278,6 +278,80 @@ class AttributeTest(unittest.TestCase):
         self.assertIn('codex: base 10,000;', out)
         self.assertIn('identity: 1 + 0 = 1', out)
 
+class BaseTest(unittest.TestCase):
+    """`ledger.py base`: the fixed base per CLI version and the alert on a rise."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / 'usage.jsonl'
+
+    def write(self, *rows):
+        self.path.write_text(lines(*rows), encoding='utf-8')
+        return str(self.path)
+
+    @staticmethod
+    def row(version, base, agent='codex', model='gpt-6.1-sol', key='ctx_first_base'):
+        r = {'at': 1, 'agent': agent, 'surface': 'cli:' + agent, 'model': model, key: base}
+        if version:
+            r['cli_version'] = version
+        return r
+
+    def rows(self):
+        return [self.row('0.169.0', 13000), self.row('0.169.0', 13200), self.row('0.169.0', 13100),
+                self.row('0.170.0', 13800), self.row('0.170.0', 13900),
+                self.row(None, 12000), self.row('2.1.330', 21000, 'claude', 'opus'), self.row('2.1.330', 21400, 'claude', 'opus'),
+                {'at': 2, 'agent': 'ringo', 'surface': 'pipeline', 'ctx_first_base': 5},
+                self.row('0.170.0', 0), 'not json', {'at': 3, 'agent': 'codex'}]
+
+    def test_median_per_version_with_change_against_the_previous_version(self):
+        code, out, err = run('base', '--usage', self.write(*self.rows()), '--json')
+        self.assertEqual((code, err), (0, ''))
+        doc = json.loads(out)
+        codex = next(g for g in doc['groups'] if g['agent'] == 'codex')
+        self.assertEqual([(v['cli_version'], v['rows'], v['base'], v['change_pct']) for v in codex['versions']],
+                         [('unknown', 1, 12000, None), ('0.169.0', 3, 13100, None), ('0.170.0', 2, 13850, 5.7)])
+        claude = next(g for g in doc['groups'] if g['agent'] == 'claude')
+        self.assertEqual([(v['cli_version'], v['base']) for v in claude['versions']], [('2.1.330', 21200)])
+        self.assertEqual(doc['source']['skipped_lines'], 1)
+        self.assertEqual(doc['source']['rows_without_base'], 2, 'a zero base and a row with none')
+        self.assertEqual(doc['alerts'], [])
+
+    def test_versions_sort_by_number_not_text(self):
+        rows = [self.row('0.9.0', 10000), self.row('0.10.0', 11000)]
+        code, out, _ = run('base', '--usage', self.write(*rows), '--json')
+        self.assertEqual([v['cli_version'] for v in json.loads(out)['groups'][0]['versions']], ['0.9.0', '0.10.0'])
+
+    def test_max_rise_exits_1_only_when_the_newest_version_rose_past_it(self):
+        usage = self.write(*self.rows())
+        code, out, _ = run('base', '--usage', usage, '--max-rise', '5')
+        self.assertEqual(code, 1)
+        self.assertIn('ALERT: codex gpt-6.1-sol: base rose +5.7% from 0.169.0 to 0.170.0 (limit 5.0%)', out)
+        code, out, _ = run('base', '--usage', usage, '--max-rise', '10')
+        self.assertEqual(code, 0)
+        self.assertNotIn('ALERT', out)
+        # unknown rows are never "the previous version", and a single known version has nothing to compare
+        code, _, _ = run('base', '--usage', self.write(self.row(None, 1000), self.row('1.0.0', 99999)), '--max-rise', '0')
+        self.assertEqual(code, 0)
+        # a fall is not an alert
+        code, _, _ = run('base', '--usage', self.write(self.row('1.0.0', 20000), self.row('1.1.0', 10000)), '--max-rise', '0')
+        self.assertEqual(code, 0)
+
+    def test_rows_before_the_first_call_field_fall_back_to_the_session_base(self):
+        rows = [self.row('0.1.0', 9000, key='ctx_base'), self.row('0.1.0', 11000)]
+        _, out, _ = run('base', '--usage', self.write(*rows), '--json')
+        v = json.loads(out)['groups'][0]['versions'][0]
+        self.assertEqual((v['rows'], v['base'], v['first_call_rows']), (2, 10000, 1))
+
+    def test_an_unreadable_file_is_a_usage_error_and_text_names_the_columns(self):
+        code, _, err = run('base', '--usage', str(Path(self.dir.name) / 'missing.jsonl'))
+        self.assertEqual(code, 2)
+        self.assertIn('cannot read', err)
+        _, out, _ = run('base', '--usage', self.write(*self.rows()))
+        self.assertIn('cli_version', out)
+        self.assertIn('+5.7', out)
+        self.assertIn('1 unreadable rows', out)
+
 
 if __name__ == '__main__':
     unittest.main()

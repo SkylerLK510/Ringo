@@ -594,10 +594,15 @@ pub struct Job {
     fresh_thread: bool,
     sent_bytes: u64,
     measured: bool,
+    /// What this turn's own first call measured as the agent's fixed base (set with `measured`): the usage row's
+    /// `ctx_first_base`, which `ledger.py base` groups by CLI version.
+    first_base: Option<u64>,
     /// The turn began from Ringo's record (a handoff), which the next turn's dwell guard reads.
     started_fresh: bool,
     /// Each model call's input side, in order (`Note::CallInput`): the fixed/carry/growth split of the usage record.
     call_inputs: Vec<u64>,
+    /// The agent CLI's version, as it told it (Codex's initialize answer, Claude's system/init): the usage row's `cli_version`.
+    cli_version: Option<String>,
     /// The wall-clock time the job started: `started` is monotonic and does not run while the computer sleeps, so
     /// the two clocks disagree by the length of a sleep (see `awake::slept_secs`).
     wall_start: SystemTime,
@@ -2186,7 +2191,8 @@ impl Session {
             // session lost the very words everything after it builds on. Pin those words (to OWNER_PIN_BYTES) at the
             // top and fill the rest in what is left. A session that fits whole never gets here, so it is unchanged.
             let who = match turns[0].kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
-            let pin = record_head(&format!("#{} · the owner to {who}: {}\n", turns[0].id, turns[0].title_full.trim()), OWNER_PIN_BYTES);
+            let words = record_head(&format!("#{} · the owner to {who}: {}\n", turns[0].id, turns[0].title_full.trim()), OWNER_PIN_BYTES);
+            let pin = format!("{words}(the rest of #{} is in the whole record)\n", turns[0].id);
             let (mut k, mut kt, u, _) = fill((RECORD_BYTES - 128).saturating_sub(pin.len() + 1), true);
             k.push(pin.clone());
             kt.push(None);
@@ -2288,8 +2294,8 @@ impl Session {
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
-                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false,
-                              call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now() });
+                              fresh_thread: false, sent_bytes: 0, measured: false, first_base: None, started_fresh: false,
+                              call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now(), cli_version: None });
         Ok(id)
     }
 
@@ -3263,6 +3269,12 @@ impl Session {
                     record["record_whole_bytes"] = whole.into();
                 }
             }
+            if let Some(base) = job.first_base {
+                record["ctx_first_base"] = base.into();
+            }
+            if let Some(version) = &job.cli_version {
+                record["cli_version"] = version.as_str().into(); // what `ledger.py base` groups by
+            }
             if let Some(secs) = slept {
                 record["host_slept_s"] = secs.into();
             }
@@ -3463,6 +3475,7 @@ impl Session {
                             }
                         }
                         Note::Model(model) => job.model = Some(model),
+                        Note::CliVersion(version) => job.cli_version = Some(version),
                         Note::Uncounted => job.uncounted += 1,
                         Note::Tokens(t) | Note::TokensSoFar(t) => {
                             // A resumed Codex or agy turn reports its conversation's usage so far (Codex 16,829
@@ -3574,7 +3587,9 @@ impl Session {
                                 if job.fresh_thread && !job.measured && n > 0 {
                                     job.measured = true;
                                     let bases = self.bases.entry(agent).or_default();
-                                    bases.push_back(n.saturating_sub(job.sent_bytes / 4).max(1_000));
+                                    let base = n.saturating_sub(job.sent_bytes / 4).max(1_000);
+                                    job.first_base = Some(base);
+                                    bases.push_back(base);
                                     while bases.len() > 3 {
                                         bases.pop_front();
                                     }
@@ -4642,7 +4657,8 @@ mod tests {
         assert!(inline.len() <= RECORD_BYTES, "{} bytes", inline.len());
         assert!(inline.contains("#1 · the owner to codex: ORIGINAL-REQUEST"), "turn #1 is pinned");
         let pin_end = inline.find("\n(#2 to #").expect("the notice follows the pin, naming #2 to #k");
-        assert!(inline[..pin_end].len() <= OWNER_PIN_BYTES, "the pin is bounded");
+        assert!(inline[..pin_end].len() <= OWNER_PIN_BYTES + 64, "the pin is bounded");
+        assert!(inline[..pin_end].contains("(the rest of #1 is in the whole record)"));
         let k: usize = inline[pin_end..].split("to #").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
         assert!(inline.contains(&format!("#{}", k + 1)) && !inline.contains(&format!("#{k} · the owner")));
         assert!(inline.contains(&format!(", {} earlier turns", k - 1)), "the count is #2..=#k: {}", &inline[pin_end..pin_end + 80]);
@@ -5031,7 +5047,8 @@ mod tests {
                 fs::write(j.dir.join("reply.md"), "x".repeat(k)).unwrap();
             }
             let (inline, _, complete) = s.record_full(&s.lane(agent, 11), 0);
-            if !inline.contains("#1 · the owner") {
+            // a turn left out ends the scan (turn #1 stays in the record, pinned, so it no longer says so)
+            if inline.contains("earlier turns, are in the whole record") || inline.contains("(the rest of #1 is") {
                 break;
             }
             if !inline.contains(READ_LINE_PREFIX) {
@@ -5459,6 +5476,29 @@ mod tests {
         // a first call below the base: fixed and growth share the difference (decompose.py's surplus)
         assert_eq!(attribute(&[8_000, 20_000], 10_000), Some((18_000, 0, 12_000)));
         assert_eq!(attribute(&[], 1), None);
+    }
+
+    #[test]
+    fn a_row_names_the_cli_version_and_the_base_its_first_call_measured() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "version").unwrap();
+        s.jobs[id - 1].fresh_thread = true;
+        s.jobs[id - 1].sent_bytes = 4_000; // ~1,000 tokens sent
+        s.tx.send(Event::Note(id, Note::CliVersion("0.170.0".into()))).unwrap();
+        s.tx.send(Event::Note(id, Note::Context(14_000))).unwrap();
+        s.pump();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!((row["cli_version"].as_str(), row["ctx_first_base"].as_u64()), (Some("0.170.0"), Some(13_000)));
+        // a resumed turn measures no base and, if its CLI said nothing, names no version: old rows read the same
+        let id = s.new_job(Kind::Agent { agent, write: false }, "resumed").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert!(row.get("cli_version").is_none() && row.get("ctx_first_base").is_none());
     }
 
     #[test]

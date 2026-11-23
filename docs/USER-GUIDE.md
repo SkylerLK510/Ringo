@@ -179,6 +179,13 @@ lists of your skills and connectors. Only that agent's turns pay for it; `@claud
   five-hour and weekly ones and the full resets you have left. Ringo asks Claude and Codex directly; that takes
   about a second and no tokens.
 
+If some lines of that record cannot be read (a torn or hand-edited line), `/usage` says how many; they are left out of the sums.
+
+While an agent is working, Ringo keeps your computer from going to sleep (so a laptop lid timer or idle sleep does not
+cut a paid turn off mid-way), and lets go a minute after the last turn ends or while it is waiting for you to answer.
+Set `RINGO_KEEP_AWAKE=0` before starting Ringo to turn this off. If the computer slept during a turn anyway, the job's
+log says so and the record notes how long, so you can tell that from a backend failure.
+
 On a wide terminal the side panel keeps a small gauge for each limit too, so you can see how much is left while you
 work.
 

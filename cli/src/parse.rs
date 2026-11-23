@@ -70,6 +70,10 @@ pub enum Note {
     TokensSoFar(Tokens),
     /// The model the agent says it runs, for the usage record.
     Model(String),
+    /// The version of the agent's own CLI, read for free from what it already sends (Codex's `initialize` answer,
+    /// Claude's `system/init`), for the usage record: a CLI upgrade that adds tools shows up as a rise in the fixed
+    /// base of the rows that name it.
+    CliVersion(String),
     /// A finished model call that reported no token count (a Ringo pipeline's): unknown, not zero.
     Uncounted,
     /// What a running turn has used so far, as its messages report it (Claude): shown until the turn's own count
@@ -102,6 +106,14 @@ pub enum Note {
     Refused(usize),
     /// Claude's `rate_limit_event` (its `rate_limit_info`): how much of the owner's plan is used, for /usage.
     Limits(Value),
+}
+
+/// The version in a Codex `userAgent` ("codex_cli_rs/0.170.0 (Ubuntu 22.04; x86_64) ..."): what follows the first slash
+/// up to the next space, when it starts with a digit.
+fn version_of(user_agent: &str) -> Option<String> {
+    let after = user_agent.split_once('/')?.1;
+    let word: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+    word.starts_with(|c: char| c.is_ascii_digit()).then_some(word)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,7 +485,11 @@ impl Parser {
             if std::mem::replace(&mut self.init, true) {
                 return self.fail("codex: initialize was answered twice".into());
             }
-            return Vec::new();
+            // `userAgent` is "codex_cli_rs/0.170.0 (Ubuntu 22.04; x86_64) ...": the version follows the first slash
+            return match m.pointer("/result/userAgent").and_then(Value::as_str).and_then(version_of) {
+                Some(version) => vec![Note::CliVersion(version)],
+                None => Vec::new(),
+            };
         }
         let p = m.get("params").unwrap_or(&NULL);
         // The main thread's own: a subagent's thread reports through its parent's collab items.
@@ -706,6 +722,9 @@ impl Parser {
                     return self.fail(format!("claude is using an API key ({source}), not the subscription login"));
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
+                if !s(e, "claude_code_version").is_empty() && parent.is_none() {
+                    notes.push(Note::CliVersion(s(e, "claude_code_version").to_string()));
+                }
                 if !s(e, "model").is_empty() {
                     notes.push(Note::Model(s(e, "model").to_string()));
                 }
@@ -1363,6 +1382,24 @@ mod tests {
         }
         let (mut p, _) = run(Style::Codex, CODEX);
         assert!(p.leftover().is_empty(), "a completed turn was counted at turn/completed");
+    }
+
+    #[test]
+    fn the_agents_cli_version_is_read_from_what_it_already_sends() {
+        let codex = r#"{"id":1,"result":{"userAgent":"codex_cli_rs/0.170.0 (Ubuntu 22.04.5; x86_64) WSL (ringo; 1)"}}"#;
+        assert_eq!(run(Style::Codex, &[codex]).1, vec![Note::CliVersion("0.170.0".into())]);
+        // the existing fixture's answer carries one too; an answer with none says nothing
+        assert_eq!(run(Style::Codex, &[CODEX[0]]).1, vec![Note::CliVersion("0.165.0".into())]);
+        assert!(run(Style::Codex, &[r#"{"id":1,"result":{}}"#]).1.is_empty());
+        assert!(run(Style::Codex, &[r#"{"id":1,"result":{"userAgent":"weird"}}"#]).1.is_empty());
+        let claude = r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none","claude_code_version":"2.1.330","model":"m"}"#;
+        let notes = run(Style::Claude, &[claude]).1;
+        assert!(notes.contains(&Note::CliVersion("2.1.330".into())), "{notes:?}");
+        // a Claude init without the field (older builds), and agy (its stream names no version): nothing
+        assert!(!run(Style::Claude, &[r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}"#]).1
+            .iter().any(|n| matches!(n, Note::CliVersion(_))));
+        assert!(!run(Style::Agy, &[r#"{"event":"init","conversation_id":"c","init":{"cwd":"/w"}}"#]).1
+            .iter().any(|n| matches!(n, Note::CliVersion(_))));
     }
 
     #[test]

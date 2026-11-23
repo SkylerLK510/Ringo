@@ -877,7 +877,13 @@ keep their room. A record is "cut" (and links the whole record) by what it leave
 out or shown short of its whole form, a files-read line that does not name every file read (or was left out for lack
 of room), a cut diff, or turns from before a restart that did not all fit. Its files-read line alone (one line inline,
 a `read:` line per turn in the whole record) is not a cut. The cap never takes the record past its 60,000 bytes, never
-drops the diff or the files-read line, and leaves the whole record as it was. A brand-new conversation, and the record
+drops the diff or the files-read line, and leaves the whole record as it was. The inline record fills newest first, so
+in a long session the first turn, the owner's original request, was the first one left out. When any turn is left out, the
+inline record now starts with that first message from the owner, word for word up to 2,000 bytes (cut with the usual
+notice), then a line saying the rest of #1 is in the whole record, then the omission notice naming the range actually
+left out ("#2 to #k, n earlier turns"), then the newest turns. The pin comes out of the 60,000 bytes, not on top of
+them. A session whose turns all fit is unchanged byte for byte. (Unit-tested with synthetic 60-turn sessions; not
+measured on live conversations.) A brand-new conversation, and the record
 of turns an agent missed, get the lean form. How the richer record changes the answers is not measured, and no saving
 or quality gain is claimed for it.
 
@@ -1022,8 +1028,21 @@ read when the shell opens and again after a turn when the last read is ten minut
   Each line also names its `surface` and `billing`, the job's `calls` when the agent reports them, `ctx_base`,
   `ctx_fixed`, `ctx_carry` and `ctx_growth` once the agent's base is measured, and `record_inline_bytes` and
   `record_whole_bytes` for a turn that started fresh from Ringo's record. Older lines lack these and `/usage` reads old and new
-  lines alike; they are described in [TOKEN-USAGE.md](TOKEN-USAGE.md#cost-weighted-usage-w-and-the-ledger) and read
+  lines alike; a line is one locked write, so two shells sharing the file cannot interleave a row, and `/usage` and
+  `ledger.py report` say "N unreadable rows" when a line cannot be read (a torn or hand-edited one; it is left out of
+  every sum). A row also names the agent CLI's `cli_version` (Codex's initialize answer, Claude's `system/init`; agy's
+  stream names none, so its rows omit it), `ctx_first_base` for a turn that began a new conversation (what its first
+  call read beyond Ringo's text), and `host_slept_s` when the computer slept more than a minute during the turn (the
+  wall clock ran ahead of the monotonic one; the job's log says "the computer slept for ~N min during this turn"), so a
+  failure then is not blamed on the backend. They are described in [TOKEN-USAGE.md](TOKEN-USAGE.md#cost-weighted-usage-w-and-the-ledger) and read
   offline with `python3 ledger.py`.
+- **Keeping the computer awake:** while at least one job has a running agent process and none is waiting on you (a
+  pending question or approval), Ringo holds a sleep inhibitor, and releases it 60 seconds after the last such job ends.
+  On WSL it is a `powershell.exe` that calls `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)` and waits on
+  its stdin (Windows sleep, which logind inside WSL cannot stop); on Linux `systemd-inhibit --what=sleep ... cat`, if
+  installed; on macOS `caffeinate -i -w <ringo pid>`. `RINGO_KEEP_AWAKE=0` turns it off. A missing tool or a failed
+  start is one line in the job's log and nothing else. The hold/release rule is unit-tested with a fake spawner; the
+  real inhibitors have not been run in tests (needs a live check on a WSL host).
 - **Plans:** asked of each set-up agent in the background, about a second each:
   - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given
     a message, so no model call (its answer says cost 0). Claude marks it experimental. When it fails, or succeeds

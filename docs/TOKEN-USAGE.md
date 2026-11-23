@@ -86,6 +86,9 @@ included) reads old and new lines alike.
 | `calls` | the job's model calls were reported | Codex and Claude report each model call; a plain agent reports none, so the key is absent, never 0 |
 | `ctx_base`, `ctx_fixed`, `ctx_carry`, `ctx_growth` | the agent's base is measured | the split below |
 | `record_inline_bytes`, `record_whole_bytes` | the turn started fresh from Ringo's record | the inline handoff text sent, and the size of `record.md` |
+| `cli_version` | the CLI named its version | Codex: from the `initialize` answer's `userAgent` (`codex_cli_rs/0.170.0 ...`); Claude: `claude_code_version` of `system/init`; agy's stream names none, so absent |
+| `ctx_first_base` | the turn began a new conversation | what its first call read beyond the text Ringo sent (input side less sent bytes / 4): this turn's own measure of the fixed base |
+| `host_slept_s` | the computer slept more than 60 s during the turn | wall-clock seconds beyond the monotonic clock |
 
 The context split is over each call's input side (what it read, cached or not: Codex `last.inputTokens`; Claude input
 plus cache read plus cache write). With `first` the turn's first call and B the agent's fixed base: **fixed** is
@@ -101,7 +104,18 @@ call's output.
 ```
 python3 ledger.py report --window 24h --window all     # by agent, surface, model and window
 python3 ledger.py attribute --agent codex --base 13022  # the split, from the shell's events.jsonl
+python3 ledger.py base --max-rise 5                     # fixed base per CLI version; exit 1 on a rise past 5%
 ```
+
+`base` answers "did a CLI upgrade quietly add to every call?": per agent and model, the median fixed base of each
+`cli_version` (versions ordered by number), and the change against the previous version. A row's base is its
+`ctx_first_base`; a row from before that key falls back to `ctx_base`, the session's median of its last three
+measurements (the `first_call_rows` field of `--json` says how many rows had their own). Rows without `cli_version`
+group as `unknown` (listed first, never compared), and rows with no base at all (resumed turns) are counted and left out.
+`--max-rise PCT` exits 1 when the newest known version's base is more than PCT percent above the previous one's.
+Measured context for the alert's size: Codex 0.170.0 with the shell's flags reads 13,793 input tokens for a trivial
+turn; a tool or instruction added by an upgrade shows as a rise in this number. No threshold is recommended: the
+history is too short to say what an ordinary change between versions is.
 
 `report` shows per group the jobs, calls, the four counts, T, W and the fixed/carry/growth shares. A line from before
 the ledger gets its surface from the agent's name and its calls are unknown; a pipeline line is replaced by one entry per
