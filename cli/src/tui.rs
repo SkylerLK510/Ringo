@@ -2492,6 +2492,17 @@ impl App {
                                        note: format!("in 7 days · {} in 24 hours · {} this session", fmt_tokens(got(&day)),
                                                      fmt_tokens(got(&session))) });
         }
+        // a limit a turn ran into in the last day, from Ringo's record: which, how long ago, and when it starts over
+        for (name, kind, at, resets) in self.s.limits_hit_since(86_400) {
+            let style = Agent::from_name(&name).map(|a| self.agent_style(a)).unwrap_or(t.ringo);
+            let what = match kind.as_str() { "usage" => "its usage limit", "rate" => "a rate limit", _ => "an overloaded provider" };
+            let ends = match resets {
+                Some(r) if r > now => format!(" · starts over at {}", ringo_cli::limits::fmt_reset(r, now, ringo_cli::limits::local_offset(now))),
+                Some(_) => " · has started over".to_string(),
+                None => String::new(),
+            };
+            self.out.push(agent_head(&name, style, &format!(" hit {what} {} ago{ends}", fmt_until(now.saturating_sub(at))), &t));
+        }
         let asked = self.plan_agents();
         let others: Vec<Agent> = self.agents.iter().copied().filter(|a| self.s.installed(*a) && !asked.contains(a)).collect();
         for agent in others {
@@ -2729,13 +2740,16 @@ impl App {
         for (said, handle) in done {
             let Ok((agent, result)) = handle.join() else { continue };
             let (style, t) = (self.agent_style(agent), self.theme);
-            // Claude's own answer is experimental: a turn's last rate-limit event, when there is one, stands in
+            // Claude's own answer is experimental: a turn's last rate-limit event, when there is one, stands in. For
+            // Codex the snapshot its turns' live rate-limit updates built does.
             let (plan, why) = match result {
                 Ok(plan) => (Some(plan), None),
-                Err(e) => match self.s.claude_limits.as_ref().filter(|_| agent.spec().adapter == ringo_cli::Adapter::Claude) {
-                    Some(info) => (Some(ringo_cli::claude_plan_from_event(info)),
-                                   Some(format!("from this session's last claude turn; its own answer failed: {e}"))),
-                    None => (None, Some(e)),
+                Err(e) => match (agent.spec().adapter, &self.s.claude_limits, &self.s.codex_limits) {
+                    (ringo_cli::Adapter::Claude, Some(info), _) => (Some(ringo_cli::claude_plan_from_event(info)),
+                        Some(format!("from this session's last claude turn; its own answer failed: {e}"))),
+                    (ringo_cli::Adapter::Codex, _, Some(snapshot)) => (Some(ringo_cli::codex_plan(&serde_json::json!({"rateLimits": snapshot}))),
+                        Some(format!("from this session's last codex turn; its own answer failed: {e}"))),
+                    _ => (None, Some(e)),
                 },
             };
             if let Some(plan) = &plan {

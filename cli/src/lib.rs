@@ -6,6 +6,8 @@ pub mod context_policy;
 pub mod evidence;
 pub mod framing;
 pub mod gateway;
+pub mod imports;
+pub mod limits;
 pub mod parse;
 pub mod routing;
 pub mod rt;
@@ -557,6 +559,13 @@ pub struct Job {
     reached: bool,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
+    /// The limit the turn ran into (a usage or rate limit, a busy provider), with when it starts over when the agent
+    /// said: the failure names it, and the usage record keeps it.
+    pub limit: Option<limits::Limit>,
+    /// Codex: the plan's rate-limit snapshot as live updates built it during this turn.
+    pub rate_limits: Option<serde_json::Value>,
+    /// Claude said the conversation this turn resumed is gone: the next turn starts fresh from Ringo's record.
+    resume_lost: bool,
     /// The model the agent said it runs, when it says (for the usage record).
     pub model: Option<String>,
     /// A turn in the agents' talk (the shell's /discuss): the others hear all of its reply, not its first lines.
@@ -784,6 +793,8 @@ pub struct Session {
     pub asker: PathBuf,
     /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
     pub claude_limits: Option<serde_json::Value>,
+    /// Codex's rate-limit snapshot as its last turn's live updates left it (see `Note::CodexLimits`).
+    pub codex_limits: Option<serde_json::Value>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
     pub always_ask: Vec<String>,
     /// Rules the owner allowed for this session: answered at once, and given to every later Claude turn.
@@ -1214,7 +1225,7 @@ impl Session {
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
-                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
+                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, codex_limits: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx })
     }
 
@@ -2236,7 +2247,8 @@ impl Session {
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
                               fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false,
-                              call_inputs: Vec::new(), record_bytes: None });
+                              call_inputs: Vec::new(), record_bytes: None,
+                              limit: None, rate_limits: None, resume_lost: false });
         Ok(id)
     }
 
@@ -2487,6 +2499,18 @@ impl Session {
                 // Image generation, and goals (an aim Codex pursues by itself over many turns), are tools no turn here
                 // uses: 14,733 tokens a trivial turn with them, 13,564 without (codex-cli 0.166.0).
                 cmd.args(["-c", "features.image_generation=false", "-c", "features.goals=false"]);
+                // Two more instruction blocks no turn here can use (Ringo's own turn runner already turns both off,
+                // `turnrun_codex_bridge.py`). Codex's skills list is in every call, and the question tool cannot
+                // be answered, as `features.default_mode_request_user_input` above already says. A trivial turn
+                // (`codex exec`, "Reply with just: ok", codex-cli 0.170.0, input tokens): 13,793 with the shell's
+                // flags before; 13,318 without the skills list (-475); 13,368 without the question tool (-425);
+                // 12,893 with both (-900). Skills stay for an agent whose spec has them (Claude's specialists only,
+                // today). `tools.update_plan.enabled=false` changed nothing (13,793), so it is not set, and
+                // subagents stay: 4 of 47 Codex shell jobs in the owner's logs made a subagent call, none a plan update.
+                if !spec.skills {
+                    cmd.args(["-c", "skills.include_instructions=false"]);
+                }
+                cmd.args(["-c", "tools.experimental_request_user_input.enabled=false"]);
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
                 }
@@ -2528,8 +2552,15 @@ impl Session {
                                                "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
                 input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
                                      serde_json::json!({"id": 2, "method": method, "params": thread})));
-                turn = Some(serde_json::json!({"id": 3, "method": "turn/start",
-                                               "params": {"input": content}}));
+                // The tier's effort goes with every turn as well as in `-c` above: turn/start takes `effort` ("Override
+                // the reasoning effort for this turn and subsequent turns", codex-cli 0.170.0's schema), and a
+                // resumed thread may keep the effort it was started with instead of the launch's setting (T3 Code
+                // sends it on each turn for that reason). The standard tier sets none: Codex's own choice stands.
+                let mut params = serde_json::json!({"input": content});
+                if let Some(effort) = self.tier.effort() {
+                    params["effort"] = effort.into();
+                }
+                turn = Some(serde_json::json!({"id": 3, "method": "turn/start", "params": params}));
                 Style::Codex
             }
             Adapter::Claude => {
@@ -2636,6 +2667,14 @@ impl Session {
                         .arg(serde_json::json!({"mcpServers": {"ringo": {"command": self.asker, "args": args}}}).to_string());
                     allowed.push("mcp__ringo__ask_agent".into());
                     self.jobs[id - 1].can_ask = true;
+                    // A resumed session can send its first request before the MCP server has connected, and the ask
+                    // tool is then missing from that turn (T3 Code's `ClaudeAdapterV2.ts` waits for it on resume for
+                    // that reason). 0 makes Claude Code wait for the connection first; Ringo's own turn runner already
+                    // sets it for the same tool (`turnrun_native_bridge.py`). A new session connects before its
+                    // first request as it always did, so only a resumed turn is changed.
+                    if resume.is_some() {
+                        cmd.env("MCP_CONNECTION_NONBLOCKING", "0");
+                    }
                 }
                 if !allowed.is_empty() {
                     cmd.arg("--allowedTools").args(&allowed);
@@ -2667,6 +2706,32 @@ impl Session {
                 // first; with the repository's file as well, the two go in one file of the job's, as bytes, so neither
                 // needs to be UTF-8. Nothing here stops the turn: a file that cannot be read or written is said in its log.
                 let doc = ["CLAUDE.md", "AGENTS.md"].iter().map(|d| cwd.join(d)).find(|p| p.is_file());
+                // Claude's own loading of that file is off, so its `@path` imports are expanded here (see `imports`): a
+                // CLAUDE.md that is only `@AGENTS.md` otherwise reaches Claude as that literal line (Claude Code
+                // 2.1.330: asked for a codeword in AGENTS.md, Claude answered NONE).
+                let doc = doc.map(|file| match imports::expand(&file, &cwd) {
+                    Ok(done) => {
+                        for note in &done.notes {
+                            self.jobs[id - 1].push_log(note.clone());
+                        }
+                        if done.imported.is_empty() {
+                            return file;
+                        }
+                        let expanded = dir.join("project.md");
+                        match fs::write(&expanded, &done.text) {
+                            Ok(()) => {
+                                let names: Vec<String> = done.imported.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+                                self.jobs[id - 1].push_log(format!("{}'s @imports are expanded for this turn: {}", file.file_name().unwrap_or_default().to_string_lossy(), names.join(", ")));
+                                expanded
+                            }
+                            Err(e) => {
+                                self.jobs[id - 1].push_log(format!("{}'s @imports are left as written: {e}", file.display()));
+                                file
+                            }
+                        }
+                    }
+                    Err(_) => file,
+                });
                 let rules = match fs::read(self.rules_path()) {
                     Ok(bytes) => Some(bytes).filter(|b| !b.trim_ascii().is_empty()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -3091,6 +3156,10 @@ impl Session {
                 let _ = tx.send(Event::Note(id, note));
             }
             let exit = child.wait();
+            // Claude may say the session it was asked to resume is gone on its stderr alone, and exit with no result.
+            if style == Style::Claude && fs::read_to_string(dir.join("stderr.txt")).is_ok_and(|e| parse::mentions_lost_session(&e)) {
+                let _ = tx.send(Event::Note(id, Note::ResumeLost));
+            }
             let status = if cancel.load(Ordering::SeqCst) {
                 Status::Cancelled
             } else if let Err(reason) = parser.finish() {
@@ -3160,7 +3229,8 @@ impl Session {
         if matches!(job.kind, Kind::Agent { .. }) && job.live.total() > 0 {
             job.uncounted += 1;
         }
-        if job.counted || used.total() > 0 || unknown {
+        // A turn that ran into a limit is a row too, with nothing used: /usage says which limit was hit and when it ends.
+        if job.counted || used.total() > 0 || unknown || job.limit.is_some() {
             let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
             let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             // What the counts are of: the tier (it sets the effort), the model when the agent names it, a pipeline's
@@ -3206,6 +3276,10 @@ impl Session {
             if job.uncounted > 0 {
                 record["uncounted_calls"] = job.uncounted.into(); // the counts below are of its other calls alone
             }
+            // The limit the turn ran into; additive, as the fields above (older rows lack it and readers ignore it).
+            if let Some(limit) = &job.limit {
+                record["limit"] = serde_json::json!({"kind": limit.kind.name(), "resets_at": limit.resets_at});
+            }
             match unknown {
                 true => record["unknown"] = true.into(),
                 false => for (key, n) in [("input", used.input), ("cache_read", used.cache_read),
@@ -3232,6 +3306,11 @@ impl Session {
             if let Some(untold) = untold {
                 self.told.entry(agent).or_insert(untold);
             }
+        }
+        // Claude's saved conversation is gone: forget it, so this agent's next turn starts fresh from Ringo's record
+        // of the conversation instead of resuming the dead session again (and failing the same way).
+        if self.jobs[id - 1].resume_lost && let Kind::Agent { agent, write: false } = self.jobs[id - 1].kind {
+            self.start_over(agent);
         }
         let job = &mut self.jobs[id - 1];
         job.asks.clear(); // nobody is waiting for these answers any more
@@ -3543,6 +3622,21 @@ impl Session {
                         }
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
                         Note::Limits(info) => self.claude_limits = Some(info),
+                        Note::CodexLimits(snapshot) => {
+                            job.rate_limits = Some(snapshot.clone());
+                            self.codex_limits = Some(snapshot);
+                        }
+                        Note::Limit(limit) => {
+                            job.push_log(format!("{}: {} ({})", limit.agent, limit.describe(), limit.message));
+                            job.limit = Some(limit);
+                        }
+                        Note::ResumeLost => {
+                            if !job.resume_lost {
+                                job.push_log("the saved conversation is gone from the agent's own store: the next turn starts \
+                                              fresh from Ringo's record of this one".into());
+                            }
+                            job.resume_lost = true;
+                        }
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above
                     }
                     // Provider-backed delivery, not process creation: a model action, or usage this turn added.
@@ -3582,6 +3676,22 @@ impl Session {
             }
         }
         (by, first)
+    }
+
+    /// The limits turns ran into in the last `secs` seconds, from `usage.jsonl` (every session's): for each agent the
+    /// latest one, as (agent, kind, when it was hit, when it starts over when known). A row without a `limit` is
+    /// not one; rows from before the field was added read as they always did.
+    pub fn limits_hit_since(&self, secs: u64) -> Vec<(String, String, u64, Option<u64>)> {
+        let now = limits::unix_now();
+        let mut last: BTreeMap<String, (String, u64, Option<u64>)> = BTreeMap::new();
+        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
+            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            let (Some(kind), at) = (r.pointer("/limit/kind").and_then(|k| k.as_str()), r["at"].as_u64().unwrap_or(0)) else { continue };
+            if now.saturating_sub(at) <= secs && last.get(r["agent"].as_str().unwrap_or("?")).is_none_or(|(_, before, _)| *before <= at) {
+                last.insert(r["agent"].as_str().unwrap_or("?").to_string(), (kind.to_string(), at, r.pointer("/limit/resets_at").and_then(|v| v.as_u64())));
+            }
+        }
+        last.into_iter().map(|(agent, (kind, at, resets))| (agent, kind, at, resets)).collect()
     }
 
     /// The live job whose durable private folder is `dir`. A job from an earlier shell has no entry: its record and
@@ -4289,9 +4399,16 @@ pub fn claude_plan_from_event(info: &serde_json::Value) -> Plan {
     plan
 }
 
-/// Codex's `account/rateLimits/read` answer (codex-cli 0.166.0).
+/// Codex's `account/rateLimits/read` answer (codex-cli 0.170.0). The answer has the plan's own limit twice: as
+/// `rateLimitsByLimitId.codex` and, as the older single bucket, `rateLimits`. The keyed one is preferred. A `rateLimits`
+/// that names another limit than "codex" (a model's own bucket) is not the plan's and gives no gauges. Besides the two
+/// windows, what the snapshot says of the account's credits, its spend limit and the limit that was reached is told.
 pub fn codex_plan(r: &serde_json::Value) -> Plan {
-    let limits = &r["rateLimits"];
+    let limits = match r.pointer("/rateLimitsByLimitId/codex").filter(|l| l.is_object()) {
+        Some(keyed) => keyed,
+        None if r["rateLimits"]["limitId"].as_str().is_some_and(|id| id != "codex") => return Plan::default(),
+        None => &r["rateLimits"],
+    };
     let mut plan = Plan { name: limits["planType"].as_str().unwrap_or("").to_string(), ..Plan::default() };
     for key in ["primary", "secondary"] {
         let w = &limits[key];
@@ -4307,6 +4424,27 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
     }
     if let Some(n) = r.pointer("/rateLimitResetCredits/availableCount").and_then(|n| n.as_u64()).filter(|n| *n > 0) {
         plan.notes.push(format!("{n} full reset{} left", if n == 1 { "" } else { "s" }));
+    }
+    let credits = &limits["credits"];
+    if credits["unlimited"] == true {
+        plan.notes.push("credits unlimited".into());
+    } else if credits["hasCredits"] == true && let Some(balance) = credits["balance"].as_str() {
+        plan.notes.push(format!("credits balance {balance}"));
+    }
+    // a spend limit the account's owner set: how much of it is used, and when it starts over
+    let spend = &limits["individualLimit"];
+    if let (Some(used), Some(limit)) = (spend["used"].as_str(), spend["limit"].as_str()) {
+        let now = limits::unix_now();
+        let ends = spend["resetsAt"].as_u64().filter(|r| *r > now)
+            .map(|r| format!(", starts over {}", limits::fmt_reset(r, now, limits::local_offset(now)))).unwrap_or_default();
+        let left = spend["remainingPercent"].as_i64().map(|p| format!(", {p}% left")).unwrap_or_default();
+        plan.notes.push(format!("spend limit {used} of {limit} used{left}{ends}"));
+    }
+    if limits["spendControlReached"] == true {
+        plan.notes.push("spend limit reached".into());
+    }
+    if let Some(reached) = limits["rateLimitReachedType"].as_str() {
+        plan.notes.push(format!("limit reached: {}", reached.replace('_', " ")));
     }
     plan
 }
@@ -4987,6 +5125,28 @@ mod tests {
         assert_eq!(plan.name, "plus");
         assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 41.0), ("week", 34.0)]);
         assert_eq!(plan.notes, ["2 full resets left"]);
+        // codex-cli 0.170.0: the plan's own limit is `rateLimitsByLimitId.codex`, preferred over the older single
+        // bucket `rateLimits`, which may be another limit's (a model's own, with its own windows)
+        let keyed = serde_json::json!({
+            "rateLimits": {"limitId": "codex_bengalfox", "planType": "plus", "primary": {"usedPercent": 3, "windowDurationMins": 300}},
+            "rateLimitsByLimitId": {"codex_bengalfox": {"limitId": "codex_bengalfox", "primary": {"usedPercent": 3, "windowDurationMins": 300}},
+                "codex": {"limitId": "codex", "planType": "pro", "primary": {"usedPercent": 77, "windowDurationMins": 300, "resetsAt": 1_793_594_030u64},
+                          "secondary": {"usedPercent": 12, "windowDurationMins": 10080},
+                          "credits": {"hasCredits": true, "unlimited": false, "balance": "42.50"},
+                          "individualLimit": {"limit": "100", "used": "58", "remainingPercent": 42, "resetsAt": 1u64},
+                          "rateLimitReachedType": "workspace_member_credits_depleted", "spendControlReached": true}}});
+        let plan = codex_plan(&keyed);
+        assert_eq!(plan.name, "pro");
+        assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 77.0), ("week", 12.0)]);
+        assert_eq!(plan.notes, ["credits balance 42.50", "spend limit 58 of 100 used, 42% left", "spend limit reached",
+                                "limit reached: workspace member credits depleted"]);
+        // only another limit's bucket: no gauges, not the plan's
+        let other = serde_json::json!({"rateLimits": {"limitId": "codex_bengalfox", "primary": {"usedPercent": 3, "windowDurationMins": 300}}});
+        assert_eq!(codex_plan(&other), Plan::default());
+        // unlimited credits; a bucket with no limitId at all is taken as the plan's, as before
+        let unlimited = codex_plan(&serde_json::json!({"rateLimits": {"credits": {"hasCredits": false, "unlimited": true},
+                                                                    "primary": {"usedPercent": 1, "windowDurationMins": 300}}}));
+        assert_eq!((unlimited.windows.len(), unlimited.notes.as_slice()), (1, &["credits unlimited".to_string()][..]));
         // a window with no figure for how much is used is left out: unknown is not 0% used
         let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
         assert_eq!(claude_plan(&json(r#"{"rate_limits": {"limits": [{"kind": "session"}, {"kind": "weekly_all", "percent": 59}]}}"#))

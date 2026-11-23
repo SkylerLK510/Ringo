@@ -559,7 +559,8 @@ fn agent_commands_are_pinned() {
                 "-c", "model_provider=\"openai\"", "-c", "features.default_mode_request_user_input=false",
                 "-c", "include_collaboration_mode_instructions=false", "-c", "analytics.enabled=false",
                 "-c", "features.plugins=false", "-c", "features.apps=false", "-c", "features.image_generation=false",
-                "-c", "features.goals=false", "-c", "model_auto_compact_token_limit=64000"].map(String::from).to_vec();
+                "-c", "features.goals=false", "-c", "skills.include_instructions=false",
+                "-c", "tools.experimental_request_user_input.enabled=false", "-c", "model_auto_compact_token_limit=64000"].map(String::from).to_vec();
     let mut codex_turn = |write: bool| -> (Vec<String>, String, String) {
         let (argv, _) = turn(agent("codex"), write, &codex);
         let thread = threads(&codex).pop().unwrap().to_string();
@@ -1187,11 +1188,17 @@ fn tiers_set_each_agents_effort_and_every_job_leaves_a_usage_record() {
     // standard: each agent's own default, as before tiers
     let (c, x, a) = effort(&mut s, ringo_cli::Tier::Standard);
     assert!(!c.contains("--effort") && !x.contains("model_reasoning_effort") && !a.contains("--effort"), "{c}\n{x}\n{a}");
+    // turn/start carries the tier's effort too (a resumed thread may ignore the launch's -c); none for standard
+    let turn_effort = || serde_json::from_str::<serde_json::Value>(
+        &fs::read_to_string(format!("{}.turn", codex.display())).unwrap()).unwrap()["params"]["effort"].clone();
+    assert!(turn_effort().is_null(), "standard sends no effort");
     let (c, x, a) = effort(&mut s, ringo_cli::Tier::Quick);
     assert!(has(&c, &["--effort", "low"]) && has(&x, &["-c", "model_reasoning_effort=\"low\""]) && has(&a, &["--effort", "low"]),
             "{c}\n{x}\n{a}");
+    assert_eq!(turn_effort(), "low");
     for tier in [ringo_cli::Tier::Deep, ringo_cli::Tier::Ultra] {
         let (c, x, a) = effort(&mut s, tier);
+        assert_eq!(turn_effort(), "xhigh");
         // agy's default model has no xhigh (agy 1.4.12): it gets its highest, high
         assert!(has(&c, &["--effort", "xhigh"]) && has(&x, &["-c", "model_reasoning_effort=\"xhigh\""]) && has(&a, &["--effort", "high"]),
                 "{c}\n{x}\n{a}");
@@ -2801,6 +2808,8 @@ fn an_agent_asks_another_in_the_middle_of_its_turn() {
     let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
     assert!(env.contains("CLAUDE_CODE_DISABLE_CLAUDE_MDS=1") && env.contains("CLAUDE_CODE_DISABLE_AUTO_MEMORY=1")
             && env.contains("RINGO_CHILD=1"), "the server runs inside a turn Ringo launched: {env}");
+    // a resumed turn with the ask tool waits for the MCP server to connect; the argument that resumes it is there too
+    assert!(argv.iter().any(|a| a == "--resume") && env.lines().any(|l| l == "MCP_CONNECTION_NONBLOCKING=0"), "{argv:?}\n{env}");
     assert_eq!(s.job(id).unwrap().reply(), "heard: all done/", "what codex said came back into the turn");
     assert!(s.job(id).unwrap().log.iter().any(|l| l == "asks codex: is a.txt fine?"), "{:?}", s.job(id).unwrap().log);
     // the turn it asked for: codex's own, read-only though the session edits, told who asks, with no means to ask on
@@ -2810,6 +2819,12 @@ fn an_agent_asks_another_in_the_middle_of_its_turn() {
     assert_eq!((threads(&codex).last().unwrap()["params"]["sandbox"].as_str(), s.mode), (Some("read-only"), Mode::Ask));
     let heard = turn_text(&codex);
     assert!(heard.contains("claude is in the middle of a turn for me and asks you:\n\nis a.txt fine?\n\nAnswer claude directly"), "{heard}");
+    // a new session (nothing to resume) is as it always was
+    s.forget();
+    let (_, argv) = turn(&mut s, false);
+    let env = fs::read_to_string(format!("{}.env", claude.display())).unwrap();
+    assert!(!argv.iter().any(|a| a == "--resume") && argv.iter().any(|a| a == "--mcp-config") && !env.contains("MCP_CONNECTION_NONBLOCKING"),
+            "{argv:?}\n{env}");
     // at most MAX_ASKS of them a turn: the next is told so, and no turn starts for it
     let before = s.jobs.len();
     fs::write(&asks, "codex|one\ncodex|two\ncodex|three\ncodex|four\n").unwrap();
@@ -2840,4 +2855,104 @@ fn an_agent_asks_another_in_the_middle_of_its_turn() {
     let served = Command::new(env!("CARGO_BIN_EXE_ringo")).args(["ask-server", "/nonexistent", "codex"]).env("RINGO_CHILD", "1")
         .stdin(std::process::Stdio::null()).output().unwrap();
     assert_eq!(served.status.code(), Some(0), "with nothing asked it ends when its input does");
+}
+
+/// Claude Code 2.1.330 says "No conversation found with session ID" when the session a turn resumes is not in its
+/// store any more (cleaned up, or another machine's). The turn fails, and the agent's next turn must not resume the
+/// dead session again and fail the same way: it starts fresh from Ringo's record of the conversation. The error is in
+/// an error result, or on stderr alone when Claude exits before it sends one.
+#[test]
+fn a_session_claude_no_longer_has_is_not_resumed_again() {
+    let gone = "No conversation found with session ID: s-1";
+    for (name, how) in [("result", format!("echo '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"errors\":[\"{gone}\"]}}'")),
+                        ("stderr", format!("echo '{gone}' >&2; exit 1"))] {
+        let r = repo(&format!("lost-session-{name}"));
+        let claude = fake(&root(), &format!("claude-lost-{name}"), &format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
+            head -n 1 > \"$0.stdin\"\n\
+            if grep -qx -- --resume \"$0.argv\"; then {how}; exit 1; fi\n\
+            echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\",\"apiKeySource\":\"none\"}}'\n\
+            echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n"));
+        let mut s = session(&r, agent("claude"), &claude);
+        said(&mut s, "claude", "first question");
+        assert!(s.has_conversation(agent("claude")));
+        let id = s.launch_agent(agent("claude"), false, "second question").unwrap();
+        assert!(matches!(wait(&mut s, id), Status::Failed(_)), "{name}");
+        assert!(s.job(id).unwrap().log.iter().any(|l| l.contains("the saved conversation is gone")), "{:?}", s.job(id).unwrap().log);
+        assert!(!s.has_conversation(agent("claude")), "{name}: the dead session is forgotten");
+        said(&mut s, "claude", "third question");
+        let (heard, resumed) = claude_heard(&claude);
+        assert!(!resumed && heard.starts_with("Ringo's record of this conversation so far, which you start fresh from")
+                && heard.contains("first question"), "{name}: {heard}");
+    }
+}
+
+/// A turn that runs into a limit says so plainly, keeps it on the job, and leaves a usage row with the limit in it
+/// (nothing was used, but the row is how /usage knows which limit was hit and when it starts over). Codex tells the
+/// reset in its live rate-limit snapshot before the error that ends the turn (codex-cli 0.170.0's shapes).
+#[test]
+fn a_usage_limit_is_named_on_the_job_and_in_the_usage_record() {
+    let r = repo("limit-rows");
+    let state = root().join("limit-rows-state");
+    let _ = fs::remove_dir_all(&state);
+    let events = r#"reset=$(( $(date +%s) + 3600 ))
+echo '{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","planType":"plus","primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":'$reset'}}}}'
+echo '{"method":"error","params":{"threadId":"t-1","turnId":"u","willRetry":false,"error":{"message":"You hit your usage limit.","codexErrorInfo":"usageLimitExceeded"}}}'
+echo '{"method":"turn/completed","params":{"threadId":"t-1","turn":{"id":"u","status":"failed","error":{"message":"You hit your usage limit.","codexErrorInfo":"usageLimitExceeded"}}}}'"#;
+    let codex = fake(&root(), "codex-limit", &codex_script("", events));
+    let mut s = Session::with_state(&r, &state).unwrap();
+    s.programs.insert(agent("codex"), codex);
+    let id = s.launch_agent(agent("codex"), false, "work").unwrap();
+    let Status::Failed(why) = wait(&mut s, id) else { panic!("the turn must fail") };
+    assert!(why.starts_with("codex: usage limit reached — resets at "), "{why}");
+    let job = s.job(id).unwrap();
+    let limit = job.limit.clone().expect("the job keeps the limit");
+    assert_eq!(limit.kind, ringo_cli::limits::LimitKind::Usage);
+    assert!(limit.resets_at.is_some_and(|r| r > ringo_cli::limits::unix_now()), "{limit:?}");
+    assert!(job.rate_limits.as_ref().is_some_and(|l| l["primary"]["usedPercent"] == 100), "the live snapshot is the job's");
+    assert_eq!(s.codex_limits.as_ref().map(|l| l["planType"].clone()), Some("plus".into()));
+    // the usage row: the limit, additive beside the counts (zero: nothing was used)
+    let rows = usage_rows(&state);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!((rows[0]["agent"].as_str(), rows[0]["limit"]["kind"].as_str(), rows[0]["limit"]["resets_at"].as_u64(), rows[0]["input"].as_u64()),
+               (Some("codex"), Some("usage"), limit.resets_at, Some(0)));
+    // /usage's line: the latest limit each agent hit in the last day
+    let hit = s.limits_hit_since(86_400);
+    assert_eq!(hit.len(), 1);
+    assert_eq!((hit[0].0.as_str(), hit[0].1.as_str(), hit[0].3), ("codex", "usage", limit.resets_at));
+    // an old row without the field reads as it always did
+    let mut text = fs::read_to_string(state.join("usage.jsonl")).unwrap();
+    text.push_str("{\"at\":1,\"agent\":\"codex\",\"input\":5,\"output\":1}\n");
+    fs::write(state.join("usage.jsonl"), text).unwrap();
+    assert_eq!(s.limits_hit_since(u64::MAX).len(), 1);
+    assert_eq!(s.used_since(u64::MAX).0["codex"].total(), 6);
+}
+
+/// Claude's own loading of CLAUDE.md is off in Ringo's turns, so the repository's file is appended by Ringo: a
+/// CLAUDE.md that is only `@AGENTS.md` must reach Claude as AGENTS.md's text (Claude Code 2.1.330 was asked for the
+/// codeword in AGENTS.md and answered NONE with the import left literal). The file Claude is given is the job's own
+/// expanded copy; the repository's files are untouched, and a file without imports is given as it is.
+#[test]
+fn a_claude_md_import_reaches_claude_expanded() {
+    let r = repo("claude-import");
+    fs::write(r.join("AGENTS.md"), "The codeword is KIWI.\n").unwrap();
+    fs::write(r.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+    git(&r, &["add", "."]);
+    git(&r, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "rules"]);
+    let claude = fake(&root(), "claude-import", CLAUDE_TALKS);
+    let mut s = session(&r, agent("claude"), &claude);
+    let given = |claude: &Path| -> String {
+        let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+        let lines: Vec<&str> = argv.lines().collect();
+        let at = lines.iter().position(|a| *a == "--append-system-prompt-file").unwrap();
+        fs::read_to_string(lines[at + 1]).unwrap()
+    };
+    let id = said(&mut s, "claude", "what is the codeword?");
+    assert_eq!(given(&claude), "The codeword is KIWI.\n");
+    assert!(s.job(id).unwrap().log.iter().any(|l| l.contains("@imports are expanded for this turn: AGENTS.md")), "{:?}", s.job(id).unwrap().log);
+    assert_eq!(fs::read_to_string(r.join("CLAUDE.md")).unwrap(), "@AGENTS.md\n");
+    // no import: the file itself, as before
+    fs::remove_file(r.join("CLAUDE.md")).unwrap();
+    said(&mut s, "claude", "again");
+    let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+    assert!(argv.lines().any(|a| a == r.join("AGENTS.md").to_string_lossy()), "{argv}");
 }
