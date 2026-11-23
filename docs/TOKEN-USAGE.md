@@ -11,6 +11,7 @@ provider calls, tokenizer dependency or normal-path processing.
 | `cache_write` | Cache-write input tokens |
 | `output` | Output tokens |
 | `reasoning_output` | Of `output`, the tokens spent on reasoning (Codex reports them; absent when no call did) |
+| `weighted` | Cost-weighted usage (W) of the run's paid calls, per provider unit; see [Cost-weighted usage (W) and the ledger](#cost-weighted-usage-w-and-the-ledger) |
 
 The reported total is `input + cache_read + cache_write + output`;
 `reasoning_output` is already inside `output` and is never added to it. These are
@@ -28,6 +29,88 @@ names the `backend` and the `model` and `effort` Ringo asked for; `null` means t
 CLI's default, which is not recorded, so pin both (`codex-chatgpt@MODEL/EFFORT`)
 for runs that will be compared. `elapsed_s` covers the whole task, the findings
 export included, and a failed run reports it too.
+
+## Cost-weighted usage (W) and the ledger
+
+Two numbers describe a task's consumption. **T** is raw tokens: `input + cache_read + cache_write + output`, with
+failed attempts counted. **W** weighs the same four counts by what each kind costs the owner's plan. They can
+disagree: an offline replay (see [Long conversations](#long-conversations)) found a change that cut raw input by
+about 3% while raising credit-weighted cost, because cached tokens are cheap and uncached ones are not. Reporting T
+alone could pass a change that costs more plan quota, so reports carry both. W adds no model call, and nothing Ringo
+decides or sends depends on it.
+
+**Weights.** One table per runtime (`harness.py`, mirrored in `cli/src/rt/harness.rs`, kept equal by the parity gate),
+held as integers over a divisor so both runtimes add exactly the same numbers.
+
+| Provider and model | Uncached input | Cached input (read) | Cache write | Output | Unit |
+|---|---|---|---|---|---|
+| Codex, GPT-6.1 Sol | 50 | 2.5 | 50 | 250 | credits per million tokens |
+| Codex, GPT-6 Luna | 2.5 | 0.25 | 2.5 | 12.5 | credits per million tokens |
+| Claude (any model) | 1 | 0.05 | 2.0 | 5 | weighted tokens: multiples of the uncached input price |
+
+- The Codex rates are the published ones in [EXPERIMENTS.md](EXPERIMENTS.md) ("Cost"). OpenAI publishes no cache-write
+  rate, so a Codex `cache_write` (normally 0) is charged at the uncached rate.
+- The Claude weights are relative to each model's own uncached input price, so they do not depend on the model. The
+  cache write uses the 1-hour figure (2.0, not the 5-minute 1.25) because the code already assumes a 1-hour cache for
+  Claude Code subscriptions (`CLAUDE_TTL_S = 3600` in the context policy). Reasoning tokens are already inside `output`.
+- The model is matched exactly. In a pipeline it is the one Ringo asked for (`--model`, `codex-chatgpt@MODEL`); a call
+  on the CLI default names none. A shell row's model is the one the agent itself reports, when it reports one (Codex
+  does, so shell Codex rows carry their default model). A Codex model not in the table, or a call that names none,
+  makes W **unknown**: it is `null` and the model is listed (`"(not named)"` for none). Ringo never guesses a price. A call without complete counts is
+  unknown too.
+- W is in credits (Codex) or weighted tokens (Claude), never in dollars, and never summed across providers: a run
+  that used both reports `unit: "mixed"` with `value: null` and keeps each in `by_unit`.
+
+**In a pipeline run.** Every paid attempt's `usage` in the trace names the `surface` (`cli:claude`, `cli:codex`,
+`local:ollama` or `plain`), the `billing` (`subscription`, `local` or `unknown`) and `batch` (`false`: there is no
+batch path yet). They are added to a copy; usage that was `null` stays `null`, and a record that names no backend is
+left as it was. The run summary (state.json, summary.json, the `harness:` stderr line, `work`'s report) ends with
+
+```json
+"weighted": {"unit": "codex_credits", "value": 80.0, "unknown_models": [], "unweighted_calls": 0,
+             "by_unit": {"codex_credits": 80.0}}
+```
+
+`value` is `null` when no paid call ran on a weighted surface, when any such call was unknown, or when there is more
+than one unit. `unweighted_calls` counts paid attempts on surfaces without weights (plain commands, Ollama); they are a
+different unit and are reported beside W, not inside it. `task-report.json` copies the block into
+`consumption.weighted`.
+
+**In the shell.** Each line of `usage.jsonl` gains these keys. Older lines lack them and every reader (`/usage`
+included) reads old and new lines alike.
+
+| Key | Written when | Meaning |
+|---|---|---|
+| `surface` | always | `cli:codex`, `cli:claude`, `cli:agy`, `plain` or `pipeline` |
+| `billing` | always | `subscription` for the three CLIs; `unknown` for a plain agent and a pipeline (its per-call billing is in its trace) |
+| `calls` | the job's model calls were reported | Codex and Claude report each model call; a plain agent reports none, so the key is absent, never 0 |
+| `ctx_base`, `ctx_fixed`, `ctx_carry`, `ctx_growth` | the agent's base is measured | the split below |
+| `record_inline_bytes`, `record_whole_bytes` | the turn started fresh from Ringo's record | the inline handoff text sent, and the size of `record.md` |
+
+The context split is over each call's input side (what it read, cached or not: Codex `last.inputTokens`; Claude input
+plus cache read plus cache write). With `first` the turn's first call and B the agent's fixed base: **fixed** is
+`min(call, B)`, **carry** is `max(0, min(call, first) - B)` (the conversation the turn began with), **growth** is
+`max(0, call - first)` (what the turn added). The parts can exceed the total when a turn's first call is below B.
+B is the median of the session's last three measured bases (what a new conversation's first call read beyond the
+message); it is per session and not persisted, so a shell that has not yet run a fresh read turn for the agent writes no
+`ctx_` keys. The base itself is measured from input plus output, and the split uses input alone; the difference is one
+call's output.
+
+**The offline tool.** `ledger.py` reads files and makes no model call:
+
+```
+python3 ledger.py report --window 24h --window all     # by agent, surface, model and window
+python3 ledger.py attribute --agent codex --base 13022  # the split, from the shell's events.jsonl
+```
+
+`report` shows per group the jobs, calls, the four counts, T, W and the fixed/carry/growth shares. A line from before
+the ledger gets its surface from the agent's name and its calls are unknown; a pipeline line is replaced by one entry per
+paid attempt in its `trace/trace.jsonl` when that exists (`--no-traces` keeps the line, `--trace DIR` adds a trace).
+`attribute` re-splits the shell's saved events with the shell's own call rule and lists why each report that another
+counting would take for a call was not one (`before_turn`, `other_turn`, `behind_or_malformed`, `no_last`, `repeat`).
+A job counts for the agent its usage row names, so an owner's own agent on the same protocol (a specialist, with its
+own base) is left out and counted as such; a job without a row falls back to its protocol. `--base` is one agent's
+base, so it needs `--agent`. It measures consumption; it makes no claim about what any change saves.
 
 ## Codex call overhead
 

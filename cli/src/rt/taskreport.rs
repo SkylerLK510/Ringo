@@ -550,6 +550,9 @@ pub fn build(
         "untokened_calls".into(),
         if summary.contains_key("untokened_calls") { untokened_summary.clone() } else { Value::from(incomplete_requests) },
     );
+    if let Some(weighted @ Value::Object(_)) = summary.get("weighted") {
+        consumed.insert("weighted".into(), weighted.clone());
+    }
     if rows.iter().any(|r| r["scope"] == "provider_turn_aggregate") {
         gaps.push(gap("aggregate_attribution_unknown", "aggregate model subtotals are not added again; separately recorded child overlap and the underlying provider request count are unavailable"));
     }

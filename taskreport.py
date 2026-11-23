@@ -259,6 +259,8 @@ def build(records, summary=None, blockers=(), final_state='unknown', trace=None,
         'unknown_usage_requests': unknown_requests,
         'untokened_calls': summary.get('untokened_calls', incomplete_requests),
     }
+    if isinstance(summary.get('weighted'), dict):
+        consumed['weighted'] = summary['weighted']
     any_aggregate = any(row['scope'] == 'provider_turn_aggregate' for row in rows)
     if any_aggregate:
         gaps.append({'kind': 'aggregate_attribution_unknown',

@@ -24,6 +24,12 @@ fn fixtures() -> Vec<Value> {
         json!({"records":[],"blockers":[{}, {"signature":null}, {"signature":"None","count":18446744073709551616u128}, {"signature":1,"count":2.5}, {"signature":true,"count":-2}]}),
         json!({"records":[],"blockers":[{"count":null}]}),
         json!({"records":[],"blockers":[{"signature":[]}]}),
+        // the run's cost-weighted usage: copied whole when it is an object, left out when it is anything else
+        json!({"records":[{"step":"s","attempt":1,"status":"ok","usage":{"input":5,"surface":"cli:codex","billing":"subscription","batch":false}}],
+               "summary":{"calls":1,"weighted":{"unit":"codex_credits","value":0.25,"unknown_models":[],"unweighted_calls":0,"by_unit":{"codex_credits":0.25}}},"final_state":"done"}),
+        json!({"records":[],"summary":{"calls":2,"weighted":{"unit":"mixed","value":null,"unknown_models":["gpt-7"],"unweighted_calls":1,
+               "by_unit":{"codex_credits":1.5,"claude_weighted_tokens":null}}},"final_state":"done"}),
+        json!({"records":[],"summary":{"calls":1,"weighted":5},"final_state":"done"}),
     ];
     for status in ["ok", "error", "malformed", "fatal", "started", "admission_refused"] {
         for usage in [

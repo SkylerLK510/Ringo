@@ -593,6 +593,20 @@ pub struct Job {
     measured: bool,
     /// The turn began from Ringo's record (a handoff), which the next turn's dwell guard reads.
     started_fresh: bool,
+    /// Each model call's input side, in order (`Note::CallInput`): the fixed/carry/growth split of the usage record.
+    call_inputs: Vec<u64>,
+    /// A turn that started fresh from Ringo's record: the inline handoff text and record.md, in bytes.
+    record_bytes: Option<(u64, Option<u64>)>,
+}
+
+/// Per-call contexts split against the agent's fixed base `b` (decompose.py's definitions): fixed = min(c, b),
+/// carry = max(0, min(c, first) - b), growth = max(0, c - first). The parts can exceed the total when a turn's first
+/// call is below b (fixed and growth then share b - first).
+pub fn attribute(contexts: &[u64], b: u64) -> Option<(u64, u64, u64)> {
+    let first = *contexts.first()?;
+    Some(contexts.iter().fold((0, 0, 0), |(fixed, carry, growth), &c| {
+        (fixed + c.min(b), carry + c.min(first).saturating_sub(b), growth + c.saturating_sub(first))
+    }))
 }
 
 impl Job {
@@ -1908,11 +1922,18 @@ impl Session {
             _ => format!("told {} what {span} did (about {} tokens)", agent.name(), fmt_k(about)),
         };
         let note = if busy.is_some() { note + ", and which turns are still at work here" } else { note };
+        let record_inline = text.len() as u64;
+        let record_whole = whole.len() as u64;
         let text = format!("{text}{}The owner's new message:\n{prompt}", busy.unwrap_or_default());
-        if let Err(e) = fs::write(&file, whole) {
-            self.jobs[id - 1].push_log(format!("the whole record could not be kept: {e}"));
-        }
+        let write_ok = match fs::write(&file, whole) {
+            Ok(()) => true,
+            Err(e) => {
+                self.jobs[id - 1].push_log(format!("the whole record could not be kept: {e}"));
+                false
+            }
+        };
         if fresh {
+            self.jobs[id - 1].record_bytes = Some((record_inline, write_ok.then_some(record_whole)));
             self.told.remove(&agent); // the turns before the restart it had not heard are in the record (`carried`)
         }
         if fresh && let Some(old) = resume.take() {
@@ -2214,7 +2235,8 @@ impl Session {
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
-                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false });
+                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false,
+                              call_inputs: Vec::new(), record_bytes: None });
         Ok(id)
     }
 
@@ -3116,6 +3138,7 @@ impl Session {
         for asked in left {
             let _ = self.kill(asked);
         }
+        let base = match self.jobs[id - 1].kind { Kind::Agent { agent, .. } => self.base_median(agent), _ => None };
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
         job.activity = match &status {
@@ -3148,6 +3171,37 @@ impl Session {
             }
             if let Kind::Ringo { command } = &job.kind {
                 record["command"] = command.as_str().into();
+            }
+            // What the usage is of, for the ledger (docs/TOKEN-USAGE.md): the surface and how it is billed, the model calls
+            // it made when it reported them, how its context splits into fixed, carried and growth, and the sizes of the
+            // record a fresh start began from. Additive: older rows lack these and every reader ignores unknown keys.
+            let (surface, billing) = match &job.kind {
+                Kind::Agent { agent, .. } => match agent.spec().adapter {
+                    Adapter::Codex => ("cli:codex", "subscription"),
+                    Adapter::Claude => ("cli:claude", "subscription"),
+                    Adapter::Agy => ("cli:agy", "subscription"),
+                    Adapter::Plain => ("plain", "unknown"),
+                },
+                Kind::Ringo { .. } => ("pipeline", "unknown"),
+            };
+            record["surface"] = surface.into();
+            record["billing"] = billing.into();
+            if job.calls > 0 {
+                record["calls"] = job.calls.into();
+            }
+            if let (Kind::Agent { .. }, Some(b)) = (&job.kind, base) {
+                if let Some((fixed, carry, growth)) = attribute(&job.call_inputs, b) {
+                    record["ctx_base"] = b.into();
+                    record["ctx_fixed"] = fixed.into();
+                    record["ctx_carry"] = carry.into();
+                    record["ctx_growth"] = growth.into();
+                }
+            }
+            if let Some((inline, whole)) = job.record_bytes {
+                record["record_inline_bytes"] = inline.into();
+                if let Some(whole) = whole {
+                    record["record_whole_bytes"] = whole.into();
+                }
             }
             if job.uncounted > 0 {
                 record["uncounted_calls"] = job.uncounted.into(); // the counts below are of its other calls alone
@@ -3456,6 +3510,7 @@ impl Session {
                             }
                         }
                         Note::Call => job.calls += 1,
+                        Note::CallInput(n) => job.call_inputs.push(n),
                         Note::Touched(path) => {
                             let cwd = job.worktree.clone().unwrap_or_else(|| self.repo.clone());
                             let path = Path::new(&path);
@@ -5231,5 +5286,103 @@ mod tests {
             s.pump();
         }
         assert_eq!(s.bases.get(&agent).unwrap(), &VecDeque::from([15_000, 16_000, 1_000]));
+    }
+
+    // --- the ledger fields of usage.jsonl ---
+
+    /// Like `ctx_session` but with a state folder of its own, so a finished job's usage.jsonl stays in the test.
+    fn ledger_session(name: &str, fills: u64) -> (Session, Agent) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!("ringo-ledger-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::SeqCst)));
+        let repo = path.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        let mut s = Session::with_state(&repo, &path.join("state")).unwrap();
+        s.context_mode = context_policy::Mode::Static;
+        s.codex_home = s.dir.join("codex-home");
+        fs::create_dir_all(&s.codex_home).unwrap();
+        let agent = Agent::from_name(name).unwrap();
+        ctx_turn(&mut s, agent, Status::Done, 5);
+        s.context.insert(agent, fills);
+        s.threads.insert(agent, "thread-1".into());
+        (s, agent)
+    }
+
+    fn last_usage_row(s: &Session) -> serde_json::Value {
+        let text = fs::read_to_string(s.root.join("usage.jsonl")).unwrap();
+        serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn attribution_matches_decompose_definitions() {
+        assert_eq!(attribute(&[12_000, 15_000, 9_000], 10_000), Some((29_000, 4_000, 3_000)));
+        // a first call below the base: fixed and growth share the difference (decompose.py's surplus)
+        assert_eq!(attribute(&[8_000, 20_000], 10_000), Some((18_000, 0, 12_000)));
+        assert_eq!(attribute(&[], 1), None);
+    }
+
+    #[test]
+    fn a_finished_turn_records_its_context_split() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        s.bases.insert(agent, VecDeque::from([10_000]));
+        let tokens = Tokens { input: 100, cache_read: 50, cache_write: 0, output: 10 };
+        let id = s.new_job(Kind::Agent { agent, write: false }, "ledger").unwrap();
+        for n in [12_000u64, 15_000, 9_000] {
+            s.tx.send(Event::Note(id, Note::Call)).unwrap();
+            s.tx.send(Event::Note(id, Note::CallInput(n))).unwrap();
+        }
+        s.pump();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!((row["ctx_base"].as_u64(), row["ctx_fixed"].as_u64(), row["ctx_carry"].as_u64(), row["ctx_growth"].as_u64()),
+                   (Some(10_000), Some(29_000), Some(4_000), Some(3_000)));
+        assert_eq!((row["calls"].as_u64(), row["surface"].as_str(), row["billing"].as_str()), (Some(3), Some("cli:codex"), Some("subscription")));
+        assert_eq!(row["input"].as_u64(), Some(100));
+        // no measured base: no context fields, and the calls are still there
+        let (mut s, agent) = ledger_session("codex", 0);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "ledger").unwrap();
+        for n in [12_000u64, 15_000] {
+            s.tx.send(Event::Note(id, Note::Call)).unwrap();
+            s.tx.send(Event::Note(id, Note::CallInput(n))).unwrap();
+        }
+        s.pump();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert!(["ctx_base", "ctx_fixed", "ctx_carry", "ctx_growth"].iter().all(|k| row.get(*k).is_none()), "{row}");
+        assert_eq!(row["calls"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn a_fresh_start_records_its_record_sizes() {
+        let (mut s, agent) = ledger_session("codex", HANDOFF_AT + 1);
+        let jobs = s.jobs.len();
+        let id = s.new_job(Kind::Agent { agent, write: false }, "fix the failing tests").unwrap();
+        let mut resume = s.threads.get(&agent).cloned();
+        let sent = s.handoff(id, agent, &mut resume, "fix the failing tests").map(|(text, _)| text.len() as u64);
+        assert!(resume.is_none() && s.jobs[id - 1].started_fresh, "past handoff_at the turn starts fresh");
+        assert_eq!(s.jobs.len(), jobs + 1);
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 10, cache_read: 0, cache_write: 0, output: 1 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        let whole = fs::metadata(s.jobs[id - 1].dir.join("record.md")).unwrap().len();
+        assert_eq!(row["record_whole_bytes"].as_u64(), Some(whole));
+        let inline = row["record_inline_bytes"].as_u64().unwrap();
+        assert!(inline > 0 && inline <= sent.unwrap() - "fix the failing tests".len() as u64, "{inline} of {sent:?}");
+        // a resumed turn has neither
+        let (mut s, agent) = ledger_session("codex", 50_000);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "again").unwrap();
+        let mut resume = s.threads.get(&agent).cloned();
+        let _ = s.handoff(id, agent, &mut resume, "again");
+        assert!(resume.is_some());
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 10, cache_read: 0, cache_write: 0, output: 1 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert!(row.get("record_inline_bytes").is_none() && row.get("record_whole_bytes").is_none(), "{row}");
     }
 }

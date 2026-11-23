@@ -1019,6 +1019,11 @@ read when the shell opens and again after a turn when the last read is ten minut
   counts; and what they are counts of: the tier, the model when the agent names it, a pipeline's command, and the
   job's folder (a pipeline's trace there names each call's model and effort). A job that finished without reporting
   any count appends a line with `"unknown": true` and no counts: unknown is not zero, and the sums leave it out.
+  Each line also names its `surface` and `billing`, the job's `calls` when the agent reports them, `ctx_base`,
+  `ctx_fixed`, `ctx_carry` and `ctx_growth` once the agent's base is measured, and `record_inline_bytes` and
+  `record_whole_bytes` for a turn that started fresh from Ringo's record. Older lines lack these and `/usage` reads old and new
+  lines alike; they are described in [TOKEN-USAGE.md](TOKEN-USAGE.md#cost-weighted-usage-w-and-the-ledger) and read
+  offline with `python3 ledger.py`.
 - **Plans:** asked of each set-up agent in the background, about a second each:
   - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given
     a message, so no model call (its answer says cost 0). Claude marks it experimental. When it fails, or succeeds
