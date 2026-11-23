@@ -2,6 +2,7 @@
 //! agent edits in private git worktrees until the owner applies them. The terminal shell (`ringo`) and, later,
 //! the IDE drive a `Session` and render its jobs.
 
+pub mod awake;
 pub mod context_policy;
 pub mod evidence;
 pub mod framing;
@@ -597,6 +598,9 @@ pub struct Job {
     started_fresh: bool,
     /// Each model call's input side, in order (`Note::CallInput`): the fixed/carry/growth split of the usage record.
     call_inputs: Vec<u64>,
+    /// The wall-clock time the job started: `started` is monotonic and does not run while the computer sleeps, so
+    /// the two clocks disagree by the length of a sleep (see `awake::slept_secs`).
+    wall_start: SystemTime,
     /// A turn that started fresh from Ringo's record: the inline handoff text and record.md, in bytes.
     record_bytes: Option<(u64, Option<u64>)>,
 }
@@ -795,6 +799,8 @@ pub struct Session {
     pub routed: VecDeque<(usize, String)>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
+    /// Holds the computer awake while a model call runs (`awake`); off in tests and with RINGO_KEEP_AWAKE=0.
+    awake: Option<awake::KeepAwake<awake::System>>,
 }
 
 /// Tokens as a log line says them: 12.3k.
@@ -1233,7 +1239,9 @@ impl Session {
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
                      usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
-                     routed: VecDeque::new(), tx, rx })
+                     routed: VecDeque::new(), tx, rx,
+                     awake: (!cfg!(test) && !awake::disabled(std::env::var("RINGO_KEEP_AWAKE").ok().as_deref()))
+                         .then(|| awake::KeepAwake::new(awake::System::new(is_wsl()))) })
     }
 
     pub fn running(&self) -> usize {
@@ -2281,7 +2289,7 @@ impl Session {
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
                               fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false,
-                              call_inputs: Vec::new(), record_bytes: None });
+                              call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now() });
         Ok(id)
     }
 
@@ -3186,6 +3194,13 @@ impl Session {
         let base = match self.jobs[id - 1].kind { Kind::Agent { agent, .. } => self.base_median(agent), _ => None };
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
+        // The monotonic clock stops while the computer sleeps and the wall clock does not: a turn whose wall time ran
+        // more than 60 s past its own elapsed time had the computer asleep under it, and a connection that broke then
+        // is the sleep's doing, not the backend's.
+        let slept = job.wall_start.elapsed().ok().and_then(|wall| awake::slept_secs(job.started.elapsed(), wall));
+        if let Some(secs) = slept {
+            job.push_log(format!("the computer slept for ~{} min during this turn", (secs + 30) / 60));
+        }
         job.activity = match &status {
             Status::Done => parse::short(&reply, 80),
             Status::Failed(reason) => reason.clone(),
@@ -3247,6 +3262,9 @@ impl Session {
                 if let Some(whole) = whole {
                     record["record_whole_bytes"] = whole.into();
                 }
+            }
+            if let Some(secs) = slept {
+                record["host_slept_s"] = secs.into();
             }
             if job.uncounted > 0 {
                 record["uncounted_calls"] = job.uncounted.into(); // the counts below are of its other calls alone
@@ -3349,8 +3367,19 @@ impl Session {
     }
 
     /// Folds pending events into the jobs; true when anything changed.
+    /// Hold the computer awake while a backend process runs and the owner is not the one being waited on.
+    fn keep_awake(&mut self) {
+        let wanted = self.jobs.iter().any(|j| j.running() && j.pid.is_some() && j.asks.is_empty());
+        if let Some(line) = self.awake.as_mut().and_then(|a| a.tick(wanted, Instant::now())) {
+            if let Some(job) = self.jobs.iter_mut().rev().find(|j| j.running()) {
+                job.push_log(line);
+            }
+        }
+    }
+
     pub fn pump(&mut self) -> bool {
         let mut changed = self.take_asks();
+        self.keep_awake();
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -5430,6 +5459,27 @@ mod tests {
         // a first call below the base: fixed and growth share the difference (decompose.py's surplus)
         assert_eq!(attribute(&[8_000, 20_000], 10_000), Some((18_000, 0, 12_000)));
         assert_eq!(attribute(&[], 1), None);
+    }
+
+    #[test]
+    fn a_turn_the_computer_slept_through_says_so_in_its_row_and_log() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        let tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        let id = s.new_job(Kind::Agent { agent, write: false }, "slept").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        // the wall clock ran 1,900 s while the monotonic one ran about none
+        s.jobs[id - 1].wall_start = SystemTime::now() - Duration::from_secs(1900);
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!(row["host_slept_s"].as_u64().map(|n| n / 60), Some(31));
+        assert!(s.jobs[id - 1].log.iter().any(|l| l.contains("the computer slept for ~32 min")), "{:?}", s.jobs[id - 1].log);
+        // an ordinary turn has no such field
+        let id = s.new_job(Kind::Agent { agent, write: false }, "awake").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        s.end_with(id, Status::Done, "done".into());
+        assert!(last_usage_row(&s).get("host_slept_s").is_none());
     }
 
     #[test]
