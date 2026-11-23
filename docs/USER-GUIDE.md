@@ -182,6 +182,14 @@ lists of your skills and connectors. Only that agent's turns pay for it; `@claud
 On a wide terminal the side panel keeps a small gauge for each limit too, so you can see how much is left while you
 work.
 
+When a turn runs into a limit it says so ("usage limit reached — resets at 15:38 (local)", "rate limited",
+"overloaded"), and `/usage` lists the latest limit each agent hit in the last day and when it starts over. Ringo does
+not send the work to another agent by itself. A Codex turn that only keeps retrying for 10 minutes is stopped with
+the last error instead of waiting for ever. If your repository's `CLAUDE.md` is just `@AGENTS.md` (or imports other
+files inside the repository), Claude now gets those files' text: Ringo expands the imports itself, since Claude's own
+loading of `CLAUDE.md` is off in its turns. If Claude's saved conversation is gone, the next turn starts again from
+Ringo's record of the conversation instead of failing the same way.
+
 ## Talk to a different agent
 
 Put its name first: `@codex why is this slow?`. The rest of the conversation goes to Codex too, until you pick another

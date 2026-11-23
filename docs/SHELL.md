@@ -112,6 +112,15 @@ How the instructions reach the model, each turn:
   stops the turn before it starts: a turn without them would not be that agent's.
 - **Claude:** appended to the system prompt (`--append-system-prompt-file`), after your `rules.md` and before the
   project's `CLAUDE.md` or `AGENTS.md`. The turn stays in safe mode, as lean as any other.
+  The project's file is appended with its `@path` imports expanded: Claude's own loading of `CLAUDE.md` is off in these
+  turns, so a `CLAUDE.md` that is only `@AGENTS.md` reached Claude as that literal line (checked with Claude Code
+  2.1.330: asked for a codeword kept in `AGENTS.md`, Claude answered NONE). An import is `@path` at the start of a line
+  or after whitespace, outside code fences and `` `code spans` ``, naming a file inside the repository (read from the
+  importing file's folder; links out of the repository and `~/` paths are refused). A line that is only an import is
+  replaced by the file's text; an import inside a line leaves the line and adds the file after the document under
+  `## Imported from PATH`. Imports nest five files deep, a file is taken in once (cycles add nothing), at most 64 KiB is
+  added (the job's log says when an import is left as written), and a missing file stays as written. The turn is given
+  an expanded copy in its own folder; your files are not changed.
 - **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
   turns they stand in for any `developer_instructions` in your Codex settings.
 - **The file's `model` and `tools` lines (Claude only):** an agent file made for Claude Code can name both in its
@@ -297,6 +306,11 @@ the shell in a pty):
 
 Three things failed on the way and are why the code is as it is: under safe mode the tool was not there; Ringo's own
 guard refused the server; and Codex refused the call for want of approval.
+
+A resumed Claude turn that carries the tool runs with `MCP_CONNECTION_NONBLOCKING=0`, so Claude Code waits for the MCP
+server to connect before its first request (without it the first request can go out before the server is up and the
+tool is missing from that turn: T3 Code waits on resume for this reason, and Ringo's own turn runner already sets it).
+A new session is left as it was.
 
 Not done: Claude is not given the tool unless your message names an agent; an agent that was asked cannot ask in
 its turn; agy cannot ask.
@@ -582,6 +596,22 @@ each (2026-10-31, Claude Code 2.1.316, codex-cli 0.165.0; the last two rows 2026
 | Codex turn, per call | 17,133 | 14,350 |
 | Claude turn that edits, without Claude Code's skills | 12,432 | 9,320 |
 | Codex turn, per call, without image generation and goals | 14,733 | 13,564 |
+
+Two more Codex blocks go from every turn (2026-11-23, codex-cli 0.170.0, one trivial `codex exec` turn, "Reply with
+just: ok", the shell's other flags set; input tokens): its skills list (`skills.include_instructions=false`) and its
+question tool (`tools.experimental_request_user_input.enabled=false`, for the same reason the mode text above goes:
+Codex cannot stop to ask here).
+
+| Codex trivial turn | Input tokens | Change |
+|---|---|---|
+| the shell's flags before | 13,793 | |
+| without the skills list | 13,318 | −475 |
+| without the question tool | 13,368 | −425 |
+| both | 12,893 | −900 |
+
+`tools.update_plan.enabled=false` was measured too and changed nothing (13,793), so it is not set; plan updates stay
+(47 Codex shell jobs in the owner's logs had none) and so do subagents (4 of those 47 made a subagent call). Skills
+are kept for an agent whose file asks for them (`skills`), which only Claude's specialists can.
 
 **Your own Codex instructions.** Codex reads `~/.codex/AGENTS.md` (or `$CODEX_HOME`'s) into every turn, and Claude's
 safe mode has no counterpart for it. When that file sends Codex to Ringo, as a Ringo user's often does, a turn in the
@@ -908,6 +938,10 @@ before this one ended may not be known yet.
 | `deep` | `--effort xhigh` | `"xhigh"` | `--effort high` | |
 | `ultra` | `--effort xhigh` | `"xhigh"` | `--effort high` | Ringo's review of each turn here that changes files, then one revision turn when it finds defects |
 
+Codex gets the effort twice: `-c model_reasoning_effort` at launch, and `effort` on each `turn/start` (codex-cli 0.170.0's
+schema: "Override the reasoning effort for this turn and subsequent turns"), since a resumed thread may keep the effort
+it started with instead of the launch setting. `standard` sends neither.
+
 A tier changes no prompt: effort is a model setting, not text. The shell starts in `standard` every time, so a tier
 that spends more is never left on from an earlier day. `deep` is xhigh, not high, because an owner's own settings can
 already run Claude at xhigh (Claude Code reads `effortLevel` from its settings under `--safe-mode` too), and high
@@ -1014,6 +1048,22 @@ week's, in its colour. A wide terminal's side panel keeps a small gauge for ever
 read when the shell opens and again after a turn when the last read is ten minutes old: no tokens either.
 
 - **This session:** the jobs in memory, by agent.
+- **A limit a turn hit:** a turn that runs into a limit fails with it said plainly, "usage limit reached — resets at
+  15:38 (local)", "rate limited" or "overloaded", and `/usage` lists the latest one each agent hit in the last day
+  ("codex hit its usage limit 12 min ago · starts over at 15:38 (local)"). Codex says it in its error's
+  `codexErrorInfo` (`usageLimitExceeded`, `rateLimitExceeded`, `serverOverloaded`, or retries that ran out on a 429)
+  and the reset comes from the rate-limit snapshot its live `account/rateLimits/updated` notifications build (the
+  window that is full), else from the time in its text ("Try again at 3:37 PM.", "try again in 20 minutes"). Claude:
+  a `rate_limit_event` whose status is `rejected` with no overage to fall back on (its `resetsAt`), an assistant
+  message with `error: "rate_limit"`, a result with `api_error_status` 429 or `terminal_reason: "blocking_limit"`
+  (a usage limit), and 529 (overloaded: the same request may go through shortly); a message whose model is
+  `<synthetic>` is a notice Claude Code wrote itself, not an API call, and is not counted as one. agy: `QUOTA_EXHAUSTED`
+  (or a refusal) in its own error text, with `quotaResetTimeStamp`, `quotaResetDelay` or `retryDelay`; no quota
+  endpoint is called. Nothing reroutes the turn: it only names what happened. The job keeps it and its usage row gains
+  `"limit": {"kind": "usage|rate|overloaded", "resets_at": <unix seconds or null>}` (a turn that hit a limit leaves a
+  row with zero counts, so the record has it). Codex that keeps reporting `willRetry` errors for 10 minutes with no
+  other event between them is stopped with "Codex kept retrying for 10 min: <last error>". If a read of Codex's plan
+  fails, `/usage` shows the snapshot its last turn's live updates built, as it does for Claude.
 - **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder. Each finished job that used tokens
   appends one line: when, which agent (or `ringo` for a pipeline), and its input, cache-read, cache-write and output
   counts; and what they are counts of: the tier, the model when the agent names it, a pipeline's command, and the
@@ -1030,7 +1080,11 @@ read when the shell opens and again after a turn when the last read is ten minut
     with no limits in it (its own read of the plan failed), the last `rate_limit_event` a Claude turn in this session
     sent stands in.
   - **Codex:** `account/rateLimits/read` over `codex app-server` (no thread is started): each window's used percent,
-    length and reset time, and the full resets left. `account/rateLimitResetCredit/consume`, which spends one, is never
+    length and reset time, and the full resets left. The plan's own limit is `rateLimitsByLimitId.codex`, preferred
+    over the older single `rateLimits` bucket, which gives no gauges when it names another limit than `codex` (a
+    model's own). The line also says the account's credits (balance, or unlimited), a spend limit (`individualLimit`:
+    used of limit, and when it starts over), and `rateLimitReachedType` when a limit was reached (codex-cli 0.170.0's
+    schema). `account/rateLimitResetCredit/consume`, which spends one, is never
     called.
   - **agy:** it reports no plan usage.
 

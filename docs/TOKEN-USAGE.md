@@ -86,6 +86,7 @@ included) reads old and new lines alike.
 | `calls` | the job's model calls were reported | Codex and Claude report each model call; a plain agent reports none, so the key is absent, never 0 |
 | `ctx_base`, `ctx_fixed`, `ctx_carry`, `ctx_growth` | the agent's base is measured | the split below |
 | `record_inline_bytes`, `record_whole_bytes` | the turn started fresh from Ringo's record | the inline handoff text sent, and the size of `record.md` |
+| `limit` | the turn ran into a usage or rate limit, or a busy provider | `{"kind": "usage" \| "rate" \| "overloaded", "resets_at": unix seconds or null}`; the row exists even when nothing was counted (its counts are then 0) |
 
 The context split is over each call's input side (what it read, cached or not: Codex `last.inputTokens`; Claude input
 plus cache read plus cache write). With `first` the turn's first call and B the agent's fixed base: **fixed** is
@@ -113,6 +114,12 @@ own base) is left out and counted as such; a job without a row falls back to its
 base, so it needs `--agent`. It measures consumption; it makes no claim about what any change saves.
 
 ## Codex call overhead
+
+Two blocks of the stock Codex request are no use in a shell turn, and the shell turns them off: its skills list and
+its question tool (codex-cli 0.170.0, 2026-11-23, one trivial `codex exec` turn, input tokens: 13,793 with the shell's
+earlier flags; 13,318 without the skills list; 13,368 without the question tool; 12,893 without both, 900 fewer).
+`tools.update_plan.enabled=false` changed nothing (13,793) and is not set. See `docs/SHELL.md`, **Tools a Ringo turn
+never needs**. One trivial turn is one measurement, not a claim about a long turn's cost.
 
 A native Codex call carries more than Ringo's prompt. In codex-cli 0.164 the
 stock request added the Codex agent prompt, code-mode and multi-agent tool
