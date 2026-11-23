@@ -879,6 +879,22 @@ fn record_cap(fills: u64, base: Option<u64>) -> usize {
     4 * (fills.saturating_sub(base.unwrap_or(fills / 2)) * 3 / 8) as usize
 }
 
+/// Add one row to a JSON-lines file as a single locked write. Several shells (and a shell and its detached
+/// pipelines) share one `usage.jsonl`; `writeln!` on an unbuffered file is two writes (the text, then the newline) and
+/// a long row can be split by the OS, so two writers could interleave and leave one unreadable line that every
+/// reader then skips. The row is formatted whole (newline included), written with one `write_all` under an exclusive
+/// advisory lock (`File::lock`: flock on Unix, LockFileEx on Windows) and unlocked. A failed write is dropped: a
+/// usage row is a record, never a reason to fail a job.
+fn append_row(path: &Path, record: &serde_json::Value) {
+    let line = format!("{record}\n");
+    let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    if f.lock().is_err() {
+        return;
+    }
+    let _ = f.write_all(line.as_bytes());
+    let _ = f.unlock();
+}
+
 /// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
 fn record_head(text: &str, room: usize) -> String {
     if text.len() <= room {
@@ -3242,9 +3258,7 @@ impl Session {
                     record[key] = n.into();
                 },
             }
-            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.root.join("usage.jsonl")) {
-                let _ = writeln!(f, "{record}");
-            }
+            append_row(&self.root.join("usage.jsonl"), &record);
         }
         // A turn that failed before its agent counted a token, took a step or said a word never took its message
         // in: what its start marked as told goes back, so the agent's next turn is told it again. Before, only a
@@ -3589,6 +3603,14 @@ impl Session {
     pub fn used_since(&self, secs: u64) -> (BTreeMap<String, Tokens>, Option<u64>) {
         let (mut windows, first) = self.used_windows(&[secs]);
         (windows.remove(0), first)
+    }
+
+    /// How many non-blank lines of `usage.jsonl` are not a readable JSON row (a torn or hand-edited line). Every
+    /// reader skips them, so /usage says how many there were rather than silently under-counting.
+    pub fn unreadable_usage_rows(&self) -> usize {
+        fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines()
+            .filter(|l| !l.trim().is_empty() && !serde_json::from_str::<serde_json::Value>(l).is_ok_and(|v| v.is_object()))
+            .count()
     }
 
     /// The same counts for each of several windows in one read of `usage.jsonl`: /usage asks for a day and a week,
@@ -5376,6 +5398,30 @@ mod tests {
     fn last_usage_row(s: &Session) -> serde_json::Value {
         let text = fs::read_to_string(s.root.join("usage.jsonl")).unwrap();
         serde_json::from_str(text.lines().last().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn concurrent_usage_rows_never_interleave_and_unreadable_ones_are_counted() {
+        let (s, _) = ledger_session("codex", 0);
+        let path = s.root.join("usage.jsonl");
+        let _ = fs::remove_file(&path);
+        let writers: Vec<_> = (0..8).map(|w| {
+            let path = path.clone();
+            thread::spawn(move || for n in 0..50 {
+                // a long row (past one pipe-sized write) is the one a plain writeln! could split
+                append_row(&path, &serde_json::json!({"at": n, "agent": format!("w{w}"), "pad": "x".repeat(6000)}));
+            })
+        }).collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 400);
+        assert!(text.ends_with('\n'));
+        assert_eq!(s.unreadable_usage_rows(), 0, "every row is whole");
+        // a torn line and a blank line: the torn one is counted, the blank one is not
+        fs::write(&path, format!("{text}{{\"at\": 1, \"agent\"\n\n[1]\n")).unwrap();
+        assert_eq!(s.unreadable_usage_rows(), 2);
     }
 
     #[test]

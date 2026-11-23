@@ -2470,6 +2470,11 @@ impl App {
         };
         let total = |m: &BTreeMap<String, u64>| fmt_tokens(m.values().sum());
         let t = self.theme;
+        let unreadable = self.s.unreadable_usage_rows();
+        let kept = match unreadable {
+            0 => kept,
+            n => format!("{kept} · {n} unreadable row{} skipped", if n == 1 { "" } else { "s" }),
+        };
         self.gap();
         self.out.push(Out::Line(Line::from(vec![
             Span::styled("  tokens through Ringo", t.title.add_modifier(Modifier::BOLD)),

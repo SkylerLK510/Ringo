@@ -107,6 +107,14 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(doc['windows'][2]['groups'], doc['windows'][1]['groups'])
         self.assertEqual(list(doc), ['source', 'windows'])
 
+    def test_text_report_names_unreadable_rows_only_when_there_are_some(self):
+        import ledger
+        src = {'path': 'u.jsonl', 'rows': 3, 'skipped_lines': 2, 'traces_expanded': 0}
+        text = ledger.report_text({'source': src, 'windows': []})
+        self.assertIn('2 unreadable rows', text)
+        text = ledger.report_text({'source': dict(src, skipped_lines=0), 'windows': []})
+        self.assertNotIn('unreadable', text)
+
     def test_pipeline_rows_expand_from_their_trace(self):
         job = self.trace()
         usage = self.usage({'at': NOW - 5, 'agent': 'ringo', 'job': job, 'input': 9, 'cache_read': 9, 'cache_write': 9, 'output': 9})

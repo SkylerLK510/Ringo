@@ -192,6 +192,8 @@ def report_text(doc):
     src = doc['source']
     lines = [f"ledger: {src['path']}: {src['rows']} rows, {src['skipped_lines']} lines skipped, "
              f"{src['traces_expanded']} traces expanded; 0 model calls"]
+    if src['skipped_lines']:
+        lines.append(f"  {src['skipped_lines']} unreadable rows (not JSON objects; left out of every total)")
     head = ['agent', 'surface', 'model', 'jobs', 'calls', 'input', 'cache_read', 'cache_write', 'output', 'T', 'W',
             'fixed%', 'carry%', 'growth%', 'ctx jobs']
     for w in doc['windows']:
