@@ -688,6 +688,8 @@ struct RetryWatch {
     since: Option<Instant>,
     last: String,
     stalled: Option<String>,
+    /// The output thread is about to reap the process: from here on its pid may be reused, so nothing may signal it.
+    done: bool,
 }
 
 /// How many of the owner's lines went to a running turn, and whether its stdin has closed: the sender and the reader
@@ -818,6 +820,8 @@ pub struct Session {
     pub claude_limits: Option<serde_json::Value>,
     /// Codex's rate-limit snapshot as its last turn's live updates left it (see `Note::CodexLimits`).
     pub codex_limits: Option<serde_json::Value>,
+    /// A keep-awake warning that had no running job to be said to (see `say_awake`).
+    awake_note: Option<String>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
     pub always_ask: Vec<String>,
     /// Rules the owner allowed for this session: answered at once, and given to every later Claude turn.
@@ -1289,7 +1293,7 @@ impl Session {
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
-                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, codex_limits: None, always_ask, allowed: BTreeSet::new(),
+                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, codex_limits: None, awake_note: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx,
                      awake: (!cfg!(test) && !awake::disabled(std::env::var("RINGO_KEEP_AWAKE").ok().as_deref()))
                          .then(|| awake::KeepAwake::new(awake::System::new(is_wsl()))) })
@@ -2343,6 +2347,9 @@ impl Session {
                               fresh_thread: false, sent_bytes: 0, measured: false, first_base: None, started_fresh: false,
                               call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now(), cli_version: None,
                               limit: None, rate_limits: None, resume_lost: false, retry: Arc::default() });
+        if let Some(note) = self.awake_note.take() {
+            self.jobs[id - 1].push_log(note);
+        }
         Ok(id)
     }
 
@@ -2812,19 +2819,21 @@ impl Session {
                         for note in &done.notes {
                             self.jobs[id - 1].push_log(note.clone());
                         }
-                        if done.imported.is_empty() {
-                            return Some(file);
-                        }
-                        let expanded = dir.join("project.md");
-                        match fs::write(&expanded, &done.text) {
+                        // Always the checked bytes, in a copy of the job's own: handing Claude the repository's path would
+                        // let it open whatever that path is by then (a link swapped in after the containment check). A copy
+                        // that cannot be written leaves the document out, never the original path.
+                        let copy = dir.join("project.md");
+                        match fs::write(&copy, &done.text) {
                             Ok(()) => {
-                                let names: Vec<String> = done.imported.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
-                                self.jobs[id - 1].push_log(format!("{}'s @imports are expanded for this turn: {}", file.file_name().unwrap_or_default().to_string_lossy(), names.join(", ")));
-                                Some(expanded)
+                                if !done.imported.is_empty() {
+                                    let names: Vec<String> = done.imported.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+                                    self.jobs[id - 1].push_log(format!("{}'s @imports are expanded for this turn: {}", file.file_name().unwrap_or_default().to_string_lossy(), names.join(", ")));
+                                }
+                                Some(copy)
                             }
                             Err(e) => {
-                                self.jobs[id - 1].push_log(format!("{}'s @imports are left as written: {e}", file.display()));
-                                Some(file)
+                                self.jobs[id - 1].push_log(format!("the project's {} is left out of this turn: its copy could not be written: {e}", file.file_name().unwrap_or_default().to_string_lossy()));
+                                None
                             }
                         }
                     }
@@ -3272,6 +3281,9 @@ impl Session {
             for note in parser.leftover() {
                 let _ = tx.send(Event::Note(id, note));
             }
+            // Set under the watch's lock before the process is reaped: the runner signals under the same lock, so it
+            // either signals a process that is still there or sees `done` and leaves it alone.
+            watch.lock().unwrap_or_else(|e| e.into_inner()).done = true;
             let exit = child.wait();
             let stalled = watch.lock().unwrap_or_else(|e| e.into_inner()).stalled.clone();
             let status = if cancel.load(Ordering::SeqCst) {
@@ -3298,7 +3310,7 @@ impl Session {
             // Claude may say the session it was asked to resume is gone on its stderr alone, and exit with no result:
             // only a failed turn that resumed one is told so.
             if style == Style::Claude && parser.was_resumed() && matches!(status, Status::Failed(_))
-                && fs::read_to_string(dir.join("stderr.txt")).is_ok_and(|e| parse::mentions_lost_session(&e)) {
+                && (parser.lost_session_seen() || fs::read_to_string(dir.join("stderr.txt")).is_ok_and(|e| parse::mentions_lost_session(&e))) {
                 let _ = tx.send(Event::Note(id, Note::ResumeLost));
             }
             let _ = tx.send(Event::Ended(id, status));
@@ -3524,10 +3536,18 @@ impl Session {
     /// Hold the computer awake while a backend process runs and the owner is not the one being waited on.
     fn keep_awake(&mut self) {
         let wanted = self.jobs.iter().any(|j| j.running() && j.pid.is_some() && j.asks.is_empty());
-        if let Some(line) = self.awake.as_mut().and_then(|a| a.tick(wanted, Instant::now())) {
-            if let Some(job) = self.jobs.iter_mut().rev().find(|j| j.running()) {
-                job.push_log(line);
-            }
+        let line = self.awake.as_mut().and_then(|a| a.tick(wanted, Instant::now()));
+        self.say_awake(line);
+    }
+
+    /// Gives a keep-awake warning to the job that is running. With none running (the helper died during the grace
+    /// after the last turn, and the hold is then given up for the session) the warning is kept, and the next job to
+    /// start gets it in its log, so the owner is not left with no hold and no reason.
+    fn say_awake(&mut self, line: Option<String>) {
+        let Some(line) = line else { return };
+        match self.jobs.iter_mut().rev().find(|j| j.running()) {
+            Some(job) => job.push_log(line),
+            None => self.awake_note = Some(line),
         }
     }
 
@@ -3541,9 +3561,11 @@ impl Session {
             let stalled = {
                 let mut w = job.retry.lock().unwrap_or_else(|e| e.into_inner());
                 match w.since {
-                    Some(since) if w.stalled.is_none() && now.saturating_duration_since(since) >= limits::CODEX_RETRY_STALL => {
+                    Some(since) if !w.done && w.stalled.is_none() && now.saturating_duration_since(since) >= limits::CODEX_RETRY_STALL => {
                         let message = limits::retry_stall_message(&w.last);
                         w.stalled = Some(message.clone());
+                        // still under the lock: the process cannot have been reaped, so its pid is still its own
+                        stop_group(pid, Duration::from_secs(3), false);
                         Some(message)
                     }
                     _ => None,
@@ -3551,7 +3573,6 @@ impl Session {
             };
             if let Some(message) = stalled {
                 job.push_log(format!("stopping: {message}"));
-                stop_group(pid, Duration::from_secs(3), false);
             }
         }
     }
@@ -3559,7 +3580,6 @@ impl Session {
     pub fn pump(&mut self) -> bool {
         let mut changed = self.take_asks();
         self.keep_awake();
-        self.check_retry_stalls(Instant::now());
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -3822,6 +3842,8 @@ impl Session {
                 }
             }
         }
+        // after the events above, so a job that ended (its `Ended` was queued) is not looked at as still running
+        self.check_retry_stalls(Instant::now());
         changed
     }
 
@@ -5712,6 +5734,20 @@ mod tests {
         // a torn line and a blank line: the torn one is counted, the blank one is not
         fs::write(&path, format!("{text}{{\"at\": 1, \"agent\"\n\n[1]\n")).unwrap();
         assert_eq!(s.unreadable_usage_rows(), 2);
+    }
+
+    #[test]
+    fn a_keep_awake_warning_with_no_job_running_goes_to_the_next_job() {
+        let (mut s, _) = ledger_session("codex", 0);
+        s.jobs.clear(); // none of the session's earlier jobs is running
+        s.say_awake(Some("could not keep the computer awake: powershell.exe exited".into()));
+        assert!(s.awake_note.is_some(), "kept, with no job to say it to");
+        let id = s.new_job(Kind::Ringo { command: "x".into() }, "next").unwrap();
+        assert!(s.job(id).unwrap().log.iter().any(|l| l.contains("powershell.exe exited")), "{:?}", s.job(id).unwrap().log);
+        assert!(s.awake_note.is_none(), "said once");
+        // with a job running it goes straight to that job
+        s.say_awake(Some("second".into()));
+        assert!(s.job(id).unwrap().log.iter().any(|l| l == "second") && s.awake_note.is_none());
     }
 
     #[test]

@@ -203,6 +203,8 @@ pub struct Parser {
     /// Codex: what effort to send when the turn's request names none (given the model the thread answered with):
     /// see `limits::codex_default_effort`.
     effort_default: Option<Box<dyn Fn(Option<&str>) -> Option<String> + Send>>,
+    /// A result frame of a resumed turn carried the lost-session diagnostic (whether or not it marked itself an error).
+    lost_seen: bool,
     /// The turn resumed a saved conversation (only then can its store be the thing that is gone).
     resumed: bool,
 }
@@ -377,7 +379,7 @@ impl Parser {
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
                  total: Tokens::default(), turn_id: String::new(), init: false, sends_turn: false, turn_sent: false,
-                 acked: false, clock: Clock::now(), retrying: None, retry_last: String::new(), rate_limits: Value::Null, limit: None, effort_default: None, resumed: false }
+                 acked: false, clock: Clock::now(), retrying: None, retry_last: String::new(), rate_limits: Value::Null, limit: None, effort_default: None, lost_seen: false, resumed: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -405,6 +407,11 @@ impl Parser {
     pub fn resuming(mut self, resumed: bool) -> Parser {
         self.resumed = resumed;
         self
+    }
+
+    /// A resumed turn's result frame said the saved conversation is gone, error or not.
+    pub fn lost_session_seen(&self) -> bool {
+        self.lost_seen
     }
 
     pub fn was_resumed(&self) -> bool {
@@ -1008,10 +1015,15 @@ impl Parser {
                 // A resumed session Claude no longer has (its error is in `errors`, or in the result's text). Only an error
                 // result of a turn that resumed counts: a successful reply that quotes the phrase (a log, this very
                 // code) must not make Ringo forget a conversation that is fine.
+                // A frame that carries the diagnostic without calling itself an error is kept in mind: if the process then
+                // exits unsuccessfully, that is the same loss (`lost_session_seen`).
                 let failed = e.get("is_error") == Some(&Value::Bool(true)) || subtype != "success";
-                if failed && self.resumed
+                if self.resumed
                     && mentions_lost_session(&format!("{} {}", self.reply, e.get("errors").map(Value::to_string).unwrap_or_default())) {
-                    notes.push(Note::ResumeLost);
+                    self.lost_seen = true;
+                    if failed {
+                        notes.push(Note::ResumeLost);
+                    }
                 }
                 if self.compacted && self.reply.trim().is_empty() {
                     self.reply = "compacted the conversation".into(); // a compaction is done without words
@@ -2189,6 +2201,8 @@ mod tests {
         // a successful reply that quotes the phrase (a log, this code) leaves the session alone
         let quoted = r#"{"type":"result","subtype":"success","is_error":false,"result":"the log says: No conversation found with session ID: s-1"}"#;
         assert!(!resumed(&[quoted]).1.contains(&Note::ResumeLost));
+        // ... but it is remembered: if the process then fails, the runner treats it as the stderr case
+        assert!(resumed(&[quoted]).0.lost_session_seen() && !run(Style::Claude, &[quoted]).0.lost_session_seen());
         assert!(!run(Style::Claude, &[CLAUDE[6]]).1.contains(&Note::ResumeLost));
         assert!(mentions_lost_session("Error: No conversation found with session ID: abc") && !mentions_lost_session("fine"));
     }

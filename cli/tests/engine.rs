@@ -546,11 +546,12 @@ fn agent_commands_are_pinned() {
         let job = s.job(id).unwrap();
         assert_eq!(job.unchanged, write, "the fakes change nothing");
         let wt = job.worktree.clone().map(|w| w.to_string_lossy().into_owned());
+        let jobdir = job.dir.to_string_lossy().into_owned();
         let argv = fs::read_to_string(format!("{}.argv", program.display())).unwrap_or_default();
         let stdin = fs::read_to_string(format!("{}.stdin", program.display())).unwrap_or_default();
         let _ = fs::remove_file(format!("{}.stdin", program.display()));
         let argv = argv.lines().map(|a| match &wt { Some(w) => a.replace(w.as_str(), "WT"), None => a.to_string() })
-            .map(|a| a.replace(&repo, "REPO")).collect();
+            .map(|a| a.replace(&repo, "REPO")).map(|a| a.replace(&jobdir, "JOB")).collect();
         (argv, stdin)
     };
     // Codex cannot ask, so the ask tool, its mode text and analytics go; plugins and apps only for a connector task.
@@ -594,13 +595,13 @@ fn agent_commands_are_pinned() {
     let here = [&["acceptEdits"][..], &deny(&[]), &["--settings", &rules]].concat();
     let message = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"the task\"}}\n".to_string();
     assert_eq!(turn(agent("claude"), false, &claude),
-               (want(&head, &[&here[..], &["--append-system-prompt-file", "REPO/AGENTS.md"]].concat()), message.clone()));
+               (want(&head, &[&here[..], &["--append-system-prompt-file", "JOB/project.md"]].concat()), message.clone()));
     assert_eq!(turn(agent("claude"), false, &claude),
-               (want(&head, &[&here[..], &["--resume", "s-1", "--append-system-prompt-file", "REPO/AGENTS.md"]].concat()),
+               (want(&head, &[&here[..], &["--resume", "s-1", "--append-system-prompt-file", "JOB/project.md"]].concat()),
                 message.clone()));
     assert_eq!(turn(agent("claude"), true, &claude),
                (want(&head, &[&["acceptEdits"][..], &deny(&[]), &["--settings", &rules, "--append-system-prompt-file",
-                                                                  "WT/AGENTS.md"]].concat()),
+                                                                  "JOB/project.md"]].concat()),
                 message.clone()));
     assert_eq!(turn(agent("grok"), true, &grok),
                (want(&["-p", "the task", "--output-format", "plain", "--no-auto-update", "--always-approve", "--cwd", "WT"], &[]),
@@ -2866,7 +2867,10 @@ fn an_agent_asks_another_in_the_middle_of_its_turn() {
 fn a_session_claude_no_longer_has_is_not_resumed_again() {
     let gone = "No conversation found with session ID: s-1";
     for (name, how) in [("result", format!("echo '{{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"errors\":[\"{gone}\"]}}'")),
-                        ("stderr", format!("echo '{gone}' >&2; exit 1"))] {
+                        ("stderr", format!("echo '{gone}' >&2; exit 1")),
+                        // the diagnostic in a result that does not call itself an error, then a failed exit
+                        ("stdout", format!("echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"{gone}\"}}'")),
+                        ] {
         let r = repo(&format!("lost-session-{name}"));
         let claude = fake(&root(), &format!("claude-lost-{name}"), &format!("#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\n\
             head -n 1 > \"$0.stdin\"\n\
@@ -2951,11 +2955,13 @@ fn a_claude_md_import_reaches_claude_expanded() {
     assert_eq!(given(&claude), "The codeword is KIWI.\n");
     assert!(s.job(id).unwrap().log.iter().any(|l| l.contains("@imports are expanded for this turn: AGENTS.md")), "{:?}", s.job(id).unwrap().log);
     assert_eq!(fs::read_to_string(r.join("CLAUDE.md")).unwrap(), "@AGENTS.md\n");
-    // no import: the file itself, as before
+    // no import: still a copy of the checked bytes in the job's folder, never the repository's own path
     fs::remove_file(r.join("CLAUDE.md")).unwrap();
-    said(&mut s, "claude", "again");
+    let id = said(&mut s, "claude", "again");
+    assert_eq!(given(&claude), "The codeword is KIWI.\n");
     let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
-    assert!(argv.lines().any(|a| a == r.join("AGENTS.md").to_string_lossy()), "{argv}");
+    assert!(argv.lines().any(|a| a == s.job(id).unwrap().dir.join("project.md").to_string_lossy())
+            && !argv.lines().any(|a| a == r.join("AGENTS.md").to_string_lossy()), "{argv}");
 }
 
 /// A Codex turn that reports one `willRetry` error and then says nothing more sends no second error for the
@@ -3012,4 +3018,22 @@ fn the_standard_tier_sends_the_owners_effort_or_the_models_default() {
     assert_eq!(turn_effort("cache", &|d| fs::write(d.join("models_cache.json"), cache).unwrap()), ("high".into(), false));
     // else nothing, said once in the log
     assert_eq!(turn_effort("none", &|_| {}), (serde_json::Value::Null, true));
+}
+
+/// A Codex that reports a retry and then exits has been reaped by its output thread, and its pid may be anyone's: the
+/// watchdog must not signal it or say it stopped it, even when its `Ended` is still queued and the clock is far past
+/// the cap.
+#[test]
+fn the_retry_watchdog_leaves_a_process_that_has_exited_alone() {
+    let r = repo("retry-exited");
+    let events = r#"echo '{"method":"error","params":{"threadId":"t-1","turnId":"u","willRetry":true,"error":{"message":"stream disconnected"}}}'"#;
+    let codex = fake(&root(), "codex-retry-exited", &codex_script("", events));
+    let mut s = session(&r, agent("codex"), &codex);
+    let id = s.launch_agent(agent("codex"), false, "work").unwrap();
+    std::thread::sleep(Duration::from_millis(1500)); // exited and reaped; nothing has pumped its events yet
+    assert!(s.job(id).unwrap().running(), "its end has not been taken in yet");
+    s.check_retry_stalls(Instant::now() + Duration::from_secs(3600));
+    assert!(!s.job(id).unwrap().log.iter().any(|l| l.starts_with("stopping:")), "{:?}", s.job(id).unwrap().log);
+    let Status::Failed(why) = wait(&mut s, id) else { panic!("a turn with no completion fails") };
+    assert!(!why.contains("kept retrying"), "{why}");
 }

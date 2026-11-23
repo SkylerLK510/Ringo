@@ -285,7 +285,12 @@ fn toml_top_level_string(text: &str, key: &str) -> Option<String> {
         if line.starts_with('[') {
             return None;
         }
-        let Some(rest) = line.strip_prefix(key).map(str::trim_start).and_then(|r| r.strip_prefix('=')) else { continue };
+        // the key bare, or quoted either way (`"key" = ...` and `'key' = ...` are the same key in TOML)
+        let after_key = match line.chars().next() {
+            Some(q @ ('"' | '\'')) => line[1..].strip_prefix(key).and_then(|r| r.strip_prefix(q)),
+            _ => line.strip_prefix(key),
+        };
+        let Some(rest) = after_key.map(str::trim_start).and_then(|r| r.strip_prefix('=')) else { continue };
         let value = rest.trim().split('#').next().unwrap_or("").trim();
         let value = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))?;
         return (!value.is_empty()).then(|| value.to_string());
@@ -396,6 +401,13 @@ mod tests {
         std::fs::write(dir.join("config.toml"), "# mine\nmodel_reasoning_effort = \"low\"  # quiet\n[profiles.deep]\nmodel_reasoning_effort = \"xhigh\"\n").unwrap();
         assert_eq!(codex_default_effort(&dir, None).as_deref(), Some("low"));
         assert_eq!(codex_default_effort(&dir, Some("gpt-6-sol")).as_deref(), Some("low"));
+        // a quoted key is the same key, in either quote style
+        for quoted in ["\"model_reasoning_effort\" = \"minimal\"\n", "'model_reasoning_effort' = 'minimal'\n"] {
+            std::fs::write(dir.join("config.toml"), quoted).unwrap();
+            assert_eq!(codex_default_effort(&dir, Some("gpt-6-sol")).as_deref(), Some("minimal"), "{quoted}");
+        }
+        std::fs::write(dir.join("config.toml"), "\"model_reasoning_effort_x\" = \"nope\"\n").unwrap();
+        assert_eq!(codex_default_effort(&dir, Some("gpt-6-sol")).as_deref(), Some("high"), "another key is not it");
         std::fs::write(dir.join("config.toml"), "model = \"x\"\n[profiles.deep]\nmodel_reasoning_effort = \"xhigh\"\n").unwrap();
         assert_eq!(codex_default_effort(&dir, Some("gpt-6-luna")).as_deref(), Some("medium"));
         // a broken cache is none, not a failure

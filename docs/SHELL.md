@@ -123,7 +123,9 @@ How the instructions reach the model, each turn:
   budget, never whole), and a missing file stays as written. The project file itself is held to the same rule: a
   `CLAUDE.md` or `AGENTS.md` that links to a file outside the repository (a cloned repository can contain one) is
   left out of the turn with one log line, never sent. The turn is given
-  an expanded copy in its own folder; your files are not changed.
+  a copy of the checked text in its own folder (`project.md`), with or without imports: Claude is never given the
+  repository's own path, which could be swapped for a link after the check. If the copy cannot be written the file is
+  left out with a log line. Your files are not changed.
 - **Codex:** the thread's `developerInstructions`, given on `thread/start` and `thread/resume`. For that agent's
   turns they stand in for any `developer_instructions` in your Codex settings.
 - **The file's `model` and `tools` lines (Claude only):** an agent file made for Claude Code can name both in its
@@ -953,7 +955,7 @@ live (codex-cli 0.170.0), after a turn with effort `high` a new app-server proce
 `reasoningEffort: high` although it was launched with `-c model_reasoning_effort="low"`, so the launch setting never
 applied to a resumed thread, and a turn that sent no effort ran on whatever an earlier turn had set. So `standard`
 sends one too: your own `model_reasoning_effort` from `$CODEX_HOME/config.toml` (default `~/.codex`; a top-level key,
-not one under a profile) when you set it, else the thread's model's `default_reasoning_level` from
+not one under a profile; the key may be bare or quoted) when you set it, else the thread's model's `default_reasoning_level` from
 `$CODEX_HOME/models_cache.json` (the model is the one the thread answers with, or the one you chose), else nothing,
 and the job's log says it could not tell.
 
@@ -1078,9 +1080,10 @@ read when the shell opens and again after a turn when the last read is ten minut
   `"limit": {"kind": "usage|rate|overloaded", "resets_at": <unix seconds or null>}` (a turn that hit a limit leaves a
   row with zero counts, so the record has it). Codex that keeps reporting `willRetry` errors for 10 minutes with no
   other event between them is stopped with "Codex kept retrying for 10 min: <last error>"; the shell also checks this
-  on its own timer, so a Codex that retries once and then goes quiet is stopped too. The saved-conversation reset
+  on its own timer, so a Codex that retries once and then goes quiet is stopped too (a process that has already exited is never signalled). The saved-conversation reset
   ("No conversation found with session ID") applies only to a resumed turn that failed, never to a successful reply
-  that quotes the phrase. If a read of Codex's plan
+  that quotes the phrase (a result that carries it without calling itself an error counts when the process then
+  fails). If a read of Codex's plan
   fails, `/usage` shows the snapshot its last turn's live updates built, as it does for Claude.
 - **The last 24 hours and 7 days:** from `usage.jsonl` in Ringo's state folder (each line read on its own, as bytes:
   one line that is not UTF-8 costs that line alone, and is counted among the unreadable rows). Each finished job that used tokens
@@ -1091,7 +1094,8 @@ read when the shell opens and again after a turn when the last read is ten minut
   Each line also names its `surface` and `billing`, the job's `calls` when the agent reports them, `ctx_base`,
   `ctx_fixed`, `ctx_carry` and `ctx_growth` once the agent's base is measured, and `record_inline_bytes` and
   `record_whole_bytes` for a turn that started fresh from Ringo's record. Older lines lack these and `/usage` reads old and new
-  lines alike; a line is one locked write, so two shells sharing the file cannot interleave a row, and `/usage` and
+  lines alike; a line is one write under an advisory file lock, which is best effort: when the lock is unavailable the row is
+  still written, unlocked, and two shells doing that at once can interleave it into an unreadable line, and `/usage` and
   `ledger.py report` say "N unreadable rows" when a line cannot be read (a torn or hand-edited one; it is left out of
   every sum). A row also names the agent CLI's `cli_version` (Codex's initialize answer, Claude's `system/init`; agy's
   stream names none, so its rows omit it), `ctx_first_base` for a turn that began a new conversation (what its first
@@ -1105,7 +1109,8 @@ read when the shell opens and again after a turn when the last read is ten minut
   its stdin (Windows sleep, which logind inside WSL cannot stop); on Linux `systemd-inhibit --what=sleep ... cat`, if
   installed; on macOS `caffeinate -i -w <ringo pid>`. `RINGO_KEEP_AWAKE=0` turns it off. A missing tool or a failed
   start is one line in the job's log and nothing else, and so is a helper that exits by itself while a call runs
-  ("could not keep the computer awake: powershell.exe exited"): it is checked on each tick and not started again that session. The hold/release rule is unit-tested with a fake spawner; the
+  ("could not keep the computer awake: powershell.exe exited"): it is checked on each tick and not started again that session. If that happens between turns, the line goes to
+  the log of the next job that starts. The hold/release rule is unit-tested with a fake spawner; the
   real inhibitors have not been run in tests (needs a live check on a WSL host).
 - **Plans:** asked of each set-up agent in the background, about a second each:
   - **Claude:** Claude Code's `get_usage` control request (2.1.316), sent to a print-mode session that is never given
