@@ -4,12 +4,14 @@ model, changes nothing. See docs/TOKEN-USAGE.md "Cost-weighted usage (W) and the
 
     python3 ledger.py report    [--state DIR | --usage FILE] [--window W]... [--now EPOCH] [--no-traces] [--trace DIR]... [--json]
     python3 ledger.py attribute [--shell DIR] [--agent codex|claude] [--base N] [--json]
+    python3 ledger.py base      [--state DIR | --usage FILE] [--max-rise PCT] [--json]
 """
 import argparse
 import glob
 import json
 import os
 import sys
+import statistics
 import time
 from pathlib import Path
 
@@ -192,6 +194,8 @@ def report_text(doc):
     src = doc['source']
     lines = [f"ledger: {src['path']}: {src['rows']} rows, {src['skipped_lines']} lines skipped, "
              f"{src['traces_expanded']} traces expanded; 0 model calls"]
+    if src['skipped_lines']:
+        lines.append(f"  {src['skipped_lines']} unreadable rows (not JSON objects; left out of every total)")
     head = ['agent', 'surface', 'model', 'jobs', 'calls', 'input', 'cache_read', 'cache_write', 'output', 'T', 'W',
             'fixed%', 'carry%', 'growth%', 'ctx jobs']
     for w in doc['windows']:
@@ -304,6 +308,8 @@ def claude_calls(lines):
         message = event.get('message')
         if not isinstance(message, dict) or not isinstance(message.get('id'), str) or not isinstance(message.get('usage'), dict):
             continue
+        if message.get('model') == '<synthetic>':
+            continue  # a notice Claude Code wrote itself, not an API call (the Rust parser skips it the same way)
         if message['id'] in seen:
             continue
         seen.add(message['id'])
@@ -448,6 +454,124 @@ def attribute_text(doc):
     return '\n'.join(lines)
 
 
+# ---- base: the fixed base per agent CLI version ---------------------------------------------------------------------
+#
+# What an agent reads on the first call of a new conversation, beyond what Ringo sent it, is its fixed base: its own
+# system prompt, tools and instructions. A CLI upgrade that adds a tool or an instruction makes every later turn
+# dearer without any change of Ringo's, and nothing says so. Each usage row names the CLI version (`cli_version`, read
+# from what the CLI already sends) and, for a turn that began a new conversation, the base its first call measured
+# (`ctx_first_base`, the call's input side less the bytes Ringo sent). Rows from before that field carry only
+# `ctx_base`, the session's median of its last three measurements: used when the row has no first-call figure of its
+# own. Rows without a version group as "unknown", listed but never compared.
+
+def version_key(text):
+    """(1, (0, 170, 0)) for '0.170.0'; None for a version with no leading numbers ('unknown')."""
+    parts = []
+    for piece in text.split('.'):
+        digits = ''.join(ch for ch in piece if ch.isdigit())
+        if not piece[:1].isdigit():
+            break
+        parts.append(int(digits))
+        if not piece.isdigit():
+            break
+    return tuple(parts) if parts else None
+
+
+def base_of(row):
+    """The row's fixed-base measure and where it came from, or (None, None)."""
+    for key, source in (('ctx_first_base', 'first call'), ('ctx_base', 'session median')):
+        if whole(row.get(key)) and row[key] > 0:
+            return row[key], source
+    return None, None
+
+
+def base_groups(usage_file):
+    """[{agent, model, versions: [{cli_version, rows, base, change_pct}]}], rows without any base counted apart."""
+    try:
+        text = Path(usage_file).read_text(encoding='utf-8', errors='replace')
+    except OSError as e:
+        raise Usage(f'cannot read {usage_file}: {e.strerror or e}')
+    found, without, skipped = {}, 0, 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            row = None
+        if not isinstance(row, dict):
+            skipped += 1
+            continue
+        agent = row.get('agent') if isinstance(row.get('agent'), str) else '?'
+        if agent == 'ringo' or row.get('surface') in ('pipeline', 'plain'):
+            continue
+        value, source = base_of(row)
+        if value is None:
+            without += 1
+            continue
+        version = row.get('cli_version') if isinstance(row.get('cli_version'), str) and row['cli_version'] else 'unknown'
+        model = row.get('model') if isinstance(row.get('model'), str) else '-'
+        found.setdefault((agent, model), {}).setdefault(version, []).append((value, source))
+    groups = []
+    for (agent, model), by_version in sorted(found.items()):
+        known = sorted((v for v in by_version if version_key(v) is not None), key=version_key)
+        order = [v for v in by_version if version_key(v) is None] + known
+        versions, previous = [], None
+        for v in order:
+            base = round(statistics.median(b for b, _ in by_version[v]))
+            change = None
+            if version_key(v) is not None and previous:
+                change = round((base - previous) * 100 / previous, 1)
+            versions.append({'cli_version': v, 'rows': len(by_version[v]), 'base': base, 'change_pct': change,
+                             'first_call_rows': sum(1 for _, s in by_version[v] if s == 'first call')})
+            if version_key(v) is not None:
+                previous = base
+        groups.append({'agent': agent, 'model': model, 'versions': versions})
+    return groups, {'path': str(usage_file), 'rows_without_base': without, 'skipped_lines': skipped}
+
+
+def base_alerts(groups, max_rise):
+    """The (agent, model) groups whose newest known version's base rose more than `max_rise` percent."""
+    alerts = []
+    for g in groups:
+        known = [v for v in g['versions'] if version_key(v['cli_version']) is not None]
+        if len(known) >= 2 and known[-1]['change_pct'] is not None and known[-1]['change_pct'] > max_rise:
+            alerts.append({'agent': g['agent'], 'model': g['model'], 'cli_version': known[-1]['cli_version'],
+                           'previous': known[-2]['cli_version'], 'change_pct': known[-1]['change_pct']})
+    return alerts
+
+
+def base_text(doc):
+    src = doc['source']
+    lines = [f"ledger base: {src['path']}: first-call input tokens (the fixed base) per agent, model and CLI version; 0 model calls"]
+    if src['skipped_lines']:
+        lines.append(f"  {src['skipped_lines']} unreadable rows (not JSON objects; left out)")
+    if src['rows_without_base']:
+        lines.append(f"  {src['rows_without_base']} rows carry no base measure (resumed turns); left out")
+    if not doc['groups']:
+        lines.append('  (no rows with a base)')
+    for g in doc['groups']:
+        rows = [['agent', 'model', 'cli_version', 'rows', 'base', 'change%']]
+        for v in g['versions']:
+            rows.append([g['agent'], g['model'], v['cli_version'], v['rows'], f"{v['base']:,}",
+                         '-' if v['change_pct'] is None else f"{v['change_pct']:+.1f}"])
+        lines += ['', table(rows)]
+    for a in doc['alerts']:
+        lines.append(f"ALERT: {a['agent']} {a['model']}: base rose {a['change_pct']:+.1f}% from {a['previous']} to {a['cli_version']}"
+                     f" (limit {doc['max_rise']}%)")
+    return '\n'.join(lines)
+
+
+def base(args):
+    """Print the table; return 1 when --max-rise is set and the newest version's base rose more than that."""
+    usage = Path(args.usage) if args.usage else Path(args.state or state_root()) / 'usage.jsonl'
+    groups, source = base_groups(usage)
+    alerts = base_alerts(groups, args.max_rise) if args.max_rise is not None else []
+    doc = {'source': source, 'groups': groups, 'max_rise': args.max_rise, 'alerts': alerts}
+    print(json.dumps(doc, indent=2) if args.json else base_text(doc))
+    return 1 if alerts else 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='ledger.py', description='Offline usage ledger: tokens, weights (W) and context split. '
                                                                     'Reads files only; no model calls.')
@@ -466,8 +590,15 @@ def main(argv=None):
     a.add_argument('--agent', choices=['codex', 'claude'])
     a.add_argument('--base', type=positive_int, help="the agent's fixed base in tokens (default: the median ctx_base in usage.jsonl)")
     a.add_argument('--json', action='store_true')
+    b = sub.add_parser('base', help="each CLI version's fixed base (first-call input tokens) and how it changed")
+    b.add_argument('--state', help='the Ringo state folder (default $RINGO_RELEASE_HOME or ~/.local/share/ringo)')
+    b.add_argument('--usage', help='a usage.jsonl file (default <state>/usage.jsonl)')
+    b.add_argument('--max-rise', type=float, help='exit 1 when the newest version\'s base rose more than this many percent')
+    b.add_argument('--json', action='store_true')
     try:
         args = parser.parse_args(argv)
+        if args.command == 'base':
+            return base(args)
         (report if args.command == 'report' else attribute)(args)
     except Usage as e:
         print(f'ledger.py: {e}', file=sys.stderr)

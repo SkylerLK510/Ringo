@@ -2,6 +2,7 @@
 //! turn succeeded. They fail closed: a line that is not JSON, a failed turn, a missing completion record or an
 //! empty final reply makes the job fail, never succeed.
 
+use crate::limits::{self, Clock, Limit, LimitKind};
 use serde_json::Value;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +71,10 @@ pub enum Note {
     TokensSoFar(Tokens),
     /// The model the agent says it runs, for the usage record.
     Model(String),
+    /// The version of the agent's own CLI, read for free from what it already sends (Codex's `initialize` answer,
+    /// Claude's `system/init`), for the usage record: a CLI upgrade that adds tools shows up as a rise in the fixed
+    /// base of the rows that name it.
+    CliVersion(String),
     /// A finished model call that reported no token count (a Ringo pipeline's): unknown, not zero.
     Uncounted,
     /// What a running turn has used so far, as its messages report it (Claude): shown until the turn's own count
@@ -102,6 +107,26 @@ pub enum Note {
     Refused(usize),
     /// Claude's `rate_limit_event` (its `rate_limit_info`): how much of the owner's plan is used, for /usage.
     Limits(Value),
+    /// Codex's rate-limit snapshot as live `account/rateLimits/updated` notifications have built it so far (only its
+    /// own `codex` limit): the job's plan snapshot, which /usage shows when a read of the plan fails.
+    CodexLimits(Value),
+    /// The turn ran into a limit of the owner's plan or the provider's (see `limits`): the job keeps it, and the
+    /// usage record says it. The failure that follows names it plainly.
+    Limit(Limit),
+    /// Claude's saved conversation is gone ("No conversation found with session ID"): the next turn starts fresh from
+    /// Ringo's record instead of resuming it again.
+    ResumeLost,
+}
+
+/// What Claude says when the session a turn resumes is not in its store any more (Claude Code 2.1.330).
+pub const RESUME_GONE: &str = "No conversation found with session ID";
+
+/// The version in a Codex `userAgent` ("codex_cli_rs/0.170.0 (Ubuntu 22.04; x86_64) ..."): what follows the first slash
+/// up to the next space, when it starts with a digit.
+fn version_of(user_agent: &str) -> Option<String> {
+    let after = user_agent.split_once('/')?.1;
+    let word: String = after.chars().take_while(|c| !c.is_whitespace()).collect();
+    word.starts_with(|c: char| c.is_ascii_digit()).then_some(word)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,6 +190,23 @@ pub struct Parser {
     sends_turn: bool,
     turn_sent: bool,
     acked: bool,
+    /// The time of the line being read, as the caller says it (`line_at`).
+    clock: Clock,
+    /// Codex: when its `willRetry` errors began with no progress between them (`limits::CODEX_RETRY_STALL`).
+    retrying: Option<std::time::Instant>,
+    /// Codex: the last `willRetry` error's text, for the stall message.
+    retry_last: String,
+    /// Codex: its rate-limit snapshot so far, merged from live updates.
+    rate_limits: Value,
+    /// The limit this turn ran into, as far as it is known.
+    limit: Option<Limit>,
+    /// Codex: what effort to send when the turn's request names none (given the model the thread answered with):
+    /// see `limits::codex_default_effort`.
+    effort_default: Option<Box<dyn Fn(Option<&str>) -> Option<String> + Send>>,
+    /// A result frame of a resumed turn carried the lost-session diagnostic (whether or not it marked itself an error).
+    lost_seen: bool,
+    /// The turn resumed a saved conversation (only then can its store be the thing that is gone).
+    resumed: bool,
 }
 
 /// What a missing field reads as: borrowed, so no event payload is copied just to be read.
@@ -337,7 +379,7 @@ impl Parser {
                  seen: Vec::new(), compacted: false, refused: false, turn: None, thread: String::new(), usage: Value::Null,
                  writes: Vec::new(), counted: false, steered: 0, answered: false, heard: false, writing: None,
                  total: Tokens::default(), turn_id: String::new(), init: false, sends_turn: false, turn_sent: false,
-                 acked: false }
+                 acked: false, clock: Clock::now(), retrying: None, retry_last: String::new(), rate_limits: Value::Null, limit: None, effort_default: None, lost_seen: false, resumed: false }
     }
 
     /// A Codex parser that sends `turn` (a turn/start request without its threadId) once the thread is known.
@@ -345,6 +387,35 @@ impl Parser {
         self.turn = Some(turn);
         self.sends_turn = true;
         self
+    }
+
+    /// Codex: since when it has been reporting `willRetry` errors with no progress between them, and the last of
+    /// them. The runner checks this on a timer (`Session::check_retry_stalls`), since a Codex that goes quiet sends
+    /// no further error for the parser to count from.
+    pub fn retry_state(&self) -> Option<(std::time::Instant, String)> {
+        self.retrying.map(|since| (since, self.retry_last.clone()))
+    }
+
+    /// Codex: the effort to send in the turn/start when the request has none, given the thread's model. A thread
+    /// keeps the last effort sent, so a turn that sends none runs on whatever an earlier turn set.
+    pub fn with_effort_default(mut self, default: impl Fn(Option<&str>) -> Option<String> + Send + 'static) -> Parser {
+        self.effort_default = Some(Box::new(default));
+        self
+    }
+
+    /// Says the turn resumes a saved conversation, which is what "No conversation found" can be about.
+    pub fn resuming(mut self, resumed: bool) -> Parser {
+        self.resumed = resumed;
+        self
+    }
+
+    /// A resumed turn's result frame said the saved conversation is gone, error or not.
+    pub fn lost_session_seen(&self) -> bool {
+        self.lost_seen
+    }
+
+    pub fn was_resumed(&self) -> bool {
+        self.resumed
     }
 
     pub fn style(&self) -> Style {
@@ -378,6 +449,13 @@ impl Parser {
     }
 
     pub fn line(&mut self, line: &str) -> Vec<Note> {
+        self.line_at(line, Clock::now())
+    }
+
+    /// `line` at a time the caller names: a stall is measured in the time between lines, and a reset time is read
+    /// against now, so a test says what time it is.
+    pub fn line_at(&mut self, line: &str, clock: Clock) -> Vec<Note> {
+        self.clock = clock;
         if line.trim().is_empty() {
             return Vec::new();
         }
@@ -441,13 +519,22 @@ impl Parser {
                 if self.thread.is_empty() {
                     return self.fail("codex: the thread answer names no thread".into());
                 }
+                let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
+                let mut told = Vec::new();
                 if let Some(mut turn) = self.turn.take() {
                     turn["params"]["threadId"] = self.thread.clone().into();
+                    if turn["params"].get("effort").is_none() && let Some(default) = &self.effort_default {
+                        match default(model) {
+                            Some(effort) => turn["params"]["effort"] = effort.into(),
+                            None => told.push(Note::Log("could not tell which reasoning effort this thread would use, so \
+                                                         none is sent: it keeps the one an earlier turn set".into())),
+                        }
+                    }
                     self.writes.push(turn.to_string());
                     self.turn_sent = true;
                 }
-                let model = m.pointer("/result/model").and_then(Value::as_str).filter(|m| !m.is_empty());
-                return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten().collect();
+                return [Some(Note::Session(self.thread.clone())), model.map(|m| Note::Model(m.to_string()))].into_iter().flatten()
+                    .chain(told).collect();
             }
             if id.as_u64() == Some(3) {
                 if self.thread.is_empty() || self.turn.is_some() {
@@ -473,17 +560,32 @@ impl Parser {
             if std::mem::replace(&mut self.init, true) {
                 return self.fail("codex: initialize was answered twice".into());
             }
-            return Vec::new();
+            // `userAgent` is "codex_cli_rs/0.170.0 (Ubuntu 22.04; x86_64) ...": the version follows the first slash
+            return match m.pointer("/result/userAgent").and_then(Value::as_str).and_then(version_of) {
+                Some(version) => vec![Note::CliVersion(version)],
+                None => Vec::new(),
+            };
         }
         let p = m.get("params").unwrap_or(&NULL);
         // The main thread's own: a subagent's thread reports through its parent's collab items.
         if !self.thread.is_empty() && p.get("threadId").and_then(Value::as_str).is_some_and(|t| t != self.thread) {
             return Vec::new();
         }
+        // Any event but a retry's error (or a warning, or the plan's numbers) is progress, and ends a run of retries.
+        if !matches!(method, "error" | "warning" | "configWarning" | "account/rateLimits/updated") {
+            self.retrying = None;
+        }
         let item = p.get("item").unwrap_or(&NULL);
         let activity = |text: String| Note::Activity { node: None, text };
         let mut notes = Vec::new();
         match (method, s(item, "type")) {
+            // The plan's numbers as they change during a turn, free: Codex pushes a (sparse) snapshot with each
+            // rate-limit change, and the one a turn that hits its limit fails with names when it starts over.
+            ("account/rateLimits/updated", _) => {
+                if limits::merge_codex_snapshot(&mut self.rate_limits, p.get("rateLimits").unwrap_or(&NULL)) {
+                    notes.push(Note::CodexLimits(self.rate_limits.clone()));
+                }
+            }
             ("item/agentMessage/delta", _) => notes.push(Note::Partial(s(p, "delta").to_string())),
             ("item/completed", "agentMessage") => {
                 self.reply = s(item, "text").to_string();
@@ -626,17 +728,26 @@ impl Parser {
                 self.completed += 1;
                 let turn = p.get("turn").unwrap_or(&NULL);
                 if s(turn, "status") == "failed" {
-                    let why = turn.pointer("/error/message").and_then(Value::as_str).unwrap_or("the turn failed");
-                    return self.fail(format!("codex: {}", short(why, 200)));
+                    let error = turn.get("error").cloned().unwrap_or(Value::Null);
+                    return self.codex_failure(&error, "the turn failed");
                 }
                 notes.push(self.codex_tokens());
             }
+            // Codex retries a failed request by itself and says so each time. Retries with nothing else between them
+            // for `CODEX_RETRY_STALL` are not going to end: the turn stops with the last error, as a failure the
+            // owner can act on, instead of waiting for ever.
             ("error", _) if p.get("willRetry").and_then(Value::as_bool) == Some(true) => {
-                notes.push(Note::Log(format!("retrying: {}", short(p.pointer("/error/message").and_then(Value::as_str).unwrap_or(""), 200))));
+                let why = short(p.pointer("/error/message").and_then(Value::as_str).unwrap_or(""), 200);
+                let since = *self.retrying.get_or_insert(self.clock.mono);
+                self.retry_last = why.clone();
+                if self.clock.mono.saturating_duration_since(since) >= limits::CODEX_RETRY_STALL {
+                    return self.fail(limits::retry_stall_message(&why));
+                }
+                notes.push(Note::Log(format!("retrying: {why}")));
             }
             ("error", _) => {
-                let why = p.pointer("/error/message").and_then(Value::as_str).unwrap_or("an error");
-                return self.fail(format!("codex: {}", short(why, 200)));
+                let error = p.get("error").cloned().unwrap_or(Value::Null);
+                return self.codex_failure(&error, "an error");
             }
             ("warning" | "configWarning", _) => {
                 let text = p.get("message").or_else(|| p.get("summary")).and_then(Value::as_str).unwrap_or("");
@@ -644,6 +755,46 @@ impl Parser {
             }
             _ => {}
         }
+        notes
+    }
+
+    /// A Codex turn's failure (a `TurnError`: its message and `codexErrorInfo`). A usage or rate limit is named as
+    /// one, with when it starts over: from the rate-limit snapshot when a window is full, else from the time in
+    /// Codex's own text ("Try again at 3:37 PM."). Codex 0.170.0's `codexErrorInfo` is a name (`usageLimitExceeded`,
+    /// `rateLimitExceeded`, `serverOverloaded`) or an object keyed by one (`responseTooManyFailedAttempts` with the
+    /// last attempt's `httpStatusCode`: retries that ran out on a 429 are a rate limit).
+    fn codex_failure(&mut self, error: &Value, fallback: &str) -> Vec<Note> {
+        let message = error.get("message").and_then(Value::as_str).unwrap_or(fallback);
+        let info = error.get("codexErrorInfo").unwrap_or(&NULL);
+        let (code, detail) = match info {
+            Value::String(name) => (name.as_str(), &NULL),
+            Value::Object(o) => o.iter().next().map(|(k, v)| (k.as_str(), v)).unwrap_or(("", &NULL)),
+            _ => ("", &NULL),
+        };
+        let kind = match code {
+            "usageLimitExceeded" => Some(LimitKind::Usage),
+            "rateLimitExceeded" => Some(LimitKind::Rate),
+            "serverOverloaded" => Some(LimitKind::Overloaded),
+            _ if detail.get("httpStatusCode").and_then(Value::as_u64) == Some(429) => Some(LimitKind::Rate),
+            // a proxy that strips the error's name leaves Codex's own words
+            _ if message.contains("hit your usage limit") => Some(LimitKind::Usage),
+            _ => None,
+        };
+        let Some(kind) = kind else { return self.fail(format!("codex: {}", short(message, 200))) };
+        let (now, offset) = (self.clock.unix, limits::local_offset(self.clock.unix));
+        let resets_at = (kind != LimitKind::Overloaded).then(|| {
+            limits::codex_reset_from_snapshot(&self.rate_limits, now).or_else(|| limits::codex_reset_from_text(message, now, offset))
+        }).flatten();
+        self.limit_hit(Limit { agent: "codex", kind, resets_at, message: short(message, 200) })
+    }
+
+    /// A limit the turn ran into: told to the job, and the turn fails with it said plainly.
+    fn limit_hit(&mut self, limit: Limit) -> Vec<Note> {
+        let limit = match &self.limit { Some(before) => before.refined_by(limit), None => limit };
+        self.limit = Some(limit.clone());
+        let reason = format!("{}: {}", limit.agent, limit.describe_at(self.clock.unix, limits::local_offset(self.clock.unix)));
+        let mut notes = vec![Note::Limit(limit)];
+        notes.extend(self.fail(reason));
         notes
     }
 
@@ -706,6 +857,9 @@ impl Parser {
                     return self.fail(format!("claude is using an API key ({source}), not the subscription login"));
                 }
                 notes.push(Note::Session(s(e, "session_id").to_string()));
+                if !s(e, "claude_code_version").is_empty() && parent.is_none() {
+                    notes.push(Note::CliVersion(s(e, "claude_code_version").to_string()));
+                }
                 if !s(e, "model").is_empty() {
                     notes.push(Note::Model(s(e, "model").to_string()));
                 }
@@ -755,6 +909,14 @@ impl Parser {
             ("rate_limit_event", _) => {
                 if let Some(info) = e.get("rate_limit_info").filter(|i| i.is_object()) {
                     notes.push(Note::Limits(info.clone()));
+                    // A rejected request with no overage to fall back on is the plan's usage limit; `resetsAt`
+                    // says when it starts over. The turn then ends with an error result of its own (below), which
+                    // names the limit: nothing stops here.
+                    let overage = s(info, "overageStatus").starts_with("allowed") || info.get("isUsingOverage") == Some(&Value::Bool(true));
+                    if s(info, "status") == "rejected" && !overage {
+                        notes.extend(self.claude_limit(LimitKind::Usage, info.get("resetsAt").and_then(Value::as_u64),
+                                                       format!("rejected: {}", s(info, "rateLimitType"))));
+                    }
                 }
             }
             ("system", "compact_boundary") => {
@@ -769,7 +931,14 @@ impl Parser {
                 }
             }
             ("assistant", _) => {
-                if let (Some(id), Some(usage)) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage")) {
+                // The message's own `error` names a limit the API refused with (Claude Code 2.1.330: "rate_limit").
+                if s(e, "error") == "rate_limit" {
+                    notes.extend(self.claude_limit(LimitKind::Usage, None, "rate_limit".into()));
+                }
+                // A message whose model is "<synthetic>" is a notice Claude Code wrote itself ("You've hit your
+                // limit"), not an API call: it has no usage of its own and is no model call, so it is not counted.
+                let synthetic = e.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>");
+                if let (Some(id), Some(usage), false) = (e.pointer("/message/id").and_then(Value::as_str), e.pointer("/message/usage"), synthetic) {
                     let t = Tokens { input: u(usage, "input_tokens"), cache_write: u(usage, "cache_creation_input_tokens"),
                                      cache_read: u(usage, "cache_read_input_tokens"), output: u(usage, "output_tokens") };
                     match self.seen.iter_mut().find(|(seen, _)| seen == id) {
@@ -843,11 +1012,42 @@ impl Parser {
                 if let Some(text) = e.get("result").and_then(Value::as_str) {
                     self.reply = text.to_string();
                 }
+                // A resumed session Claude no longer has (its error is in `errors`, or in the result's text). Only an error
+                // result of a turn that resumed counts: a successful reply that quotes the phrase (a log, this very
+                // code) must not make Ringo forget a conversation that is fine.
+                // A frame that carries the diagnostic without calling itself an error is kept in mind: if the process then
+                // exits unsuccessfully, that is the same loss (`lost_session_seen`).
+                let failed = e.get("is_error") == Some(&Value::Bool(true)) || subtype != "success";
+                if self.resumed
+                    && mentions_lost_session(&format!("{} {}", self.reply, e.get("errors").map(Value::to_string).unwrap_or_default())) {
+                    self.lost_seen = true;
+                    if failed {
+                        notes.push(Note::ResumeLost);
+                    }
+                }
                 if self.compacted && self.reply.trim().is_empty() {
                     self.reply = "compacted the conversation".into(); // a compaction is done without words
                 }
                 if e.get("is_error") == Some(&Value::Bool(true)) || subtype != "success" {
-                    notes.extend(self.fail(format!("claude ended with {subtype}: {}", short(&self.reply.clone(), 200))));
+                    // a limit says so plainly: the API's own status (429: the plan's limit; 529: the provider is busy,
+                    // and the same request may go through a moment later), or the turn's end reason
+                    let status = e.get("api_error_status").and_then(Value::as_u64);
+                    let kind = match status {
+                        Some(529) => Some(LimitKind::Overloaded),
+                        Some(429) => Some(LimitKind::Usage),
+                        _ if s(e, "terminal_reason") == "blocking_limit" => Some(LimitKind::Usage),
+                        _ => self.limit.as_ref().map(|l| l.kind),
+                    };
+                    match kind {
+                        Some(kind) => {
+                            let said = short(&self.reply.clone(), 200);
+                            notes.extend(self.claude_limit(kind, None, said));
+                            let limit = self.limit.clone().expect("set just above");
+                            let reason = format!("claude: {}", limit.describe_at(self.clock.unix, limits::local_offset(self.clock.unix)));
+                            notes.extend(self.fail(reason));
+                        }
+                        None => notes.extend(self.fail(format!("claude ended with {subtype}: {}", short(&self.reply.clone(), 200)))),
+                    }
                 }
             }
             ("control_request", _) => {
@@ -878,6 +1078,18 @@ impl Parser {
             _ => {}
         }
         notes
+    }
+
+    /// A limit Claude reported, kept once it is known and again when more of it is (a reset time): the notes that
+    /// tell the job. It does not stop the turn: Claude's own error result does, naming it.
+    fn claude_limit(&mut self, kind: LimitKind, resets_at: Option<u64>, message: String) -> Vec<Note> {
+        let new = Limit { agent: "claude", kind, resets_at, message };
+        let limit = match &self.limit { Some(before) => before.refined_by(new), None => new };
+        if self.limit.as_ref() == Some(&limit) {
+            return Vec::new();
+        }
+        self.limit = Some(limit.clone());
+        vec![Note::Limit(limit)]
     }
 
     fn claude_tool(&mut self, block: &Value, parent: &Option<String>) -> Vec<Note> {
@@ -1001,15 +1213,26 @@ impl Parser {
                 if s(r, "status") != "SUCCESS" {
                     // the reason is in `error` (agy 1.4.12: an effort its model lacks); `response` is empty then
                     let said = [s(r, "error"), self.reply.as_str()].into_iter().find(|t| !t.trim().is_empty()).unwrap_or("");
-                    let why = format!("agy ended with {}: {}", s(r, "status"), short(said, 200));
-                    notes.extend(self.fail(why));
+                    // A quota is in agy's own error text, with when it starts over (`limits::agy_limit`); a status that
+                    // says refusal is how its SDK stops a turn on one.
+                    let text = format!("{} {} {}", s(r, "status"), s(r, "error"), self.reply);
+                    match limits::agy_limit(&text, self.clock.unix) {
+                        Some(limit) => notes.extend(self.limit_hit(limit)),
+                        None => {
+                            let why = format!("agy ended with {}: {}", s(r, "status"), short(said, 200));
+                            notes.extend(self.fail(why));
+                        }
+                    }
                 } else if self.reply.trim().is_empty() && !denied.is_empty() {
                     notes.extend(self.fail(format!("agy stopped: it needed permission for {}", denied.join(", "))));
                 } else {
                     notes.push(Note::Reply(self.reply.clone()));
                 }
             }
-            "error" => return self.fail(format!("agy: {}", short(&e.to_string(), 200))),
+            "error" => return match limits::agy_limit(&e.to_string(), self.clock.unix) {
+                Some(limit) => self.limit_hit(limit),
+                None => self.fail(format!("agy: {}", short(&e.to_string(), 200))),
+            },
             _ => {}
         }
         notes
@@ -1048,6 +1271,11 @@ impl Parser {
             _ => Ok(()),
         }
     }
+}
+
+/// Whether text says a resumed Claude conversation is gone from its store.
+pub fn mentions_lost_session(text: &str) -> bool {
+    text.contains(RESUME_GONE)
 }
 
 /// Claude's tokens for this run, every model and subagent included. A resumed session's `modelUsage` is the whole
@@ -1363,6 +1591,24 @@ mod tests {
         }
         let (mut p, _) = run(Style::Codex, CODEX);
         assert!(p.leftover().is_empty(), "a completed turn was counted at turn/completed");
+    }
+
+    #[test]
+    fn the_agents_cli_version_is_read_from_what_it_already_sends() {
+        let codex = r#"{"id":1,"result":{"userAgent":"codex_cli_rs/0.170.0 (Ubuntu 22.04.5; x86_64) WSL (ringo; 1)"}}"#;
+        assert_eq!(run(Style::Codex, &[codex]).1, vec![Note::CliVersion("0.170.0".into())]);
+        // the existing fixture's answer carries one too; an answer with none says nothing
+        assert_eq!(run(Style::Codex, &[CODEX[0]]).1, vec![Note::CliVersion("0.165.0".into())]);
+        assert!(run(Style::Codex, &[r#"{"id":1,"result":{}}"#]).1.is_empty());
+        assert!(run(Style::Codex, &[r#"{"id":1,"result":{"userAgent":"weird"}}"#]).1.is_empty());
+        let claude = r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none","claude_code_version":"2.1.330","model":"m"}"#;
+        let notes = run(Style::Claude, &[claude]).1;
+        assert!(notes.contains(&Note::CliVersion("2.1.330".into())), "{notes:?}");
+        // a Claude init without the field (older builds), and agy (its stream names no version): nothing
+        assert!(!run(Style::Claude, &[r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}"#]).1
+            .iter().any(|n| matches!(n, Note::CliVersion(_))));
+        assert!(!run(Style::Agy, &[r#"{"event":"init","conversation_id":"c","init":{"cwd":"/w"}}"#]).1
+            .iter().any(|n| matches!(n, Note::CliVersion(_))));
     }
 
     #[test]
@@ -1803,5 +2049,161 @@ mod tests {
     fn plain_needs_text() {
         assert!(run(Style::Plain, &[]).0.finish().is_err());
         assert_eq!(run(Style::Plain, &["hello"]).0.finish(), Ok(()));
+    }
+
+    // ---- limits (codex-cli 0.170.0, Claude Code 2.1.330, agy 1.4.12 shapes) ----
+
+    /// 2026-11-23 12:00:00 UTC, as the clock of a test.
+    fn at(secs: u64) -> Clock {
+        static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let base = *BASE.get_or_init(std::time::Instant::now);
+        Clock { mono: base + std::time::Duration::from_secs(secs), unix: 1_795_435_200 + secs }
+    }
+
+    fn run_at(style: Style, lines: &[(u64, &str)]) -> (Parser, Vec<Note>) {
+        let mut p = Parser::new(style);
+        let notes = lines.iter().flat_map(|(secs, l)| p.line_at(l, at(*secs))).collect();
+        (p, notes)
+    }
+
+    fn limit_of(notes: &[Note]) -> Option<Limit> {
+        notes.iter().find_map(|n| match n { Note::Limit(l) => Some(l.clone()), _ => None })
+    }
+
+    fn failure_of(p: &Parser) -> String {
+        p.finish().unwrap_err()
+    }
+
+    #[test]
+    fn codex_usage_limits_are_named_with_when_they_end() {
+        let open = [r#"{"id":1,"result":{}}"#, r#"{"id":2,"result":{"thread":{"id":"T"}}}"#, r#"{"id":3,"result":{"turn":{"id":"U"}}}"#];
+        let lines = |extra: &[&'static str]| -> Vec<(u64, &'static str)> {
+            open.iter().chain(extra.iter()).map(|l| (0, *l)).collect()
+        };
+        // the live snapshot says when the full window starts over; the failed turn is a usage limit with that time
+        let snapshot = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","planType":"plus","primary":{"usedPercent":100,"windowDurationMins":300,"resetsAt":1795438800},"secondary":{"usedPercent":40,"windowDurationMins":10080,"resetsAt":1795900000}}}}"#;
+        let model_bucket = r#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex_bengalfox","primary":{"usedPercent":3,"resetsAt":1795500000}}}}"#;
+        let error = r#"{"method":"error","params":{"threadId":"T","turnId":"U","willRetry":false,"error":{"message":"You've hit your usage limit. Try again later.","codexErrorInfo":"usageLimitExceeded"}}}"#;
+        let (p, notes) = run_at(Style::Codex, &lines(&[snapshot, model_bucket, error]));
+        let limit = limit_of(&notes).expect("a usage limit");
+        assert_eq!((limit.agent, limit.kind, limit.resets_at), ("codex", LimitKind::Usage, Some(1_795_438_800)));
+        assert!(failure_of(&p).starts_with("codex: usage limit reached — resets at "), "{}", failure_of(&p));
+        assert!(notes.contains(&Note::Fail(failure_of(&p))));
+        // the model's own bucket did not change the plan's snapshot: one CodexLimits note, the plan's
+        let told: Vec<&Value> = notes.iter().filter_map(|n| match n { Note::CodexLimits(v) => Some(v), _ => None }).collect();
+        assert_eq!(told.len(), 1);
+        assert_eq!(told[0]["primary"]["usedPercent"], 100);
+        // no snapshot: the reset is read from Codex's own words
+        let wait = r#"{"method":"error","params":{"threadId":"T","turnId":"U","willRetry":false,"error":{"message":"Rate limit hit, try again in 20 minutes.","codexErrorInfo":"rateLimitExceeded"}}}"#;
+        let limit = limit_of(&run_at(Style::Codex, &lines(&[wait])).1).unwrap();
+        assert_eq!((limit.kind, limit.resets_at), (LimitKind::Rate, Some(1_795_435_200 + 1200)));
+        // retries that ran out on a 429 (the last attempt's status), in a failed turn/completed
+        let exhausted = r#"{"method":"turn/completed","params":{"threadId":"T","turn":{"id":"U","status":"failed","error":{"message":"exceeded retry limit, last status: 429 Too Many Requests","codexErrorInfo":{"responseTooManyFailedAttempts":{"httpStatusCode":429}}}}}}"#;
+        let (p, notes) = run_at(Style::Codex, &lines(&[exhausted]));
+        assert_eq!(limit_of(&notes).map(|l| (l.kind, l.resets_at)), Some((LimitKind::Rate, None)));
+        assert_eq!(failure_of(&p), "codex: rate limited — try again in a few minutes");
+        // a proxy that strips the error's name leaves the words
+        let words = r#"{"method":"error","params":{"threadId":"T","turnId":"U","willRetry":false,"error":{"message":"You've hit your usage limit.","codexErrorInfo":null}}}"#;
+        assert_eq!(limit_of(&run_at(Style::Codex, &lines(&[words])).1).map(|l| l.kind), Some(LimitKind::Usage));
+        // an overloaded server; and a 500 or any other error is no limit, and reads as it always did
+        let busy = r#"{"method":"error","params":{"threadId":"T","turnId":"U","willRetry":false,"error":{"message":"busy","codexErrorInfo":"serverOverloaded"}}}"#;
+        assert_eq!(limit_of(&run_at(Style::Codex, &lines(&[busy])).1).map(|l| l.kind), Some(LimitKind::Overloaded));
+        let boom = r#"{"method":"error","params":{"threadId":"T","turnId":"U","willRetry":false,"error":{"message":"boom","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":500}}}}}"#;
+        let (p, notes) = run_at(Style::Codex, &lines(&[boom]));
+        assert!(limit_of(&notes).is_none());
+        assert_eq!(failure_of(&p), "codex: boom");
+    }
+
+    #[test]
+    fn codex_retries_with_no_progress_stop_the_turn_after_ten_minutes() {
+        let err = r#"{"method":"error","params":{"threadId":"T","turnId":"U","willRetry":true,"error":{"message":"stream disconnected"}}}"#;
+        let progress = r#"{"method":"item/started","params":{"threadId":"T","turnId":"U","item":{"type":"reasoning","id":"r"}}}"#;
+        let open = [(0, r#"{"id":1,"result":{}}"#), (0, r#"{"id":2,"result":{"thread":{"id":"T"}}}"#), (0, r#"{"id":3,"result":{"turn":{"id":"U"}}}"#)];
+        let with = |more: &[(u64, &'static str)]| open.iter().chain(more.iter()).copied().collect::<Vec<_>>();
+        // retries for just under ten minutes: still waiting
+        let (p, notes) = run_at(Style::Codex, &with(&[(10, err), (300, err), (609, err)]));
+        assert!(p.failure.is_none() && notes.contains(&Note::Log("retrying: stream disconnected".into())));
+        // the retry that arrives ten minutes after the first stops it, with the last error
+        let (p, notes) = run_at(Style::Codex, &with(&[(10, err), (300, err), (610, err)]));
+        assert_eq!(failure_of(&p), "Codex kept retrying for 10 min: stream disconnected");
+        assert!(notes.contains(&Note::Fail("Codex kept retrying for 10 min: stream disconnected".into())));
+        // any progress in between starts the count again: 9 minutes of retries, a step, 9 more
+        let (p, _) = run_at(Style::Codex, &with(&[(10, err), (550, err), (560, progress), (570, err), (1100, err)]));
+        assert!(p.failure.is_none(), "{:?}", p.failure);
+        // a warning is not progress
+        let warn = r#"{"method":"warning","params":{"message":"still trying"}}"#;
+        let (p, _) = run_at(Style::Codex, &with(&[(10, err), (300, warn), (700, err)]));
+        assert!(failure_of(&p).starts_with("Codex kept retrying for 10 min"));
+        assert_eq!(limits::CODEX_RETRY_STALL.as_secs(), 600);
+    }
+
+    #[test]
+    fn claude_limits_are_told_and_a_synthetic_notice_is_no_call() {
+        let init = r#"{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}"#;
+        let rejected = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1795438800,"rateLimitType":"five_hour","overageStatus":"rejected","isUsingOverage":false}}"#;
+        // the notice Claude Code writes itself: a model of "<synthetic>", no usage worth counting, no API call
+        let notice = r#"{"type":"assistant","message":{"id":"n1","model":"<synthetic>","content":[{"type":"text","text":"You've hit your limit"}],"usage":{"input_tokens":0,"output_tokens":0}},"error":"rate_limit","parent_tool_use_id":null}"#;
+        let result = r#"{"type":"result","subtype":"success","is_error":true,"api_error_status":429,"result":"You've hit your limit","terminal_reason":"blocking_limit"}"#;
+        let (p, notes) = run_at(Style::Claude, &[(0, init), (1, rejected), (2, notice), (3, result)]);
+        let told: Vec<&Limit> = notes.iter().filter_map(|n| match n { Note::Limit(l) => Some(l), _ => None }).collect();
+        assert_eq!((told[0].kind, told[0].resets_at), (LimitKind::Usage, Some(1_795_438_800)));
+        assert!(told.iter().all(|l| l.resets_at == Some(1_795_438_800)), "the reset time stays: {told:?}");
+        assert!(failure_of(&p).starts_with("claude: usage limit reached — resets at "), "{}", failure_of(&p));
+        assert!(!notes.iter().any(|n| matches!(n, Note::Call | Note::CallInput(_) | Note::Context(_) | Note::Live(_))),
+                "a synthetic notice is not a model call: {notes:?}");
+        // a real message of the same turn still is one
+        let real = r#"{"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","content":[],"usage":{"input_tokens":3,"output_tokens":2}},"parent_tool_use_id":null}"#;
+        assert!(run(Style::Claude, &[real]).1.contains(&Note::Call));
+        // a rejected request that overage covers is no limit
+        let overage = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":1795438800,"overageStatus":"allowed","isUsingOverage":true}}"#;
+        assert!(limit_of(&run(Style::Claude, &[overage]).1).is_none());
+        // the API's own status alone: 429 is the plan's limit, 529 a busy provider
+        let status = |code: u64| format!(r#"{{"type":"result","subtype":"success","is_error":true,"api_error_status":{code},"result":"API Error"}}"#);
+        let (p, notes) = run(Style::Claude, &[&status(429)]);
+        assert_eq!(limit_of(&notes).map(|l| (l.kind, l.resets_at)), Some((LimitKind::Usage, None)));
+        assert_eq!(failure_of(&p), "claude: usage limit reached — the reset time was not reported");
+        let (p, notes) = run(Style::Claude, &[&status(529)]);
+        assert_eq!(limit_of(&notes).map(|l| l.kind), Some(LimitKind::Overloaded));
+        assert_eq!(failure_of(&p), "claude: overloaded — the provider is busy; try again shortly");
+        // any other failure reads as it did
+        let (p, notes) = run(Style::Claude, &[&status(500)]);
+        assert!(limit_of(&notes).is_none() && failure_of(&p).starts_with("claude ended with success: API Error"));
+    }
+
+    #[test]
+    fn agy_limits_come_from_its_own_error_text() {
+        let quota = "Error 429, Message: Quota exhausted for test model., Status: RESOURCE_EXHAUSTED, Details: [map[@type:type.googleapis.com/google.rpc.ErrorInfo metadata:map[quotaResetDelay:3600s quotaResetTimeStamp:2026-11-24T01:05:00Z] reason:QUOTA_EXHAUSTED]]";
+        let result = json!({"event": "result", "result": {"status": "ERROR", "error": quota, "response": "", "usage": {}}}).to_string();
+        let (p, notes) = run_at(Style::Agy, &[(0, AGY[0]), (1, &result)]);
+        let limit = limit_of(&notes).expect("a quota");
+        assert_eq!((limit.agent, limit.kind, limit.resets_at), ("agy", LimitKind::Usage, crate::iso_secs("2026-11-24T01:05:00Z")));
+        assert!(failure_of(&p).starts_with("agy: usage limit reached — resets at "), "{}", failure_of(&p));
+        // a stream error event says it the same way; one that is no limit reads as it did
+        let event = json!({"event": "error", "message": quota}).to_string();
+        assert_eq!(limit_of(&run(Style::Agy, &[&event]).1).map(|l| l.kind), Some(LimitKind::Usage));
+        let plain = r#"{"event":"result","result":{"status":"ERROR","response":"quota","usage":{}}}"#;
+        let (p, notes) = run(Style::Agy, &[plain]);
+        assert!(limit_of(&notes).is_none() && failure_of(&p).starts_with("agy ended with ERROR"));
+    }
+
+    #[test]
+    fn a_lost_claude_session_is_told() {
+        let gone = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"errors":["No conversation found with session ID: s-1"]}"#;
+        let resumed = |lines: &[&str]| {
+            let mut p = Parser::new(Style::Claude).resuming(true);
+            let notes: Vec<Note> = lines.iter().flat_map(|l| p.line(l)).collect();
+            (p, notes)
+        };
+        let (p, notes) = resumed(&[gone]);
+        assert!(notes.contains(&Note::ResumeLost) && p.finish().is_err());
+        // not a resumed turn: the phrase cannot be about a store it never opened
+        assert!(!run(Style::Claude, &[gone]).1.contains(&Note::ResumeLost));
+        // a successful reply that quotes the phrase (a log, this code) leaves the session alone
+        let quoted = r#"{"type":"result","subtype":"success","is_error":false,"result":"the log says: No conversation found with session ID: s-1"}"#;
+        assert!(!resumed(&[quoted]).1.contains(&Note::ResumeLost));
+        // ... but it is remembered: if the process then fails, the runner treats it as the stderr case
+        assert!(resumed(&[quoted]).0.lost_session_seen() && !run(Style::Claude, &[quoted]).0.lost_session_seen());
+        assert!(!run(Style::Claude, &[CLAUDE[6]]).1.contains(&Note::ResumeLost));
+        assert!(mentions_lost_session("Error: No conversation found with session ID: abc") && !mentions_lost_session("fine"));
     }
 }

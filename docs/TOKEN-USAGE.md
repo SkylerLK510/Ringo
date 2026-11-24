@@ -86,6 +86,10 @@ included) reads old and new lines alike.
 | `calls` | the job's model calls were reported | Codex and Claude report each model call; a plain agent reports none, so the key is absent, never 0 |
 | `ctx_base`, `ctx_fixed`, `ctx_carry`, `ctx_growth` | the agent's base is measured | the split below |
 | `record_inline_bytes`, `record_whole_bytes` | the turn started fresh from Ringo's record | the inline handoff text sent, and the size of `record.md` |
+| `limit` | the turn ran into a usage or rate limit, or a busy provider | `{"kind": "usage" \| "rate" \| "overloaded", "resets_at": unix seconds or null}`; the row exists even when nothing was counted (its counts are then 0) |
+| `cli_version` | the CLI named its version | Codex: from the `initialize` answer's `userAgent` (`codex_cli_rs/0.170.0 ...`); Claude: `claude_code_version` of `system/init`; agy's stream names none, so absent |
+| `ctx_first_base` | the turn began a new conversation | what its first call read beyond the text Ringo sent (input side less sent bytes / 4): this turn's own measure of the fixed base |
+| `host_slept_s` | the computer slept more than 60 s during the turn | wall-clock seconds beyond the monotonic clock |
 
 The context split is over each call's input side (what it read, cached or not: Codex `last.inputTokens`; Claude input
 plus cache read plus cache write). With `first` the turn's first call and B the agent's fixed base: **fixed** is
@@ -101,7 +105,18 @@ call's output.
 ```
 python3 ledger.py report --window 24h --window all     # by agent, surface, model and window
 python3 ledger.py attribute --agent codex --base 13022  # the split, from the shell's events.jsonl
+python3 ledger.py base --max-rise 5                     # fixed base per CLI version; exit 1 on a rise past 5%
 ```
+
+`base` answers "did a CLI upgrade quietly add to every call?": per agent and model, the median fixed base of each
+`cli_version` (versions ordered by number), and the change against the previous version. A row's base is its
+`ctx_first_base`; a row from before that key falls back to `ctx_base`, the session's median of its last three
+measurements (the `first_call_rows` field of `--json` says how many rows had their own). Rows without `cli_version`
+group as `unknown` (listed first, never compared), and rows with no base at all (resumed turns) are counted and left out.
+`--max-rise PCT` exits 1 when the newest known version's base is more than PCT percent above the previous one's.
+Measured context for the alert's size: Codex 0.170.0 with the shell's flags reads 13,793 input tokens for a trivial
+turn; a tool or instruction added by an upgrade shows as a rise in this number. No threshold is recommended: the
+history is too short to say what an ordinary change between versions is.
 
 `report` shows per group the jobs, calls, the four counts, T, W and the fixed/carry/growth shares. A line from before
 the ledger gets its surface from the agent's name and its calls are unknown; a pipeline line is replaced by one entry per
@@ -113,6 +128,12 @@ own base) is left out and counted as such; a job without a row falls back to its
 base, so it needs `--agent`. It measures consumption; it makes no claim about what any change saves.
 
 ## Codex call overhead
+
+Two blocks of the stock Codex request are no use in a shell turn, and the shell turns them off: its skills list and
+its question tool (codex-cli 0.170.0, 2026-11-23, one trivial `codex exec` turn, input tokens: 13,793 with the shell's
+earlier flags; 13,318 without the skills list; 13,368 without the question tool; 12,893 without both, 900 fewer).
+`tools.update_plan.enabled=false` changed nothing (13,793) and is not set. See `docs/SHELL.md`, **Tools a Ringo turn
+never needs**. One trivial turn is one measurement, not a claim about a long turn's cost.
 
 A native Codex call carries more than Ringo's prompt. In codex-cli 0.164 the
 stock request added the Codex agent prompt, code-mode and multi-agent tool

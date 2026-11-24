@@ -2,10 +2,13 @@
 //! agent edits in private git worktrees until the owner applies them. The terminal shell (`ringo`) and, later,
 //! the IDE drive a `Session` and render its jobs.
 
+pub mod awake;
 pub mod context_policy;
 pub mod evidence;
 pub mod framing;
 pub mod gateway;
+pub mod imports;
+pub mod limits;
 pub mod parse;
 pub mod routing;
 pub mod rt;
@@ -65,6 +68,8 @@ impl<W: Write> EventLog<W> {
 /// Maximum UTF-8 bytes of the inline record, including separators and cut notices. This is a text-size bound,
 /// not a token estimate or limit. The current owner's message and the handoff envelope are separate.
 const RECORD_BYTES: usize = 60_000;
+/// The most of the owner's first message the inline record pins at its top when a long session leaves turn #1 out.
+const OWNER_PIN_BYTES: usize = 2_000;
 /// Files a job remembers it read (the working set the record names), the oldest dropped.
 const READ_FILES: usize = 200;
 /// The inline record's one line of files read: at most this many paths and bytes (the rest are in the whole record).
@@ -557,6 +562,15 @@ pub struct Job {
     reached: bool,
     pid: Option<u32>,
     cancel: Arc<AtomicBool>,
+    /// Codex: what the output thread sees of its retries, and the stall the runner stopped the turn for.
+    retry: Arc<Mutex<RetryWatch>>,
+    /// The limit the turn ran into (a usage or rate limit, a busy provider), with when it starts over when the agent
+    /// said: the failure names it, and the usage record keeps it.
+    pub limit: Option<limits::Limit>,
+    /// Codex: the plan's rate-limit snapshot as live updates built it during this turn.
+    pub rate_limits: Option<serde_json::Value>,
+    /// Claude said the conversation this turn resumed is gone: the next turn starts fresh from Ringo's record.
+    resume_lost: bool,
     /// The model the agent said it runs, when it says (for the usage record).
     pub model: Option<String>,
     /// A turn in the agents' talk (the shell's /discuss): the others hear all of its reply, not its first lines.
@@ -591,10 +605,18 @@ pub struct Job {
     fresh_thread: bool,
     sent_bytes: u64,
     measured: bool,
+    /// What this turn's own first call measured as the agent's fixed base (set with `measured`): the usage row's
+    /// `ctx_first_base`, which `ledger.py base` groups by CLI version.
+    first_base: Option<u64>,
     /// The turn began from Ringo's record (a handoff), which the next turn's dwell guard reads.
     started_fresh: bool,
     /// Each model call's input side, in order (`Note::CallInput`): the fixed/carry/growth split of the usage record.
     call_inputs: Vec<u64>,
+    /// The agent CLI's version, as it told it (Codex's initialize answer, Claude's system/init): the usage row's `cli_version`.
+    cli_version: Option<String>,
+    /// The wall-clock time the job started: `started` is monotonic and does not run while the computer sleeps, so
+    /// the two clocks disagree by the length of a sleep (see `awake::slept_secs`).
+    wall_start: SystemTime,
     /// A turn that started fresh from Ringo's record: the inline handoff text and record.md, in bytes.
     record_bytes: Option<(u64, Option<u64>)>,
 }
@@ -656,6 +678,18 @@ pub struct JobUsage {
     pub unknown: bool,
     pub uncounted_calls: u64,
     pub tokens: Tokens,
+}
+
+/// Codex's retries as the output thread sees them (since when, the last error), shared with the runner so a turn
+/// that keeps retrying and then goes quiet is still stopped (`Session::check_retry_stalls`); `stalled` is the message
+/// the output thread ends the job with.
+#[derive(Default)]
+struct RetryWatch {
+    since: Option<Instant>,
+    last: String,
+    stalled: Option<String>,
+    /// The output thread is about to reap the process: from here on its pid may be reused, so nothing may signal it.
+    done: bool,
 }
 
 /// How many of the owner's lines went to a running turn, and whether its stdin has closed: the sender and the reader
@@ -784,6 +818,10 @@ pub struct Session {
     pub asker: PathBuf,
     /// The last rate-limit event a Claude turn reported here: /usage's fallback when Claude's own answer fails.
     pub claude_limits: Option<serde_json::Value>,
+    /// Codex's rate-limit snapshot as its last turn's live updates left it (see `Note::CodexLimits`).
+    pub codex_limits: Option<serde_json::Value>,
+    /// A keep-awake warning that had no running job to be said to (see `say_awake`).
+    awake_note: Option<String>,
     /// Rules that wait for the owner in every mode: ALWAYS_ASK and the owner's own.
     pub always_ask: Vec<String>,
     /// Rules the owner allowed for this session: answered at once, and given to every later Claude turn.
@@ -793,6 +831,8 @@ pub struct Session {
     pub routed: VecDeque<(usize, String)>,
     tx: Sender<Event>,
     rx: Receiver<Event>,
+    /// Holds the computer awake while a model call runs (`awake`); off in tests and with RINGO_KEEP_AWAKE=0.
+    awake: Option<awake::KeepAwake<awake::System>>,
 }
 
 /// Tokens as a log line says them: 12.3k.
@@ -875,6 +915,45 @@ fn read_line(files: &[&str], max: usize) -> (String, usize) {
 /// rule. With no measured base, half of the conversation is assumed to be the fixed base.
 fn record_cap(fills: u64, base: Option<u64>) -> usize {
     4 * (fills.saturating_sub(base.unwrap_or(fills / 2)) * 3 / 8) as usize
+}
+
+/// Add one row to a JSON-lines file as a single locked write. Several shells (and a shell and its detached
+/// pipelines) share one `usage.jsonl`; `writeln!` on an unbuffered file is two writes (the text, then the newline) and
+/// a long row can be split by the OS, so two writers could interleave and leave one unreadable line that every
+/// reader then skips. The row is formatted whole (newline included), written with one `write_all` under an exclusive
+/// advisory lock (`File::lock`: flock on Unix, LockFileEx on Windows) and unlocked. A failed write is dropped: a
+/// usage row is a record, never a reason to fail a job.
+fn append_row(path: &Path, record: &serde_json::Value) {
+    let line = format!("{record}\n");
+    // Read and append together: on Windows LockFileEx needs read or write access, which an append-only handle may
+    // not give `File::lock`. If the lock still cannot be had, the row is written unlocked rather than dropped: a
+    // row that might interleave with another is better kept than lost (readers count and skip an unreadable one).
+    let Ok(mut f) = fs::OpenOptions::new().create(true).read(true).append(true).open(path) else { return };
+    let locked = f.lock().is_ok();
+    let _ = f.write_all(line.as_bytes());
+    if locked {
+        let _ = f.unlock();
+    }
+}
+
+/// Every row of a usage file, each line read on its own: the bytes are split on `\n` and a line that is not UTF-8
+/// is read lossily, so one bad byte costs that line alone and never the whole record (`read_to_string` failed the
+/// whole file). The rows that are JSON objects, and how many non-blank lines were not. One reader for the totals,
+/// the limits, a job's row and the unreadable-row count.
+fn read_usage_rows(path: &Path) -> (Vec<serde_json::Value>, usize) {
+    let bytes = fs::read(path).unwrap_or_default();
+    let (mut rows, mut bad) = (Vec::new(), 0);
+    for line in bytes.split(|b| *b == b'\n') {
+        let text = String::from_utf8_lossy(line);
+        if text.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) if v.is_object() => rows.push(v),
+            _ => bad += 1,
+        }
+    }
+    (rows, bad)
 }
 
 /// A prefix within a byte budget, with the notice inside that budget and no split UTF-8 codepoint.
@@ -1214,8 +1293,10 @@ impl Session {
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
-                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, always_ask, allowed: BTreeSet::new(),
-                     routed: VecDeque::new(), tx, rx })
+                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, codex_limits: None, awake_note: None, always_ask, allowed: BTreeSet::new(),
+                     routed: VecDeque::new(), tx, rx,
+                     awake: (!cfg!(test) && !awake::disabled(std::env::var("RINGO_KEEP_AWAKE").ok().as_deref()))
+                         .then(|| awake::KeepAwake::new(awake::System::new(is_wsl()))) })
     }
 
     pub fn running(&self) -> usize {
@@ -2122,24 +2203,52 @@ impl Session {
             part
         };
         let is_whole = |i: usize, j: &Job| i + 1 == turns.len() || j.talk || j.asked_by.is_some();
-        let mut kept = Vec::new();
-        let mut kept_turn: Vec<Option<usize>> = Vec::new(); // the turn each kept piece renders (None: a notice)
-        let mut used = 0;
-        for (i, j) in turns.iter().enumerate().rev() {
-            let part = render(j, is_whole(i, j), false);
-            // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
-            // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
-            let part = record_head(&part, RECORD_BYTES - 128);
-            if used + part.len() + usize::from(!kept.is_empty()) > RECORD_BYTES - 128 && !kept.is_empty() {
-                let omitted = format!("(#{} to #{}, {} earlier turns, are in the whole record)\n", turns[0].id, j.id, i + 1);
-                used += omitted.len() + 1;
-                kept.push(omitted);
-                kept_turn.push(None);
-                break;
+        // Fill the inline record newest first within `limit`. With `pinned` the first turn is not a candidate (its
+        // owner words are pinned by the caller), so the omission notice names #2 to #k. Returns the pieces, the turn
+        // each renders (None: a notice), the bytes used, and whether a turn was left out.
+        let fill = |limit: usize, pinned: bool| {
+            let mut kept: Vec<String> = Vec::new();
+            let mut kept_turn: Vec<Option<usize>> = Vec::new();
+            let mut used = 0;
+            let mut left_out = false;
+            for (i, j) in turns.iter().enumerate().rev() {
+                if pinned && i == 0 {
+                    break;
+                }
+                let part = render(j, is_whole(i, j), false);
+                // Reserve space for an omission notice; count the join separators too. Even one turn can overflow
+                // through a huge file list, failure message or multibyte text, so the newest turn must also be bounded.
+                let part = record_head(&part, RECORD_BYTES - 128);
+                if used + part.len() + usize::from(!kept.is_empty()) > limit && !kept.is_empty() {
+                    let first = if pinned { turns[1].id } else { turns[0].id };
+                    let count = if pinned { i } else { i + 1 };
+                    let omitted = format!("(#{first} to #{}, {count} earlier turns, are in the whole record)\n", j.id);
+                    used += omitted.len() + 1;
+                    kept.push(omitted);
+                    kept_turn.push(None);
+                    left_out = true;
+                    break;
+                }
+                used += part.len() + usize::from(!kept.is_empty());
+                kept.push(part);
+                kept_turn.push(Some(i));
             }
-            used += part.len() + usize::from(!kept.is_empty());
-            kept.push(part);
-            kept_turn.push(Some(i));
+            (kept, kept_turn, used, left_out)
+        };
+        let (mut kept, mut kept_turn, mut used, left_out) = fill(RECORD_BYTES - 128, false);
+        if left_out && turns.len() > 1 {
+            // The first turn is the owner's original request and the newest-first fill leaves it out first, so a long
+            // session lost the very words everything after it builds on. Pin those words (to OWNER_PIN_BYTES) at the
+            // top and fill the rest in what is left. A session that fits whole never gets here, so it is unchanged.
+            let who = match turns[0].kind { Kind::Agent { agent, .. } => agent.name(), Kind::Ringo { .. } => "ringo" };
+            let words = record_head(&format!("#{} · the owner to {who}: {}\n", turns[0].id, turns[0].title_full.trim()), OWNER_PIN_BYTES);
+            let pin = format!("{words}(the rest of #{} is in the whole record)\n", turns[0].id);
+            let (mut k, mut kt, u, _) = fill((RECORD_BYTES - 128).saturating_sub(pin.len() + 1), true);
+            k.push(pin.clone());
+            kt.push(None);
+            used = u + pin.len() + 1;
+            kept = k;
+            kept_turn = kt;
         }
         kept.reverse();
         kept_turn.reverse();
@@ -2235,8 +2344,12 @@ impl Session {
                              codex_turn: None, connectors: false, reached: false, model: None, talk: false, can_ask: false, asked: 0, asked_by: None, counted: false,
                              uncounted: 0, so_far: Tokens::default(), told_now: (Vec::new(), None),
                               task_assignment: None, task_thread: None, task_resume: None, fresh_rollback: None,
-                              fresh_thread: false, sent_bytes: 0, measured: false, started_fresh: false,
-                              call_inputs: Vec::new(), record_bytes: None });
+                              fresh_thread: false, sent_bytes: 0, measured: false, first_base: None, started_fresh: false,
+                              call_inputs: Vec::new(), record_bytes: None, wall_start: SystemTime::now(), cli_version: None,
+                              limit: None, rate_limits: None, resume_lost: false, retry: Arc::default() });
+        if let Some(note) = self.awake_note.take() {
+            self.jobs[id - 1].push_log(note);
+        }
         Ok(id)
     }
 
@@ -2487,6 +2600,18 @@ impl Session {
                 // Image generation, and goals (an aim Codex pursues by itself over many turns), are tools no turn here
                 // uses: 14,733 tokens a trivial turn with them, 13,564 without (codex-cli 0.166.0).
                 cmd.args(["-c", "features.image_generation=false", "-c", "features.goals=false"]);
+                // Two more instruction blocks no turn here can use (Ringo's own turn runner already turns both off,
+                // `turnrun_codex_bridge.py`). Codex's skills list is in every call, and the question tool cannot
+                // be answered, as `features.default_mode_request_user_input` above already says. A trivial turn
+                // (`codex exec`, "Reply with just: ok", codex-cli 0.170.0, input tokens): 13,793 with the shell's
+                // flags before; 13,318 without the skills list (-475); 13,368 without the question tool (-425);
+                // 12,893 with both (-900). Skills stay for an agent whose spec has them (Claude's specialists only,
+                // today). `tools.update_plan.enabled=false` changed nothing (13,793), so it is not set, and
+                // subagents stay: 4 of 47 Codex shell jobs in the owner's logs made a subagent call, none a plan update.
+                if !spec.skills {
+                    cmd.args(["-c", "skills.include_instructions=false"]);
+                }
+                cmd.args(["-c", "tools.experimental_request_user_input.enabled=false"]);
                 if let Some(effort) = self.tier.effort() {
                     cmd.args(["-c", &format!("model_reasoning_effort=\"{effort}\"")]);
                 }
@@ -2528,8 +2653,19 @@ impl Session {
                                                "params": {"clientInfo": {"name": "ringo", "version": env!("CARGO_PKG_VERSION")}}});
                 input = Some(format!("{hello}\n{}\n{}\n", serde_json::json!({"method": "initialized"}),
                                      serde_json::json!({"id": 2, "method": method, "params": thread})));
-                turn = Some(serde_json::json!({"id": 3, "method": "turn/start",
-                                               "params": {"input": content}}));
+                // The effort goes with every turn, as well as in `-c` above. turn/start takes `effort` ("Override the
+                // reasoning effort for this turn and subsequent turns", codex-cli 0.170.0's schema), and it sticks:
+                // checked live, after a turn with effort `high` a new app-server process that resumed the thread
+                // reported `reasoningEffort: high`, launched with `-c model_reasoning_effort="low"`. So the launch's
+                // `-c` never applied to a resumed thread, and a turn that sent none left the thread on whatever an
+                // earlier turn (a deeper tier's) had set. The tier's effort goes here when it has one; the standard
+                // tier sends the owner's own (config.toml), else the model's default (models_cache.json), once the
+                // thread's model is known (`Parser::with_effort_default`), else none, and says so in the job's log.
+                let mut params = serde_json::json!({"input": content});
+                if let Some(effort) = self.tier.effort() {
+                    params["effort"] = effort.into();
+                }
+                turn = Some(serde_json::json!({"id": 3, "method": "turn/start", "params": params}));
                 Style::Codex
             }
             Adapter::Claude => {
@@ -2636,6 +2772,14 @@ impl Session {
                         .arg(serde_json::json!({"mcpServers": {"ringo": {"command": self.asker, "args": args}}}).to_string());
                     allowed.push("mcp__ringo__ask_agent".into());
                     self.jobs[id - 1].can_ask = true;
+                    // A resumed session can send its first request before the MCP server has connected, and the ask
+                    // tool is then missing from that turn (T3 Code's `ClaudeAdapterV2.ts` waits for it on resume for
+                    // that reason). 0 makes Claude Code wait for the connection first; Ringo's own turn runner already
+                    // sets it for the same tool (`turnrun_native_bridge.py`). A new session connects before its
+                    // first request as it always did, so only a resumed turn is changed.
+                    if resume.is_some() {
+                        cmd.env("MCP_CONNECTION_NONBLOCKING", "0");
+                    }
                 }
                 if !allowed.is_empty() {
                     cmd.arg("--allowedTools").args(&allowed);
@@ -2667,6 +2811,39 @@ impl Session {
                 // first; with the repository's file as well, the two go in one file of the job's, as bytes, so neither
                 // needs to be UTF-8. Nothing here stops the turn: a file that cannot be read or written is said in its log.
                 let doc = ["CLAUDE.md", "AGENTS.md"].iter().map(|d| cwd.join(d)).find(|p| p.is_file());
+                // Claude's own loading of that file is off, so its `@path` imports are expanded here (see `imports`): a
+                // CLAUDE.md that is only `@AGENTS.md` otherwise reaches Claude as that literal line (Claude Code
+                // 2.1.330: asked for a codeword in AGENTS.md, Claude answered NONE).
+                let doc = doc.map(|file| match imports::expand(&file, &cwd) {
+                    Ok(done) => {
+                        for note in &done.notes {
+                            self.jobs[id - 1].push_log(note.clone());
+                        }
+                        // Always the checked bytes, in a copy of the job's own: handing Claude the repository's path would
+                        // let it open whatever that path is by then (a link swapped in after the containment check). A copy
+                        // that cannot be written leaves the document out, never the original path.
+                        let copy = dir.join("project.md");
+                        match fs::write(&copy, &done.text) {
+                            Ok(()) => {
+                                if !done.imported.is_empty() {
+                                    let names: Vec<String> = done.imported.iter().map(|f| f.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+                                    self.jobs[id - 1].push_log(format!("{}'s @imports are expanded for this turn: {}", file.file_name().unwrap_or_default().to_string_lossy(), names.join(", ")));
+                                }
+                                Some(copy)
+                            }
+                            Err(e) => {
+                                self.jobs[id - 1].push_log(format!("the project's {} is left out of this turn: its copy could not be written: {e}", file.file_name().unwrap_or_default().to_string_lossy()));
+                                None
+                            }
+                        }
+                    }
+                    // never the raw path: a document that resolves outside the repository (or cannot be read) adds nothing
+                    Err(e) => {
+                        self.jobs[id - 1].push_log(format!("the project's {} is left out of this turn: {e}", file.file_name().unwrap_or_default().to_string_lossy()));
+                        None
+                    }
+                });
+                let doc = doc.flatten();
                 let rules = match fs::read(self.rules_path()) {
                     Ok(bytes) => Some(bytes).filter(|b| !b.trim_ascii().is_empty()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -2768,10 +2945,19 @@ impl Session {
         };
         cmd.current_dir(&cwd);
         agent_env(&mut cmd);
+        // Codex: a turn whose tier names no effort sends the thread's own (see `limits::codex_default_effort`)
+        let effort_default = turn.as_ref().is_some_and(|t| t["params"].get("effort").is_none()).then(|| {
+            let (home, chosen) = (self.codex_home.clone(), chosen_model.clone());
+            move |model: Option<&str>| limits::codex_default_effort(&home, model.or(chosen.as_deref()))
+        });
         let parser = match turn {
             Some(turn) => Parser::new(style).with_turn(turn),
             None => Parser::new(style),
         };
+        let parser = match effort_default {
+            Some(default) => parser.with_effort_default(default),
+            None => parser,
+        }.resuming(resume.is_some());
         if let Err(e) = self.spawn(id, cmd, parser, input, None) {
             // the agent never got this turn's handoff, so its next turn is told those turns again
             self.roll_back_turn(id, agent, heard, untold);
@@ -2993,6 +3179,7 @@ impl Session {
         }
         let (tx, cancel, pid) = (self.tx.clone(), self.jobs[id - 1].cancel.clone(), child.id());
         let gate = self.jobs[id - 1].gate.clone();
+        let watch = self.jobs[id - 1].retry.clone();
         let stdout = child.stdout.take();
         thread::spawn(move || {
             // An agent's raw stream; a pipeline's would only copy its trace.jsonl.
@@ -3005,6 +3192,10 @@ impl Session {
                         stop_group(pid, Duration::from_secs(3), false); // fail closed: stop the turn now
                     }
                     let _ = tx.send(Event::Note(id, note));
+                }
+                if style == Style::Codex {
+                    let mut w = watch.lock().unwrap_or_else(|e| e.into_inner());
+                    (w.since, w.last) = parser.retry_state().map_or((None, String::new()), |(s, l)| (Some(s), l));
                 }
                 for line in parser.take_writes() {
                     if let Some(pipe) = &closer {
@@ -3090,9 +3281,15 @@ impl Session {
             for note in parser.leftover() {
                 let _ = tx.send(Event::Note(id, note));
             }
+            // Set under the watch's lock before the process is reaped: the runner signals under the same lock, so it
+            // either signals a process that is still there or sees `done` and leaves it alone.
+            watch.lock().unwrap_or_else(|e| e.into_inner()).done = true;
             let exit = child.wait();
+            let stalled = watch.lock().unwrap_or_else(|e| e.into_inner()).stalled.clone();
             let status = if cancel.load(Ordering::SeqCst) {
                 Status::Cancelled
+            } else if let Some(reason) = stalled {
+                Status::Failed(reason)
             } else if let Err(reason) = parser.finish() {
                 Status::Failed(reason)
             } else {
@@ -3109,6 +3306,12 @@ impl Session {
             };
             if style != Style::Trace && !parser.reply().is_empty() {
                 let _ = fs::write(dir.join("reply.md"), parser.reply());
+            }
+            // Claude may say the session it was asked to resume is gone on its stderr alone, and exit with no result:
+            // only a failed turn that resumed one is told so.
+            if style == Style::Claude && parser.was_resumed() && matches!(status, Status::Failed(_))
+                && (parser.lost_session_seen() || fs::read_to_string(dir.join("stderr.txt")).is_ok_and(|e| parse::mentions_lost_session(&e))) {
+                let _ = tx.send(Event::Note(id, Note::ResumeLost));
             }
             let _ = tx.send(Event::Ended(id, status));
         });
@@ -3141,6 +3344,13 @@ impl Session {
         let base = match self.jobs[id - 1].kind { Kind::Agent { agent, .. } => self.base_median(agent), _ => None };
         let job = &mut self.jobs[id - 1];
         job.elapsed = Some(job.started.elapsed());
+        // The monotonic clock stops while the computer sleeps and the wall clock does not: a turn whose wall time ran
+        // more than 60 s past its own elapsed time had the computer asleep under it, and a connection that broke then
+        // is the sleep's doing, not the backend's.
+        let slept = job.wall_start.elapsed().ok().and_then(|wall| awake::slept_secs(job.started.elapsed(), wall));
+        if let Some(secs) = slept {
+            job.push_log(format!("the computer slept for ~{} min during this turn", (secs + 30) / 60));
+        }
         job.activity = match &status {
             Status::Done => parse::short(&reply, 80),
             Status::Failed(reason) => reason.clone(),
@@ -3160,7 +3370,8 @@ impl Session {
         if matches!(job.kind, Kind::Agent { .. }) && job.live.total() > 0 {
             job.uncounted += 1;
         }
-        if job.counted || used.total() > 0 || unknown {
+        // A turn that ran into a limit is a row too, with nothing used: /usage says which limit was hit and when it ends.
+        if job.counted || used.total() > 0 || unknown || job.limit.is_some() {
             let who = match job.kind { Kind::Agent { agent, .. } => agent.name().to_string(), Kind::Ringo { .. } => "ringo".into() };
             let at = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
             // What the counts are of: the tier (it sets the effort), the model when the agent names it, a pipeline's
@@ -3203,8 +3414,21 @@ impl Session {
                     record["record_whole_bytes"] = whole.into();
                 }
             }
+            if let Some(base) = job.first_base {
+                record["ctx_first_base"] = base.into();
+            }
+            if let Some(version) = &job.cli_version {
+                record["cli_version"] = version.as_str().into(); // what `ledger.py base` groups by
+            }
+            if let Some(secs) = slept {
+                record["host_slept_s"] = secs.into();
+            }
             if job.uncounted > 0 {
                 record["uncounted_calls"] = job.uncounted.into(); // the counts below are of its other calls alone
+            }
+            // The limit the turn ran into; additive, as the fields above (older rows lack it and readers ignore it).
+            if let Some(limit) = &job.limit {
+                record["limit"] = serde_json::json!({"kind": limit.kind.name(), "resets_at": limit.resets_at});
             }
             match unknown {
                 true => record["unknown"] = true.into(),
@@ -3213,9 +3437,7 @@ impl Session {
                     record[key] = n.into();
                 },
             }
-            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.root.join("usage.jsonl")) {
-                let _ = writeln!(f, "{record}");
-            }
+            append_row(&self.root.join("usage.jsonl"), &record);
         }
         // A turn that failed before its agent counted a token, took a step or said a word never took its message
         // in: what its start marked as told goes back, so the agent's next turn is told it again. Before, only a
@@ -3232,6 +3454,11 @@ impl Session {
             if let Some(untold) = untold {
                 self.told.entry(agent).or_insert(untold);
             }
+        }
+        // Claude's saved conversation is gone: forget it, so this agent's next turn starts fresh from Ringo's record
+        // of the conversation instead of resuming the dead session again (and failing the same way).
+        if self.jobs[id - 1].resume_lost && let Kind::Agent { agent, write: false } = self.jobs[id - 1].kind {
+            self.start_over(agent);
         }
         let job = &mut self.jobs[id - 1];
         job.asks.clear(); // nobody is waiting for these answers any more
@@ -3306,8 +3533,53 @@ impl Session {
     }
 
     /// Folds pending events into the jobs; true when anything changed.
+    /// Hold the computer awake while a backend process runs and the owner is not the one being waited on.
+    fn keep_awake(&mut self) {
+        let wanted = self.jobs.iter().any(|j| j.running() && j.pid.is_some() && j.asks.is_empty());
+        let line = self.awake.as_mut().and_then(|a| a.tick(wanted, Instant::now()));
+        self.say_awake(line);
+    }
+
+    /// Gives a keep-awake warning to the job that is running. With none running (the helper died during the grace
+    /// after the last turn, and the hold is then given up for the session) the warning is kept, and the next job to
+    /// start gets it in its log, so the owner is not left with no hold and no reason.
+    fn say_awake(&mut self, line: Option<String>) {
+        let Some(line) = line else { return };
+        match self.jobs.iter_mut().rev().find(|j| j.running()) {
+            Some(job) => job.push_log(line),
+            None => self.awake_note = Some(line),
+        }
+    }
+
+    /// Stops a Codex turn that has been retrying for `CODEX_RETRY_STALL` with no progress at `now`, with its last
+    /// error as the failure. The parser counts the same ten minutes when another retry error arrives; this is the
+    /// look from outside for the turn that retries and then says nothing more. `now` is a parameter so a test can say
+    /// what time it is.
+    pub fn check_retry_stalls(&mut self, now: Instant) {
+        for job in self.jobs.iter_mut().filter(|j| j.running()) {
+            let Some(pid) = job.pid else { continue };
+            let stalled = {
+                let mut w = job.retry.lock().unwrap_or_else(|e| e.into_inner());
+                match w.since {
+                    Some(since) if !w.done && w.stalled.is_none() && now.saturating_duration_since(since) >= limits::CODEX_RETRY_STALL => {
+                        let message = limits::retry_stall_message(&w.last);
+                        w.stalled = Some(message.clone());
+                        // still under the lock: the process cannot have been reaped, so its pid is still its own
+                        stop_group(pid, Duration::from_secs(3), false);
+                        Some(message)
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(message) = stalled {
+                job.push_log(format!("stopping: {message}"));
+            }
+        }
+    }
+
     pub fn pump(&mut self) -> bool {
         let mut changed = self.take_asks();
+        self.keep_awake();
         while let Ok(event) = self.rx.try_recv() {
             changed = true;
             match event {
@@ -3391,6 +3663,7 @@ impl Session {
                             }
                         }
                         Note::Model(model) => job.model = Some(model),
+                        Note::CliVersion(version) => job.cli_version = Some(version),
                         Note::Uncounted => job.uncounted += 1,
                         Note::Tokens(t) | Note::TokensSoFar(t) => {
                             // A resumed Codex or agy turn reports its conversation's usage so far (Codex 16,829
@@ -3502,7 +3775,9 @@ impl Session {
                                 if job.fresh_thread && !job.measured && n > 0 {
                                     job.measured = true;
                                     let bases = self.bases.entry(agent).or_default();
-                                    bases.push_back(n.saturating_sub(job.sent_bytes / 4).max(1_000));
+                                    let base = n.saturating_sub(job.sent_bytes / 4).max(1_000);
+                                    job.first_base = Some(base);
+                                    bases.push_back(base);
                                     while bases.len() > 3 {
                                         bases.pop_front();
                                     }
@@ -3543,6 +3818,21 @@ impl Session {
                         }
                         Note::Fail(reason) => job.push_log(format!("stopping: {reason}")),
                         Note::Limits(info) => self.claude_limits = Some(info),
+                        Note::CodexLimits(snapshot) => {
+                            job.rate_limits = Some(snapshot.clone());
+                            self.codex_limits = Some(snapshot);
+                        }
+                        Note::Limit(limit) => {
+                            job.push_log(format!("{}: {} ({})", limit.agent, limit.describe(), limit.message));
+                            job.limit = Some(limit);
+                        }
+                        Note::ResumeLost => {
+                            if !job.resume_lost {
+                                job.push_log("the saved conversation is gone from the agent's own store: the next turn starts \
+                                              fresh from Ringo's record of this one".into());
+                            }
+                            job.resume_lost = true;
+                        }
                         Note::Permission(_) | Note::Unserved(_) => {} // handled above
                     }
                     // Provider-backed delivery, not process creation: a model action, or usage this turn added.
@@ -3552,6 +3842,8 @@ impl Session {
                 }
             }
         }
+        // after the events above, so a job that ended (its `Ended` was queued) is not looked at as still running
+        self.check_retry_stalls(Instant::now());
         changed
     }
 
@@ -3562,14 +3854,19 @@ impl Session {
         (windows.remove(0), first)
     }
 
+    /// How many non-blank lines of `usage.jsonl` are not a readable JSON row (a torn or hand-edited line). Every
+    /// reader skips them, so /usage says how many there were rather than silently under-counting.
+    pub fn unreadable_usage_rows(&self) -> usize {
+        read_usage_rows(&self.root.join("usage.jsonl")).1
+    }
+
     /// The same counts for each of several windows in one read of `usage.jsonl`: /usage asks for a day and a week,
     /// and the record is one short line a job (a year of daily use is a few MB).
     pub fn used_windows(&self, secs: &[u64]) -> (Vec<BTreeMap<String, Tokens>>, Option<u64>) {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let mut by: Vec<BTreeMap<String, Tokens>> = secs.iter().map(|_| BTreeMap::new()).collect();
         let mut first = None;
-        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
             let at = r["at"].as_u64().unwrap_or(0);
             first = first.or(Some(at));
             let age = now.saturating_sub(at);
@@ -3584,6 +3881,21 @@ impl Session {
         (by, first)
     }
 
+    /// The limits turns ran into in the last `secs` seconds, from `usage.jsonl` (every session's): for each agent the
+    /// latest one, as (agent, kind, when it was hit, when it starts over when known). A row without a `limit` is
+    /// not one; rows from before the field was added read as they always did.
+    pub fn limits_hit_since(&self, secs: u64) -> Vec<(String, String, u64, Option<u64>)> {
+        let now = limits::unix_now();
+        let mut last: BTreeMap<String, (String, u64, Option<u64>)> = BTreeMap::new();
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
+            let (Some(kind), at) = (r.pointer("/limit/kind").and_then(|k| k.as_str()), r["at"].as_u64().unwrap_or(0)) else { continue };
+            if now.saturating_sub(at) <= secs && last.get(r["agent"].as_str().unwrap_or("?")).is_none_or(|(_, before, _)| *before <= at) {
+                last.insert(r["agent"].as_str().unwrap_or("?").to_string(), (kind.to_string(), at, r.pointer("/limit/resets_at").and_then(|v| v.as_u64())));
+            }
+        }
+        last.into_iter().map(|(agent, (kind, at, resets))| (agent, kind, at, resets)).collect()
+    }
+
     /// The live job whose durable private folder is `dir`. A job from an earlier shell has no entry: its record and
     /// evidence on disk are the only evidence left.
     pub fn job_by_dir(&self, dir: &Path) -> Option<&Job> {
@@ -3595,8 +3907,7 @@ impl Session {
     pub fn job_usage(&self, dir: &Path) -> JobUsage {
         let wanted = dir.to_string_lossy();
         let mut found = None;
-        for line in fs::read_to_string(self.root.join("usage.jsonl")).unwrap_or_default().lines() {
-            let Ok(r) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
             if r["job"].as_str() != Some(wanted.as_ref()) {
                 continue;
             }
@@ -4289,9 +4600,16 @@ pub fn claude_plan_from_event(info: &serde_json::Value) -> Plan {
     plan
 }
 
-/// Codex's `account/rateLimits/read` answer (codex-cli 0.166.0).
+/// Codex's `account/rateLimits/read` answer (codex-cli 0.170.0). The answer has the plan's own limit twice: as
+/// `rateLimitsByLimitId.codex` and, as the older single bucket, `rateLimits`. The keyed one is preferred. A `rateLimits`
+/// that names another limit than "codex" (a model's own bucket) is not the plan's and gives no gauges. Besides the two
+/// windows, what the snapshot says of the account's credits, its spend limit and the limit that was reached is told.
 pub fn codex_plan(r: &serde_json::Value) -> Plan {
-    let limits = &r["rateLimits"];
+    let limits = match r.pointer("/rateLimitsByLimitId/codex").filter(|l| l.is_object()) {
+        Some(keyed) => keyed,
+        None if r["rateLimits"]["limitId"].as_str().is_some_and(|id| id != "codex") => return Plan::default(),
+        None => &r["rateLimits"],
+    };
     let mut plan = Plan { name: limits["planType"].as_str().unwrap_or("").to_string(), ..Plan::default() };
     for key in ["primary", "secondary"] {
         let w = &limits[key];
@@ -4307,6 +4625,27 @@ pub fn codex_plan(r: &serde_json::Value) -> Plan {
     }
     if let Some(n) = r.pointer("/rateLimitResetCredits/availableCount").and_then(|n| n.as_u64()).filter(|n| *n > 0) {
         plan.notes.push(format!("{n} full reset{} left", if n == 1 { "" } else { "s" }));
+    }
+    let credits = &limits["credits"];
+    if credits["unlimited"] == true {
+        plan.notes.push("credits unlimited".into());
+    } else if credits["hasCredits"] == true && let Some(balance) = credits["balance"].as_str() {
+        plan.notes.push(format!("credits balance {balance}"));
+    }
+    // a spend limit the account's owner set: how much of it is used, and when it starts over
+    let spend = &limits["individualLimit"];
+    if let (Some(used), Some(limit)) = (spend["used"].as_str(), spend["limit"].as_str()) {
+        let now = limits::unix_now();
+        let ends = spend["resetsAt"].as_u64().filter(|r| *r > now)
+            .map(|r| format!(", starts over {}", limits::fmt_reset(r, now, limits::local_offset(now)))).unwrap_or_default();
+        let left = spend["remainingPercent"].as_i64().map(|p| format!(", {p}% left")).unwrap_or_default();
+        plan.notes.push(format!("spend limit {used} of {limit} used{left}{ends}"));
+    }
+    if limits["spendControlReached"] == true {
+        plan.notes.push("spend limit reached".into());
+    }
+    if let Some(reached) = limits["rateLimitReachedType"].as_str() {
+        plan.notes.push(format!("limit reached: {}", reached.replace('_', " ")));
     }
     plan
 }
@@ -4546,6 +4885,43 @@ mod tests {
         assert!(inline.starts_with("#1 · the owner to codex: constraint-0:"));
         assert!(inline.contains("(cut; the whole is in the record)"));
         assert!(whole.contains("END-OF-FAILURE") && whole.contains("file-4999-"));
+    }
+
+    #[test]
+    fn a_long_session_keeps_the_owners_first_request_and_names_the_range_it_omitted() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..60 {
+            let task = if n == 0 { format!("ORIGINAL-REQUEST {}", "x".repeat(5000)) } else { format!("turn-{n}: {}", "界".repeat(700)) };
+            let id = record_turn(&mut s, &task);
+            s.jobs[id - 1].talk = true;
+            fs::write(s.jobs[id - 1].dir.join("reply.md"), "r".repeat(3000)).unwrap();
+        }
+        let (inline, whole) = s.fresh_record(agent, &s.lane(agent, s.jobs.len() + 1), 0);
+        assert!(inline.len() <= RECORD_BYTES, "{} bytes", inline.len());
+        assert!(inline.contains("#1 · the owner to codex: ORIGINAL-REQUEST"), "turn #1 is pinned");
+        let pin_end = inline.find("\n(#2 to #").expect("the notice follows the pin, naming #2 to #k");
+        assert!(inline[..pin_end].len() <= OWNER_PIN_BYTES + 64, "the pin is bounded");
+        assert!(inline[..pin_end].contains("(the rest of #1 is in the whole record)"));
+        let k: usize = inline[pin_end..].split("to #").nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        assert!(inline.contains(&format!("#{}", k + 1)) && !inline.contains(&format!("#{k} · the owner")));
+        assert!(inline.contains(&format!(", {} earlier turns", k - 1)), "the count is #2..=#k: {}", &inline[pin_end..pin_end + 80]);
+        assert!(inline.contains("turn-59:"));
+        assert!(whole.contains(&"x".repeat(5000)), "the whole record keeps all of it");
+    }
+
+    #[test]
+    fn a_short_session_record_has_no_pin_and_is_unchanged() {
+        let mut s = record_session();
+        let agent = Agent::from_name("codex").unwrap();
+        for n in 0..3 {
+            let id = record_turn(&mut s, &format!("small task {n}"));
+            s.jobs[id - 1].talk = true;
+        }
+        let (inline, _) = s.fresh_record(agent, &s.lane(agent, 4), 0);
+        assert!(inline.starts_with("#1 · the owner to codex: small task 0\n"));
+        assert_eq!(inline.matches("#1 ·").count(), 1, "told once, not pinned again");
+        assert!(!inline.contains("earlier turns"));
     }
 
     #[test]
@@ -4915,7 +5291,8 @@ mod tests {
                 fs::write(j.dir.join("reply.md"), "x".repeat(k)).unwrap();
             }
             let (inline, _, complete) = s.record_full(&s.lane(agent, 11), 0);
-            if !inline.contains("#1 · the owner") {
+            // a turn left out ends the scan (turn #1 stays in the record, pinned, so it no longer says so)
+            if inline.contains("earlier turns, are in the whole record") || inline.contains("(the rest of #1 is") {
                 break;
             }
             if !inline.contains(READ_LINE_PREFIX) {
@@ -4987,6 +5364,28 @@ mod tests {
         assert_eq!(plan.name, "plus");
         assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 41.0), ("week", 34.0)]);
         assert_eq!(plan.notes, ["2 full resets left"]);
+        // codex-cli 0.170.0: the plan's own limit is `rateLimitsByLimitId.codex`, preferred over the older single
+        // bucket `rateLimits`, which may be another limit's (a model's own, with its own windows)
+        let keyed = serde_json::json!({
+            "rateLimits": {"limitId": "codex_bengalfox", "planType": "plus", "primary": {"usedPercent": 3, "windowDurationMins": 300}},
+            "rateLimitsByLimitId": {"codex_bengalfox": {"limitId": "codex_bengalfox", "primary": {"usedPercent": 3, "windowDurationMins": 300}},
+                "codex": {"limitId": "codex", "planType": "pro", "primary": {"usedPercent": 77, "windowDurationMins": 300, "resetsAt": 1_793_594_030u64},
+                          "secondary": {"usedPercent": 12, "windowDurationMins": 10080},
+                          "credits": {"hasCredits": true, "unlimited": false, "balance": "42.50"},
+                          "individualLimit": {"limit": "100", "used": "58", "remainingPercent": 42, "resetsAt": 1u64},
+                          "rateLimitReachedType": "workspace_member_credits_depleted", "spendControlReached": true}}});
+        let plan = codex_plan(&keyed);
+        assert_eq!(plan.name, "pro");
+        assert_eq!(plan.windows.iter().map(|w| (w.name.as_str(), w.percent)).collect::<Vec<_>>(), [("5 hours", 77.0), ("week", 12.0)]);
+        assert_eq!(plan.notes, ["credits balance 42.50", "spend limit 58 of 100 used, 42% left", "spend limit reached",
+                                "limit reached: workspace member credits depleted"]);
+        // only another limit's bucket: no gauges, not the plan's
+        let other = serde_json::json!({"rateLimits": {"limitId": "codex_bengalfox", "primary": {"usedPercent": 3, "windowDurationMins": 300}}});
+        assert_eq!(codex_plan(&other), Plan::default());
+        // unlimited credits; a bucket with no limitId at all is taken as the plan's, as before
+        let unlimited = codex_plan(&serde_json::json!({"rateLimits": {"credits": {"hasCredits": false, "unlimited": true},
+                                                                    "primary": {"usedPercent": 1, "windowDurationMins": 300}}}));
+        assert_eq!((unlimited.windows.len(), unlimited.notes.as_slice()), (1, &["credits unlimited".to_string()][..]));
         // a window with no figure for how much is used is left out: unknown is not 0% used
         let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
         assert_eq!(claude_plan(&json(r#"{"rate_limits": {"limits": [{"kind": "session"}, {"kind": "weekly_all", "percent": 59}]}}"#))
@@ -5314,11 +5713,108 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_usage_rows_never_interleave_and_unreadable_ones_are_counted() {
+        let (s, _) = ledger_session("codex", 0);
+        let path = s.root.join("usage.jsonl");
+        let _ = fs::remove_file(&path);
+        let writers: Vec<_> = (0..8).map(|w| {
+            let path = path.clone();
+            thread::spawn(move || for n in 0..50 {
+                // a long row (past one pipe-sized write) is the one a plain writeln! could split
+                append_row(&path, &serde_json::json!({"at": n, "agent": format!("w{w}"), "pad": "x".repeat(6000)}));
+            })
+        }).collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 400);
+        assert!(text.ends_with('\n'));
+        assert_eq!(s.unreadable_usage_rows(), 0, "every row is whole");
+        // a torn line and a blank line: the torn one is counted, the blank one is not
+        fs::write(&path, format!("{text}{{\"at\": 1, \"agent\"\n\n[1]\n")).unwrap();
+        assert_eq!(s.unreadable_usage_rows(), 2);
+    }
+
+    #[test]
+    fn a_keep_awake_warning_with_no_job_running_goes_to_the_next_job() {
+        let (mut s, _) = ledger_session("codex", 0);
+        s.jobs.clear(); // none of the session's earlier jobs is running
+        s.say_awake(Some("could not keep the computer awake: powershell.exe exited".into()));
+        assert!(s.awake_note.is_some(), "kept, with no job to say it to");
+        let id = s.new_job(Kind::Ringo { command: "x".into() }, "next").unwrap();
+        assert!(s.job(id).unwrap().log.iter().any(|l| l.contains("powershell.exe exited")), "{:?}", s.job(id).unwrap().log);
+        assert!(s.awake_note.is_none(), "said once");
+        // with a job running it goes straight to that job
+        s.say_awake(Some("second".into()));
+        assert!(s.job(id).unwrap().log.iter().any(|l| l == "second") && s.awake_note.is_none());
+    }
+
+    #[test]
+    fn a_line_that_is_not_utf8_costs_that_line_alone() {
+        let (s, _) = ledger_session("codex", 0);
+        let path = s.root.join("usage.jsonl");
+        let now = limits::unix_now();
+        let mut bytes = format!("{{\"at\":{now},\"agent\":\"codex\",\"input\":5,\"output\":1}}\n").into_bytes();
+        bytes.extend_from_slice(b"{\"at\":1,\"agent\":\"x\xff\xfe\"}\n"); // lossy: still a row, with replacement characters
+        bytes.extend_from_slice(b"\xff\xfe not json\n");
+        bytes.extend_from_slice(format!("{{\"at\":{now},\"agent\":\"codex\",\"input\":2,\"output\":1,\"limit\":{{\"kind\":\"usage\"}}}}\n").as_bytes());
+        fs::write(&path, bytes).unwrap();
+        assert_eq!(s.unreadable_usage_rows(), 1);
+        assert_eq!(s.used_since(60).0["codex"].total(), 9, "both good rows count");
+        assert_eq!(s.limits_hit_since(60).len(), 1);
+    }
+
+    #[test]
     fn attribution_matches_decompose_definitions() {
         assert_eq!(attribute(&[12_000, 15_000, 9_000], 10_000), Some((29_000, 4_000, 3_000)));
         // a first call below the base: fixed and growth share the difference (decompose.py's surplus)
         assert_eq!(attribute(&[8_000, 20_000], 10_000), Some((18_000, 0, 12_000)));
         assert_eq!(attribute(&[], 1), None);
+    }
+
+    #[test]
+    fn a_row_names_the_cli_version_and_the_base_its_first_call_measured() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        let id = s.new_job(Kind::Agent { agent, write: false }, "version").unwrap();
+        s.jobs[id - 1].fresh_thread = true;
+        s.jobs[id - 1].sent_bytes = 4_000; // ~1,000 tokens sent
+        s.tx.send(Event::Note(id, Note::CliVersion("0.170.0".into()))).unwrap();
+        s.tx.send(Event::Note(id, Note::Context(14_000))).unwrap();
+        s.pump();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!((row["cli_version"].as_str(), row["ctx_first_base"].as_u64()), (Some("0.170.0"), Some(13_000)));
+        // a resumed turn measures no base and, if its CLI said nothing, names no version: old rows read the same
+        let id = s.new_job(Kind::Agent { agent, write: false }, "resumed").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert!(row.get("cli_version").is_none() && row.get("ctx_first_base").is_none());
+    }
+
+    #[test]
+    fn a_turn_the_computer_slept_through_says_so_in_its_row_and_log() {
+        let (mut s, agent) = ledger_session("codex", 0);
+        let tokens = Tokens { input: 100, cache_read: 0, cache_write: 0, output: 10 };
+        let id = s.new_job(Kind::Agent { agent, write: false }, "slept").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        // the wall clock ran 1,900 s while the monotonic one ran about none
+        s.jobs[id - 1].wall_start = SystemTime::now() - Duration::from_secs(1900);
+        s.end_with(id, Status::Done, "done".into());
+        let row = last_usage_row(&s);
+        assert_eq!(row["host_slept_s"].as_u64().map(|n| n / 60), Some(31));
+        assert!(s.jobs[id - 1].log.iter().any(|l| l.contains("the computer slept for ~32 min")), "{:?}", s.jobs[id - 1].log);
+        // an ordinary turn has no such field
+        let id = s.new_job(Kind::Agent { agent, write: false }, "awake").unwrap();
+        s.jobs[id - 1].counted = true;
+        s.jobs[id - 1].tokens = tokens;
+        s.end_with(id, Status::Done, "done".into());
+        assert!(last_usage_row(&s).get("host_slept_s").is_none());
     }
 
     #[test]
