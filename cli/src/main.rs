@@ -2,6 +2,7 @@
 //! runtime unless a release decides otherwise (then, and for the other commands, Ringo's Python harness `ringo.py`
 //! runs).
 
+mod connect;
 mod setup;
 mod theme;
 mod tui;
@@ -18,6 +19,7 @@ ringo: Ringo's shell and harness.
   ringo                     open the shell (on a terminal); type /help there
   ringo --resume | -r       go on with a conversation from this folder: after a quit, a crash or a closed terminal
   ringo setup               add a coding agent (codex, claude, agy, grok, or one you name) and sign in
+  ringo connect             manage connected services (GitHub, Git, ClickUp...) and web access (yes/no)
   ringo review|design|work ...
                             run a Ringo pipeline natively: the same requests as python3 ringo.py ...
                             (with release state, ringo.py decides which runtime runs it)
@@ -59,6 +61,7 @@ fn main() -> ExitCode {
             setup::run();
             ExitCode::SUCCESS
         }
+        Some("connect") => connect::run_cli(&args[1..]),
         Some("-V" | "--version") => {
             match &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)] {
                 "" => println!("ringo {}", env!("CARGO_PKG_VERSION")),

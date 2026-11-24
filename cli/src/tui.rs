@@ -68,6 +68,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/drop N", "remove job N's worktree"),
     ("/kill N", "stop job N"),
     ("/setup", "add an agent and sign in to it"),
+    ("/connect [NAME|web yes|no]", "manage connected services (GitHub, Git, ClickUp...) and web access yes/no"),
     ("/update", "update the agents found out of date, and check the pipelines' release"),
     ("/update approve", "move the pipelines to the release /update checked"),
     ("/restart", "start Ringo again (an update applies), the conversations going on"),
@@ -292,6 +293,7 @@ pub enum Cmd {
     Task(TaskCmd),
     Help,
     Setup,
+    Connect(String),
     Theme(Option<String>),
     /// `/update` (None) or `/update auto on|off`.
     Update(Option<bool>),
@@ -471,6 +473,7 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "restart" => Ok(Cmd::Restart),
             "setup" => Ok(Cmd::Setup),
+            "connect" => Ok(Cmd::Connect(tail.into())),
             "undo" => Ok(Cmd::Undo),
             "copy" => Ok(Cmd::Copy),
             "attach" => Ok(Cmd::Attach(tail.into())),
@@ -1683,6 +1686,7 @@ struct App {
     updated: Option<String>,
     staged: Option<PathBuf>,
     setup: bool,
+    access: crate::connect::AccessConfig,
     label: String,
     agents: Vec<Agent>,
     theme: Theme,
@@ -1800,7 +1804,7 @@ impl App {
               fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, menu_off: false, menu_page: 6, choice: 0, ended: Vec::new(),
-              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
+              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, access: crate::connect::AccessConfig::default(), label, agents, theme,
               started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
               revision: None, revision_id: None, task_turns: Default::default(), quota: None, reviewer: None }
@@ -3544,6 +3548,12 @@ impl App {
                 self.setup = true;
                 None
             }
+            Cmd::Connect(args) => {
+                let out = crate::connect::handle_shell(&args, &mut self.access, &self.s.repo)?;
+                self.s.web_access = self.access.web_access;
+                self.s.paused_connectors = self.access.paused_keywords();
+                Some(out)
+            }
             Cmd::Backend(spec) => {
                 self.s.backend = spec;
                 Some(format!("  Ringo pipelines now use --backend {}", self.s.backend))
@@ -4764,6 +4774,9 @@ pub fn run(start: Start) -> ExitCode {
             app.s.models.insert(agent, model.to_string());
         }
     }
+    app.access = crate::connect::AccessConfig::from_settings(&saved);
+    app.s.web_access = app.access.web_access;
+    app.s.paused_connectors = app.access.paused_keywords();
     match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
             if let Some(why) = app.s.selected_task_error.take() {

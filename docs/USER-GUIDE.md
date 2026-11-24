@@ -358,6 +358,7 @@ after every turn, so a crash loses at most the turn it cut short.
 | Command | What it does |
 |---|---|
 | `/setup` | add an agent and sign in to it |
+| `/connect [NAME\|web yes\|no]` | manage connected services (GitHub, Git, ClickUp...) and web access yes/no |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens. If you use releases, it also checks whether the pipelines' release is behind this Ringo |
 | `/update approve` | move the pipelines to the release `/update` checked |
 

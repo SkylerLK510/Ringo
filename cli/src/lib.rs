@@ -472,10 +472,19 @@ const CODEX_CONNECTOR_NOTE: &str = "\n\n(Ringo: this reaches a connector. Ask fo
 
 /// Whether a task names a service only the owner's connectors reach. An identifier (`email_parser`) is one word.
 pub fn names_connector(task: &str) -> bool {
+    names_connector_allowed(task, &[])
+}
+
+/// Same as `names_connector`, excluding connector keywords paused by the user in `/connect`.
+pub fn names_connector_allowed(task: &str, paused: &[String]) -> bool {
     let lower = task.to_lowercase();
     let words: Vec<&str> = lower.split(|c: char| !(c.is_alphanumeric() || c == '_')).filter(|w| !w.is_empty()).collect();
-    words.iter().any(|w| CONNECTOR_WORDS.contains(w))
-        || CONNECTOR_PHRASES.iter().any(|p| words.windows(2).any(|w| w.join(" ") == *p))
+    let is_paused = |w: &str| paused.iter().any(|p| p == w);
+    let word_hit = words.iter().any(|w| CONNECTOR_WORDS.contains(w) && !is_paused(w));
+    let phrase_hit = CONNECTOR_PHRASES.iter().any(|p| {
+        !is_paused("gdrive") && !is_paused("google") && words.windows(2).any(|w| w.join(" ") == *p)
+    });
+    word_hit || phrase_hit
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -803,6 +812,10 @@ pub struct Session {
     pub mode: Mode,
     /// How hard they think (see `Tier`).
     pub tier: Tier,
+    /// Harness-level web/internet access toggle (`/connect web yes|no`), overriding underlying model configs.
+    pub web_access: bool,
+    /// Connector keywords paused by `/connect pause NAME` so Ringo withholds them from agent turns.
+    pub paused_connectors: Vec<String>,
     /// The model each agent's turns run on, where the owner chose one (`/model`): a name the agent's own program
     /// takes (Claude Code's `--model`, Codex's thread `model`). None for an agent: its own default.
     pub models: HashMap<Agent, String>,
@@ -1293,7 +1306,7 @@ impl Session {
                      #[cfg(feature = "turnrun")]
                      trial_broker: None,
                      returned: Vec::new(), start: 1,
-                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, root: resolved(root), claude_limits: None, codex_limits: None, awake_note: None, always_ask, allowed: BTreeSet::new(),
+                     usage_so_far: HashMap::new(), usage_synced: HashSet::new(), mode: Mode::Ask, tier: Tier::Standard, web_access: true, paused_connectors: Vec::new(), root: resolved(root), claude_limits: None, codex_limits: None, awake_note: None, always_ask, allowed: BTreeSet::new(),
                      routed: VecDeque::new(), tx, rx,
                      awake: (!cfg!(test) && !awake::disabled(std::env::var("RINGO_KEEP_AWAKE").ok().as_deref()))
                          .then(|| awake::KeepAwake::new(awake::System::new(is_wsl()))) })
@@ -2453,7 +2466,7 @@ impl Session {
         // put back if the turn never starts: what the handoff took as heard, and the turns before a restart it took as told
         let (heard, untold) = (self.heard.get(&agent).cloned(), self.told.get(&agent).cloned());
         let connectors = prompt.trim() != "/compact"
-            && (names_connector(prompt) || (!write && self.reached(agent, id)));
+            && (names_connector_allowed(prompt, &self.paused_connectors) || (!write && self.reached(agent, id)));
         if !write {
             self.jobs[id - 1].lane = self.separate.then_some(agent);
             if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
@@ -2581,11 +2594,13 @@ impl Session {
                     self.jobs[id - 1].can_ask = true;
                 }
                 let auto = edits && self.mode == Mode::Auto;
+                let net = auto && self.web_access;
                 if edits {
-                    // Auto: the sandbox has the network, for git, gh and package installs, and Codex's own reviewer
-                    // answers its approval requests. Ask: no network, said outright, whatever an earlier turn had.
-                    cmd.args(["-c", &format!("sandbox_workspace_write.network_access={auto}")]);
+                    // Auto + web_access: sandbox has network; otherwise strictly off, overriding user Codex config.
+                    cmd.args(["-c", &format!("sandbox_workspace_write.network_access={net}")]);
                 }
+                // Harness-level override of Codex web_search setting (`/connect web yes|no`).
+                cmd.args(["-c", if self.web_access { "web_search=\"live\"" } else { "web_search=\"disabled\"" }]);
                 cmd.args(["-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\""]);
                 // Codex cannot stop to ask here, so the ask tool and its mode instructions go, and analytics (its
                 // upload delays the exit by about 0.33 s). Plugins and apps (documents, browser and computer-use
@@ -2740,6 +2755,10 @@ impl Session {
                 let mut deny: Vec<&str> = Vec::new();
                 if !edits {
                     deny.extend(["Bash", "Edit", "Write", "NotebookEdit"]);
+                }
+                if !self.web_access {
+                    // Harness-level override: blocks Claude web search & fetch regardless of user Claude settings.
+                    deny.extend(["WebSearch", "WebFetch"]);
                 }
                 deny.extend(OUT_OF_TURN_TOOLS);
                 if self.mode != Mode::Read {
