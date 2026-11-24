@@ -28,6 +28,16 @@ BUDGET = 400_000      # bytes of material, including the change itself and the m
 WHOLE_FILE = 16_000   # an unchanged file up to this size goes in whole; a larger one as windows around matches
 WINDOW = 15           # lines of context above and below each match in a windowed file
 LISTED = 200          # manifest lines per list before it summarizes the rest
+CHANGED_WINDOW = 25   # lines above and below each changed line in a windowed changed file (to be tuned by measurement)
+REFILL_STEPS = (60, 150)  # auto mode re-widens windowed changed files through these, then to the whole file
+LONG_LINE = 1000      # in windowed mode a longer line is cut to this many characters
+OUTLINE_LISTED = 200  # outline lines of one windowed changed file before it summarizes the rest
+MODES = ('auto', 'full', 'windowed')
+# Lock files and generated files (windowed mode): no file block, no diff section, only a stat line.
+LOCK_NAMES = frozenset({'Cargo.lock', 'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml',
+                        'poetry.lock', 'uv.lock', 'Pipfile.lock', 'composer.lock', 'Gemfile.lock', 'go.sum', 'flake.lock'})
+GENERATED_SUFFIXES = ('.min.js', '.min.css', '.map')
+GENERATED_MARKS = ('@generated', 'DO NOT EDIT')  # in a file's first five lines
 READMES = ('README.md', 'README.rst', 'README.txt', 'README')
 PROSE = {'.md', '.markdown', '.rst', '.txt', '.adoc'}  # changed prose names no symbols ('the function above...')
 # GIT_LITERAL_PATHSPECS: a changed path such as 'pages/[id].tsx' or ':x' names that file, never a glob or magic.
@@ -48,6 +58,9 @@ COMMON = KEYWORDS | {'self', 'cls', 'this', 'super', 'main', 'init', 'test', 'se
                      'const', 'static', 'public', 'private', 'protected', 'def', 'class', 'function', 'struct',
                      'impl', 'pub', 'async', 'var', 'let', 'val', 'export', 'default', 'import', 'from'}
 KIND_ORDER = ('definition', 'subclass', 'reference', 'test')
+HUNK = re.compile(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)')
+PLAIN_NAME = re.compile(r'[^"\\\s\x00-\x1f\x7f]+')  # names git prints unquoted
+PY_DEF = re.compile(r'^\s*(?:async\s+)?(?:def|class)\b')  # a Python definition line, for the outline
 
 
 class ContextError(ValueError):
@@ -180,12 +193,11 @@ def hunks(repo, mb, head, old, new, text=None):
     """(old changed line numbers, new changed line numbers, hunk header contexts, removed lines, added lines).
     text: this pair's section of the whole -U0 diff, when it was read once for every pair (see all_hunks)."""
     if text is None:
-        paths = [p for p in dict.fromkeys((old, new)) if p]
-        text = git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head, '--', *paths)
+        text = pair_diff(repo, mb, head, old, new)
     olds, news, headers, minus, plus = set(), set(), [], [], []
     started = False
     for line in text.splitlines():
-        m = re.match(r'@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)', line)
+        m = HUNK.match(line)
         if m:
             started = True
             a, b, c, d = int(m[1]), int(m[2] or 1), int(m[3]), int(m[4] or 1)
@@ -199,18 +211,45 @@ def hunks(repo, mb, head, old, new, text=None):
     return olds, news, headers, minus, plus
 
 
-def all_hunks(repo, mb, head, pairs):
-    """hunks() of every pair from one -U0 diff instead of one git process per changed file. git prints one
-    'diff --git' section per entry of changes(), in the same order; if the sections do not line up with the
-    pairs (count, or a plain path missing from its header), every pair is read on its own as before."""
-    text = git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head)
+def pair_diff(repo, mb, head, old, new):
+    """The -U0 diff of one changed pair, read on its own."""
+    paths = [p for p in dict.fromkeys((old, new)) if p]
+    return git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head, '--', *paths)
+
+
+def aligned_sections(text, pairs):
+    """One 'diff --git' section of a whole diff per pair, or None if they do not line up with the pairs (count, or a
+    plain path missing from its header). git prints one section per entry of changes(), in the same order."""
     sections = re.split(r'^(?=diff --git )', text, flags=re.M)[1:]
-    plain = re.compile(r'[^"\\\s\x00-\x1f\x7f]+')  # names git prints unquoted
     if len(sections) == len(pairs) and all(
-            not plain.fullmatch(path or '') or f' b/{path}' in section.split('\n', 1)[0]
+            not PLAIN_NAME.fullmatch(path or '') or f' b/{path}' in section.split('\n', 1)[0]
             for (old, new), section in zip(pairs, sections) for path in [new or old]):
-        return [hunks(repo, mb, head, old, new, text=section) for (old, new), section in zip(pairs, sections)]
-    return [hunks(repo, mb, head, old, new) for old, new in pairs]
+        return sections
+    return None
+
+
+def diff_texts(repo, mb, head, pairs):
+    """The -U0 diff text of every pair from one git process instead of one per changed file; if the sections do not
+    line up with the pairs, every pair is read on its own."""
+    sections = aligned_sections(git(repo, 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '-M', '-U0', mb, head), pairs)
+    return sections if sections is not None else [pair_diff(repo, mb, head, old, new) for old, new in pairs]
+
+
+def all_hunks(repo, mb, head, pairs):
+    """hunks() of every pair (see diff_texts)."""
+    return [hunks(repo, mb, head, old, new, text=text) for (old, new), text in zip(pairs, diff_texts(repo, mb, head, pairs))]
+
+
+def new_points(text):
+    """The new-side lines a -U0 diff changes, one line for a pure deletion: the line that now sits where the deleted
+    lines were (hunks() has none for it, its new-side range is empty). Callers clamp them to the file."""
+    points = set()
+    for line in text.splitlines():
+        m = HUNK.match(line)
+        if m:
+            c, d = int(m[3]), int(m[4] or 1)
+            points.update(range(c, c + d) if d else [c + 1])
+    return points
 
 
 def python_symbols(source, lines):
@@ -377,29 +416,88 @@ def rank(found):
     return sorted(found.items(), key=key)
 
 
-def windows(text, lines, room):
-    """Line-numbered windows around the matched lines, merged, as many as fit in room bytes counting each window's
-    'a-b, ' in the manifest: (text, shown spans, total spans). Lines split on '\\n' only, as git grep -n counts
-    them; str.splitlines would also split on form feeds and other separators and shift every window."""
+def line_rows(text):
+    """A file's lines: split on '\\n' only, as git grep -n counts them (str.splitlines would also split on form feeds
+    and other separators and shift every window), without a trailing '\\r' or a final empty line."""
     rows = [row.removesuffix('\r') for row in text.split('\n')]
     if rows[-1] == '':
         rows.pop()
+    return rows
+
+
+def spans_around(count, lines, window):
+    """[a, b] line spans of `window` lines above and below each line (of count lines), merged when they touch."""
     spans = []
     for n in sorted(lines):
-        a, b = max(1, n - WINDOW), min(len(rows), n + WINDOW)
+        a, b = max(1, n - window), min(count, n + window)
         if spans and a <= spans[-1][1] + 1:
             spans[-1][1] = max(spans[-1][1], b)
         else:
             spans.append([a, b])
+    return spans
+
+
+def span_text(rows, a, b):
+    return f'--- lines {a}-{b} ---\n' + ''.join(f'{i}: {rows[i - 1]}\n' for i in range(a, b + 1))
+
+
+def windows(text, lines, room):
+    """Line-numbered windows around the matched lines, merged, as many as fit in room bytes counting each window's
+    'a-b, ' in the manifest: (text, shown spans, total spans)."""
+    rows = line_rows(text)
+    spans = spans_around(len(rows), lines, WINDOW)
     out, used = [], 0
     for a, b in spans:
-        part = f'--- lines {a}-{b} ---\n' + ''.join(f'{i}: {rows[i - 1]}\n' for i in range(a, b + 1))
+        part = span_text(rows, a, b)
         cost = len(part.encode()) + len(f'{a}-{b}, ')
         if used + cost > room:
             break
         out.append(part)
         used += cost
     return ''.join(out), [f'{a}-{b}' for a, b in spans[:len(out)]], len(spans)
+
+
+def cut_line(row):
+    """A line over LONG_LINE characters, cut (minified code, data): it would fill the budget with one line."""
+    if len(row) <= LONG_LINE:
+        return row
+    return f'{row[:LONG_LINE]} \u2026[{len(row) - LONG_LINE} more characters cut]'
+
+
+def cut_long_lines(text):
+    return '\n'.join(cut_line(row) for row in text.split('\n'))
+
+
+def is_generated(path, text):
+    """A lock file, a minified or source-map file, or a file whose first five lines say it is generated."""
+    name = PurePosixPath(path).name
+    return (name in LOCK_NAMES or name.endswith(GENERATED_SUFFIXES)
+            or any(mark in line for line in text.split('\n')[:5] for mark in GENERATED_MARKS))
+
+
+def outline(rows, spans, python):
+    """The definition-like lines outside the spans, numbered, as the text after '--- outline ---'; text_symbols' own
+    detection (DEFINES, CONSTANT, SIGNATURE), plus def and class lines for Python."""
+    inside = set()
+    for a, b in spans:
+        inside.update(range(a, b + 1))
+    found = [i for i, row in enumerate(rows, 1)
+             if i not in inside and (text_symbols([], [row]) or (python and PY_DEF.match(row)))]
+    lines = ['--- outline ---', *(f'{i}: {rows[i - 1]}' for i in found[:OUTLINE_LISTED])]
+    if len(found) > OUTLINE_LISTED:
+        lines.append(f'... and {len(found) - OUTLINE_LISTED} more')
+    return '\n'.join(lines) + '\n'
+
+
+def changed_windows(path, rows, points, width):
+    """(block text after the label, shown spans 'a-b') of a large changed file: windows of +-width lines around each
+    changed line and the outline of the definitions outside them. rows are the file's lines, long ones already cut."""
+    count = len(rows)
+    spans = spans_around(count, {min(max(n, 1), count) for n in points}, width)
+    head = (f'(windowed: {count} lines at head; shown: \u00b1{width} lines around each change and the outline below; '
+            'other lines are unchanged since the merge base)\n')
+    return (head + ''.join(span_text(rows, a, b) for a, b in spans) + outline(rows, spans, path.endswith('.py')),
+            [f'{a}-{b}' for a, b in spans])
 
 
 def describe(why):
@@ -416,19 +514,45 @@ def listing(items):
     return shown or ['- none']
 
 
-def build(repo, base, head, pr_text=None, budget=BUDGET):
+def build(repo, base, head, pr_text=None, budget=BUDGET, mode='auto', changed_window=CHANGED_WINDOW):
     """The review material for base...head in repo, as one string of at most `budget` UTF-8 bytes unless the change
-    itself (PR text, diff, changed files, README) is already larger; then it has no context blocks."""
+    itself (PR text, diff, changed files, README) is already larger; then it has no context blocks.
+
+    mode: 'full' sends every changed file whole (the control of any comparison); 'windowed' sends a changed file
+    over WHOLE_FILE as windows of +-changed_window lines around its changes plus an outline, and lock and generated
+    files as a stat line; 'auto' builds 'full' and, only if the change alone is over the budget, 'windowed' instead,
+    then spends what the budget has left re-widening the windows."""
     repo = Path(repo)
     if not isinstance(budget, int) or budget <= 0:
         raise ContextError('the context budget must be a positive number of bytes')
+    if mode not in MODES:
+        raise ContextError(f'the context mode must be auto, full or windowed, not {mode!r}')
+    if not isinstance(changed_window, int) or changed_window < 0:
+        raise ContextError('the changed window must be a non-negative number of lines')
     if not repo.is_dir():
         raise ContextError(f'{repo} is not a folder')
     with Objects(repo) as objects:
-        return _build(repo, base, head, pr_text, budget, objects)
+        if mode == 'auto':
+            material, need = _build(repo, base, head, pr_text, budget, objects, False, changed_window)
+            if need <= budget:
+                return material
+            return _build(repo, base, head, pr_text, budget, objects, True, changed_window, auto_need=need)[0]
+        return _build(repo, base, head, pr_text, budget, objects, mode == 'windowed', changed_window)[0]
 
 
-def _build(repo, base, head, pr_text, budget, objects):
+def replace_generated(diff, pairs, stats):
+    """The diff with each generated or lock file's section cut to its 'diff --git' line and a stat line; stats is
+    {path: (added, deleted)}. Unchanged if the sections do not line up with the changed files."""
+    sections = aligned_sections(diff, pairs)
+    if sections is None:
+        return diff
+    return ''.join(section.split('\n', 1)[0] + f'\n(generated or lock file: +{stats[new][0]} -{stats[new][1]} lines; not shown)\n'
+                   if new in stats else section for (_, new), section in zip(pairs, sections))
+
+
+def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CHANGED_WINDOW, auto_need=None):
+    """(material, bytes of the change alone: PR text, diff, changed files, README). auto_need: set when auto mode
+    chose windowed because the full change needed that many bytes; windowed changed files are then re-widened."""
     base_id, head_id = commit(repo, base, 'base'), commit(repo, head, 'head')
     mb = git(repo, 'merge-base', base_id, head_id).strip()
     complete(repo, *dict.fromkeys((head_id, mb, base_id)))
@@ -436,11 +560,18 @@ def _build(repo, base, head, pr_text, budget, objects):
                f'{base_id}...{head_id}')
     pairs = changes(repo, mb, head_id)
     changed = [new for _, new in pairs if new]
+    detail = {}  # windowed: changed path -> (added lines, removed lines, new-side changed lines)
+    if windowed:
+        for (old, new), text in zip(pairs, diff_texts(repo, mb, head_id, pairs)):
+            if new:
+                _, _, _, minus, plus = hunks(repo, mb, head_id, old, new, text=text)
+                detail[new] = (len(plus), len(minus), new_points(text))
     parts = []
     if pr_text is not None:
         parts.append(f'=== PR description ===\n{pr_text}')
+    diff_at = len(parts)
     parts.append(f'=== change.diff ===\n{diff}')
-    submodules = []
+    submodules, wfiles, generated = [], [], {}  # wfiles: windowed changed files, in change order
     for path in changed:
         text = blob(repo, head_id, path, objects)
         if text is None:
@@ -450,24 +581,46 @@ def _build(repo, base, head, pr_text, budget, objects):
                 text = f'(submodule at commit {e[2]}; its contents are not in this repository and are not shown)\n'
             else:
                 text = '(binary or not UTF-8 text; not shown)\n'
+        elif windowed and is_generated(path, text):
+            added, deleted, _ = detail[path]
+            generated[path] = (added, deleted)
+            parts.append(f'=== {path} (generated or lock file; not shown) ===\n+{added} -{deleted} lines\n')
+            continue
+        elif windowed and len(text.encode()) > WHOLE_FILE:
+            entry = {'path': path, 'text': text, 'rows': [cut_line(r) for r in line_rows(text)],
+                     'points': detail[path][2], 'index': len(parts), 'whole': False}
+            wide(entry, window)
+            wfiles.append(entry)
+            parts.append(entry['block'])
+            continue
         parts.append(f'=== {path} (after the change) ===\n{text}')
+    if generated:
+        parts[diff_at] = f'=== change.diff ===\n{replace_generated(diff, pairs, generated)}'
     readme = next((r for r in READMES if r not in changed and (objects.read(head_id, r) or ('',))[0] == 'blob'), None)
     if readme:
         text = blob(repo, head_id, readme, objects)
         if text is not None:
             parts.append(f'=== {readme} ===\n{text}')
     required = '\n'.join(parts)
+    change_bytes = len(required.encode())
     syms, owners = symbols(repo, mb, head_id, pairs, objects)
     found = matches(repo, head_id, syms, owners, set(changed) | ({readme} if readme else set()))
 
     added, skipped, unreadable = [], [], []
     def manifest():
+        wnotes = [f"{w['path']}: lines {', '.join(w['spans'])} of {len(w['rows'])}" if w['spans']
+                  else f"{w['path']}: no changed lines of {len(w['rows'])}" for w in wfiles if not w['whole']]
         lines = ['=== context manifest ===',
                  f'Built by Ringo from git objects, read-only: base {base_id}, head {head_id}, merge-base {mb}; '
-                 f'budget {budget} bytes.',
+                 f'budget {budget} bytes' + ('; changed files: windowed' if windowed else '') + '.',
+                 *([f'(auto mode: windowed because the change alone is {auto_need} bytes, over the {budget}-byte budget)']
+                   if auto_need is not None else []),
                  'Always included: ' + ', '.join(filter(None, ['the PR description' if pr_text is not None else None,
                                                              'the three-dot diff', f'{len(changed)} changed file(s) at head',
                                                              readme])) + '.',
+                 *(['Changed files sent as windows:', *listing(wnotes),
+                    'Generated or lock files shown as a stat line:',
+                    *listing([f'{p}: +{a} -{d} lines' for p, (a, d) in generated.items()])] if windowed else []),
                  f'Changed symbols searched with word matches at head ({len(syms)}): ' + (', '.join(syms[:LISTED]) or 'none')
                  + (f', ... and {len(syms) - LISTED} more' if len(syms) > LISTED else '') + '.',
                  f'Classes of changed methods, searched for subclasses only ({len(owners)}): '
@@ -497,6 +650,8 @@ def _build(repo, base, head, pr_text, budget, objects):
         if text is None:
             used += note(unreadable, path)
             continue
+        if windowed:
+            text = cut_long_lines(text)
         if len(text.encode()) <= min(WHOLE_FILE, room):
             block, line = label + text, f'{path}: whole file; {why}'
         else:
@@ -514,11 +669,35 @@ def _build(repo, base, head, pr_text, budget, objects):
         skipped.insert(0, added.pop()['skip'])
     if len(skipped) > 1 and len(required.encode()) < budget < len(material().encode()):  # the list itself overflows
         skipped[:] = [f'{len(skipped)} unchanged file(s) that reference the change']
+    if auto_need is not None:
+        # Auto mode: the windows were the price of fitting; the context blocks are placed, so spend what is left on
+        # wider windows. Steps in order: every file at 60 lines, then at 150, then whole; a file takes a step only if
+        # the whole material still fits the budget.
+        for step in [*(s for s in REFILL_STEPS if s > window), None]:
+            for w in wfiles:
+                if w['whole']:
+                    continue
+                before = {k: w[k] for k in ('block', 'spans', 'width', 'whole')}
+                if step is None:
+                    w.update(block=f"=== {w['path']} (after the change) ===\n{w['text']}", whole=True)
+                else:
+                    wide(w, step)
+                parts[w['index']], was = w['block'], required
+                required = '\n'.join(parts)
+                if len(material().encode()) > budget:
+                    w.update(before)
+                    parts[w['index']], required = before['block'], was
     result = material()
     excess = len(result.encode()) - budget
     if excess > 0:  # the change itself (PR text, diff, changed files, README) is over budget: context blocks were
         # dropped first; the manifest says by how much instead of sending oversized material silently.
         overflow = ('Over the budget by {} bytes before this notice: required material and its manifest do not fit. Additional context '
                     'may have been omitted. A claim that rests on what is not shown is still a question.'.format(excess))
-        return '\n'.join([required, *[a['block'] for a in added], manifest() + overflow + '\n'])
-    return result
+        return '\n'.join([required, *[a['block'] for a in added], manifest() + overflow + '\n']), change_bytes
+    return result, change_bytes
+
+
+def wide(entry, width):
+    """Set a windowed changed file's block, spans and width: windows of +-width lines around its changes."""
+    body, entry['spans'] = changed_windows(entry['path'], entry['rows'], entry['points'], width)
+    entry['block'], entry['width'] = f"=== {entry['path']} (after the change) ===\n{body}", width
