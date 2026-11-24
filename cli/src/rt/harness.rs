@@ -2320,6 +2320,7 @@ pub struct Args {
     pub head: Option<String>,
     pub pr_text: Option<String>,
     pub context_budget: Option<i64>,
+    pub context_mode: Option<String>,
     pub findings_json: Option<String>,
     pub rb_pr_json: Option<String>,
     pub agent: String,
@@ -2362,7 +2363,8 @@ pub fn repo_material(args: &Args) -> Result<String> {
     };
     let repo = args.repo.as_deref().unwrap_or("");
     let budget = args.context_budget.unwrap_or(super::context::BUDGET);
-    super::context::build(Path::new(repo), args.base.as_deref().unwrap_or(""), args.head.as_deref().unwrap_or(""), pr_text.as_deref(), budget)
+    let mode = args.context_mode.as_deref().unwrap_or("auto");
+    super::context::build_mode(Path::new(repo), args.base.as_deref().unwrap_or(""), args.head.as_deref().unwrap_or(""), pr_text.as_deref(), budget, mode, super::context::CHANGED_WINDOW)
 }
 
 /// The pr block for --findings-json: repo and pr_number from --rb-pr-json (ReviewBench's pr.json), base and head
@@ -2629,6 +2631,7 @@ enum Kind {
     Float,
     Progress,
     Summary,
+    ContextMode,
 }
 
 struct Opt {
@@ -2661,6 +2664,7 @@ fn options(command: &str) -> Vec<Opt> {
                 "with --repo: material size limit in bytes (default {}); the change itself is never dropped, only unchanged context blocks",
                 super::context::BUDGET
             ))),
+            opt(&["--context-mode"], "context_mode", Kind::ContextMode, s("with --repo: how changed files are sent (default auto): full sends every changed file whole; windowed sends a file over 16000 bytes as line windows around its changes plus an outline, and lock/generated files as a stat line; auto is full unless the change alone is over the budget, then windowed, re-widened to fill the budget")),
             opt(&["--findings-json"], "findings_json", Kind::Str, s("also write the findings as ReviewBench agent-contract JSON here (anchors checked against --head with --repo, unchecked otherwise)")),
             opt(&["--rb-pr-json"], "rb_pr_json", Kind::Str, s("with --findings-json: ReviewBench's pr.json, for the pr block's repo and pr_number")),
             opt(&["--agent"], "agent", Kind::Str, s("with --findings-json: the agent and producer name (default ringo)")),
@@ -2820,7 +2824,7 @@ fn collapse(text: &str) -> String {
 }
 
 fn choices(kind: Kind) -> &'static [&'static str] {
-    match kind { Kind::Progress => &["auto", "always", "never"], Kind::Summary => &["auto", "text", "json"], _ => &[] }
+    match kind { Kind::Progress => &["auto", "always", "never"], Kind::Summary => &["auto", "text", "json"], Kind::ContextMode => &["auto", "full", "windowed"], _ => &[] }
 }
 fn metavar(o: &Opt) -> String {
     if choices(o.kind).is_empty() { o.dest.to_uppercase() } else { format!("{{{}}}", choices(o.kind).join(",")) }
@@ -3062,6 +3066,7 @@ fn parse_args(argv: &[String], prog: &str) -> std::result::Result<Args, Exit> {
         head: get("head"),
         pr_text: get("pr_text"),
         context_budget: get("context_budget").and_then(|v| py::int(&v)),
+        context_mode: get("context_mode"),
         findings_json: get("findings_json"),
         rb_pr_json: get("rb_pr_json"),
         agent: get("agent").unwrap_or_else(|| if review { "ringo".into() } else { String::new() }),
@@ -3104,7 +3109,7 @@ pub fn main(argv: &[String], identity: Value) -> i32 {
         2
     };
     if args.command == "review" {
-        let flags: Vec<&str> = [("base", args.base.is_some()), ("head", args.head.is_some()), ("pr_text", args.pr_text.is_some()), ("context_budget", args.context_budget.is_some())]
+        let flags: Vec<&str> = [("base", args.base.is_some()), ("head", args.head.is_some()), ("pr_text", args.pr_text.is_some()), ("context_budget", args.context_budget.is_some()), ("context_mode", args.context_mode.is_some())]
             .iter()
             .filter(|(_, set)| *set)
             .map(|(f, _)| *f)
@@ -3126,6 +3131,9 @@ pub fn main(argv: &[String], identity: Value) -> i32 {
         }
         if given(&args.repo).is_some() && args.context_budget.is_none() {
             args.context_budget = Some(super::context::BUDGET);
+        }
+        if given(&args.repo).is_some() && args.context_mode.is_none() {
+            args.context_mode = Some("auto".to_string());
         }
     }
     if args.max_calls.is_some() {
