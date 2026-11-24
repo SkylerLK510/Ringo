@@ -571,7 +571,7 @@ class WindowedTest(unittest.TestCase):
             with mock.patch.object(backends, 'run_isolated', return_value='No defects found.'), \
                     mock.patch('sys.stderr', new_callable=io.StringIO), mock.patch('sys.stdout', new_callable=io.StringIO):
                 self.assertEqual(harness.main(argv + (['--context-mode', mode] if mode else [])), 0)
-            self.assertEqual((trace / 'material.txt').read_text(), context.build(repo, base, head, mode=mode or 'auto'))
+            self.assertEqual((trace / 'material.txt').read_bytes().decode('utf-8'), context.build(repo, base, head, mode=mode or 'auto'))
 
 
 class GrepFallbackTest(unittest.TestCase):
