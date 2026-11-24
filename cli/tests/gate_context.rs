@@ -63,7 +63,8 @@ FUNCS = {
     'new_points': context.new_points,
     'cut_line_each': lambda rows: [context.cut_line(r) for r in rows],
     'cut_long_lines': context.cut_long_lines,
-    'is_generated_each': lambda pairs: [context.is_generated(p, t) for p, t in pairs],
+    'generated_kind_each': lambda cases: [context.generated_kind(p, t, b, d) for p, t, b, d in cases],
+    'replace_generated': lambda diff, pairs, stats: (lambda r: [r[0], sorted(r[1])])(context.replace_generated(diff, [tuple(p) for p in pairs], {i: tuple(s) for i, s in stats})),
     'line_rows': context.line_rows,
     'changed_windows': lambda path, rows, points, width: context.changed_windows(path, rows, set(points), width),
     'diff_texts': lambda repo, mb, head, pairs: context.diff_texts(repo, mb, head, [tuple(p) for p in pairs]),
@@ -1024,6 +1025,11 @@ fn windowed_repo() -> (PathBuf, String, String) {
         f("late.py", "a\nb\nc\nd\ne\n# @generated\nX = 1\n"),
         f("app.min.js", "var a=1;\n"),
         f("app.js.map", "{\"v\":1}\n"),
+        f("yarn.lock", &"y1\n".repeat(40)),
+        f("link.txt", "plain\n"),
+        f("odd dir/Cargo.lock", "old\n"),
+        f("marked.py", "# @generated\nX = 1\n"),
+        f("newmark.py", "X = 1\n"),
         f("user.py", &user),
         f("README.md", "# Big\n"),
         fb(b"image.png", "100644", b"\x89PNG\x00\x00one"),
@@ -1056,6 +1062,10 @@ fn windowed_repo() -> (PathBuf, String, String) {
         f("late.py", "a\nb\nc\nd\ne\n# @generated\nX = 2\n"),
         f("app.min.js", "var a=2;\n"),
         f("app.js.map", "{\"v\":2}\n"),
+        fb(b"link.txt", "120000", b"a.py"),
+        f("odd dir/Cargo.lock", "new\n"),
+        f("marked.py", "# @generated\nX = 2\n"),
+        f("newmark.py", "# DO NOT EDIT\nX = 2\n"),
         f("user.py", &user),
         f("README.md", "# Big\n"),
         fb(b"image.png", "100644", b"\x89PNG\x00\x00two"),
@@ -1103,6 +1113,13 @@ fn windowed_and_auto_material_is_identical_on_large_changed_files() {
         "=== gen2.c (generated or lock file; not shown) ===\n",
         "=== app.js.map (generated or lock file; not shown) ===\n",
         "=== late.py (after the change) ===\na\nb\n", // @generated past line 5 is not a marker
+        "=== newmark.py (after the change) ===\n# DO NOT EDIT\nX = 2\n", // a marker the change adds does not classify
+        "=== marked.py (generated or lock file; not shown) ===\n+1 -1 lines\n",
+        "+X = 2\n", // marker-only: the diff stays
+        "diff --git a/yarn.lock b/yarn.lock\n(generated or lock file: +0 -40 lines; not shown)\n", // a deleted lock file
+        "- odd dir/Cargo.lock: generated or lock file; diff kept (could not be matched)\n",
+        "- marked.py: +1 -1 lines; file block shown as a stat line (marked generated); diff kept\n",
+        "diff --git a/Cargo.lock b/Cargo.lock\n(generated", // cut although link.txt is a type change
         "=== small.py (after the change) ===\ndef tiny(x):\n    return x + 1\n",
         "- rename_same2.py: no changed lines of 2700\n",
         "--- outline ---\n1: def f0(x):\n",
@@ -1169,6 +1186,35 @@ fn windowed_and_auto_material_is_identical_on_the_fixture_and_edge_repositories(
 }
 
 #[test]
+fn a_window_as_wide_as_i64_max_covers_the_file_as_python_does() {
+    assert_eq!(context::spans_around(10, &BTreeSet::from([5]), i64::MAX), vec![(1, 10)]);
+    let repo = init("wide");
+    let base = commit(&repo, &[f("a.py", &funcs(900, "a")), f("README.md", "# R\n")], &[]);
+    let head = commit(&repo, &[f("a.py", &funcs(900, "a").replace("return x + 100 ", "return x + 1000 ")), f("README.md", "# R\n")], &[&base]);
+    let mut cases = Vec::new();
+    for budget in [context::BUDGET, 1000, 20_000] {
+        cases.push((repo.clone(), base.clone(), head.clone(), None, budget));
+    }
+    for (mode, window) in [("windowed", i64::MAX), ("auto", i64::MAX), ("windowed", i64::MAX - 1), ("windowed", 1 << 62)] {
+        same_builds_mode(&cases, Some((mode, window)));
+    }
+}
+
+#[test]
+fn windowing_never_sends_more_than_full_and_auto_returns_the_smaller_when_neither_fits() {
+    let repo = init("never-larger");
+    let base = commit(&repo, &[f("a.py", &funcs(900, "a")), f("README.md", "# R\n")], &[]);
+    let head = commit(&repo, &[f("a.py", &funcs(900, "a")), f("added.py", &funcs(900, "n")), f("README.md", "# R\n")], &[&base]);
+    let w = context::build_mode(&repo, &base, &head, None, context::BUDGET, "windowed", 25).unwrap();
+    assert!(w.contains("=== added.py (after the change) ===\ndef f0(x):\n    return x + 0  # n\n") && !w.contains("added.py: lines"));
+    let cases: Vec<_> = [1000, 20_000, context::BUDGET].iter().map(|&b| (repo.clone(), base.clone(), head.clone(), None, b)).collect();
+    same_builds_mode(&cases, None);
+    same_builds_mode(&cases, Some(("windowed", 25)));
+    let size = |mode: &str| context::build_mode(&repo, &base, &head, None, 1000, mode, 25).unwrap().len();
+    assert_eq!(context::build(&repo, &base, &head, None, 1000).unwrap().len(), size("full").min(size("windowed")));
+}
+
+#[test]
 fn mode_errors_have_python_s_exact_text() {
     let (repo, base, head) = fixture(&[]);
     let r = repo.to_str().unwrap();
@@ -1191,14 +1237,44 @@ fn windowed_helpers_match_on_many_inputs() {
         .flat_map(|&n| words.iter().map(move |w| w.repeat(n)))
         .chain((0..60).map(|_| (0..r.next(1100) as usize).map(|_| words[r.next(6) as usize]).collect::<String>()))
         .collect();
-    let paths_texts: Vec<(String, String)> = [
+    let named: Vec<(&str, &str)> = vec![
         ("Cargo.lock", ""), ("a/b/yarn.lock", "x"), ("x.min.js", ""), ("x.min.css", ""), ("a.map", ""), ("x.min.json", ""), ("dir/Cargo.lock.bak", ""), ("go.sum", ""),
         ("a.py", "# @generated"), ("a.py", "a\nb\nc\nd\n// DO NOT EDIT\n"), ("a.py", "a\nb\nc\nd\ne\nDO NOT EDIT\n"), ("a.py", "do not edit\n"), ("a.rs", "x @generated y\n"),
         ("flake.lock", "x"), ("pnpm-lock.yaml", ""), ("sub\n/Gemfile.lock", ""), ("./uv.lock", ""), ("x.MAP", ""),
-    ]
-    .iter()
-    .map(|(p, t)| (p.to_string(), t.to_string()))
-    .collect();
+    ];
+    let mut paths_texts: Vec<(String, Option<String>, Option<String>, bool)> = Vec::new();
+    for (p, t) in &named {
+        for base in [None, Some(t.to_string()), Some("plain\n".to_string()), Some("# @generated\n".to_string())] {
+            for deleted in [false, true] {
+                paths_texts.push((p.to_string(), Some(t.to_string()), base.clone(), deleted));
+            }
+        }
+        paths_texts.push((p.to_string(), None, Some(t.to_string()), false));
+    }
+    // replace_generated: changes (old, new), a diff of some of their headers (a type change prints two), stats for some
+    let pairs: Vec<(Option<&str>, Option<&str>)> = vec![
+        (Some("a.py"), Some("a.py")), (None, Some("n.py")), (Some("o.py"), None), (Some("old.py"), Some("new.py")),
+        (Some("t.lock"), Some("t.lock")), (Some("odd dir/x"), Some("odd dir/x")), (Some("y.lock"), None), (Some("a.py"), Some("a.py")),
+    ];
+    let headers = ["diff --git a/a.py b/a.py", "diff --git a/n.py b/n.py", "diff --git a/o.py b/o.py", "diff --git a/old.py b/new.py",
+        "diff --git a/t.lock b/t.lock", "diff --git a/odd dir/x b/odd dir/x", "diff --git a/y.lock b/y.lock", "diff --git a/zzz b/zzz"];
+    let mut replaces: Vec<(String, Vec<(usize, (usize, usize))>)> = Vec::new();
+    {
+        let mut q = Lcg(21);
+        for _ in 0..120 {
+            let mut diff = if q.next(4) == 0 { "preamble\n".to_string() } else { String::new() };
+            for _ in 0..q.next(9) {
+                diff += &format!("{}\nindex 1..2\n+x\n", headers[q.next(headers.len() as u64) as usize]);
+            }
+            let mut stats: Vec<(usize, (usize, usize))> = Vec::new();
+            for i in 0..pairs.len() {
+                if q.next(2) == 0 {
+                    stats.push((i, (q.next(9) as usize, q.next(9) as usize)));
+                }
+            }
+            replaces.push((diff, stats));
+        }
+    }
     let diffs: Vec<String> = (0..200)
         .map(|_| {
             (0..r.next(8))
@@ -1220,8 +1296,9 @@ fn windowed_helpers_match_on_many_inputs() {
     }
     let mut calls: Vec<(&str, Value)> = vec![
         ("cut_line_each", json!([long])),
-        ("is_generated_each", json!([paths_texts])),
+        ("generated_kind_each", json!([paths_texts])),
     ];
+    calls.extend(replaces.iter().map(|(d, st)| ("replace_generated", json!([d, pairs, st.iter().map(|(i, (a, b))| json!([i, [a, b]])).collect::<Vec<_>>()]))));
     calls.extend(diffs.iter().map(|d| ("new_points", json!([d]))));
     calls.extend(texts.iter().map(|t| ("line_rows", json!([t]))));
     calls.extend(texts.iter().map(|t| ("cut_long_lines", json!([t]))));
@@ -1230,8 +1307,13 @@ fn windowed_helpers_match_on_many_inputs() {
     let want = oracle(&calls);
     let mut got = vec![
         json!({"ok": long.iter().map(|l| context::cut_line(l)).collect::<Vec<_>>()}),
-        json!({"ok": paths_texts.iter().map(|(p, t)| context::is_generated(p, t)).collect::<Vec<_>>()}),
+        json!({"ok": paths_texts.iter().map(|(p, t, b, d)| context::generated_kind(p, t.as_deref(), b.as_deref(), *d)).collect::<Vec<_>>()}),
     ];
+    let rust_pairs: Vec<context::Pair> = pairs.iter().map(|(o, n)| (o.map(str::to_string), n.map(str::to_string))).collect();
+    got.extend(replaces.iter().map(|(d, st)| {
+        let (out, matched) = context::replace_generated(d, &rust_pairs, &st.iter().copied().collect());
+        json!({"ok": [out, matched]})
+    }));
     got.extend(diffs.iter().map(|d| json!({"ok": context::new_points(d)})));
     got.extend(texts.iter().map(|t| json!({"ok": context::line_rows(t)})));
     got.extend(texts.iter().map(|t| json!({"ok": context::cut_long_lines(t)})));

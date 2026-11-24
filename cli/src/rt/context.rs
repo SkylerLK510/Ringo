@@ -1028,7 +1028,7 @@ pub fn spans_around(count: i64, lines: &BTreeSet<u64>, window: i64) -> Vec<(i64,
     let mut spans: Vec<(i64, i64)> = Vec::new();
     for &n in lines {
         let n = n.min(i64::MAX as u64 / 2) as i64;
-        let (a, b) = (1.max(n - window), count.min(n + window));
+        let (a, b) = (1.max(n.saturating_sub(window)), count.min(n.saturating_add(window)));
         match spans.last_mut() {
             Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
             _ => spans.push((a, b)),
@@ -1079,12 +1079,43 @@ pub fn cut_long_lines(text: &str) -> String {
     text.split('\n').map(cut_line).collect::<Vec<_>>().join("\n")
 }
 
-/// A lock file, a minified or source-map file, or a file whose first five lines say it is generated.
-pub fn is_generated(path: &str, text: &str) -> bool {
+/// The text says in its first five lines that it is generated.
+pub fn has_mark(text: &str) -> bool {
+    text.split('\n').take(5).any(|line| GENERATED_MARKS.iter().any(|m| line.contains(m)))
+}
+
+/// How a changed text file counts as generated, or None: 'lock' for a lock file or a minified or source-map file (by
+/// name: the file block and the diff section become a stat line), 'marked' for a file whose first five lines say it
+/// is generated (the file block becomes a stat line; the diff stays, since the marker is text the change itself can
+/// add). text: the file at head, or at the merge base for a deletion; base_text: the file at the merge base, if it
+/// existed there as text. A marker the change adds to an existing file does not classify it.
+pub fn generated_kind(path: &str, text: Option<&str>, base_text: Option<&str>, deleted: bool) -> Option<&'static str> {
+    let text = text?;
     let name = parts(path).last().copied().unwrap_or("");
-    LOCK_NAMES.contains(&name)
-        || GENERATED_SUFFIXES.iter().any(|s| name.ends_with(s))
-        || text.split('\n').take(5).any(|line| GENERATED_MARKS.iter().any(|m| line.contains(m)))
+    if LOCK_NAMES.contains(&name) || GENERATED_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return Some("lock");
+    }
+    (!deleted && has_mark(text) && base_text.is_none_or(has_mark)).then_some("marked")
+}
+
+/// generated_kind of one change: a deletion by its merge-base text, anything else by its text at head and, if the
+/// file existed, at the merge base.
+fn generated_kind_of(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: Option<&str>, objects: &mut Objects) -> Result<Option<&'static str>> {
+    let old = old.filter(|p| !p.is_empty());
+    let new = new.filter(|p| !p.is_empty());
+    let base_text = match old {
+        Some(o) => match blob(repo, mb, o, Some(objects)) {
+            Ok(t) => t,
+            Err(e) if e.is(Exc::Context) => None,
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    let text = match new {
+        Some(n) => blob(repo, head, n, Some(objects))?,
+        None => base_text.clone(),
+    };
+    Ok(generated_kind(new.or(old).unwrap_or(""), text.as_deref(), base_text.as_deref(), new.is_none()))
 }
 
 /// The definition-like lines outside the spans, numbered, as the text after '--- outline ---'; text_symbols' own
@@ -1184,7 +1215,9 @@ pub fn build_mode(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, bu
         if need <= budget {
             return Ok(material);
         }
-        return Ok(_build(&repo, base, head, pr_text, budget, &mut objects, how(true, Some(need)))?.0);
+        let windowed = _build(&repo, base, head, pr_text, budget, &mut objects, how(true, Some(need)))?.0;
+        // Windows are meant to make the change fit. If they still do not, send whichever is smaller (a tie: full).
+        return Ok(if windowed.len() as i64 <= budget || windowed.len() < material.len() { windowed } else { material });
     }
     Ok(_build(&repo, base, head, pr_text, budget, &mut objects, how(mode == "windowed", None))?.0)
 }
@@ -1217,29 +1250,66 @@ struct Wide {
     width: i64,
 }
 
-/// Set a windowed changed file's block, spans and width: windows of +-width lines around its changes.
-fn wide(entry: &mut Wide, width: i64) {
-    let (body, spans) = changed_windows(&entry.path, &entry.rows, &entry.points, width);
-    entry.block = format!("=== {} (after the change) ===\n{body}", entry.path);
-    entry.spans = spans;
-    entry.width = width;
+fn whole_block(entry: &Wide) -> String {
+    format!("=== {} (after the change) ===\n{}", entry.path, entry.text)
 }
 
-/// The diff with each generated or lock file's section cut to its 'diff --git' line and a stat line; stats holds
-/// (path, (added, deleted)). Unchanged if the sections do not line up with the changed files.
-fn replace_generated(diff: &str, pairs: &[Pair], stats: &[(String, (usize, usize))]) -> String {
-    let Some(sections) = aligned_sections(diff, pairs) else { return diff.to_string() };
-    let mut out = String::new();
-    for ((_, new), section) in pairs.iter().zip(sections) {
-        match new.as_deref().and_then(|n| stats.iter().find(|(p, _)| p == n)) {
-            Some((_, (a, d))) => {
+/// Set a windowed changed file's block, spans and width: windows of +-width lines around its changes. A block that is
+/// not smaller in bytes than the whole file (a new file, or windows covering nearly all of it, with their line
+/// numbers and outline) is the whole file instead: windowing never sends more than full mode does.
+fn wide(entry: &mut Wide, width: i64) {
+    let (body, spans) = changed_windows(&entry.path, &entry.rows, &entry.points, width);
+    let block = format!("=== {} (after the change) ===\n{body}", entry.path);
+    entry.spans = spans;
+    entry.width = width;
+    let whole = whole_block(entry);
+    if block.len() >= whole.len() {
+        entry.block = whole;
+        entry.whole = true;
+    } else {
+        entry.block = block;
+    }
+}
+
+/// (diff, matched): the diff with the section of each lock file cut to its 'diff --git' line and a stat line, and the
+/// set of change indices that were. stats is {change index: (added, deleted)}. A section belongs to a change by its
+/// header, 'diff --git a/OLD b/NEW' with plain names; a change is cut only if exactly one section is its own and no
+/// other change has the same header (a type change prints two sections; an unusual name cannot be matched), so
+/// anything else stays in the diff.
+pub fn replace_generated(diff: &str, pairs: &[Pair], stats: &BTreeMap<usize, (usize, usize)>) -> (String, BTreeSet<usize>) {
+    // re.split(r'^(?=diff --git )', diff, flags=re.M)
+    let starts: Vec<usize> = (0..diff.len())
+        .filter(|&i| (i == 0 || diff.as_bytes()[i - 1] == b'\n') && diff.as_bytes()[i..].starts_with(b"diff --git "))
+        .collect();
+    let first = &diff[..starts.first().copied().unwrap_or(diff.len())];
+    let sections: Vec<&str> =
+        starts.iter().enumerate().map(|(k, &a)| &diff[a..starts.get(k + 1).copied().unwrap_or(diff.len())]).collect();
+    let mut expected: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (old, new)) in pairs.iter().enumerate() {
+        let (a, b) = (old.as_deref().filter(|p| !p.is_empty()).or(new.as_deref()).unwrap_or(""), new.as_deref().filter(|p| !p.is_empty()).or(old.as_deref()).unwrap_or(""));
+        if PLAIN.is_match(a) && PLAIN.is_match(b) {
+            expected.entry(format!("diff --git a/{a} b/{b}")).or_default().push(i);
+        }
+    }
+    let mut hits: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (k, section) in sections.iter().enumerate() {
+        if let Some(owners) = expected.get(section.split('\n').next().unwrap_or("")).filter(|o| o.len() == 1) {
+            hits.entry(owners[0]).or_default().push(k);
+        }
+    }
+    let matched: BTreeSet<usize> = stats.keys().copied().filter(|i| hits.get(i).is_some_and(|h| h.len() == 1)).collect();
+    let cut: HashMap<usize, (usize, usize)> = matched.iter().map(|i| (hits[i][0], stats[i])).collect();
+    let mut out = first.to_string();
+    for (k, section) in sections.iter().enumerate() {
+        match cut.get(&k) {
+            Some((a, d)) => {
                 out.push_str(section.split('\n').next().unwrap_or(""));
                 out.push_str(&format!("\n(generated or lock file: +{a} -{d} lines; not shown)\n"));
             }
             None => out.push_str(section),
         }
     }
-    out
+    (out, matched)
 }
 
 /// (material, bytes of the change alone: PR text, diff, changed files, README).
@@ -1261,16 +1331,22 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     )?;
     let pairs = changes(repo, &mb, &head_id)?;
     let changed: Vec<String> = pairs.iter().filter_map(|(_, new)| new.clone().filter(|n| !n.is_empty())).collect();
-    // windowed: changed path -> (added lines, removed lines, new-side changed lines)
-    let mut detail: HashMap<String, (usize, usize, BTreeSet<u64>)> = HashMap::new();
+    // windowed, by change index: (added, removed) line counts, new-side changed lines, and how it counts as generated
+    let mut stats: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    let mut points: HashMap<usize, BTreeSet<u64>> = HashMap::new();
+    let mut kinds: BTreeMap<usize, &'static str> = BTreeMap::new();
     if windowed {
-        for ((old, new), text) in pairs.iter().zip(diff_texts(repo, &mb, &head_id, &pairs)?) {
-            if let Some(new) = new.as_deref().filter(|n| !n.is_empty()) {
-                let (_, _, _, minus, plus) = hunks(repo, &mb, &head_id, old.as_deref(), Some(new), Some(&text))?;
-                detail.insert(new.to_string(), (plus.len(), minus.len(), new_points(&text)));
+        for (i, ((old, new), text)) in pairs.iter().zip(diff_texts(repo, &mb, &head_id, &pairs)?).enumerate() {
+            let (_, _, _, minus, plus) = hunks(repo, &mb, &head_id, old.as_deref(), new.as_deref(), Some(&text))?;
+            stats.insert(i, (plus.len(), minus.len()));
+            points.insert(i, new_points(&text));
+            if let Some(kind) = generated_kind_of(repo, &mb, &head_id, old.as_deref(), new.as_deref(), objects)? {
+                kinds.insert(i, kind);
             }
         }
     }
+    let pair_of: HashMap<&str, usize> =
+        pairs.iter().enumerate().filter_map(|(i, (_, new))| new.as_deref().filter(|n| !n.is_empty()).map(|n| (n, i))).collect();
     let mut parts: Vec<String> = Vec::new();
     if let Some(pr) = pr_text {
         parts.push(format!("=== PR description ===\n{pr}"));
@@ -1279,12 +1355,10 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     parts.push(format!("=== change.diff ===\n{diff}"));
     let mut submodules = Vec::new();
     let mut wfiles: Vec<Wide> = Vec::new(); // windowed changed files, in change order
-    let mut generated: Vec<(String, (usize, usize))> = Vec::new();
     for path in &changed {
         let text = match blob(repo, &head_id, path, Some(objects))? {
-            Some(text) if windowed && is_generated(path, &text) => {
-                let (added, deleted, _) = &detail[path];
-                generated.push((path.clone(), (*added, *deleted)));
+            Some(_) if windowed && kinds.contains_key(&pair_of[path.as_str()]) => {
+                let (added, deleted) = stats[&pair_of[path.as_str()]];
                 parts.push(format!("=== {path} (generated or lock file; not shown) ===\n+{added} -{deleted} lines\n"));
                 continue;
             }
@@ -1293,7 +1367,7 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
                     path: path.clone(),
                     rows: line_rows(&text).into_iter().map(cut_line).collect(),
                     text,
-                    points: detail[path].2.clone(),
+                    points: points[&pair_of[path.as_str()]].clone(),
                     index: parts.len(),
                     whole: false,
                     block: String::new(),
@@ -1316,8 +1390,12 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
         };
         parts.push(format!("=== {path} (after the change) ===\n{text}"));
     }
-    if !generated.is_empty() {
-        parts[diff_at] = format!("=== change.diff ===\n{}", replace_generated(&diff, &pairs, &generated));
+    let locks: BTreeMap<usize, (usize, usize)> = kinds.iter().filter(|(_, k)| **k == "lock").map(|(i, _)| (*i, stats[i])).collect();
+    let mut matched = BTreeSet::new();
+    if !locks.is_empty() {
+        let (cut, m) = replace_generated(&diff, &pairs, &locks);
+        parts[diff_at] = format!("=== change.diff ===\n{cut}");
+        matched = m;
     }
     let mut readme = None;
     for r in READMES {
@@ -1351,7 +1429,18 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     let always = [pr_text.map(|_| "the PR description".to_string()), Some("the three-dot diff".to_string()),
                   Some(format!("{} changed file(s) at head", changed.len())), readme.map(str::to_string)];
     let always = always.into_iter().flatten().collect::<Vec<_>>().join(", ");
-    let stat_notes: Vec<String> = generated.iter().map(|(p, (a, d))| format!("{p}: +{a} -{d} lines")).collect();
+    let (mut cut_notes, mut kept_notes): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (&i, &kind) in &kinds {
+        let name = pairs[i].1.as_deref().filter(|n| !n.is_empty()).or(pairs[i].0.as_deref()).unwrap_or("");
+        let (a, d) = stats[&i];
+        if kind == "lock" && matched.contains(&i) {
+            cut_notes.push(format!("{name}: +{a} -{d} lines"));
+        } else if kind == "lock" {
+            kept_notes.push(format!("{name}: generated or lock file; diff kept (could not be matched)"));
+        } else {
+            kept_notes.push(format!("{name}: +{a} -{d} lines; file block shown as a stat line (marked generated); diff kept"));
+        }
+    }
     let manifest = |added: &[Added], skipped: &[String], unreadable: &[String], wfiles: &[Wide]| -> String {
         let mut lines = vec![
             "=== context manifest ===".to_string(),
@@ -1378,8 +1467,10 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
                 .collect();
             lines.push("Changed files sent as windows:".to_string());
             lines.extend(listing(&wnotes));
-            lines.push("Generated or lock files shown as a stat line:".to_string());
-            lines.extend(listing(&stat_notes));
+            lines.push("Generated or lock files shown as a stat line (file block and diff):".to_string());
+            lines.extend(listing(&cut_notes));
+            lines.push("Generated or lock files whose diff was kept:".to_string());
+            lines.extend(listing(&kept_notes));
         }
         lines.extend([
             format!("Changed symbols searched with word matches at head ({}): {}.", syms.len(), names(&syms)),
@@ -1475,7 +1566,7 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
                 let before = (wfiles[k].block.clone(), wfiles[k].spans.clone(), wfiles[k].width, wfiles[k].whole);
                 match step {
                     None => {
-                        wfiles[k].block = format!("=== {} (after the change) ===\n{}", wfiles[k].path, wfiles[k].text);
+                        wfiles[k].block = whole_block(&wfiles[k]);
                         wfiles[k].whole = true;
                     }
                     Some(width) => wide(&mut wfiles[k], width),
