@@ -800,6 +800,13 @@ class Run:
             self.calls -= 1
             self.admission_refusals += 1
 
+    def cancel_reservation(self):
+        """Release a reservation when a local process failed to launch (OSError) before any call ran."""
+        with self.lock:
+            if self.calls < 1:
+                raise ValueError('no call reservation to release')
+            self.calls -= 1
+
     def record(self, rec, reply=None, raw=None):
         """Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, written whole
         to the step's .raw.txt artifact (a private 0700 folder) while the record keeps only a bounded excerpt of
@@ -1079,6 +1086,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
         'MATERIAL', material, 'untrusted change material written by its author')
     system_hash = sha(system)
     replies, skipped = {}, set()
+    state_lock = threading.Lock()
     gates, gate_lock, stop, failures = {}, threading.Lock(), threading.Event(), []
 
     def one(label, p, message):
@@ -1148,6 +1156,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                             'seconds': round(time.monotonic() - t0, 6)})
                 raise
             except OSError as exc:  # the command cannot run: every retry would fail too
+                run.cancel_reservation()
                 run.record({**rec, 'status': 'fatal', 'error': f'{type(exc).__name__}: {exc}',
                             'seconds': round(time.monotonic() - t0, 6)})
                 raise
@@ -1183,20 +1192,22 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
             return text
 
     def step(p):
-        if 'when' in p and (p['when'] in skipped or not pipelines.has_issues(replies[p['when']])):
-            skipped.add(p['id'])
-            run.record({'step': p['id'], 'attempt': 0, 'pass': p['id'], 'status': 'skipped'})
-            return
-        messages = pipelines.requests(plan, p, replies)
-        if not messages:  # a checker with no findings to check
-            replies[p['id']] = ''
-            return
+        with state_lock:
+            if 'when' in p and (p['when'] in skipped or not pipelines.has_issues(replies[p['when']])):
+                skipped.add(p['id'])
+                run.record({'step': p['id'], 'attempt': 0, 'pass': p['id'], 'status': 'skipped'})
+                return
+            messages = pipelines.requests(plan, p, replies)
+            if not messages:  # a checker with no findings to check
+                replies[p['id']] = ''
+                return
         if len(messages) == 1 or run.max_cost is not None:  # under a dollar cap, one call at a time
             texts = [one(p['id'] if len(messages) == 1 else f"{p['id']}.batch-{k + 1}", p, m) for k, m in enumerate(messages)]
         else:
             texts = parallel(lambda km: one(f"{p['id']}.batch-{km[0] + 1}", p, km[1]),
                              list(enumerate(messages)), min(8, len(messages)))
-        replies[p['id']] = pipelines.combine(plan, p, replies, texts)
+        with state_lock:
+            replies[p['id']] = pipelines.combine(plan, p, replies, texts)
 
     for wave in pipelines.waves(plan):
         if len(wave) == 1 or run.max_cost is not None:  # under a dollar cap, one call at a time
