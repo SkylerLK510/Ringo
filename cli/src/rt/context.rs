@@ -500,6 +500,24 @@ pub fn all_hunks(repo: &Path, mb: &str, head: &str, pairs: &[Pair]) -> Result<Ve
     pairs.iter().zip(&texts).map(|((old, new), text)| hunks(repo, mb, head, old.as_deref(), new.as_deref(), Some(text))).collect()
 }
 
+/// (added, removed) line counts of a -U0 diff text. Unlike hunks(), a 'diff --git' line ends the hunk, so the
+/// '--- a/x' and '+++ b/x' lines of a second section (a type change prints two) are not counted.
+pub fn change_counts(text: &str) -> (usize, usize) {
+    let (mut added, mut removed, mut started) = (0, 0, false);
+    for line in py::splitlines(text, false) {
+        if line.starts_with("diff --git ") {
+            started = false;
+        } else if HUNK.is_match(line) {
+            started = true;
+        } else if started && line.starts_with('-') {
+            removed += 1;
+        } else if started && line.starts_with('+') {
+            added += 1;
+        }
+    }
+    (added, removed)
+}
+
 /// The new-side lines a -U0 diff changes, one line for a pure deletion: the line that now sits where the deleted lines
 /// were (hunks() has none for it, its new-side range is empty). Callers clamp them to the file.
 pub fn new_points(text: &str) -> BTreeSet<u64> {
@@ -1030,7 +1048,7 @@ pub fn spans_around(count: i64, lines: &BTreeSet<u64>, window: i64) -> Vec<(i64,
         let n = n.min(i64::MAX as u64 / 2) as i64;
         let (a, b) = (1.max(n.saturating_sub(window)), count.min(n.saturating_add(window)));
         match spans.last_mut() {
-            Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
             _ => spans.push((a, b)),
         }
     }
@@ -1087,15 +1105,16 @@ pub fn has_mark(text: &str) -> bool {
 /// How a changed text file counts as generated, or None: 'lock' for a lock file or a minified or source-map file (by
 /// name: the file block and the diff section become a stat line), 'marked' for a file whose first five lines say it
 /// is generated (the file block becomes a stat line; the diff stays, since the marker is text the change itself can
-/// add). text: the file at head, or at the merge base for a deletion; base_text: the file at the merge base, if it
-/// existed there as text. A marker the change adds to an existing file does not classify it.
-pub fn generated_kind(path: &str, text: Option<&str>, base_text: Option<&str>, deleted: bool) -> Option<&'static str> {
+/// add). text: the file at head, or at the merge base for a deletion; existed: the file existed at the merge base;
+/// base_text: its text there, None if it was not readable text (binary, not UTF-8). A marker the change adds to an
+/// existing file does not classify it, and neither does one on a file whose old version cannot be read.
+pub fn generated_kind(path: &str, text: Option<&str>, base_text: Option<&str>, deleted: bool, existed: bool) -> Option<&'static str> {
     let text = text?;
     let name = parts(path).last().copied().unwrap_or("");
     if LOCK_NAMES.contains(&name) || GENERATED_SUFFIXES.iter().any(|s| name.ends_with(s)) {
         return Some("lock");
     }
-    (!deleted && has_mark(text) && base_text.is_none_or(has_mark)).then_some("marked")
+    (!deleted && has_mark(text) && (!existed || base_text.is_some_and(has_mark))).then_some("marked")
 }
 
 /// generated_kind of one change: a deletion by its merge-base text, anything else by its text at head and, if the
@@ -1103,10 +1122,14 @@ pub fn generated_kind(path: &str, text: Option<&str>, base_text: Option<&str>, d
 fn generated_kind_of(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: Option<&str>, objects: &mut Objects) -> Result<Option<&'static str>> {
     let old = old.filter(|p| !p.is_empty());
     let new = new.filter(|p| !p.is_empty());
+    let mut existed = old.is_some();
     let base_text = match old {
         Some(o) => match blob(repo, mb, o, Some(objects)) {
             Ok(t) => t,
-            Err(e) if e.is(Exc::Context) => None,
+            Err(e) if e.is(Exc::Context) => {
+                existed = false;
+                None
+            }
             Err(e) => return Err(e),
         },
         None => None,
@@ -1115,7 +1138,7 @@ fn generated_kind_of(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: 
         Some(n) => blob(repo, head, n, Some(objects))?,
         None => base_text.clone(),
     };
-    Ok(generated_kind(new.or(old).unwrap_or(""), text.as_deref(), base_text.as_deref(), new.is_none()))
+    Ok(generated_kind(new.or(old).unwrap_or(""), text.as_deref(), base_text.as_deref(), new.is_none(), existed))
 }
 
 /// The definition-like lines outside the spans, numbered, as the text after '--- outline ---'; text_symbols' own
@@ -1216,8 +1239,13 @@ pub fn build_mode(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, bu
             return Ok(material);
         }
         let windowed = _build(&repo, base, head, pr_text, budget, &mut objects, how(true, Some(need)))?.0;
-        // Windows are meant to make the change fit. If they still do not, send whichever is smaller (a tie: full).
-        return Ok(if windowed.len() as i64 <= budget || windowed.len() < material.len() { windowed } else { material });
+        if windowed.len() as i64 <= budget {
+            return Ok(windowed);
+        }
+        // Windows are meant to make the change fit. If they still do not, send whichever is smaller of full and the
+        // plain windowed build (what mode='windowed' gives, without auto's explanation and refill); a tie: full.
+        let plain = _build(&repo, base, head, pr_text, budget, &mut objects, how(true, None))?.0;
+        return Ok(if plain.len() < material.len() { plain } else { material });
     }
     Ok(_build(&repo, base, head, pr_text, budget, &mut objects, how(mode == "windowed", None))?.0)
 }
@@ -1273,9 +1301,9 @@ fn wide(entry: &mut Wide, width: i64) {
 
 /// (diff, matched): the diff with the section of each lock file cut to its 'diff --git' line and a stat line, and the
 /// set of change indices that were. stats is {change index: (added, deleted)}. A section belongs to a change by its
-/// header, 'diff --git a/OLD b/NEW' with plain names; a change is cut only if exactly one section is its own and no
-/// other change has the same header (a type change prints two sections; an unusual name cannot be matched), so
-/// anything else stays in the diff.
+/// header, 'diff --git a/OLD b/NEW' with plain names, and may have several (a type change prints a deletion and an
+/// addition): all of a change's sections become one header line and one stat line. A header that two changes share, or
+/// an unusual name, cannot be matched, so those sections stay in the diff.
 pub fn replace_generated(diff: &str, pairs: &[Pair], stats: &BTreeMap<usize, (usize, usize)>) -> (String, BTreeSet<usize>) {
     // re.split(r'^(?=diff --git )', diff, flags=re.M)
     let starts: Vec<usize> = (0..diff.len())
@@ -1297,8 +1325,9 @@ pub fn replace_generated(diff: &str, pairs: &[Pair], stats: &BTreeMap<usize, (us
             hits.entry(owners[0]).or_default().push(k);
         }
     }
-    let matched: BTreeSet<usize> = stats.keys().copied().filter(|i| hits.get(i).is_some_and(|h| h.len() == 1)).collect();
+    let matched: BTreeSet<usize> = stats.keys().copied().filter(|i| hits.get(i).is_some_and(|h| !h.is_empty())).collect();
     let cut: HashMap<usize, (usize, usize)> = matched.iter().map(|i| (hits[i][0], stats[i])).collect();
+    let dropped: BTreeSet<usize> = matched.iter().flat_map(|i| hits[i][1..].iter().copied()).collect();
     let mut out = first.to_string();
     for (k, section) in sections.iter().enumerate() {
         match cut.get(&k) {
@@ -1306,6 +1335,7 @@ pub fn replace_generated(diff: &str, pairs: &[Pair], stats: &BTreeMap<usize, (us
                 out.push_str(section.split('\n').next().unwrap_or(""));
                 out.push_str(&format!("\n(generated or lock file: +{a} -{d} lines; not shown)\n"));
             }
+            None if dropped.contains(&k) => {}
             None => out.push_str(section),
         }
     }
@@ -1337,8 +1367,7 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     let mut kinds: BTreeMap<usize, &'static str> = BTreeMap::new();
     if windowed {
         for (i, ((old, new), text)) in pairs.iter().zip(diff_texts(repo, &mb, &head_id, &pairs)?).enumerate() {
-            let (_, _, _, minus, plus) = hunks(repo, &mb, &head_id, old.as_deref(), new.as_deref(), Some(&text))?;
-            stats.insert(i, (plus.len(), minus.len()));
+            stats.insert(i, change_counts(&text));
             points.insert(i, new_points(&text));
             if let Some(kind) = generated_kind_of(repo, &mb, &head_id, old.as_deref(), new.as_deref(), objects)? {
                 kinds.insert(i, kind);

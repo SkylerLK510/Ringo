@@ -240,6 +240,23 @@ def all_hunks(repo, mb, head, pairs):
     return [hunks(repo, mb, head, old, new, text=text) for (old, new), text in zip(pairs, diff_texts(repo, mb, head, pairs))]
 
 
+def change_counts(text):
+    """(added, removed) line counts of a -U0 diff text. Unlike hunks(), a 'diff --git' line ends the hunk, so the
+    '--- a/x' and '+++ b/x' lines of a second section (a type change prints two) are not counted."""
+    added = removed = 0
+    started = False
+    for line in text.splitlines():
+        if line.startswith('diff --git '):
+            started = False
+        elif HUNK.match(line):
+            started = True
+        elif started and line[:1] == '-':
+            removed += 1
+        elif started and line[:1] == '+':
+            added += 1
+    return added, removed
+
+
 def new_points(text):
     """The new-side lines a -U0 diff changes, one line for a pure deletion: the line that now sits where the deleted
     lines were (hunks() has none for it, its new-side range is empty). Callers clamp them to the file."""
@@ -473,18 +490,19 @@ def has_mark(text):
     return any(mark in line for line in text.split('\n')[:5] for mark in GENERATED_MARKS)
 
 
-def generated_kind(path, text, base_text, deleted):
+def generated_kind(path, text, base_text, deleted, existed):
     """How a changed text file counts as generated, or None: 'lock' for a lock file or a minified or source-map file
     (by name: the file block and the diff section become a stat line), 'marked' for a file whose first five lines say
     it is generated (the file block becomes a stat line; the diff stays, since the marker is text the change itself can
-    add). text: the file at head, or at the merge base for a deletion; base_text: the file at the merge base, if it
-    existed there as text. A marker the change adds to an existing file does not classify it."""
+    add). text: the file at head, or at the merge base for a deletion; existed: the file existed at the merge base;
+    base_text: its text there, None if it was not readable text (binary, not UTF-8). A marker the change adds to an
+    existing file does not classify it, and neither does one on a file whose old version cannot be read."""
     if text is None:
         return None
     name = PurePosixPath(path).name
     if name in LOCK_NAMES or name.endswith(GENERATED_SUFFIXES):
         return 'lock'
-    if not deleted and has_mark(text) and (base_text is None or has_mark(base_text)):
+    if not deleted and has_mark(text) and (not existed or (base_text is not None and has_mark(base_text))):
         return 'marked'
     return None
 
@@ -552,19 +570,21 @@ def build(repo, base, head, pr_text=None, budget=BUDGET, mode='auto', changed_wi
             if need <= budget:
                 return material
             windowed = _build(repo, base, head, pr_text, budget, objects, True, changed_window, auto_need=need)[0]
-            # Windows are meant to make the change fit. If they still do not, send whichever is smaller (a tie: full).
-            if len(windowed.encode()) <= budget or len(windowed.encode()) < len(material.encode()):
+            if len(windowed.encode()) <= budget:
                 return windowed
-            return material
+            # Windows are meant to make the change fit. If they still do not, send whichever is smaller of full and
+            # the plain windowed build (what mode='windowed' gives, without auto's explanation and refill); a tie: full.
+            plain = _build(repo, base, head, pr_text, budget, objects, True, changed_window)[0]
+            return plain if len(plain.encode()) < len(material.encode()) else material
         return _build(repo, base, head, pr_text, budget, objects, mode == 'windowed', changed_window)[0]
 
 
 def replace_generated(diff, pairs, stats):
     """(diff, matched): the diff with the section of each lock file cut to its 'diff --git' line and a stat line, and
     the set of change indices that were. stats is {change index: (added, deleted)}. A section belongs to a change by
-    its header, 'diff --git a/OLD b/NEW' with plain names; a change is cut only if exactly one section is its own and
-    no other change has the same header (a type change prints two sections; an unusual name cannot be matched), so
-    anything else stays in the diff."""
+    its header, 'diff --git a/OLD b/NEW' with plain names, and may have several (a type change prints a deletion and an
+    addition): all of a change's sections become one header line and one stat line. A header that two changes share,
+    or an unusual name, cannot be matched, so those sections stay in the diff."""
     first = re.split(r'^(?=diff --git )', diff, flags=re.M)
     sections = first[1:]
     expected = {}
@@ -577,21 +597,23 @@ def replace_generated(diff, pairs, stats):
         owners = expected.get(section.split('\n', 1)[0], [])
         if len(owners) == 1:
             hits.setdefault(owners[0], []).append(k)
-    matched = {i for i in stats if len(hits.get(i, [])) == 1}
+    matched = {i for i in stats if hits.get(i)}
     cut = {hits[i][0]: stats[i] for i in matched}
+    dropped = {k for i in matched for k in hits[i][1:]}
     return first[0] + ''.join(
         section.split('\n', 1)[0] + f'\n(generated or lock file: +{cut[k][0]} -{cut[k][1]} lines; not shown)\n'
-        if k in cut else section for k, section in enumerate(sections)), matched
+        if k in cut else '' if k in dropped else section for k, section in enumerate(sections)), matched
 
 
 def generated_kind_of(repo, mb, head, old, new, objects):
     """generated_kind of one change: a deletion by its merge-base text, anything else by its text at head and, if the
     file existed, at the merge base."""
+    existed = bool(old)
     try:
         base_text = blob(repo, mb, old, objects) if old else None
     except ContextError:
-        base_text = None
-    return generated_kind(new or old, blob(repo, head, new, objects) if new else base_text, base_text, new is None)
+        base_text, existed = None, False
+    return generated_kind(new or old, blob(repo, head, new, objects) if new else base_text, base_text, new is None, existed)
 
 
 def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CHANGED_WINDOW, auto_need=None):
@@ -608,8 +630,7 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
     stats, points, kinds = {}, {}, {}
     if windowed:
         for i, ((old, new), text) in enumerate(zip(pairs, diff_texts(repo, mb, head_id, pairs))):
-            _, _, _, minus, plus = hunks(repo, mb, head_id, old, new, text=text)
-            stats[i], points[i] = (len(plus), len(minus)), new_points(text)
+            stats[i], points[i] = change_counts(text), new_points(text)
             kinds[i] = generated_kind_of(repo, mb, head_id, old, new, objects)
     pair_of = {new: i for i, (_, new) in enumerate(pairs) if new}
     parts = []

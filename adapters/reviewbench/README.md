@@ -25,7 +25,7 @@ stderr. A failed review exits non-zero and leaves no findings file.
 whenever the change alone fits the byte budget, and line windows around the changes in large
 changed files only when it does not (`docs/CONTEXT-COMPACTION.md`). A run that is the control of
 an A/B comparison, or that must reproduce older material, passes `--context-mode full`
-explicitly; `--context-mode windowed` always windows.
+explicitly; `--context-mode windowed` windows regardless of budget, but keeps a file whole when windowing would not save bytes.
 
 ## Build
 

@@ -63,7 +63,8 @@ FUNCS = {
     'new_points': context.new_points,
     'cut_line_each': lambda rows: [context.cut_line(r) for r in rows],
     'cut_long_lines': context.cut_long_lines,
-    'generated_kind_each': lambda cases: [context.generated_kind(p, t, b, d) for p, t, b, d in cases],
+    'generated_kind_each': lambda cases: [context.generated_kind(p, t, b, d, e) for p, t, b, d, e in cases],
+    'change_counts_each': lambda texts: [context.change_counts(t) for t in texts],
     'replace_generated': lambda diff, pairs, stats: (lambda r: [r[0], sorted(r[1])])(context.replace_generated(diff, [tuple(p) for p in pairs], {i: tuple(s) for i, s in stats})),
     'line_rows': context.line_rows,
     'changed_windows': lambda path, rows, points, width: context.changed_windows(path, rows, set(points), width),
@@ -1030,6 +1031,8 @@ fn windowed_repo() -> (PathBuf, String, String) {
         f("odd dir/Cargo.lock", "old\n"),
         f("marked.py", "# @generated\nX = 1\n"),
         f("newmark.py", "X = 1\n"),
+        fb(b"conv.py", "100644", b"\x00\x01\x02\n"),
+        f("locked/yarn.lock", &"y1\n".repeat(25)),
         f("user.py", &user),
         f("README.md", "# Big\n"),
         fb(b"image.png", "100644", b"\x89PNG\x00\x00one"),
@@ -1066,6 +1069,8 @@ fn windowed_repo() -> (PathBuf, String, String) {
         f("odd dir/Cargo.lock", "new\n"),
         f("marked.py", "# @generated\nX = 2\n"),
         f("newmark.py", "# DO NOT EDIT\nX = 2\n"),
+        f("conv.py", "# DO NOT EDIT\nX = 1\n"),
+        fb(b"locked/yarn.lock", "120000", b"../a.py"),
         f("user.py", &user),
         f("README.md", "# Big\n"),
         fb(b"image.png", "100644", b"\x89PNG\x00\x00two"),
@@ -1120,6 +1125,8 @@ fn windowed_and_auto_material_is_identical_on_large_changed_files() {
         "- odd dir/Cargo.lock: generated or lock file; diff kept (could not be matched)\n",
         "- marked.py: +1 -1 lines; file block shown as a stat line (marked generated); diff kept\n",
         "diff --git a/Cargo.lock b/Cargo.lock\n(generated", // cut although link.txt is a type change
+        "=== conv.py (after the change) ===\n# DO NOT EDIT\nX = 1\n", // an unreadable old version does not allow a marker
+        "diff --git a/locked/yarn.lock b/locked/yarn.lock\n(generated or lock file: +1 -25 lines; not shown)\ndiff --git a/marked.py", // one section pair, one line
         "=== small.py (after the change) ===\ndef tiny(x):\n    return x + 1\n",
         "- rename_same2.py: no changed lines of 2700\n",
         "--- outline ---\n1: def f0(x):\n",
@@ -1188,6 +1195,8 @@ fn windowed_and_auto_material_is_identical_on_the_fixture_and_edge_repositories(
 #[test]
 fn a_window_as_wide_as_i64_max_covers_the_file_as_python_does() {
     assert_eq!(context::spans_around(10, &BTreeSet::from([5]), i64::MAX), vec![(1, 10)]);
+    // two points at the limit: the first span ends at i64::MAX, and the second still merges into it
+    assert_eq!(context::spans_around(i64::MAX, &BTreeSet::from([1, 2]), i64::MAX), vec![(1, i64::MAX)]);
     let repo = init("wide");
     let base = commit(&repo, &[f("a.py", &funcs(900, "a")), f("README.md", "# R\n")], &[]);
     let head = commit(&repo, &[f("a.py", &funcs(900, "a").replace("return x + 100 ", "return x + 1000 ")), f("README.md", "# R\n")], &[&base]);
@@ -1212,6 +1221,18 @@ fn windowing_never_sends_more_than_full_and_auto_returns_the_smaller_when_neithe
     same_builds_mode(&cases, Some(("windowed", 25)));
     let size = |mode: &str| context::build_mode(&repo, &base, &head, None, 1000, mode, 25).unwrap().len();
     assert_eq!(context::build(&repo, &base, &head, None, 1000).unwrap().len(), size("full").min(size("windowed")));
+    // windows that save fewer bytes than auto's explanation line costs: auto still returns the plain windowed build
+    let r2 = init("small-saving");
+    let rows = |marked: bool| -> String {
+        (1..=100).map(|i| format!("L{i:03} {}\n", if marked && [1, 44, 100].contains(&i) { "yyy".to_string() + &"x".repeat(158) } else { "x".repeat(161) })).collect()
+    };
+    let b2 = commit(&r2, &[f("a.py", &rows(false))], &[]);
+    let h2 = commit(&r2, &[f("a.py", &rows(true))], &[&b2]);
+    let full = context::build_mode(&r2, &b2, &h2, None, 1000, "full", 25).unwrap();
+    let plain = context::build_mode(&r2, &b2, &h2, None, 1000, "windowed", 25).unwrap();
+    assert!(plain.len() < full.len() && full.len() - plain.len() < 89, "{} {}", full.len(), plain.len());
+    assert_eq!(context::build(&r2, &b2, &h2, None, 1000).unwrap(), plain);
+    same_builds_mode(&[(r2.clone(), b2.clone(), h2.clone(), None, 1000)], None);
 }
 
 #[test]
@@ -1242,14 +1263,19 @@ fn windowed_helpers_match_on_many_inputs() {
         ("a.py", "# @generated"), ("a.py", "a\nb\nc\nd\n// DO NOT EDIT\n"), ("a.py", "a\nb\nc\nd\ne\nDO NOT EDIT\n"), ("a.py", "do not edit\n"), ("a.rs", "x @generated y\n"),
         ("flake.lock", "x"), ("pnpm-lock.yaml", ""), ("sub\n/Gemfile.lock", ""), ("./uv.lock", ""), ("x.MAP", ""),
     ];
-    let mut paths_texts: Vec<(String, Option<String>, Option<String>, bool)> = Vec::new();
+    let mut paths_texts: Vec<(String, Option<String>, Option<String>, bool, bool)> = Vec::new();
     for (p, t) in &named {
         for base in [None, Some(t.to_string()), Some("plain\n".to_string()), Some("# @generated\n".to_string())] {
             for deleted in [false, true] {
-                paths_texts.push((p.to_string(), Some(t.to_string()), base.clone(), deleted));
+                // existed: no old version, an unreadable one (binary), or a readable one
+                for existed in [false, true] {
+                    if existed || base.is_none() {
+                        paths_texts.push((p.to_string(), Some(t.to_string()), base.clone(), deleted, existed));
+                    }
+                }
             }
         }
-        paths_texts.push((p.to_string(), None, Some(t.to_string()), false));
+        paths_texts.push((p.to_string(), None, Some(t.to_string()), false, true));
     }
     // replace_generated: changes (old, new), a diff of some of their headers (a type change prints two), stats for some
     let pairs: Vec<(Option<&str>, Option<&str>)> = vec![
@@ -1297,6 +1323,7 @@ fn windowed_helpers_match_on_many_inputs() {
     let mut calls: Vec<(&str, Value)> = vec![
         ("cut_line_each", json!([long])),
         ("generated_kind_each", json!([paths_texts])),
+        ("change_counts_each", json!([diffs])),
     ];
     calls.extend(replaces.iter().map(|(d, st)| ("replace_generated", json!([d, pairs, st.iter().map(|(i, (a, b))| json!([i, [a, b]])).collect::<Vec<_>>()]))));
     calls.extend(diffs.iter().map(|d| ("new_points", json!([d]))));
@@ -1307,7 +1334,8 @@ fn windowed_helpers_match_on_many_inputs() {
     let want = oracle(&calls);
     let mut got = vec![
         json!({"ok": long.iter().map(|l| context::cut_line(l)).collect::<Vec<_>>()}),
-        json!({"ok": paths_texts.iter().map(|(p, t, b, d)| context::generated_kind(p, t.as_deref(), b.as_deref(), *d)).collect::<Vec<_>>()}),
+        json!({"ok": paths_texts.iter().map(|(p, t, b, d, e)| context::generated_kind(p, t.as_deref(), b.as_deref(), *d, *e)).collect::<Vec<_>>()}),
+        json!({"ok": diffs.iter().map(|d| context::change_counts(d)).collect::<Vec<_>>()}),
     ];
     let rust_pairs: Vec<context::Pair> = pairs.iter().map(|(o, n)| (o.map(str::to_string), n.map(str::to_string))).collect();
     got.extend(replaces.iter().map(|(d, st)| {
