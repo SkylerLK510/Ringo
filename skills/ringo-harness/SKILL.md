@@ -75,7 +75,9 @@ The material is the text the harness supplies. Codex and custom commands may als
   untracked files are not included) and adds, after the diff, changed files and README, the unchanged
   definitions, subclasses, callers and tests of the changed symbols as `=== path (unchanged, at head) ===`
   blocks, and a `=== context manifest ===` of what it added and what the budget (`--context-budget`, default
-  400000 bytes) left out. It never fetches: a partial clone missing objects is refused, so fetch them first.
+  400000 bytes) left out. `--context-mode auto|full|windowed` (default `auto`) sets how changed files are sent: whole in
+  `full`, as line windows plus an outline in `windowed`, and `auto` is `full` unless the change alone is over the budget.
+  It never fetches: a partial clone missing objects is refused, so fetch them first.
 - **Review with `--input`:** only when there is no repository. Give the change description, the unified diff
   (`=== change.diff ===`), the full text of every changed file after the change (`=== path (after the change)
   ===`), and the README. Give the whole changed files, not only the hunks: half the real defects sit outside the

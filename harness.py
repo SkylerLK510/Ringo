@@ -20,7 +20,7 @@ only the person running the command names it, never a plan file, which a model m
 usage:
   python3 ringo.py review --input MATERIAL [--backend claude] [--checker-backend SPEC] [--pipeline PLAN.json]
                             [--out FILE] [--trace DIR] [--max-cost USD] [--unpriced-call-usd USD] [--timeout S]
-  python3 ringo.py review --repo PATH --base SHA --head SHA [--pr-text FILE] [--context-budget BYTES] [same options]
+  python3 ringo.py review --repo PATH --base SHA --head SHA [--pr-text FILE] [--context-budget BYTES] [--context-mode auto|full|windowed] [same options]
   python3 ringo.py review ... --findings-json FILE [--rb-pr-json PR.json] [--agent NAME]
   python3 ringo.py design --input BRIEF [same options]
 
@@ -1216,7 +1216,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
 def repo_material(args):
     """Review material built from a repository (context.py); the PR text file, if any, is read as UTF-8."""
     pr_text = Path(args.pr_text).read_text(encoding='utf-8') if args.pr_text else None
-    return context.build(args.repo, args.base, args.head, pr_text, args.context_budget)
+    return context.build(args.repo, args.base, args.head, pr_text, args.context_budget, args.context_mode)
 
 
 def findings_pr(args):
@@ -1358,6 +1358,11 @@ def main(argv=None, *, prog='harness.py'):
             p.add_argument('--context-budget', type=int,
                            help=f'with --repo: material size limit in bytes (default {context.BUDGET}); the change '
                                 'itself is never dropped, only unchanged context blocks')
+            p.add_argument('--context-mode', choices=context.MODES,
+                           help='with --repo: how changed files are sent (default auto): full sends every changed file '
+                                'whole; windowed sends a file over 16000 bytes as line windows around its changes plus an '
+                                'outline, and lock/generated files as a stat line; auto is full unless the change alone '
+                                'is over the budget, then windowed, re-widened to fill the budget')
             p.add_argument('--findings-json', help='also write the findings as ReviewBench agent-contract JSON here '
                                                    '(anchors checked against --head with --repo, unchecked otherwise)')
             p.add_argument('--rb-pr-json', help="with --findings-json: ReviewBench's pr.json, for the pr block's repo "
@@ -1390,7 +1395,7 @@ def main(argv=None, *, prog='harness.py'):
         p.add_argument('--max-calls', help=argparse.SUPPRESS)  # removed; kept only to explain why it fails
     args = parser.parse_args(argv)
     if args.command == 'review':
-        repo_flags = [f for f in ('base', 'head', 'pr_text', 'context_budget') if getattr(args, f) is not None]
+        repo_flags = [f for f in ('base', 'head', 'pr_text', 'context_budget', 'context_mode') if getattr(args, f) is not None]
         if (args.input is None) == (args.repo is None):
             parser.error('review needs exactly one of --input and --repo')
         if args.repo and (args.base is None or args.head is None):
@@ -1403,6 +1408,8 @@ def main(argv=None, *, prog='harness.py'):
             parser.error('--rb-pr-json works only with --findings-json')
         if args.repo and args.context_budget is None:
             args.context_budget = context.BUDGET
+        if args.repo and args.context_mode is None:
+            args.context_mode = 'auto'
     if args.max_calls is not None:
         parser.error('--max-calls was removed: the plan sets the number of calls (docs/HARNESS.md)')
     return task(args, args.command)

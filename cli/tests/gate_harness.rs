@@ -2475,6 +2475,8 @@ fn cli_help_errors_and_refusals_match_ringo_py() {
         args(&["review", "--repo", "r", "--base", "b", "--head", "h", "--context-budget", "0"]), args(&["review", "--input", "a", "--rb-pr-json", "x"]),
         args(&["review", "--input", "a", "--timeout", "abc"]), args(&["review", "--input", "a", "--", "x"]), args(&["review", "--input", "-x"]),
         args(&["review", "--context-budget", "1.5"]), args(&["review", "--input=", "--trace", "-1"]),
+        args(&["review", "--input", "a", "--context-mode", "full"]), args(&["review", "--repo", "r", "--base", "b", "--head", "h", "--context-mode", "wide"]),
+        args(&["review", "--repo", "r", "--base", "b", "--head", "h", "--context-mode"]), args(&["review", "--context-m", "auto", "--input", "a"]),
     ];
     for extra in [
         vec!["--input", "/nonexistent/m.txt"], vec!["--input", ""], vec!["--input", "full"], vec!["--input", "bad.txt"],
