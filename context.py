@@ -468,11 +468,25 @@ def cut_long_lines(text):
     return '\n'.join(cut_line(row) for row in text.split('\n'))
 
 
-def is_generated(path, text):
-    """A lock file, a minified or source-map file, or a file whose first five lines say it is generated."""
+def has_mark(text):
+    """The text says in its first five lines that it is generated."""
+    return any(mark in line for line in text.split('\n')[:5] for mark in GENERATED_MARKS)
+
+
+def generated_kind(path, text, base_text, deleted):
+    """How a changed text file counts as generated, or None: 'lock' for a lock file or a minified or source-map file
+    (by name: the file block and the diff section become a stat line), 'marked' for a file whose first five lines say
+    it is generated (the file block becomes a stat line; the diff stays, since the marker is text the change itself can
+    add). text: the file at head, or at the merge base for a deletion; base_text: the file at the merge base, if it
+    existed there as text. A marker the change adds to an existing file does not classify it."""
+    if text is None:
+        return None
     name = PurePosixPath(path).name
-    return (name in LOCK_NAMES or name.endswith(GENERATED_SUFFIXES)
-            or any(mark in line for line in text.split('\n')[:5] for mark in GENERATED_MARKS))
+    if name in LOCK_NAMES or name.endswith(GENERATED_SUFFIXES):
+        return 'lock'
+    if not deleted and has_mark(text) and (base_text is None or has_mark(base_text)):
+        return 'marked'
+    return None
 
 
 def outline(rows, spans, python):
@@ -521,7 +535,8 @@ def build(repo, base, head, pr_text=None, budget=BUDGET, mode='auto', changed_wi
     mode: 'full' sends every changed file whole (the control of any comparison); 'windowed' sends a changed file
     over WHOLE_FILE as windows of +-changed_window lines around its changes plus an outline, and lock and generated
     files as a stat line; 'auto' builds 'full' and, only if the change alone is over the budget, 'windowed' instead,
-    then spends what the budget has left re-widening the windows."""
+    then spends what the budget has left re-widening the windows. If windowed does not fit either, auto returns
+    the smaller of the two builds."""
     repo = Path(repo)
     if not isinstance(budget, int) or budget <= 0:
         raise ContextError('the context budget must be a positive number of bytes')
@@ -536,18 +551,47 @@ def build(repo, base, head, pr_text=None, budget=BUDGET, mode='auto', changed_wi
             material, need = _build(repo, base, head, pr_text, budget, objects, False, changed_window)
             if need <= budget:
                 return material
-            return _build(repo, base, head, pr_text, budget, objects, True, changed_window, auto_need=need)[0]
+            windowed = _build(repo, base, head, pr_text, budget, objects, True, changed_window, auto_need=need)[0]
+            # Windows are meant to make the change fit. If they still do not, send whichever is smaller (a tie: full).
+            if len(windowed.encode()) <= budget or len(windowed.encode()) < len(material.encode()):
+                return windowed
+            return material
         return _build(repo, base, head, pr_text, budget, objects, mode == 'windowed', changed_window)[0]
 
 
 def replace_generated(diff, pairs, stats):
-    """The diff with each generated or lock file's section cut to its 'diff --git' line and a stat line; stats is
-    {path: (added, deleted)}. Unchanged if the sections do not line up with the changed files."""
-    sections = aligned_sections(diff, pairs)
-    if sections is None:
-        return diff
-    return ''.join(section.split('\n', 1)[0] + f'\n(generated or lock file: +{stats[new][0]} -{stats[new][1]} lines; not shown)\n'
-                   if new in stats else section for (_, new), section in zip(pairs, sections))
+    """(diff, matched): the diff with the section of each lock file cut to its 'diff --git' line and a stat line, and
+    the set of change indices that were. stats is {change index: (added, deleted)}. A section belongs to a change by
+    its header, 'diff --git a/OLD b/NEW' with plain names; a change is cut only if exactly one section is its own and
+    no other change has the same header (a type change prints two sections; an unusual name cannot be matched), so
+    anything else stays in the diff."""
+    first = re.split(r'^(?=diff --git )', diff, flags=re.M)
+    sections = first[1:]
+    expected = {}
+    for i, (old, new) in enumerate(pairs):
+        a, b = old or new, new or old
+        if PLAIN_NAME.fullmatch(a) and PLAIN_NAME.fullmatch(b):
+            expected.setdefault(f'diff --git a/{a} b/{b}', []).append(i)
+    hits = {}
+    for k, section in enumerate(sections):
+        owners = expected.get(section.split('\n', 1)[0], [])
+        if len(owners) == 1:
+            hits.setdefault(owners[0], []).append(k)
+    matched = {i for i in stats if len(hits.get(i, [])) == 1}
+    cut = {hits[i][0]: stats[i] for i in matched}
+    return first[0] + ''.join(
+        section.split('\n', 1)[0] + f'\n(generated or lock file: +{cut[k][0]} -{cut[k][1]} lines; not shown)\n'
+        if k in cut else section for k, section in enumerate(sections)), matched
+
+
+def generated_kind_of(repo, mb, head, old, new, objects):
+    """generated_kind of one change: a deletion by its merge-base text, anything else by its text at head and, if the
+    file existed, at the merge base."""
+    try:
+        base_text = blob(repo, mb, old, objects) if old else None
+    except ContextError:
+        base_text = None
+    return generated_kind(new or old, blob(repo, head, new, objects) if new else base_text, base_text, new is None)
 
 
 def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CHANGED_WINDOW, auto_need=None):
@@ -560,18 +604,20 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
                f'{base_id}...{head_id}')
     pairs = changes(repo, mb, head_id)
     changed = [new for _, new in pairs if new]
-    detail = {}  # windowed: changed path -> (added lines, removed lines, new-side changed lines)
+    # windowed, by change index: (added, removed) line counts, new-side changed lines, and how it counts as generated
+    stats, points, kinds = {}, {}, {}
     if windowed:
-        for (old, new), text in zip(pairs, diff_texts(repo, mb, head_id, pairs)):
-            if new:
-                _, _, _, minus, plus = hunks(repo, mb, head_id, old, new, text=text)
-                detail[new] = (len(plus), len(minus), new_points(text))
+        for i, ((old, new), text) in enumerate(zip(pairs, diff_texts(repo, mb, head_id, pairs))):
+            _, _, _, minus, plus = hunks(repo, mb, head_id, old, new, text=text)
+            stats[i], points[i] = (len(plus), len(minus)), new_points(text)
+            kinds[i] = generated_kind_of(repo, mb, head_id, old, new, objects)
+    pair_of = {new: i for i, (_, new) in enumerate(pairs) if new}
     parts = []
     if pr_text is not None:
         parts.append(f'=== PR description ===\n{pr_text}')
     diff_at = len(parts)
     parts.append(f'=== change.diff ===\n{diff}')
-    submodules, wfiles, generated = [], [], {}  # wfiles: windowed changed files, in change order
+    submodules, wfiles = [], []  # wfiles: windowed changed files, in change order
     for path in changed:
         text = blob(repo, head_id, path, objects)
         if text is None:
@@ -581,21 +627,23 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
                 text = f'(submodule at commit {e[2]}; its contents are not in this repository and are not shown)\n'
             else:
                 text = '(binary or not UTF-8 text; not shown)\n'
-        elif windowed and is_generated(path, text):
-            added, deleted, _ = detail[path]
-            generated[path] = (added, deleted)
+        elif windowed and kinds[pair_of[path]]:
+            added, deleted = stats[pair_of[path]]
             parts.append(f'=== {path} (generated or lock file; not shown) ===\n+{added} -{deleted} lines\n')
             continue
         elif windowed and len(text.encode()) > WHOLE_FILE:
             entry = {'path': path, 'text': text, 'rows': [cut_line(r) for r in line_rows(text)],
-                     'points': detail[path][2], 'index': len(parts), 'whole': False}
+                     'points': points[pair_of[path]], 'index': len(parts), 'whole': False}
             wide(entry, window)
             wfiles.append(entry)
             parts.append(entry['block'])
             continue
         parts.append(f'=== {path} (after the change) ===\n{text}')
-    if generated:
-        parts[diff_at] = f'=== change.diff ===\n{replace_generated(diff, pairs, generated)}'
+    locks = {i: stats[i] for i, kind in kinds.items() if kind == 'lock'}
+    matched = set()
+    if locks:
+        cut, matched = replace_generated(diff, pairs, locks)
+        parts[diff_at] = f'=== change.diff ===\n{cut}'
     readme = next((r for r in READMES if r not in changed and (objects.read(head_id, r) or ('',))[0] == 'blob'), None)
     if readme:
         text = blob(repo, head_id, readme, objects)
@@ -607,6 +655,15 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
     found = matches(repo, head_id, syms, owners, set(changed) | ({readme} if readme else set()))
 
     added, skipped, unreadable = [], [], []
+    cut_notes, kept_notes = [], []
+    for i, kind in sorted(kinds.items()):
+        name = pairs[i][1] or pairs[i][0]
+        if kind == 'lock' and i in matched:
+            cut_notes.append(f'{name}: +{stats[i][0]} -{stats[i][1]} lines')
+        elif kind == 'lock':
+            kept_notes.append(f'{name}: generated or lock file; diff kept (could not be matched)')
+        elif kind == 'marked':
+            kept_notes.append(f'{name}: +{stats[i][0]} -{stats[i][1]} lines; file block shown as a stat line (marked generated); diff kept')
     def manifest():
         wnotes = [f"{w['path']}: lines {', '.join(w['spans'])} of {len(w['rows'])}" if w['spans']
                   else f"{w['path']}: no changed lines of {len(w['rows'])}" for w in wfiles if not w['whole']]
@@ -619,8 +676,8 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
                                                              'the three-dot diff', f'{len(changed)} changed file(s) at head',
                                                              readme])) + '.',
                  *(['Changed files sent as windows:', *listing(wnotes),
-                    'Generated or lock files shown as a stat line:',
-                    *listing([f'{p}: +{a} -{d} lines' for p, (a, d) in generated.items()])] if windowed else []),
+                    'Generated or lock files shown as a stat line (file block and diff):', *listing(cut_notes),
+                    'Generated or lock files whose diff was kept:', *listing(kept_notes)] if windowed else []),
                  f'Changed symbols searched with word matches at head ({len(syms)}): ' + (', '.join(syms[:LISTED]) or 'none')
                  + (f', ... and {len(syms) - LISTED} more' if len(syms) > LISTED else '') + '.',
                  f'Classes of changed methods, searched for subclasses only ({len(owners)}): '
@@ -679,7 +736,7 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
                     continue
                 before = {k: w[k] for k in ('block', 'spans', 'width', 'whole')}
                 if step is None:
-                    w.update(block=f"=== {w['path']} (after the change) ===\n{w['text']}", whole=True)
+                    w.update(block=whole_block(w), whole=True)
                 else:
                     wide(w, step)
                 parts[w['index']], was = w['block'], required
@@ -697,7 +754,16 @@ def _build(repo, base, head, pr_text, budget, objects, windowed=False, window=CH
     return result, change_bytes
 
 
+def whole_block(entry):
+    return f"=== {entry['path']} (after the change) ===\n{entry['text']}"
+
+
 def wide(entry, width):
-    """Set a windowed changed file's block, spans and width: windows of +-width lines around its changes."""
+    """Set a windowed changed file's block, spans and width: windows of +-width lines around its changes. A block
+    that is not smaller in bytes than the whole file (a new file, or windows covering nearly all of it, with their
+    line numbers and outline) is the whole file instead: windowing never sends more than full mode does."""
     body, entry['spans'] = changed_windows(entry['path'], entry['rows'], entry['points'], width)
-    entry['block'], entry['width'] = f"=== {entry['path']} (after the change) ===\n{body}", width
+    block, entry['width'] = f"=== {entry['path']} (after the change) ===\n{body}", width
+    if len(block.encode()) >= len(whole_block(entry).encode()):
+        block, entry['whole'] = whole_block(entry), True
+    entry['block'] = block
