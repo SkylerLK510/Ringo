@@ -60,6 +60,13 @@ FUNCS = {
     'is_test_each': lambda paths: [context.is_test(p) for p in paths],
     'windows': lambda t, l, r: context.windows(t, set(l), r),
     'hunks_text': lambda t: context.hunks(None, None, None, None, None, text=t),
+    'new_points': context.new_points,
+    'cut_line_each': lambda rows: [context.cut_line(r) for r in rows],
+    'cut_long_lines': context.cut_long_lines,
+    'is_generated_each': lambda pairs: [context.is_generated(p, t) for p, t in pairs],
+    'line_rows': context.line_rows,
+    'changed_windows': lambda path, rows, points, width: context.changed_windows(path, rows, set(points), width),
+    'diff_texts': lambda repo, mb, head, pairs: context.diff_texts(repo, mb, head, [tuple(p) for p in pairs]),
     'describe': lambda why: context.describe({tuple(w) for w in why}),
     'listing': context.listing,
     'symbols': lambda repo, mb, head, pairs: context.symbols(repo, mb, head, [tuple(p) for p in pairs]),
@@ -221,24 +228,41 @@ fn commit(repo: &Path, files: &[File], parents: &[&str]) -> String {
     g(repo, &args, b"")
 }
 
-fn rust_build(repo: &Path, base: &str, head: &str, pr: Option<&str>, budget: i64) -> Value {
-    res!(context::build(repo, base, head, pr, budget))
+/// A build mode and changed window; None is context.py's default call (auto, CHANGED_WINDOW).
+type Mode<'a> = Option<(&'a str, i64)>;
+
+fn rust_build(repo: &Path, base: &str, head: &str, pr: Option<&str>, budget: i64, mode: Mode) -> Value {
+    match mode {
+        None => res!(context::build(repo, base, head, pr, budget)),
+        Some((m, w)) => res!(context::build_mode(repo, base, head, pr, budget, m, w)),
+    }
 }
 
-/// Builds every case in Rust and in Python and compares; returns the number of cases.
+/// Builds every case in Rust and in Python and compares; returns the number of cases. The cases that predate the
+/// modes are checked in 'full' mode, which must stay what it was.
 fn same_builds(cases: &[(PathBuf, String, String, Option<String>, i64)]) -> usize {
+    same_builds_mode(cases, Some(("full", context::CHANGED_WINDOW)))
+}
+
+fn same_builds_mode(cases: &[(PathBuf, String, String, Option<String>, i64)], mode: Mode) -> usize {
     let calls: Vec<(&str, Value)> = cases
         .iter()
-        .map(|(r, b, h, p, n)| ("build", json!([r.to_str().unwrap(), b, h, p, n])))
+        .map(|(r, b, h, p, n)| {
+            let mut args = vec![json!(r.to_str().unwrap()), json!(b), json!(h), json!(p), json!(n)];
+            if let Some((m, w)) = mode {
+                args.extend([json!(m), json!(w)]);
+            }
+            ("build", Value::Array(args))
+        })
         .collect();
     let want = oracle(&calls);
     for ((r, b, h, p, n), want) in cases.iter().zip(&want) {
-        let got = rust_build(r, b, h, p.as_deref(), *n);
+        let got = rust_build(r, b, h, p.as_deref(), *n, mode);
         if &got != want {
             let (g, w) = (got.to_string(), want.to_string());
             let at = g.bytes().zip(w.bytes()).take_while(|(a, b)| a == b).count();
             panic!(
-                "build({r:?}, {b}, {h}, pr={p:?}, budget={n}) differs at byte {at}:\n rust:   {}\n python: {}",
+                "build({r:?}, {b}, {h}, pr={p:?}, budget={n}, mode={mode:?}) differs at byte {at}:\n rust:   {}\n python: {}",
                 &g[at.saturating_sub(200)..(at + 200).min(g.len())],
                 &w[at.saturating_sub(200)..(at + 200).min(w.len())]
             );
@@ -248,7 +272,13 @@ fn same_builds(cases: &[(PathBuf, String, String, Option<String>, i64)]) -> usiz
 }
 
 fn material_len(repo: &Path, base: &str, head: &str, budget: i64) -> i64 {
-    context::build(repo, base, head, None, budget).unwrap().len() as i64
+    context::build_mode(repo, base, head, None, budget, "full", context::CHANGED_WINDOW).unwrap().len() as i64
+}
+
+/// Bytes of the change alone (PR text, diff, changed files, README) in full mode.
+fn change_alone(repo: &Path, base: &str, head: &str) -> i64 {
+    let m = context::build_mode(repo, base, head, None, 1, "full", context::CHANGED_WINDOW).unwrap();
+    m.split("\n=== context manifest ===").next().unwrap().len() as i64
 }
 
 const PRS: [Option<&str>; 5] =
@@ -336,7 +366,7 @@ fn many_left_out_files_are_summarized_identically() {
     for budget in [context::BUDGET, req2 + 3000, 10] {
         cases.push((r2.clone(), b2.clone(), h2.clone(), None, budget));
     }
-    let m = context::build(&r2, &b2, &h2, None, context::BUDGET).unwrap();
+    let m = context::build_mode(&r2, &b2, &h2, None, context::BUDGET, "full", context::CHANGED_WINDOW).unwrap();
     assert!(m.contains("- ... and 5 more\n") && m.contains(", ... and 5 more."), "LISTED summaries");
     same_builds(&cases);
 }
@@ -490,7 +520,7 @@ fn edge_repository_material_is_identical() {
         cases.push((repo.clone(), c[0].clone(), c[1].clone(), None, budget));
     }
     let n = same_builds(&cases);
-    let m = context::build(&repo, &c[0], &c[1], None, context::BUDGET).unwrap();
+    let m = context::build_mode(&repo, &c[0], &c[1], None, context::BUDGET, "full", context::CHANGED_WINDOW).unwrap();
     // the cases this repository is for really occur
     for needle in [
         "=== sub (after the change) ===\n(submodule at commit ",
@@ -955,6 +985,263 @@ fn python_symbols_matches_cpython_on_the_stdlib_and_this_repository() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
+// Windowed and auto modes.
+
+fn funcs(n: usize, tag: &str) -> String {
+    (0..n).map(|i| format!("def f{i}(x):\n    return x + {i}  # {tag}\n\n")).collect()
+}
+
+fn js_funcs(n: usize, tag: &str) -> String {
+    (0..n).map(|i| format!("function name_{i}(a) {{\n  return a + {i}; // {tag}\n}}\n\nconst LIMIT_{i} = {i};\n")).collect()
+}
+
+/// A repository whose base and head differ in large changed files (windows, merging, outlines past the cap, a
+/// pure deletion, CRLF, non-Python definitions, added, deleted, renamed and mode-changed large files), lock and
+/// generated files, long lines (multi-byte too), small files, a binary, a gitlink and an unchanged user of f100.
+fn windowed_repo() -> (PathBuf, String, String) {
+    let repo = init("windowed");
+    let sub_a = commit(&repo, &[f("g.txt", "a\n")], &[]);
+    let sub_b = commit(&repo, &[f("g.txt", "b\n")], &[]);
+    let crlf = |t: String| t.replace('\n', "\r\n");
+    let multi = |tag: &str| format!("x = 1\n{}\ny = 2  # {tag}\n{}", "é".repeat(1500), funcs(900, "m"));
+    let user = format!("from a import f100\n\nV = f100(1)\n{}\n{}\n", "日".repeat(1400), "z".repeat(3000));
+    let base_files = vec![
+        f("a.py", &funcs(900, "a")),
+        f("b.py", &funcs(900, "b")),
+        f("c.py", &funcs(900, "c")),
+        f("web/app.js", &js_funcs(700, "a")),
+        f("crlf.py", &crlf(funcs(900, "a"))),
+        f("multi.py", &multi("a")),
+        f("rename_me.py", &funcs(900, "r")),
+        f("rename_same.py", &funcs(900, "s")),
+        f("gone.py", &funcs(900, "g")),
+        f("modeonly.py", &funcs(900, "o")),
+        f("small.py", "def tiny(x):\n    return x\n"),
+        f("Cargo.lock", &"v1\n".repeat(30)),
+        f("vendor/go.sum", &"h1\n".repeat(30)),
+        f("gen.py", "# @generated by tool\nX = 1\n"),
+        f("gen2.c", "/* a\n * b\n * DO NOT EDIT\n */\nint x;\n"),
+        f("late.py", "a\nb\nc\nd\ne\n# @generated\nX = 1\n"),
+        f("app.min.js", "var a=1;\n"),
+        f("app.js.map", "{\"v\":1}\n"),
+        f("user.py", &user),
+        f("README.md", "# Big\n"),
+        fb(b"image.png", "100644", b"\x89PNG\x00\x00one"),
+        fb(b"sub", "160000", sub_a.as_bytes()),
+    ];
+    let base = commit(&repo, &base_files, &[]);
+    let edit = |text: &str, pairs: &[(&str, &str)]| pairs.iter().fold(text.to_string(), |t, (a, b)| t.replace(a, b));
+    let a1 = edit(&funcs(900, "a"), &[("return x + 100 ", "return x + 1000 "), ("return x + 110 ", "return x + 1100 "), ("return x + 500 ", "return x + 5000 "),
+        ("def f300(x):\n    return x + 300  # a\n\n", ""), ("return x + 899 ", "return x + 8990 ")]);
+    let long_row = "Q".repeat(2500);
+    let b1 = edit(&funcs(900, "b"), &[("return x + 100 ", &format!("return x + 1000 # {long_row} ")), ("return x + 3 ", "return x + 33 ")]);
+    let c1 = format!("{}{}", funcs(900, "c"), "def appended(x):\n    return x\n"); // an end-of-file edit
+    let c1 = c1.replacen("def f0(x):\n    return x + 0  # c\n\n", "", 1); // and a deletion at the very start
+    let mut head_files: Vec<File> = vec![
+        f("a.py", &a1),
+        f("b.py", &b1),
+        f("c.py", &c1),
+        f("web/app.js", &edit(&js_funcs(700, "a"), &[("return a + 350; // a", "return a + 351; // a"), ("const LIMIT_10 = 10;", "const LIMIT_10 = 11;")])),
+        f("crlf.py", &crlf(edit(&funcs(900, "a"), &[("return x + 400 ", "return x + 4000 ")]))),
+        f("multi.py", &multi("b")),
+        f("rename_new.py", &edit(&funcs(900, "r"), &[("return x + 5 ", "return x + 55 ")])),
+        f("rename_same2.py", &funcs(900, "s")),
+        fb(b"modeonly.py", "100755", funcs(900, "o").as_bytes()),
+        f("added_big.py", &funcs(900, "n")),
+        f("small.py", "def tiny(x):\n    return x + 1\n"),
+        f("Cargo.lock", &format!("v2\n{}", "v1\n".repeat(30))),
+        f("vendor/go.sum", &"h2\n".repeat(31)),
+        f("gen.py", "# @generated by tool\nX = 2\n"),
+        f("gen2.c", "/* a\n * b\n * DO NOT EDIT\n */\nint y;\n"),
+        f("late.py", "a\nb\nc\nd\ne\n# @generated\nX = 2\n"),
+        f("app.min.js", "var a=2;\n"),
+        f("app.js.map", "{\"v\":2}\n"),
+        f("user.py", &user),
+        f("README.md", "# Big\n"),
+        fb(b"image.png", "100644", b"\x89PNG\x00\x00two"),
+        fb(b"sub", "160000", sub_b.as_bytes()),
+        f("empty.py", ""),
+    ];
+    head_files.retain(|x| x.0 != b"gone.py");
+    let head = commit(&repo, &head_files, &[&base]);
+    (repo, base, head)
+}
+
+/// Every mode and window over a spread of budgets, with PR texts: windowed and auto from the change alone's size
+/// (windowed and refilled) up to the full material, so every refill step is the last one that fits somewhere.
+fn mode_sweep(repo: &Path, base: &str, head: &str, steps: i64) -> usize {
+    let need = change_alone(repo, base, head);
+    let windowed = |w: i64| context::build_mode(repo, base, head, None, 1, "windowed", w).unwrap().split("\n=== context manifest ===").next().unwrap().len() as i64;
+    let (small, mid) = (windowed(25), windowed(150));
+    let mut budgets = vec![context::BUDGET, need + 20_000, need, need - 1, need - 100, small, small - 1, mid, mid + 1, small + 700, 10, 1];
+    budgets.extend((0..=steps).map(|k| small - 50 + k * ((need - small + 100) / steps).max(1)));
+    let mut total = 0;
+    for (mode, window) in [("windowed", 25), ("windowed", 0), ("auto", 25), ("auto", 60)] {
+        let mut cases = Vec::new();
+        for (i, &budget) in budgets.iter().enumerate() {
+            if budget > 0 {
+                cases.push((repo.to_path_buf(), base.to_string(), head.to_string(), PRS[i % PRS.len()].map(str::to_string), budget));
+            }
+        }
+        total += same_builds_mode(&cases, Some((mode, window)));
+    }
+    let mut cases = vec![(repo.to_path_buf(), base.to_string(), head.to_string(), None, context::BUDGET)];
+    cases.extend(budgets.iter().filter(|&&b| b > 0).map(|&b| (repo.to_path_buf(), base.to_string(), head.to_string(), Some("PR".into()), b)));
+    total + same_builds_mode(&cases, None)
+}
+
+#[test]
+fn windowed_and_auto_material_is_identical_on_large_changed_files() {
+    let (repo, base, head) = windowed_repo();
+    let w = context::build_mode(&repo, &base, &head, None, context::BUDGET, "windowed", context::CHANGED_WINDOW).unwrap();
+    // the cases this repository is for really occur
+    for needle in [
+        "- a.py: lines 277-357, 876-926, 1474-1524, 2671-2697 of 2697",
+        "=== Cargo.lock (generated or lock file; not shown) ===\n+1 -0 lines\n",
+        "diff --git a/Cargo.lock b/Cargo.lock\n(generated or lock file: +1 -0 lines; not shown)\n",
+        "=== vendor/go.sum (generated or lock file; not shown) ===\n",
+        "=== gen2.c (generated or lock file; not shown) ===\n",
+        "=== app.js.map (generated or lock file; not shown) ===\n",
+        "=== late.py (after the change) ===\na\nb\n", // @generated past line 5 is not a marker
+        "=== small.py (after the change) ===\ndef tiny(x):\n    return x + 1\n",
+        "- rename_same2.py: no changed lines of 2700\n",
+        "--- outline ---\n1: def f0(x):\n",
+        "... and ",
+        " \u{2026}[1527 more characters cut]\n",
+        "(windowed: 2697 lines at head; shown: \u{b1}25 lines",
+        "Changed files sent as windows:\n- a.py: lines ",
+        "(binary or not UTF-8 text; not shown)",
+        "Changed submodules, shown only as their commit:",
+    ] {
+        assert!(w.contains(needle), "{needle:?} not in the windowed material");
+    }
+    let b_block = w.split("=== b.py (after the change) ===\n").nth(1).unwrap().split("\n=== ").next().unwrap();
+    assert!(!b_block.contains(&"Q".repeat(1001)) && w.contains(&"Q".repeat(2500)), "cut in the window, whole in the diff");
+    assert!(w.contains(&"日".repeat(1000)) && !w.contains(&"日".repeat(1001)));
+    let n = mode_sweep(&repo, &base, &head, 8);
+    assert!(n > 80, "{n}");
+}
+
+#[test]
+fn auto_refill_is_identical_where_it_stops_at_every_step() {
+    // two large changed files: at the budgets below, refill ends with both at 60, both at 150, one whole, both whole
+    let repo = init("refill");
+    let files = |tag: &str| vec![f("a.py", &funcs(900, tag)), f("b.py", &funcs(900, tag)), f("README.md", "# R\n")];
+    let base = commit(&repo, &files("a"), &[]);
+    let head_files = vec![
+        f("a.py", &funcs(900, "a").replace("return x + 100 ", "return x + 1000 ")),
+        f("b.py", &funcs(900, "a").replace("return x + 100 ", "return x + 1000 ")),
+        f("README.md", "# R\n"),
+    ];
+    let head = commit(&repo, &head_files, &[&base]);
+    let need = change_alone(&repo, &base, &head);
+    let size = |w: i64| context::build_mode(&repo, &base, &head, None, 1, "windowed", w).unwrap().len() as i64;
+    let budgets = [size(25) + 10, (size(60) + size(150)) / 2, size(150) + 400, need - 100, need - 1, need];
+    let cases: Vec<_> = budgets.iter().map(|&b| (repo.clone(), base.clone(), head.clone(), None, b)).collect();
+    same_builds_mode(&cases, None);
+    // how many changed files end at each width: (25, 60, 150, whole); a file that reached whole is no longer windowed
+    let seen: Vec<[usize; 4]> = budgets
+        .iter()
+        .map(|&b| {
+            let m = context::build(&repo, &base, &head, None, b).unwrap();
+            let n = |w: &str| m.matches(&format!("shown: \u{b1}{w} lines")).count();
+            [n("25"), n("60"), n("150"), 2 - m.matches("(windowed:").count()]
+        })
+        .collect();
+    assert_eq!(seen, [[2, 0, 0, 0], [0, 1, 1, 0], [0, 0, 2, 0], [0, 0, 1, 1], [0, 0, 1, 1], [0, 0, 0, 2]], "{seen:?}");
+}
+
+#[test]
+fn windowed_and_auto_material_is_identical_on_the_fixture_and_edge_repositories() {
+    let (repo, base, head) = fixture(&[]);
+    let (r2, c) = edge_repo();
+    let mut total = 0;
+    for (mode, window) in [("windowed", 25), ("auto", 25), ("auto", 3)] {
+        let mut cases = budget_sweep(&repo, &base, &head, 20);
+        cases.extend(budget_sweep(&r2, &c[0], &c[1], 12));
+        for (b, h) in [(0, 1), (1, 0), (1, 2), (2, 3), (0, 0), (1, 5), (4, 5)] {
+            cases.push((r2.clone(), c[b].clone(), c[h].clone(), Some("PR ☃\r\n".to_string()), context::BUDGET));
+            cases.push((r2.clone(), c[b].clone(), c[h].clone(), None, 5_000));
+        }
+        total += same_builds_mode(&cases, Some((mode, window)));
+    }
+    assert!(total > 100);
+}
+
+#[test]
+fn mode_errors_have_python_s_exact_text() {
+    let (repo, base, head) = fixture(&[]);
+    let r = repo.to_str().unwrap();
+    let bad: Vec<(Value, i64)> = vec![(json!("wide"), 25), (json!(""), 25), (json!("AUTO"), 25), (json!("full"), -1), (json!("auto"), -7), (json!("it's"), 25)];
+    let calls: Vec<(&str, Value)> = bad.iter().map(|(m, w)| ("build", json!([r, base, head, null, context::BUDGET, m, w]))).collect();
+    let want = oracle(&calls);
+    for ((m, w), want) in bad.iter().zip(&want) {
+        let got = rust_build(&repo, &base, &head, None, context::BUDGET, Some((m.as_str().unwrap(), *w)));
+        assert_eq!(&got, want, "{m} {w}");
+        assert!(got.get("err").is_some());
+    }
+}
+
+#[test]
+fn windowed_helpers_match_on_many_inputs() {
+    let mut r = Lcg(5);
+    let words = ["é", "日", "x", "\u{1f600}", "ab", " "];
+    let long: Vec<String> = [0usize, 1, 999, 1000, 1001, 1002, 2500]
+        .iter()
+        .flat_map(|&n| words.iter().map(move |w| w.repeat(n)))
+        .chain((0..60).map(|_| (0..r.next(1100) as usize).map(|_| words[r.next(6) as usize]).collect::<String>()))
+        .collect();
+    let paths_texts: Vec<(String, String)> = [
+        ("Cargo.lock", ""), ("a/b/yarn.lock", "x"), ("x.min.js", ""), ("x.min.css", ""), ("a.map", ""), ("x.min.json", ""), ("dir/Cargo.lock.bak", ""), ("go.sum", ""),
+        ("a.py", "# @generated"), ("a.py", "a\nb\nc\nd\n// DO NOT EDIT\n"), ("a.py", "a\nb\nc\nd\ne\nDO NOT EDIT\n"), ("a.py", "do not edit\n"), ("a.rs", "x @generated y\n"),
+        ("flake.lock", "x"), ("pnpm-lock.yaml", ""), ("sub\n/Gemfile.lock", ""), ("./uv.lock", ""), ("x.MAP", ""),
+    ]
+    .iter()
+    .map(|(p, t)| (p.to_string(), t.to_string()))
+    .collect();
+    let diffs: Vec<String> = (0..200)
+        .map(|_| {
+            (0..r.next(8))
+                .map(|_| r.pick(&["@@ -1,2 +3,4 @@ def f():", "@@ -5 +6 @@", "@@ -0,0 +1 @@ ctx", "@@ -4,3 +9,0 @@", "@@ -4 +0,0 @@", "@@ -١٢ +٣,٠ @@", "-old", "+new", " ctx", "@@ -2 +7,2 @@x"]).to_string() + "\n")
+                .collect()
+        })
+        .collect();
+    let texts: Vec<String> = (0..120)
+        .map(|_| {
+            let n = r.next(90) as usize;
+            let text: String = (0..n).map(|_| format!("{}{}", r.pick(&["row", "def f():", "class A:", "    async def g():", "int main(int a) {", "ABC = 1", "\u{c}", "é", "x\r", "fn z() {", "export const AB_C = 2;", ""]), r.pick(&["\n", "\r\n"]))).collect();
+            if r.next(3) == 0 { text.trim_end().to_string() } else { text }
+        })
+        .collect();
+    let mut cases: Vec<(String, Vec<u64>, i64)> = Vec::new(); // (path, points, width)
+    for i in 0..texts.len() {
+        let n = texts[i].split('\n').count() as u64;
+        cases.push((if i % 2 == 0 { "m.py" } else { "m.js" }.to_string(), (0..r.next(5)).map(|_| r.next(n + 6)).collect(), r.next(12) as i64));
+    }
+    let mut calls: Vec<(&str, Value)> = vec![
+        ("cut_line_each", json!([long])),
+        ("is_generated_each", json!([paths_texts])),
+    ];
+    calls.extend(diffs.iter().map(|d| ("new_points", json!([d]))));
+    calls.extend(texts.iter().map(|t| ("line_rows", json!([t]))));
+    calls.extend(texts.iter().map(|t| ("cut_long_lines", json!([t]))));
+    let rows_of = |t: &String| context::line_rows(t).into_iter().map(context::cut_line).collect::<Vec<_>>();
+    calls.extend(texts.iter().zip(&cases).map(|(t, (p, pts, w))| ("changed_windows", json!([p, rows_of(t), pts, w]))));
+    let want = oracle(&calls);
+    let mut got = vec![
+        json!({"ok": long.iter().map(|l| context::cut_line(l)).collect::<Vec<_>>()}),
+        json!({"ok": paths_texts.iter().map(|(p, t)| context::is_generated(p, t)).collect::<Vec<_>>()}),
+    ];
+    got.extend(diffs.iter().map(|d| json!({"ok": context::new_points(d)})));
+    got.extend(texts.iter().map(|t| json!({"ok": context::line_rows(t)})));
+    got.extend(texts.iter().map(|t| json!({"ok": context::cut_long_lines(t)})));
+    got.extend(texts.iter().zip(&cases).map(|(t, (p, pts, w))| json!({"ok": context::changed_windows(p, &rows_of(t), &pts.iter().copied().collect(), *w)})));
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g, w, "call {i}: {} {}", calls[i].0, calls[i].1.to_string().chars().take(300).collect::<String>());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
 // This repository's own history.
 
 fn history() -> (PathBuf, Vec<(String, Vec<String>)>) {
@@ -1029,6 +1316,9 @@ fn history_subset_is_identical() {
     assert!(merges == 1 && plain == 3, "{merges} merge(s), {plain} commit(s): this test needs the repository's \
              history (a full clone, or fetch-depth: 0 in CI)");
     same_builds(&cases);
+    // the same commits in windowed and auto modes: this repository's changed files are mostly over 16 KB
+    same_builds_mode(&cases, Some(("windowed", context::CHANGED_WINDOW)));
+    same_builds_mode(&cases, None);
 }
 
 #[test]
@@ -1053,6 +1343,8 @@ fn budget_sweeps_are_identical() {
 #[ignore = "full-history sweep: every commit pair of the last 150 commits at three budgets (several minutes)"]
 fn history_is_identical() {
     let cases = history_cases(150, &[context::BUDGET, 40_000, 3000]);
-    let n = same_builds(&cases);
+    let n = same_builds(&cases)
+        + same_builds_mode(&cases, Some(("windowed", context::CHANGED_WINDOW)))
+        + same_builds_mode(&cases, None);
     println!("history sweep: {n} builds identical");
 }
