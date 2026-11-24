@@ -96,6 +96,30 @@ The cost is a risk to recall, not latency: a defect can sit in the unchanged lin
 is free. Count how many of the benchmark's labeled defect lines would survive the trimming. Only if most survive is a
 preregistered, paired study worth its model calls.
 
+#### Built: windowed changed files (2026-11-23)
+
+`ringo.py review --repo ... --context-mode {auto,full,windowed}` now sends changed files as windows. Status: built,
+**recall untested.** Nothing below says windowing keeps the defects a review finds; it says how many bytes it saves.
+
+- `full` sends every changed file whole, as before (byte for byte). It is the control of any comparison.
+- `windowed` sends a changed file over 16,000 bytes as line-numbered windows of ±25 lines (`CHANGED_WINDOW`, not tuned
+  yet) around the lines the change adds or edits (a pure deletion: the line where it sat), merged, plus an
+  `--- outline ---` of the definition-like lines outside the windows. Smaller files stay whole. A lock file, a
+  minified or source-map file, and a file marked `@generated` or `DO NOT EDIT` in its first five lines get a stat
+  line (`+A -D lines`) instead of a file block and a diff section. Lines over 1,000 characters are cut in windows,
+  outlines and unchanged context blocks, never in the diff. The manifest lists the windowed files and the stat-line
+  files.
+- `auto` (the default) builds `full` and uses it unless the change alone (PR text, diff, changed files, README) is over
+  the budget; then it builds `windowed`, places the context blocks, and spends the budget that is left re-widening the
+  windows to 60 lines, then 150, then the whole file, a step taken for a file only if all the material still fits. Under
+  the budget, `auto` is `full` byte for byte.
+
+Measured offline, no model calls: the change alone (no PR text) of the last 80 single-parent commits of this repository,
+each against its parent. Full: 33,257,150 bytes in all, median 374,912, largest 1,412,290; 37 of the 80 are over the
+400,000-byte budget. Windowed (±25): 10,937,948 bytes in all, median 91,587, largest 731,547; 3 are over the budget.
+These are bytes only. Whether the review still finds the defects that sit in the lines the windows leave out is not
+measured; the explicit `windowed` mode exists so a paired study can test it against `full`.
+
 ## Decision
 
 Not now. No measured gain exists on Ringo's own tasks, and the owner's priority is the CLI.
