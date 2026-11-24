@@ -105,14 +105,23 @@ preregistered, paired study worth its model calls.
 - `windowed` sends a changed file over 16,000 bytes as line-numbered windows of ±25 lines (`CHANGED_WINDOW`, not tuned
   yet) around the lines the change adds or edits (a pure deletion: the line where it sat), merged, plus an
   `--- outline ---` of the definition-like lines outside the windows. Smaller files stay whole. A lock file, a
-  minified or source-map file, and a file marked `@generated` or `DO NOT EDIT` in its first five lines get a stat
-  line (`+A -D lines`) instead of a file block and a diff section. Lines over 1,000 characters are cut in windows,
+  minified or source-map file get a stat line (`+A -D lines`) instead of a file block and a diff section (a deleted
+  lock file too: its diff becomes the header and a stat line); a file whose first five lines say `@generated` or
+  `DO NOT EDIT` (also at the merge base, if it existed there) gets the stat line as its file block only, and keeps its
+  diff, since that text is something a change can add. A diff section is cut only when its `diff --git` header
+  matches one change unambiguously; the manifest lists what was kept. A windowed block is never larger than the whole
+  file: a file whose windows would not be smaller goes whole, and an `auto` build that does not fit even windowed
+  returns the smaller of the full and windowed builds. Lines over 1,000 characters are cut in windows,
   outlines and unchanged context blocks, never in the diff. The manifest lists the windowed files and the stat-line
   files.
 - `auto` (the default) builds `full` and uses it unless the change alone (PR text, diff, changed files, README) is over
   the budget; then it builds `windowed`, places the context blocks, and spends the budget that is left re-widening the
   windows to 60 lines, then 150, then the whole file, a step taken for a file only if all the material still fits. Under
   the budget, `auto` is `full` byte for byte.
+
+`ringo.py review --repo` (so ReviewBench and the adapter in `adapters/reviewbench`) now defaults to `auto`. It is
+identical to `full` whenever the change alone fits the budget, but a comparison that needs the control, or a run that
+must reproduce older material, has to pass `--context-mode full`.
 
 Measured offline, no model calls: the change alone (no PR text) of the last 80 single-parent commits of this repository,
 each against its parent. Full: 33,257,150 bytes in all, median 374,912, largest 1,412,290; 37 of the 80 are over the
