@@ -756,5 +756,17 @@ print(json.dumps({key:max(levels,key=levels.get) if levels else qid.startswith('
         self.assertEqual(workflow.render_feedback({'checks': []}), 'None.')
 
 
+    def test_static_fixtures_precede_changing_files_for_prompt_caching(self):
+        msg = workflow.text_message(self.spec, {'value.py': 'x = 1\n'}, {})
+        self.assertLess(msg.index('=== READ-ONLY FIXTURE check.py ==='), msg.index('=== EDITABLE FILE value.py ==='))
+        bad = self.proposal('def f(x): return x\n')
+        good = self.proposal('def f(x): return 2*x\n')
+        report, seen = self.execute([bad, good])
+        self.assertEqual(report['status'], 'ready_for_review')
+        self.assertLess(seen[0][1].index('"fixtures"'), seen[0][1].index('"files"'))
+        prefix_end = seen[0][1].index('"files"')
+        self.assertEqual(seen[0][1][:prefix_end], seen[1][1][:prefix_end])
+
+
 if __name__ == '__main__':
     unittest.main()

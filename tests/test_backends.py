@@ -332,5 +332,13 @@ class ObjectScanTest(unittest.TestCase):
         self.assertEqual(list(backends.top_level_objects(snippets + '{"q1": "a"}')), [{'q1': 'a'}])
 
 
+    def test_subscription_auth_strips_anthropic_base_url(self):
+        with mock.patch.dict(os.environ, {'ANTHROPIC_BASE_URL': 'https://proxy.example', 'ANTHROPIC_API_KEY': 'sk-test'}):
+            out = backends.run_isolated(
+                [sys.executable, '-c', 'import json, os; print(json.dumps({"base": os.environ.get("ANTHROPIC_BASE_URL"), "key": os.environ.get("ANTHROPIC_API_KEY")}))'],
+                '', 10, subscription_auth=True)
+        self.assertEqual(json.loads(out), {'base': None, 'key': None})
+
+
 if __name__ == '__main__':
     unittest.main()
