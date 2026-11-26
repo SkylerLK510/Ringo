@@ -510,6 +510,8 @@ pub struct Job {
     /// The tier the session was in when the job started; it keeps it whatever the session changes to.
     pub tier: Tier,
     pub elapsed: Option<Duration>,
+    /// Time from job start until the first streamed text token arrived (zero-overhead clock read).
+    pub first_token: Option<Duration>,
     pub activity: String,
     pub tokens: Tokens,
     /// What the running turn has used so far by its own messages' counts, until its final count is in `tokens`.
@@ -2336,7 +2338,7 @@ impl Session {
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(), tier: self.tier,
-                             elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0, warned: 0,
+                             elapsed: None, first_token: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0, warned: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), read: Vec::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
@@ -3420,6 +3422,9 @@ impl Session {
             if let Some(version) = &job.cli_version {
                 record["cli_version"] = version.as_str().into(); // what `ledger.py base` groups by
             }
+            if let Some(ttft) = job.first_token {
+                record["ttft_ms"] = (ttft.as_millis() as u64).into();
+            }
             if let Some(secs) = slept {
                 record["host_slept_s"] = secs.into();
             }
@@ -3649,8 +3654,18 @@ impl Session {
                             }
                         }
                         Note::Log(line) => job.push_log(line),
-                        Note::Reply(text) => job.push(Said::Reply(text)),
-                        Note::Partial(text) => job.push(Said::Partial(text)),
+                        Note::Reply(text) => {
+                            if job.first_token.is_none() && !text.is_empty() {
+                                job.first_token = Some(job.started.elapsed());
+                            }
+                            job.push(Said::Reply(text));
+                        }
+                        Note::Partial(text) => {
+                            if job.first_token.is_none() && !text.is_empty() {
+                                job.first_token = Some(job.started.elapsed());
+                            }
+                            job.push(Said::Partial(text));
+                        }
                         Note::Step(text) => job.push(Said::Step(text)),
                         Note::Looked { kind, text } => job.push(Said::Looked(kind, text)),
                         Note::Subagent { id: sub, label } => {
@@ -3924,6 +3939,27 @@ impl Session {
             });
         }
         found.unwrap_or_default()
+    }
+
+    /// Per-agent Time to First Token (p50_ms, p95_ms, sample_count) from `usage.jsonl` over the last `secs` seconds.
+    pub fn ttft_summary(&self, secs: u64) -> BTreeMap<String, (u64, u64, usize)> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut by_agent: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
+            let (Some(at), Some(agent), Some(ms)) = (r["at"].as_u64(), r["agent"].as_str(), r["ttft_ms"].as_u64()) else {
+                continue;
+            };
+            if now.saturating_sub(at) <= secs {
+                by_agent.entry(agent.to_string()).or_default().push(ms);
+            }
+        }
+        by_agent.into_iter().map(|(agent, mut samples)| {
+            samples.sort_unstable();
+            let n = samples.len();
+            let p50 = samples[(n - 1) / 2];
+            let p95 = samples[((n * 95).div_ceil(100)).saturating_sub(1).min(n - 1)];
+            (agent, (p50, p95, n))
+        }).collect()
     }
 
     /// The oldest action an agent waits on the owner for, across every job: (job, what it asks).
