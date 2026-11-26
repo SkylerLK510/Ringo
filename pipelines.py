@@ -45,7 +45,7 @@ SECTION = re.compile(r'^#{2,4}[ \t]*\**[ \t]*(open questions|not checked)'
                      r'(?:[ \t]*\([^\n)]*\))?[ \t]*\**[ \t]*:?[ \t]*$', re.M | re.I)
 VERDICT = re.compile(rf'^[^\w\n]*({ID}\.\d+)[^\w\n]+(KEEP|REFUTED|DUP|OPEN)\b(.*)$', re.M)
 FINDING_ID = re.compile(rf'\b{ID}\.\d+')
-CUT = re.compile(rf'^[^\w\n]*({ID}\.\d+)[^\w\n]+CUT\b[^\w\n"]*"(.+)"[^\w\n]*$', re.M)
+CUT = re.compile(rf'^[^\w\n]*({ID}\.\d+)[^\w\n]+CUT\b[^\w\n"]*"(.+?)"(?:\s*[-–—:]\s*[^\n]*)?[^\w\n]*$', re.M)
 
 
 class NeedVerdicts(Exception):
@@ -318,7 +318,9 @@ def assemble(plan, replies):
         v = verdict[fid][0]
         if v == 'KEEP':
             for sentence in cuts.get(fid, []):
-                hits = list(re.finditer(rf'(?<!\S){re.escape(sentence)}(?!\S)', body))
+                hits = list(re.finditer(rf'(?<!\w){re.escape(sentence)}(?!\w)', body))
+                if len(hits) != 1:
+                    hits = list(re.finditer(re.escape(sentence), body))
                 if len(hits) != 1:
                     uncut += 1
                     continue

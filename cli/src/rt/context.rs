@@ -28,6 +28,23 @@ pub const WHOLE_FILE: i64 = 16_000;
 pub const WINDOW: i64 = 15;
 /// Manifest lines per list before it summarizes the rest.
 pub const LISTED: usize = 200;
+/// Lines above and below each changed line in a windowed changed file (to be tuned by measurement).
+pub const CHANGED_WINDOW: i64 = 25;
+/// Auto mode re-widens windowed changed files through these, then to the whole file.
+pub const REFILL_STEPS: [i64; 2] = [60, 150];
+/// In windowed mode a longer line is cut to this many characters.
+pub const LONG_LINE: usize = 1000;
+/// Outline lines of one windowed changed file before it summarizes the rest.
+pub const OUTLINE_LISTED: usize = 200;
+pub const MODES: [&str; 3] = ["auto", "full", "windowed"];
+/// Lock files and generated files (windowed mode): no file block, no diff section, only a stat line.
+const LOCK_NAMES: [&str; 12] = [
+    "Cargo.lock", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock",
+    "Pipfile.lock", "composer.lock", "Gemfile.lock", "go.sum", "flake.lock",
+];
+const GENERATED_SUFFIXES: [&str; 3] = [".min.js", ".min.css", ".map"];
+/// In a file's first five lines.
+const GENERATED_MARKS: [&str; 2] = ["@generated", "DO NOT EDIT"];
 pub const READMES: [&str; 4] = ["README.md", "README.rst", "README.txt", "README"];
 /// Changed prose names no symbols ('the function above...').
 pub const PROSE: [&str; 5] = [".md", ".markdown", ".rst", ".txt", ".adoc"];
@@ -111,6 +128,8 @@ pub static SIGNATURE: LazyLock<Regex> =
 static HUNK: LazyLock<Regex> = LazyLock::new(|| plain(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@ ?(.*)"));
 /// Names git prints unquoted.
 static PLAIN: LazyLock<Regex> = LazyLock::new(|| plain(r#"^[^"\\\s\x00-\x1f\x7f]+\z"#));
+/// A Python definition line, for the outline.
+static PY_DEF: LazyLock<Fancy> = LazyLock::new(|| fancy(r"^\s*(?:async\s+)?(?:def|class)\b"));
 static TEST_NAME: LazyLock<Regex> = LazyLock::new(|| plain(r"(_test|_spec|\.test|\.spec|Tests?)\.\w+\n?\z"));
 
 fn found_all(re: &Fancy, text: &str) -> Vec<String> {
@@ -414,13 +433,7 @@ pub fn hunks(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: Option<&
     let text = match text {
         Some(t) => t,
         None => {
-            let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U0", mb, head, "--"];
-            for p in [old, new].into_iter().flatten() {
-                if !p.is_empty() && !args[9..].contains(&p) {
-                    args.push(p);
-                }
-            }
-            read = git(repo, &args)?;
+            read = pair_diff(repo, mb, head, old, new)?;
             &read
         }
     };
@@ -443,11 +456,20 @@ pub fn hunks(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: Option<&
     Ok((olds, news, headers, minus, plus))
 }
 
-/// hunks() of every pair from one -U0 diff. git prints one 'diff --git' section per entry of changes(), in the same
-/// order; if the sections do not line up with the pairs (count, or a plain path missing from its header), every
-/// pair is read on its own.
-pub fn all_hunks(repo: &Path, mb: &str, head: &str, pairs: &[Pair]) -> Result<Vec<Hunk>> {
-    let text = git(repo, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U0", mb, head])?;
+/// The -U0 diff of one changed pair, read on its own.
+pub fn pair_diff(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: Option<&str>) -> Result<String> {
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U0", mb, head, "--"];
+    for p in [old, new].into_iter().flatten() {
+        if !p.is_empty() && !args[9..].contains(&p) {
+            args.push(p);
+        }
+    }
+    git(repo, &args)
+}
+
+/// One 'diff --git' section of a whole diff per pair, or None if they do not line up with the pairs (count, or a plain
+/// path missing from its header). git prints one section per entry of changes(), in the same order.
+pub fn aligned_sections<'a>(text: &'a str, pairs: &[Pair]) -> Option<Vec<&'a str>> {
     // re.split(r'^(?=diff --git )', text, flags=re.M)[1:]
     let starts: Vec<usize> = (0..text.len())
         .filter(|&i| (i == 0 || text.as_bytes()[i - 1] == b'\n') && text.as_bytes()[i..].starts_with(b"diff --git "))
@@ -459,12 +481,59 @@ pub fn all_hunks(repo: &Path, mb: &str, head: &str, pairs: &[Pair]) -> Result<Ve
             let path = new.as_deref().filter(|p| !p.is_empty()).or(old.as_deref()).unwrap_or("");
             !PLAIN.is_match(path) || section.split('\n').next().unwrap_or("").contains(&format!(" b/{path}"))
         });
-    let mut out = Vec::new();
-    for (i, (old, new)) in pairs.iter().enumerate() {
-        let section = if lined_up { Some(sections[i]) } else { None };
-        out.push(hunks(repo, mb, head, old.as_deref(), new.as_deref(), section)?);
+    lined_up.then_some(sections)
+}
+
+/// The -U0 diff text of every pair from one git process instead of one per changed file; if the sections do not line
+/// up with the pairs, every pair is read on its own.
+pub fn diff_texts(repo: &Path, mb: &str, head: &str, pairs: &[Pair]) -> Result<Vec<String>> {
+    let text = git(repo, &["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", "-U0", mb, head])?;
+    if let Some(sections) = aligned_sections(&text, pairs) {
+        return Ok(sections.into_iter().map(str::to_string).collect());
     }
-    Ok(out)
+    pairs.iter().map(|(old, new)| pair_diff(repo, mb, head, old.as_deref(), new.as_deref())).collect()
+}
+
+/// hunks() of every pair (see diff_texts).
+pub fn all_hunks(repo: &Path, mb: &str, head: &str, pairs: &[Pair]) -> Result<Vec<Hunk>> {
+    let texts = diff_texts(repo, mb, head, pairs)?;
+    pairs.iter().zip(&texts).map(|((old, new), text)| hunks(repo, mb, head, old.as_deref(), new.as_deref(), Some(text))).collect()
+}
+
+/// (added, removed) line counts of a -U0 diff text. Unlike hunks(), a 'diff --git' line ends the hunk, so the
+/// '--- a/x' and '+++ b/x' lines of a second section (a type change prints two) are not counted.
+pub fn change_counts(text: &str) -> (usize, usize) {
+    let (mut added, mut removed, mut started) = (0, 0, false);
+    for line in py::splitlines(text, false) {
+        if line.starts_with("diff --git ") {
+            started = false;
+        } else if HUNK.is_match(line) {
+            started = true;
+        } else if started && line.starts_with('-') {
+            removed += 1;
+        } else if started && line.starts_with('+') {
+            added += 1;
+        }
+    }
+    (added, removed)
+}
+
+/// The new-side lines a -U0 diff changes, one line for a pure deletion: the line that now sits where the deleted lines
+/// were (hunks() has none for it, its new-side range is empty). Callers clamp them to the file.
+pub fn new_points(text: &str) -> BTreeSet<u64> {
+    let mut points = BTreeSet::new();
+    for line in py::splitlines(text, false) {
+        if let Some(m) = HUNK.captures(line) {
+            let c = m.get(3).map_or(0, |x| digits(x.as_str()));
+            let d = m.get(4).map_or(1, |x| digits(x.as_str()));
+            if d > 0 {
+                points.extend(c..c.saturating_add(d));
+            } else {
+                points.insert(c.saturating_add(1));
+            }
+        }
+    }
+    points
 }
 
 /// (names, owners) of one source, or None if it does not parse.
@@ -504,7 +573,7 @@ macro_rules! python_symbols_source {
                         owners.add(owner.name)
                 walk(child, child)
                 continue
-            if isinstance(child, (ast.Assign, ast.AnnAssign)) and lines & set(range(child.lineno, child.end_lineno + 1)):
+            if isinstance(child, (ast.Assign, ast.AnnAssign)) and lines & set(range(child.lineno, (child.end_lineno or child.lineno) + 1)):
                 targets = child.targets if isinstance(child, ast.Assign) else [child.target]
                 found.update(t.id for t in targets if isinstance(t, ast.Name) and re.fullmatch(r'[A-Z][A-Z0-9_]{2,}', t.id))
             walk(child, owner)
@@ -963,30 +1032,46 @@ pub fn rank(found: BTreeMap<String, Entry>) -> Vec<(String, Entry)> {
     keyed.into_iter().map(|(_, _, path, entry)| (path, entry)).collect()
 }
 
-/// Line-numbered windows around the matched lines, merged, as many as fit in room bytes counting each window's
-/// 'a-b, ' in the manifest: (text, shown spans, total spans). Lines split on '\n' only, as git grep -n counts them.
-pub fn windows(text: &str, lines: &BTreeSet<u64>, room: i64) -> (String, Vec<String>, usize) {
+/// A file's lines: split on '\n' only, as git grep -n counts them, without a trailing '\r' or a final empty line.
+pub fn line_rows(text: &str) -> Vec<&str> {
     let mut rows: Vec<&str> = text.split('\n').map(|r| r.strip_suffix('\r').unwrap_or(r)).collect();
     if rows.last() == Some(&"") {
         rows.pop();
     }
-    let count = rows.len() as i64;
+    rows
+}
+
+/// (a, b) line spans of `window` lines above and below each line (of count lines), merged when they touch.
+pub fn spans_around(count: i64, lines: &BTreeSet<u64>, window: i64) -> Vec<(i64, i64)> {
     let mut spans: Vec<(i64, i64)> = Vec::new();
     for &n in lines {
         let n = n.min(i64::MAX as u64 / 2) as i64;
-        let (a, b) = (1.max(n - WINDOW), count.min(n + WINDOW));
+        let (a, b) = (1.max(n.saturating_sub(window)), count.min(n.saturating_add(window)));
         match spans.last_mut() {
-            Some(last) if a <= last.1 + 1 => last.1 = last.1.max(b),
+            Some(last) if a <= last.1.saturating_add(1) => last.1 = last.1.max(b),
             _ => spans.push((a, b)),
         }
     }
+    spans
+}
+
+fn span_text<S: AsRef<str>>(rows: &[S], a: i64, b: i64) -> String {
+    let mut part = format!("--- lines {a}-{b} ---\n");
+    for i in a..=b {
+        part.push_str(&format!("{i}: {}\n", rows[(i - 1) as usize].as_ref()));
+    }
+    part
+}
+
+/// Line-numbered windows around the matched lines, merged, as many as fit in room bytes counting each window's
+/// 'a-b, ' in the manifest: (text, shown spans, total spans). Lines split on '\n' only, as git grep -n counts them.
+pub fn windows(text: &str, lines: &BTreeSet<u64>, room: i64) -> (String, Vec<String>, usize) {
+    let rows = line_rows(text);
+    let spans = spans_around(rows.len() as i64, lines, WINDOW);
     let mut out: Vec<String> = Vec::new();
     let mut used = 0i64;
     for &(a, b) in &spans {
-        let mut part = format!("--- lines {a}-{b} ---\n");
-        for i in a..=b {
-            part.push_str(&format!("{i}: {}\n", rows[(i - 1) as usize]));
-        }
+        let part = span_text(&rows, a, b);
         let cost = (part.len() + format!("{a}-{b}, ").len()) as i64;
         if used + cost > room {
             break;
@@ -996,6 +1081,105 @@ pub fn windows(text: &str, lines: &BTreeSet<u64>, room: i64) -> (String, Vec<Str
     }
     let shown = spans[..out.len()].iter().map(|(a, b)| format!("{a}-{b}")).collect();
     (out.concat(), shown, spans.len())
+}
+
+/// A line over LONG_LINE characters, cut (minified code, data): it would fill the budget with one line.
+pub fn cut_line(row: &str) -> String {
+    let n = row.chars().count();
+    if n <= LONG_LINE {
+        return row.to_string();
+    }
+    let end = row.char_indices().nth(LONG_LINE).map_or(row.len(), |(i, _)| i);
+    format!("{} \u{2026}[{} more characters cut]", &row[..end], n - LONG_LINE)
+}
+
+pub fn cut_long_lines(text: &str) -> String {
+    text.split('\n').map(cut_line).collect::<Vec<_>>().join("\n")
+}
+
+/// The text says in its first five lines that it is generated.
+pub fn has_mark(text: &str) -> bool {
+    text.split('\n').take(5).any(|line| GENERATED_MARKS.iter().any(|m| line.contains(m)))
+}
+
+/// How a changed text file counts as generated, or None: 'lock' for a lock file or a minified or source-map file (by
+/// name: the file block and the diff section become a stat line), 'marked' for a file whose first five lines say it
+/// is generated (the file block becomes a stat line; the diff stays, since the marker is text the change itself can
+/// add). text: the file at head, or at the merge base for a deletion; existed: the file existed at the merge base;
+/// base_text: its text there, None if it was not readable text (binary, not UTF-8). A marker the change adds to an
+/// existing file does not classify it, and neither does one on a file whose old version cannot be read.
+pub fn generated_kind(path: &str, text: Option<&str>, base_text: Option<&str>, deleted: bool, existed: bool) -> Option<&'static str> {
+    let text = text?;
+    let name = parts(path).last().copied().unwrap_or("");
+    if LOCK_NAMES.contains(&name) || GENERATED_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return Some("lock");
+    }
+    (!deleted && has_mark(text) && (!existed || base_text.is_some_and(has_mark))).then_some("marked")
+}
+
+/// generated_kind of one change: a deletion by its merge-base text, anything else by its text at head and, if the
+/// file existed, at the merge base.
+fn generated_kind_of(repo: &Path, mb: &str, head: &str, old: Option<&str>, new: Option<&str>, objects: &mut Objects) -> Result<Option<&'static str>> {
+    let old = old.filter(|p| !p.is_empty());
+    let new = new.filter(|p| !p.is_empty());
+    let mut existed = old.is_some();
+    let base_text = match old {
+        Some(o) => match blob(repo, mb, o, Some(objects)) {
+            Ok(t) => t,
+            Err(e) if e.is(Exc::Context) => {
+                existed = false;
+                None
+            }
+            Err(e) => return Err(e),
+        },
+        None => None,
+    };
+    let text = match new {
+        Some(n) => blob(repo, head, n, Some(objects))?,
+        None => base_text.clone(),
+    };
+    Ok(generated_kind(new.or(old).unwrap_or(""), text.as_deref(), base_text.as_deref(), new.is_none(), existed))
+}
+
+/// The definition-like lines outside the spans, numbered, as the text after '--- outline ---'; text_symbols' own
+/// detection (DEFINES, CONSTANT, SIGNATURE), plus def and class lines for Python.
+pub fn outline(rows: &[String], spans: &[(i64, i64)], python: bool) -> String {
+    let mut inside = vec![false; rows.len() + 1];
+    for &(a, b) in spans {
+        for i in a..=b {
+            if let Some(slot) = inside.get_mut(i as usize) {
+                *slot = true;
+            }
+        }
+    }
+    let found: Vec<usize> = (1..=rows.len())
+        .filter(|&i| {
+            let row = &rows[i - 1];
+            !inside[i] && (!text_symbols(&[], std::slice::from_ref(row)).is_empty() || (python && found_any(&PY_DEF, row)))
+        })
+        .collect();
+    let mut lines = vec!["--- outline ---".to_string()];
+    lines.extend(found.iter().take(OUTLINE_LISTED).map(|&i| format!("{i}: {}", rows[i - 1])));
+    if found.len() > OUTLINE_LISTED {
+        lines.push(format!("... and {} more", found.len() - OUTLINE_LISTED));
+    }
+    lines.join("\n") + "\n"
+}
+
+/// (block text after the label, shown spans 'a-b') of a large changed file: windows of +-width lines around each
+/// changed line and the outline of the definitions outside them. rows are the file's lines, long ones already cut.
+pub fn changed_windows(path: &str, rows: &[String], points: &BTreeSet<u64>, width: i64) -> (String, Vec<String>) {
+    let count = rows.len() as i64;
+    let clamped: BTreeSet<u64> = points.iter().map(|&n| n.max(1).min(count as u64)).collect();
+    let spans = spans_around(count, &clamped, width);
+    let mut text = format!(
+        "(windowed: {count} lines at head; shown: \u{b1}{width} lines around each change and the outline below; other lines are unchanged since the merge base)\n"
+    );
+    for &(a, b) in &spans {
+        text.push_str(&span_text(rows, a, b));
+    }
+    text.push_str(&outline(rows, &spans, path.ends_with(".py")));
+    (text, spans.iter().map(|(a, b)| format!("{a}-{b}")).collect())
 }
 
 pub fn describe(why: &BTreeSet<(&'static str, String)>) -> String {
@@ -1023,17 +1207,47 @@ pub fn listing(items: &[String]) -> Vec<String> {
 }
 
 /// The review material for base...head in repo, as one string of at most `budget` UTF-8 bytes unless the change
-/// itself (PR text, diff, changed files, README) is already larger; then it has no context blocks.
+/// itself (PR text, diff, changed files, README) is already larger; then it has no context blocks. Mode auto (what
+/// context.py's build defaults to): see `build_mode`.
 pub fn build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i64) -> Result<String> {
+    build_mode(repo, base, head, pr_text, budget, "auto", CHANGED_WINDOW)
+}
+
+/// `build` with a mode: 'full' sends every changed file whole (the control of any comparison); 'windowed' sends a
+/// changed file over WHOLE_FILE as windows of +-changed_window lines around its changes plus an outline, and lock and
+/// generated files as a stat line; 'auto' builds 'full' and, only if the change alone is over the budget, 'windowed'
+/// instead, then spends what the budget has left re-widening the windows.
+pub fn build_mode(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i64, mode: &str, changed_window: i64) -> Result<String> {
     let repo = py::path(repo);
     if budget <= 0 {
         return Err(ctx("the context budget must be a positive number of bytes"));
+    }
+    if !MODES.contains(&mode) {
+        return Err(ctx(format!("the context mode must be auto, full or windowed, not {}", py::repr(mode))));
+    }
+    if changed_window < 0 {
+        return Err(ctx("the changed window must be a non-negative number of lines"));
     }
     if !repo.is_dir() {
         return Err(ctx(format!("{} is not a folder", repo.to_string_lossy())));
     }
     let mut objects = Objects::new(&repo);
-    _build(&repo, base, head, pr_text, budget, &mut objects)
+    let how = |windowed, auto_need| How { windowed, window: changed_window, auto_need };
+    if mode == "auto" {
+        let (material, need) = _build(&repo, base, head, pr_text, budget, &mut objects, how(false, None))?;
+        if need <= budget {
+            return Ok(material);
+        }
+        let windowed = _build(&repo, base, head, pr_text, budget, &mut objects, how(true, Some(need)))?.0;
+        if windowed.len() as i64 <= budget {
+            return Ok(windowed);
+        }
+        // Windows are meant to make the change fit. If they still do not, send whichever is smaller of full and the
+        // plain windowed build (what mode='windowed' gives, without auto's explanation and refill); a tie: full.
+        let plain = _build(&repo, base, head, pr_text, budget, &mut objects, how(true, None))?.0;
+        return Ok(if plain.len() < material.len() { plain } else { material });
+    }
+    Ok(_build(&repo, base, head, pr_text, budget, &mut objects, how(mode == "windowed", None))?.0)
 }
 
 struct Added {
@@ -1042,7 +1256,95 @@ struct Added {
     skip: String,
 }
 
-fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i64, objects: &mut Objects) -> Result<String> {
+/// How a build sends changed files. auto_need: set when auto mode chose windowed because the full change needed that
+/// many bytes; windowed changed files are then re-widened.
+struct How {
+    windowed: bool,
+    window: i64,
+    auto_need: Option<i64>,
+}
+
+/// A windowed changed file: its lines (long ones cut), its changed lines, where its block sits in the change, and
+/// the block as it stands (windows of `width` lines, or the whole file once `whole`).
+struct Wide {
+    path: String,
+    text: String,
+    rows: Vec<String>,
+    points: BTreeSet<u64>,
+    index: usize,
+    whole: bool,
+    block: String,
+    spans: Vec<String>,
+    width: i64,
+}
+
+fn whole_block(entry: &Wide) -> String {
+    format!("=== {} (after the change) ===\n{}", entry.path, entry.text)
+}
+
+/// Set a windowed changed file's block, spans and width: windows of +-width lines around its changes. A block that is
+/// not smaller in bytes than the whole file (a new file, or windows covering nearly all of it, with their line
+/// numbers and outline) is the whole file instead: windowing never sends more than full mode does.
+fn wide(entry: &mut Wide, width: i64) {
+    let (body, spans) = changed_windows(&entry.path, &entry.rows, &entry.points, width);
+    let block = format!("=== {} (after the change) ===\n{body}", entry.path);
+    entry.spans = spans;
+    entry.width = width;
+    let whole = whole_block(entry);
+    if block.len() >= whole.len() {
+        entry.block = whole;
+        entry.whole = true;
+    } else {
+        entry.block = block;
+    }
+}
+
+/// (diff, matched): the diff with the section of each lock file cut to its 'diff --git' line and a stat line, and the
+/// set of change indices that were. stats is {change index: (added, deleted)}. A section belongs to a change by its
+/// header, 'diff --git a/OLD b/NEW' with plain names, and may have several (a type change prints a deletion and an
+/// addition): all of a change's sections become one header line and one stat line. A header that two changes share, or
+/// an unusual name, cannot be matched, so those sections stay in the diff.
+pub fn replace_generated(diff: &str, pairs: &[Pair], stats: &BTreeMap<usize, (usize, usize)>) -> (String, BTreeSet<usize>) {
+    // re.split(r'^(?=diff --git )', diff, flags=re.M)
+    let starts: Vec<usize> = (0..diff.len())
+        .filter(|&i| (i == 0 || diff.as_bytes()[i - 1] == b'\n') && diff.as_bytes()[i..].starts_with(b"diff --git "))
+        .collect();
+    let first = &diff[..starts.first().copied().unwrap_or(diff.len())];
+    let sections: Vec<&str> =
+        starts.iter().enumerate().map(|(k, &a)| &diff[a..starts.get(k + 1).copied().unwrap_or(diff.len())]).collect();
+    let mut expected: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, (old, new)) in pairs.iter().enumerate() {
+        let (a, b) = (old.as_deref().filter(|p| !p.is_empty()).or(new.as_deref()).unwrap_or(""), new.as_deref().filter(|p| !p.is_empty()).or(old.as_deref()).unwrap_or(""));
+        if PLAIN.is_match(a) && PLAIN.is_match(b) {
+            expected.entry(format!("diff --git a/{a} b/{b}")).or_default().push(i);
+        }
+    }
+    let mut hits: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (k, section) in sections.iter().enumerate() {
+        if let Some(owners) = expected.get(section.split('\n').next().unwrap_or("")).filter(|o| o.len() == 1) {
+            hits.entry(owners[0]).or_default().push(k);
+        }
+    }
+    let matched: BTreeSet<usize> = stats.keys().copied().filter(|i| hits.get(i).is_some_and(|h| !h.is_empty())).collect();
+    let cut: HashMap<usize, (usize, usize)> = matched.iter().map(|i| (hits[i][0], stats[i])).collect();
+    let dropped: BTreeSet<usize> = matched.iter().flat_map(|i| hits[i][1..].iter().copied()).collect();
+    let mut out = first.to_string();
+    for (k, section) in sections.iter().enumerate() {
+        match cut.get(&k) {
+            Some((a, d)) => {
+                out.push_str(section.split('\n').next().unwrap_or(""));
+                out.push_str(&format!("\n(generated or lock file: +{a} -{d} lines; not shown)\n"));
+            }
+            None if dropped.contains(&k) => {}
+            None => out.push_str(section),
+        }
+    }
+    (out, matched)
+}
+
+/// (material, bytes of the change alone: PR text, diff, changed files, README).
+fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i64, objects: &mut Objects, how: How) -> Result<(String, i64)> {
+    let How { windowed, window, auto_need } = how;
     let base_id = commit(repo, base, "base")?;
     let head_id = commit(repo, head, "head")?;
     let mb = py::strip(&git(repo, &["merge-base", &base_id, &head_id])?).to_string();
@@ -1059,14 +1361,53 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     )?;
     let pairs = changes(repo, &mb, &head_id)?;
     let changed: Vec<String> = pairs.iter().filter_map(|(_, new)| new.clone().filter(|n| !n.is_empty())).collect();
-    let mut parts = Vec::new();
+    // windowed, by change index: (added, removed) line counts, new-side changed lines, and how it counts as generated
+    let mut stats: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    let mut points: HashMap<usize, BTreeSet<u64>> = HashMap::new();
+    let mut kinds: BTreeMap<usize, &'static str> = BTreeMap::new();
+    if windowed {
+        for (i, ((old, new), text)) in pairs.iter().zip(diff_texts(repo, &mb, &head_id, &pairs)?).enumerate() {
+            stats.insert(i, change_counts(&text));
+            points.insert(i, new_points(&text));
+            if let Some(kind) = generated_kind_of(repo, &mb, &head_id, old.as_deref(), new.as_deref(), objects)? {
+                kinds.insert(i, kind);
+            }
+        }
+    }
+    let pair_of: HashMap<&str, usize> =
+        pairs.iter().enumerate().filter_map(|(i, (_, new))| new.as_deref().filter(|n| !n.is_empty()).map(|n| (n, i))).collect();
+    let mut parts: Vec<String> = Vec::new();
     if let Some(pr) = pr_text {
         parts.push(format!("=== PR description ===\n{pr}"));
     }
+    let diff_at = parts.len();
     parts.push(format!("=== change.diff ===\n{diff}"));
     let mut submodules = Vec::new();
+    let mut wfiles: Vec<Wide> = Vec::new(); // windowed changed files, in change order
     for path in &changed {
         let text = match blob(repo, &head_id, path, Some(objects))? {
+            Some(_) if windowed && kinds.contains_key(&pair_of[path.as_str()]) => {
+                let (added, deleted) = stats[&pair_of[path.as_str()]];
+                parts.push(format!("=== {path} (generated or lock file; not shown) ===\n+{added} -{deleted} lines\n"));
+                continue;
+            }
+            Some(text) if windowed && text.len() > WHOLE_FILE as usize => {
+                let mut entry = Wide {
+                    path: path.clone(),
+                    rows: line_rows(&text).into_iter().map(cut_line).collect(),
+                    text,
+                    points: points[&pair_of[path.as_str()]].clone(),
+                    index: parts.len(),
+                    whole: false,
+                    block: String::new(),
+                    spans: Vec::new(),
+                    width: window,
+                };
+                wide(&mut entry, window);
+                parts.push(entry.block.clone());
+                wfiles.push(entry);
+                continue;
+            }
             Some(text) => text,
             None => match tree_entry(repo, &head_id, path)? {
                 Some(e) if e[1] == "commit" => {
@@ -1077,6 +1418,13 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
             },
         };
         parts.push(format!("=== {path} (after the change) ===\n{text}"));
+    }
+    let locks: BTreeMap<usize, (usize, usize)> = kinds.iter().filter(|(_, k)| **k == "lock").map(|(i, _)| (*i, stats[i])).collect();
+    let mut matched = BTreeSet::new();
+    if !locks.is_empty() {
+        let (cut, m) = replace_generated(&diff, &pairs, &locks);
+        parts[diff_at] = format!("=== change.diff ===\n{cut}");
+        matched = m;
     }
     let mut readme = None;
     for r in READMES {
@@ -1090,7 +1438,8 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     {
         parts.push(format!("=== {r} ===\n{text}"));
     }
-    let required = parts.join("\n");
+    let mut required = parts.join("\n");
+    let change_bytes = required.len() as i64;
     let (syms, owners) = symbols(repo, &mb, &head_id, &pairs, Some(objects))?;
     let mut exclude: BTreeSet<String> = changed.iter().cloned().collect();
     exclude.extend(readme.map(str::to_string));
@@ -1109,15 +1458,54 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     let always = [pr_text.map(|_| "the PR description".to_string()), Some("the three-dot diff".to_string()),
                   Some(format!("{} changed file(s) at head", changed.len())), readme.map(str::to_string)];
     let always = always.into_iter().flatten().collect::<Vec<_>>().join(", ");
-    let manifest = |added: &[Added], skipped: &[String], unreadable: &[String]| -> String {
+    let (mut cut_notes, mut kept_notes): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (&i, &kind) in &kinds {
+        let name = pairs[i].1.as_deref().filter(|n| !n.is_empty()).or(pairs[i].0.as_deref()).unwrap_or("");
+        let (a, d) = stats[&i];
+        if kind == "lock" && matched.contains(&i) {
+            cut_notes.push(format!("{name}: +{a} -{d} lines"));
+        } else if kind == "lock" {
+            kept_notes.push(format!("{name}: generated or lock file; diff kept (could not be matched)"));
+        } else {
+            kept_notes.push(format!("{name}: +{a} -{d} lines; file block shown as a stat line (marked generated); diff kept"));
+        }
+    }
+    let manifest = |added: &[Added], skipped: &[String], unreadable: &[String], wfiles: &[Wide]| -> String {
         let mut lines = vec![
             "=== context manifest ===".to_string(),
-            format!("Built by Ringo from git objects, read-only: base {base_id}, head {head_id}, merge-base {mb}; budget {budget} bytes."),
-            format!("Always included: {always}."),
+            format!(
+                "Built by Ringo from git objects, read-only: base {base_id}, head {head_id}, merge-base {mb}; budget {budget} bytes{}.",
+                if windowed { "; changed files: windowed" } else { "" }
+            ),
+        ];
+        if let Some(need) = auto_need {
+            lines.push(format!("(auto mode: windowed because the change alone is {need} bytes, over the {budget}-byte budget)"));
+        }
+        lines.push(format!("Always included: {always}."));
+        if windowed {
+            let wnotes: Vec<String> = wfiles
+                .iter()
+                .filter(|w| !w.whole)
+                .map(|w| {
+                    if w.spans.is_empty() {
+                        format!("{}: no changed lines of {}", w.path, w.rows.len())
+                    } else {
+                        format!("{}: lines {} of {}", w.path, w.spans.join(", "), w.rows.len())
+                    }
+                })
+                .collect();
+            lines.push("Changed files sent as windows:".to_string());
+            lines.extend(listing(&wnotes));
+            lines.push("Generated or lock files shown as a stat line (file block and diff):".to_string());
+            lines.extend(listing(&cut_notes));
+            lines.push("Generated or lock files whose diff was kept:".to_string());
+            lines.extend(listing(&kept_notes));
+        }
+        lines.extend([
             format!("Changed symbols searched with word matches at head ({}): {}.", syms.len(), names(&syms)),
             format!("Classes of changed methods, searched for subclasses only ({}): {}.", owners.len(), names(&owners)),
             "Added as unchanged context, in order:".to_string(),
-        ];
+        ]);
         lines.extend(listing(&added.iter().map(|a| a.note.clone()).collect::<Vec<_>>()));
         lines.push("Left out for the byte budget:".to_string());
         lines.extend(listing(skipped));
@@ -1138,7 +1526,7 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
     };
     let (mut added, mut skipped, mut unreadable): (Vec<Added>, Vec<String>, Vec<String>) = (vec![], vec![], vec![]);
     // Bytes so far: the change, the empty manifest, and slack for the '... and N more' lines. Exact check at the end.
-    let mut used = required.len() as i64 + 1 + manifest(&added, &skipped, &unreadable).len() as i64 + 3 * 40;
+    let mut used = required.len() as i64 + 1 + manifest(&added, &skipped, &unreadable, &wfiles).len() as i64 + 3 * 40;
     for (path, entry) in rank(found) {
         let why = describe(&entry.why);
         let label = format!("=== {path} (unchanged, at head) ===\n");
@@ -1153,10 +1541,13 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
             Err(e) if e.is(Exc::Context) => None,
             Err(e) => return Err(e),
         };
-        let Some(text) = text else {
+        let Some(mut text) = text else {
             used += note(&mut unreadable, path);
             continue;
         };
+        if windowed {
+            text = cut_long_lines(&text);
+        }
         let (block, line) = if (text.len() as i64) <= WHOLE_FILE.min(room) {
             (label + &text, format!("{path}: whole file; {why}"))
         } else {
@@ -1172,23 +1563,55 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
         added.push(Added { block, note: line.clone(), skip: format!("{path}: {why}") });
         used += cost + if added.len() <= LISTED { format!("- {line}\n").len() as i64 } else { 0 };
     }
-    let material = |added: &[Added], skipped: &[String], unreadable: &[String]| -> String {
-        let mut all = vec![required.as_str()];
+    let material = |required: &str, added: &[Added], skipped: &[String], unreadable: &[String], wfiles: &[Wide]| -> String {
+        let mut all = vec![required];
         all.extend(added.iter().map(|a| a.block.as_str()));
-        let m = manifest(added, skipped, unreadable);
+        let m = manifest(added, skipped, unreadable, wfiles);
         all.push(&m);
         all.join("\n")
     };
-    while !added.is_empty() && material(&added, &skipped, &unreadable).len() as i64 > budget {
+    while !added.is_empty() && material(&required, &added, &skipped, &unreadable, &wfiles).len() as i64 > budget {
         // only if the estimate above was short
         let last = added.pop().expect("not empty");
         skipped.insert(0, last.skip);
     }
-    if skipped.len() > 1 && (required.len() as i64) < budget && budget < material(&added, &skipped, &unreadable).len() as i64 {
+    if skipped.len() > 1
+        && (required.len() as i64) < budget
+        && budget < material(&required, &added, &skipped, &unreadable, &wfiles).len() as i64
+    {
         // the list itself overflows
         skipped = vec![format!("{} unchanged file(s) that reference the change", skipped.len())];
     }
-    let result = material(&added, &skipped, &unreadable);
+    if auto_need.is_some() {
+        // Auto mode: the windows were the price of fitting; the context blocks are placed, so spend what is left on
+        // wider windows. Steps in order: every file at 60 lines, then at 150, then whole; a file takes a step only if
+        // the whole material still fits the budget.
+        let steps: Vec<Option<i64>> = REFILL_STEPS.iter().filter(|&&s| s > window).map(|&s| Some(s)).chain([None]).collect();
+        for step in steps {
+            for k in 0..wfiles.len() {
+                if wfiles[k].whole {
+                    continue;
+                }
+                let before = (wfiles[k].block.clone(), wfiles[k].spans.clone(), wfiles[k].width, wfiles[k].whole);
+                match step {
+                    None => {
+                        wfiles[k].block = whole_block(&wfiles[k]);
+                        wfiles[k].whole = true;
+                    }
+                    Some(width) => wide(&mut wfiles[k], width),
+                }
+                let index = wfiles[k].index;
+                let was_part = std::mem::replace(&mut parts[index], wfiles[k].block.clone());
+                let was = std::mem::replace(&mut required, parts.join("\n"));
+                if material(&required, &added, &skipped, &unreadable, &wfiles).len() as i64 > budget {
+                    (wfiles[k].block, wfiles[k].spans, wfiles[k].width, wfiles[k].whole) = before;
+                    parts[index] = was_part;
+                    required = was;
+                }
+            }
+        }
+    }
+    let result = material(&required, &added, &skipped, &unreadable, &wfiles);
     let excess = result.len() as i64 - budget;
     if excess > 0 {
         // the change itself (PR text, diff, changed files, README) is over budget: context blocks were dropped
@@ -1203,10 +1626,10 @@ fn _build(repo: &Path, base: &str, head: &str, pr_text: Option<&str>, budget: i6
             out.push_str(&a.block);
         }
         out.push('\n');
-        out.push_str(&manifest(&added, &skipped, &unreadable));
+        out.push_str(&manifest(&added, &skipped, &unreadable, &wfiles));
         out.push_str(&overflow);
         out.push('\n');
-        return Ok(out);
+        return Ok((out, change_bytes));
     }
-    Ok(result)
+    Ok((result, change_bytes))
 }

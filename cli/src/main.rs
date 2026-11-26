@@ -3,6 +3,7 @@
 //! runs).
 
 mod doctor;
+mod highlight;
 mod setup;
 mod theme;
 mod tui;

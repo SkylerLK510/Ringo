@@ -49,6 +49,10 @@ Other options:
 
 - **Size:** the material fits a byte budget (`--context-budget`, default 400000). The budget only drops context,
   never the change itself.
+- **Changed files:** `--context-mode auto|full|windowed` (default `auto`). `full` sends every changed file whole;
+  `windowed` sends a changed file over 16000 bytes as line windows around its changes plus an outline, and lock or
+  generated files as a stat line; `auto` is `full` unless the change alone is over the budget, then `windowed`,
+  re-widened to fill the budget. Recall of windowed material is untested; see `docs/CONTEXT-COMPACTION.md`.
 - **Your own material:** `--input FILE` takes the material as one file instead.
 - **Tools:** the call has no tools on `claude`, `codex-chatgpt` and `ollama:`. The `codex` preset keeps a read-only
   shell, and a custom command's tools are unknown.
