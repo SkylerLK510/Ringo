@@ -322,6 +322,7 @@ Every turn and pipeline is a numbered job.
 | `/show N` | job N's log, and where its files are |
 | `/kill N` | stop job N and everything it started |
 | `/copy` | copy the last answer |
+| `/export [PATH]` | export this conversation, token usage, and changed files to a Markdown file |
 
 ## Keys
 
@@ -357,8 +358,11 @@ after every turn, so a crash loses at most the turn it cut short.
 
 | Command | What it does |
 |---|---|
-| `/setup` | add an agent and sign in to it |
+| `/setup` | connect, re-sign in, or remove an agent |
+| `/doctor` | check connected subscriptions, subscription-only billing hygiene, and Python/git readiness (also `/status`) |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens. If you use releases, it also checks whether the pipelines' release is behind this Ringo |
+| `/update check` | re-check Ringo, connected agents, and pipelines for updates right now |
+| `/update status` | show current Ringo and connected agent versions and update status |
 | `/update approve` | move the pipelines to the release `/update` checked |
 
 | `/restart` | start the updated Ringo: it updates itself in the background and says when this applies it (quitting applies it too); the conversations go on |
