@@ -1108,5 +1108,29 @@ class ModelMetricsTest(unittest.TestCase):
             self.assertEqual('no numbered finding' in err, unshaped)
 
 
+class AuditFixTest(unittest.TestCase):
+    def test_oserror_launch_failure_releases_reservation_and_records_fatal(self):
+        with tempfile.TemporaryDirectory() as d:
+            trace = Path(d) / 'trace'
+            run = harness.Run(trace)
+            def fail(*args):
+                raise FileNotFoundError('no such binary')
+            with self.assertRaises(FileNotFoundError):
+                harness.run_plan(pl.load_plan(None, 'review'), 'M', B, run, call_fn=fail)
+            summary = run.summary()
+            self.assertEqual((summary['calls'], summary['unfinished_calls'], summary['admission_refusals']), (0, 0, 0))
+            recs = [json.loads(line) for line in (trace / 'trace.jsonl').read_text().splitlines()]
+            self.assertEqual([r['status'] for r in recs], ['started', 'fatal'])
+
+    def test_cut_with_trailing_rationale_and_adjacent_punctuation(self):
+        p = plan([{'id': 'a', 'prompt': 'a.md', 'reply': 'findings'},
+                  {'id': 'k', 'prompt': 'k.md', 'reply': 'verdicts'}])
+        review = '### 1. Bug (`a.py:1`)\n- Problem: p1. (Side claim here.)\n'
+        replies = {'a': review, 'k': 'a.1 KEEP - verified\na.1 CUT "Side claim here." - unsupported\n'}
+        text, stats = pl.assemble(p, replies)
+        self.assertEqual((stats['kept'], stats['cuts_not_found']), (1, 0))
+        self.assertNotIn('Side claim here.', text)
+
+
 if __name__ == '__main__':
     unittest.main()

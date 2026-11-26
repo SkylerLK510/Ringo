@@ -573,7 +573,7 @@ macro_rules! python_symbols_source {
                         owners.add(owner.name)
                 walk(child, child)
                 continue
-            if isinstance(child, (ast.Assign, ast.AnnAssign)) and lines & set(range(child.lineno, child.end_lineno + 1)):
+            if isinstance(child, (ast.Assign, ast.AnnAssign)) and lines & set(range(child.lineno, (child.end_lineno or child.lineno) + 1)):
                 targets = child.targets if isinstance(child, ast.Assign) else [child.target]
                 found.update(t.id for t in targets if isinstance(t, ast.Name) and re.fullmatch(r'[A-Z][A-Z0-9_]{2,}', t.id))
             walk(child, owner)

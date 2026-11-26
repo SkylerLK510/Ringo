@@ -725,5 +725,30 @@ else:
                 process.communicate()
 
 
+    def test_stage_failure_after_chmod_cleans_up_temp_dir(self):
+        next_src = self.source / 'prompts/review.md'
+        next_src.write_text(next_src.read_text() + '\nCleanup test.\n')
+        with mock.patch.object(rel.os, 'rename', side_effect=OSError('simulated rename failure')):
+            with self.assertRaisesRegex(OSError, 'simulated rename failure'):
+                rel.stage(self.source, self.state)
+        self.assertEqual(list(self.state.glob('.stage-*')), [])
+
+    def test_activate_rejects_mismatched_python_cache_tag(self):
+        manifest = copy.deepcopy(self.manifest)
+        manifest['python_cache_tag'] = 'cpython-399-other'
+        self.rewrite_manifest(manifest)
+        with self.assertRaisesRegex(ValueError, 'restage under this interpreter'):
+            self.activate()
+        self.assertFalse((self.state / 'active.json').exists())
+
+    def test_locked_rejects_symlink_lock_file(self):
+        lock = self.state / '.lock'
+        lock.unlink(missing_ok=True)
+        lock.symlink_to(self.root / 'outside-lock')
+        with self.assertRaisesRegex(ValueError, 'symlink'):
+            with rel.locked(self.state):
+                pass
+
+
 if __name__ == '__main__':
     unittest.main()

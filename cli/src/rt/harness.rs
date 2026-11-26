@@ -1101,6 +1101,16 @@ impl Run {
         Ok(())
     }
 
+    /// Release a reservation when a local process failed to launch (OSError) before any call ran.
+    pub fn cancel_reservation(&self) -> Result<()> {
+        let mut t = lock(&self.totals);
+        if t.calls < 1 {
+            return Err(Error::value("no call reservation to release"));
+        }
+        t.calls -= 1;
+        Ok(())
+    }
+
     /// Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, written whole
     /// to a private artifact while the record keeps a bounded, hashed excerpt. Token sums stay ints: a paid attempt that reported no
     /// usage, or usage without token fields, counts under untokened_calls, as an unknown price counts under
@@ -2098,6 +2108,7 @@ impl Plan<'_> {
                 }
                 Err(exc) if exc.is(Exc::Os) => {
                     // the command cannot run: every retry would fail too
+                    self.run.cancel_reservation()?;
                     self.run.record(&with(&rec, &[("status", "fatal".into()), ("error", Value::String(described(&exc))), ("seconds", seconds())]), None, None)?;
                     return Err(exc);
                 }

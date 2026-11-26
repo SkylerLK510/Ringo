@@ -58,7 +58,7 @@ pub static FINDING_ID: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?:\A|[^\p{L}\p{N}_])([A-Za-z][\p{L}\p{N}_-]*\.\d+)"));
 /// `^[^\w\n]*(ID\.\d+)[^\w\n]+CUT\b[^\w\n"]*"(.+)"[^\w\n]*$` with re.M (the `\b` always holds when the rest matches).
 pub static CUT: LazyLock<Regex> = LazyLock::new(|| {
-    re(r#"(?m)^[^\p{L}\p{N}_\n]*([A-Za-z][\p{L}\p{N}_-]*\.\d+)[^\p{L}\p{N}_\n]+CUT[^\p{L}\p{N}_\n"]*"(.+)"[^\p{L}\p{N}_\n]*$"#)
+    re(r#"(?m)^[^\p{L}\p{N}_\n]*([A-Za-z][\p{L}\p{N}_-]*\.\d+)[^\p{L}\p{N}_\n]+CUT[^\p{L}\p{N}_\n"]*"(.+?)"(?:\s*[-–—:]\s*[^\n]*)?[^\p{L}\p{N}_\n]*$"#)
 });
 /// `^\W*no defects found\b` with re.M | re.I. Use it for `is_match` only: the trailing `\b` consumes a character.
 pub static NO_DEFECTS: LazyLock<Regex> = LazyLock::new(|| {

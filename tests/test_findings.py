@@ -249,5 +249,14 @@ class NamedFileTest(unittest.TestCase):
         self.assertEqual(findings.parse(prose), [])  # a name with a number in prose is not a file
 
 
+class ExtensionParseTest(unittest.TestCase):
+    def test_bare_uppercase_extensions_match_without_matching_titlecase_identifiers(self):
+        review = ('### 1. Typo in docs (`README.MD`)\n- Problem: broken link.\n\n'
+                  '### 2. Crash in `APP.PY:4`\n- Problem: nil deref.\n\n'
+                  '### 3. `lsmysql.New` panics on nil\n- Problem: no file mentioned.\n')
+        got = [(f['finding'], f['file'], f['start_line']) for f in findings.parse(review)]
+        self.assertEqual(got, [(1, 'README.MD', 1), (2, 'APP.PY', 4)])
+
+
 if __name__ == '__main__':
     unittest.main()
