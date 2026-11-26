@@ -1902,21 +1902,24 @@ impl App {
     }
 
     /// An empty conversation's middle: the cat (unless the side panel shows it), the name, and where to start.
-    fn splash(&self, panel: bool) -> Vec<Line<'static>> {
+    fn splash(&self, panel: bool, room: usize) -> Vec<Line<'static>> {
         let t = &self.theme;
+        let text = vec![Line::from(vec![Span::styled("▲▲ ", t.brand), Span::styled("ringo", t.brand.add_modifier(Modifier::BOLD))]),
+                        Line::default(),
+                        Line::styled("Tell Ringo what you want done, in your own words.", t.title),
+                        Line::styled("/usrman how it works · / commands · ? keys", t.dim)];
         let mut rows: Vec<Line<'static>> = Vec::new();
         if !panel {
-            if let Some(cat) = crate::mascot_art::render("idle", 0, crate::mascot_art::PIXEL_W, t) {
+            // the pixel cat is the tall one: only where the words under it still fit, since a splash too tall is not drawn
+            if let Some(cat) = crate::mascot_art::render("idle", 0, crate::mascot_art::PIXEL_W, t)
+                .filter(|cat| cat.len() + 1 + text.len() <= room) {
                 rows.extend(cat);
                 rows.push(Line::default());
             } else if let Some(cat) = mascot("idle").first() {
                 rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
             }
         }
-        rows.push(Line::from(vec![Span::styled("▲▲ ", t.brand), Span::styled("ringo", t.brand.add_modifier(Modifier::BOLD))]));
-        rows.push(Line::default());
-        rows.push(Line::styled("Tell Ringo what you want done, in your own words.", t.title));
-        rows.push(Line::styled("/usrman how it works · / commands · ? keys", t.dim));
+        rows.extend(text);
         rows
     }
 
@@ -4309,7 +4312,7 @@ impl App {
         let shown: Vec<Line<'static>> = self.fitted.iter().flatten().skip(top).take(h).cloned().collect();
         f.render_widget(Paragraph::new(shown), area);
         // until the owner says something: where to start, centred a third of the way down, under any notes
-        let splash = if self.spoke { Vec::new() } else { self.splash(panel) };
+        let splash = if self.spoke { Vec::new() } else { self.splash(panel, h.saturating_sub(total + 1)) };
         let from = (total + 1).max(h.saturating_sub(splash.len()) / 3);
         if !splash.is_empty() && from + splash.len() <= h && splash.iter().all(|l| l.width() <= area.width as usize) {
             for (i, line) in splash.into_iter().enumerate() {
@@ -4453,13 +4456,6 @@ impl App {
         let fit = |text: &str| one_row(text, width);
         let mut out: Vec<Line<'static>> = Vec::new();
         let ((_, style), (state, frame)) = (self.mood(), self.look());
-        if let Some(rows) = crate::mascot_art::render(state, frame, width, t) {
-            out.extend(rows);
-            out.push(Line::default());
-        } else if let Some(rows) = mascot(state).get(frame) {
-            out.extend(rows.iter().map(|r| Line::styled(fit(r), style)));
-            out.push(Line::default());
-        }
         out.push(head("AGENTS"));
         for &agent in &self.agents {
             let job = self.s.jobs.iter().rev()
@@ -4556,6 +4552,13 @@ impl App {
             for (agent, task, _) in &self.queue {
                 out.push(Line::styled(fit(&format!("↳ {}: {}", agent.name(), clean(task).replace('\n', " "))), t.selected));
             }
+        }
+        // the pixel cat only where it hides nothing below it; else the text cat
+        let cat = crate::mascot_art::render(state, frame, width, t).filter(|cat| cat.len() + 1 + out.len() <= height)
+            .or_else(|| mascot(state).get(frame).map(|rows| rows.iter().map(|r| Line::styled(fit(r), style)).collect()));
+        if let Some(mut cat) = cat {
+            cat.push(Line::default());
+            out.splice(0..0, cat);
         }
         if out.len() > height {
             out.truncate(height.saturating_sub(1));
@@ -5603,6 +5606,20 @@ mod tests {
         let rows = screen(&mut a, 120, 30);
         assert!(rows.iter().filter(|r| r.contains("( •.• )")).count() == 1 && rows.iter().any(|r| r.contains("▲▲ ringo  ")
                 || r.trim_start().starts_with("▲▲ ringo")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_pixel_cat_gives_way_where_it_would_hide_something() {
+        let mut a = app(&["codex", "claude", "agy"]);
+        a.theme = Theme::named("siamese", crate::theme::Depth::TrueColor).unwrap();
+        let has = |rows: &[String], text: &str| rows.iter().any(|r| r.contains(text));
+        let tall = plain(&a.panel(31, 30));
+        assert!(has(&tall, "▀") && has(&tall, "agy"), "{tall:#?}");
+        let short = plain(&a.panel(31, 14));
+        assert!(!has(&short, "▀") && has(&short, "agy") && !has(&short, "…"), "{short:#?}");
+        assert!(has(&plain(&a.splash(false, 30)), "▀"));
+        let small = a.splash(false, 10);
+        assert!(small.len() <= 10 && !has(&plain(&small), "▀") && has(&plain(&small), "in your own words"), "{small:?}");
     }
 
     #[test]
