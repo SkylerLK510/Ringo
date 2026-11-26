@@ -21,6 +21,12 @@ each file against `RB_HEAD`, clamping its lines. A finding whose file is not
 in the repository is dropped and counted in the summary Ringo prints to
 stderr. A failed review exits non-zero and leaves no findings file.
 
+`ringo.py review --repo` now defaults to `--context-mode auto`: the same material as before
+whenever the change alone fits the byte budget, and line windows around the changes in large
+changed files only when it does not (`docs/CONTEXT-COMPACTION.md`). A run that is the control of
+an A/B comparison, or that must reproduce older material, passes `--context-mode full`
+explicitly; `--context-mode windowed` windows regardless of budget, but keeps a file whole when windowing would not save bytes.
+
 ## Build
 
 From the root of the Ringo checkout, for the platform the benchmark runs:

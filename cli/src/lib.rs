@@ -519,6 +519,8 @@ pub struct Job {
     /// The tier the session was in when the job started; it keeps it whatever the session changes to.
     pub tier: Tier,
     pub elapsed: Option<Duration>,
+    /// Time from job start until the first streamed text token arrived (zero-overhead clock read).
+    pub first_token: Option<Duration>,
     pub activity: String,
     pub tokens: Tokens,
     /// What the running turn has used so far by its own messages' counts, until its final count is in `tokens`.
@@ -1588,6 +1590,61 @@ impl Session {
         true
     }
 
+    /// Zero-model-call compaction for any agent: resets its native thread so the next turn starts fresh from
+    /// Ringo's structured ground-truth handoff record without paying for an LLM summary call.
+    pub fn compact_fresh(&mut self, agent: Agent) -> Result<String, String> {
+        let before_fill = self.context.get(&agent).copied().unwrap_or(0);
+        if !self.start_over(agent) {
+            return Err(format!("{} has no conversation here to compact yet", agent.name()));
+        }
+        let fill_note = if before_fill > 0 { format!(" (was {} context)", fmt_k(before_fill)) } else { String::new() };
+        Ok(format!(
+            "  compacted {}{fill_note} with zero model calls — next turn starts a fresh thread from Ringo's ground-truth handoff",
+            agent.name()
+        ))
+    }
+
+    /// Live context & compaction inspector for `/context`: shows active policy mode, per-agent context fill,
+    /// measured fixed base, cache warmth, and next-turn handoff verdict.
+    pub fn context_report(&self, agents: &[Agent]) -> String {
+        let mode_str = match self.context_mode {
+            context_policy::Mode::Static => "static",
+            context_policy::Mode::Adaptive => "adaptive",
+            context_policy::Mode::Off => "off",
+        };
+        let mut lines = vec![format!("  Context & compaction policy: {mode_str} (RINGO_CONTEXT=static|adaptive|off)")];
+        for &agent in agents {
+            let fills = self.context.get(&agent).copied().unwrap_or(0);
+            let threshold = self.static_threshold(agent);
+            let base = self.base_median(agent);
+            let active = self.has_conversation(agent);
+            let lane = self.lane(agent, self.jobs.len() + 1);
+            let mine: Vec<&&Job> = lane.iter().filter(|j| matches!(j.kind, Kind::Agent { agent: a, .. } if a == agent)).collect();
+            let last = mine.last();
+            let idle_s = last.and_then(|j| j.elapsed.map(|e| j.started.elapsed().saturating_sub(e).as_secs()));
+            let ttl_s = if agent.spec().adapter == Adapter::Claude { context_policy::CLAUDE_TTL_S } else { context_policy::CODEX_TTL_S };
+            let warmth = match idle_s {
+                Some(i) if i > ttl_s => format!("cold ({}m idle)", i / 60),
+                Some(i) => format!("warm ({}m idle)", i / 60),
+                None => "—".into(),
+            };
+            let base_str = base.map(fmt_k).unwrap_or_else(|| "unmeasured".into());
+            let pct = if threshold > 0 { (fills * 100) / threshold } else { 0 };
+            let status = if !active {
+                "fresh next turn".to_string()
+            } else {
+                format!("{} / {} ({pct}%) · base {base_str} · cache {warmth}", fmt_k(fills), fmt_k(threshold))
+            };
+            lines.push(format!("    {:<8} {status}", agent.name()));
+        }
+        if let Ok(Some(task)) = self.selected_task() {
+            lines.push(format!("  Active task anchor: {} ({} constraints, {} decisions)",
+                task.id, task.constraints.len(), task.decisions.len()));
+        }
+        lines.push("  Commands: /compact (zero-token handoff for any agent) · /compact llm (Claude summary) · /clear".into());
+        lines.join("\n")
+    }
+
     /// The agents `agent`'s turn may ask (`peers`): the others set up that work in this folder and are installed.
     fn askable(&self, agent: Agent) -> Vec<Agent> {
         self.peers.iter().copied().filter(|a| *a != agent && a.spec().read && self.installed(*a)).collect()
@@ -2085,8 +2142,51 @@ impl Session {
     }
 
     /// `fresh_record`, and whether the inline record holds everything the whole one does (no pointer needed).
+    /// Compact structured ground-truth anchor prepended to fresh-start handoff records so compacted turns never
+    /// forget active task constraints/decisions or repeat a recent failing approach (zero model calls).
+    fn ground_truth_anchor(&self, turns: &[&Job]) -> String {
+        let mut items: Vec<String> = Vec::new();
+        if let Ok(Some(task)) = self.selected_task() {
+            if !task.objective.text.trim().is_empty() {
+                items.push(format!("- Objective ({}): {}", task.id, task.objective.text.trim()));
+            }
+            if !task.constraints.is_empty() {
+                let list: Vec<&str> = task.constraints.iter().take(6).map(|s| s.text.as_str()).collect();
+                items.push(format!("- Constraints: {}", list.join("; ")));
+            }
+            let accepted: Vec<&str> = task.decisions.iter()
+                .filter(|d| matches!(d.status, task::DecisionStatus::Accepted))
+                .take(5)
+                .map(|d| d.text.as_str())
+                .collect();
+            if !accepted.is_empty() {
+                items.push(format!("- Decisions: {}", accepted.join("; ")));
+            }
+            if !task.unresolved_issues.is_empty() {
+                let issues: Vec<&str> = task.unresolved_issues.iter().take(4).map(|s| s.text.as_str()).collect();
+                items.push(format!("- Open issues: {}", issues.join("; ")));
+            }
+        }
+        if let Some((fid, why)) = turns.iter().rev().find_map(|j| match &j.status {
+            Status::Failed(w) if !w.trim().is_empty() => Some((j.id, w.trim())),
+            _ => None,
+        }) {
+            let short = parse::short(why, 220);
+            items.push(format!("- Last failure (#{fid}, do not repeat blindly): {short}"));
+        }
+        if items.is_empty() {
+            return String::new();
+        }
+        format!("### Ground truth (pinned across compaction)\n{}\n\n", items.join("\n"))
+    }
+
     fn fresh_record_full(&self, agent: Agent, turns: &[&Job], cap: usize) -> (String, String, bool) {
-        let Some(before) = self.carried(agent) else { return self.record_full(turns, cap) };
+        let anchor = self.ground_truth_anchor(turns);
+        let prepend = |text: String| if anchor.is_empty() { text } else { format!("{anchor}{text}") };
+        let Some(before) = self.carried(agent) else {
+            let (rec, whole, complete) = self.record_full(turns, cap.saturating_sub(anchor.len()));
+            return (prepend(rec), prepend(whole), complete);
+        };
         let (lean, whole, lean_complete) = self.record_full(turns, 0);
         let separator = "\n\n(Ringo restarted here; the turns since are numbered from #1 again)\n\n";
         let join = |a: &str, b: &str| match (a.is_empty(), b.is_empty()) {
@@ -2096,8 +2196,8 @@ impl Session {
         };
         // The turns before the restart keep the room the lean record leaves them (the owner's earlier words are
         // worth more than the later paragraphs of newer replies); the rich tier gets only what is left of the cap.
-        let kept = newest(before, RECORD_BYTES.saturating_sub(lean.len() + separator.len()));
-        let reserved = if kept.trim_end().is_empty() { 0 } else { kept.trim_end().len() + separator.len() };
+        let kept = newest(before, RECORD_BYTES.saturating_sub(anchor.len() + lean.len() + separator.len()));
+        let reserved = anchor.len() + if kept.trim_end().is_empty() { 0 } else { kept.trim_end().len() + separator.len() };
         let rich = cap.min(RECORD_BYTES - 128).saturating_sub(reserved);
         let (record, complete) = if rich > lean.len() {
             let (record, _, complete) = self.record_full(turns, rich);
@@ -2106,7 +2206,7 @@ impl Session {
             (lean, lean_complete)
         };
         let complete = complete && kept.trim_end() == before.trim_end();
-        (join(&kept, &record), join(before, &whole), complete)
+        (prepend(join(&kept, &record)), prepend(join(before, &whole)), complete)
     }
 
     /// Ringo's record of `turns`, oldest first, and the same uncut: each turn's message from the owner, word for
@@ -2349,7 +2449,7 @@ impl Session {
         let dir = self.dir.join("jobs").join(id.to_string());
         private_dir(&dir)?;
         self.jobs.push(Job { id, kind, title: parse::short(title, 60), title_full: title.to_string(), status: Status::Running, started: Instant::now(), tier: self.tier,
-                             elapsed: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0, warned: 0,
+                             elapsed: None, first_token: None, activity: "starting".into(), tokens: Tokens::default(), live: Tokens::default(), calls: 0, warned: 0,
                              subs: Vec::new(), log: VecDeque::new(), fresh: Vec::new(), dir, worktree: None, base: None, applied: false, unchanged: false,
                              touched: BTreeSet::new(), read: Vec::new(), before: None, after: None, changed: Vec::new(), undone: false,
                              asks: VecDeque::new(), lane: None, steps: Vec::new(), ran: false, input: None, pid: None,
@@ -3442,6 +3542,9 @@ impl Session {
             if let Some(version) = &job.cli_version {
                 record["cli_version"] = version.as_str().into(); // what `ledger.py base` groups by
             }
+            if let Some(ttft) = job.first_token {
+                record["ttft_ms"] = (ttft.as_millis() as u64).into();
+            }
             if let Some(secs) = slept {
                 record["host_slept_s"] = secs.into();
             }
@@ -3671,8 +3774,18 @@ impl Session {
                             }
                         }
                         Note::Log(line) => job.push_log(line),
-                        Note::Reply(text) => job.push(Said::Reply(text)),
-                        Note::Partial(text) => job.push(Said::Partial(text)),
+                        Note::Reply(text) => {
+                            if job.first_token.is_none() && !text.is_empty() {
+                                job.first_token = Some(job.started.elapsed());
+                            }
+                            job.push(Said::Reply(text));
+                        }
+                        Note::Partial(text) => {
+                            if job.first_token.is_none() && !text.is_empty() {
+                                job.first_token = Some(job.started.elapsed());
+                            }
+                            job.push(Said::Partial(text));
+                        }
                         Note::Step(text) => job.push(Said::Step(text)),
                         Note::Looked { kind, text } => job.push(Said::Looked(kind, text)),
                         Note::Subagent { id: sub, label } => {
@@ -3946,6 +4059,27 @@ impl Session {
             });
         }
         found.unwrap_or_default()
+    }
+
+    /// Per-agent Time to First Token (p50_ms, p95_ms, sample_count) from `usage.jsonl` over the last `secs` seconds.
+    pub fn ttft_summary(&self, secs: u64) -> BTreeMap<String, (u64, u64, usize)> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let mut by_agent: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+        for r in read_usage_rows(&self.root.join("usage.jsonl")).0 {
+            let (Some(at), Some(agent), Some(ms)) = (r["at"].as_u64(), r["agent"].as_str(), r["ttft_ms"].as_u64()) else {
+                continue;
+            };
+            if now.saturating_sub(at) <= secs {
+                by_agent.entry(agent.to_string()).or_default().push(ms);
+            }
+        }
+        by_agent.into_iter().map(|(agent, mut samples)| {
+            samples.sort_unstable();
+            let n = samples.len();
+            let p50 = samples[(n - 1) / 2];
+            let p95 = samples[((n * 95).div_ceil(100)).saturating_sub(1).min(n - 1)];
+            (agent, (p50, p95, n))
+        }).collect()
     }
 
     /// The oldest action an agent waits on the owner for, across every job: (job, what it asks).

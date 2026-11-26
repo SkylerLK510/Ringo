@@ -42,7 +42,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer"),
     ("/attach PATH", "attach an image; /attach clipboard or Ctrl-V pastes a screenshot on macOS"),
     ("/clear", "start a new conversation"),
-    ("/compact", "shrink a long conversation so later turns cost less"),
+    ("/compact", "shrink a long conversation so later turns cost less (zero model calls; /compact llm for Claude)"),
+    ("/context", "show live context fill, cache warmth, and compaction policy"),
     ("/separate", "a conversation of its own for each agent, so none is told what the others do"),
     ("/together", "the agents back in one conversation, still working side by side"),
     ("/discuss TOPIC", "the agents talk it over among themselves, in turn, while you read (alone: the last turn)"),
@@ -274,7 +275,9 @@ pub enum Cmd {
     Copy,
     Attach(String),
     Clear,
-    Compact,
+    /// `/compact` (false: zero-token ground-truth handoff for any agent) or `/compact llm` (true: Claude native summary).
+    Compact(bool),
+    Context,
     /// `/separate` (true): each agent a conversation of its own, at the same time; `/together` (false): one again.
     Separate(bool),
     /// `?`: the keys.
@@ -452,8 +455,8 @@ fn parse_task_update(tail: &str) -> Result<TaskUpdate, String> {
 /// One input line as a command. A line without `/` or `@` is for the agent the owner is talking to; @all means every
 /// set-up agent.
 /// Commands that take nothing after them.
-const BARE: [&str; 20] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
-                          "copy", "clear", "new", "compact", "separate", "together", "auto", "usage", "cost"];
+const BARE: [&str; 21] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
+                          "copy", "clear", "new", "context", "ctx", "separate", "together", "auto", "usage", "cost"];
 
 pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
     let line = line.trim();
@@ -478,7 +481,12 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "copy" => Ok(Cmd::Copy),
             "attach" => Ok(Cmd::Attach(tail.into())),
             "clear" | "new" => Ok(Cmd::Clear),
-            "compact" => Ok(Cmd::Compact),
+            "context" | "ctx" => Ok(Cmd::Context),
+            "compact" => match (words.next(), words.next()) {
+                (None, _) => Ok(Cmd::Compact(false)),
+                (Some("llm"), None) => Ok(Cmd::Compact(true)),
+                _ => Err("/compact takes nothing after it (except `llm` for Claude's native summary): send the rest on a line of its own".into()),
+            },
             "separate" => Ok(Cmd::Separate(true)),
             "together" => Ok(Cmd::Separate(false)),
             "ask" if !tail.is_empty() => Ok(Cmd::Ask(tail.into())),
@@ -666,6 +674,11 @@ fn fmt_age(d: Duration) -> String {
     if s < 3600 { format!("{}:{:02}", s / 60, s % 60) } else { format!("{}h{:02}", s / 3600, s / 60 % 60) }
 }
 
+fn fmt_ttft(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", d.as_secs_f64()) }
+}
+
 /// A job's state in one word, as the task progress view reports it.
 fn status_label(status: &Status) -> String {
     match status {
@@ -764,8 +777,8 @@ fn closed(mut text: String) -> String {
 
 /// How long the word being written waits for its end before it shows anyway, and a table for its last row: a
 /// reply's pieces come tens of milliseconds apart, so a pause this long is the agent stopping to think or to work.
-const WORD_HOLD: Duration = Duration::from_millis(150);
-const TABLE_HOLD: Duration = Duration::from_millis(1500);
+const WORD_HOLD: Duration = Duration::from_millis(45);
+const TABLE_HOLD: Duration = Duration::from_millis(450);
 /// A word, or a link, longer than this shows as it grows (a path, a URL, a `[` that opens no link).
 const HELD_WORD: usize = 32;
 const HELD_LINK: usize = 60;
@@ -1012,8 +1025,9 @@ fn fit(line: &Line<'static>, width: usize, indent: usize) -> Vec<Line<'static>> 
 fn markdown(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     use pulldown_cmark::{Options, Parser};
     let mut md = Md { t: *theme, width: width.max(8), out: Vec::new(), spans: Vec::new(), style: Vec::new(),
-                      lists: Vec::new(), marker: None, quote: 0, code: None, table: None, links: Vec::new() };
-    for event in Parser::new_ext(&text.replace('\u{FE0F}', ""), Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH) {
+                      lists: Vec::new(), marker: None, quote: 0, code: None, code_lang: None, table: None, links: Vec::new() };
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    for event in Parser::new_ext(&text.replace('\u{FE0F}', ""), opts) {
         md.event(event);
     }
     md.flush();
@@ -1043,6 +1057,7 @@ struct Md {
     marker: Option<String>,
     quote: usize,
     code: Option<String>,
+    code_lang: Option<String>,
     table: Option<Table>,
     /// Open links: where each goes, and where its text starts in `spans`.
     links: Vec<(String, usize)>,
@@ -1074,27 +1089,41 @@ impl Md {
                 self.out.push(Line::styled("─".repeat(self.width.min(40)), self.t.dim));
                 self.blank();
             }
+            E::TaskListMarker(done) => {
+                let (glyph, style) = if done { ("☑ ", self.t.ok) } else { ("☐ ", self.t.dim) };
+                self.spans.push(Span::styled(glyph, style));
+            }
             E::Html(text) | E::InlineHtml(text) => self.spans.push(Span::styled(text.into_string(), self.cur())),
-            _ => {} // footnotes, task lists and math are not turned on
+            _ => {}
         }
     }
 
     fn start(&mut self, tag: pulldown_cmark::Tag) {
-        use pulldown_cmark::Tag as T;
+        use pulldown_cmark::{CodeBlockKind, HeadingLevel, Tag as T};
         use ratatui::style::Modifier;
         match tag {
-            T::Heading { .. } => {
+            T::Heading { level, .. } => {
                 self.flush();
                 self.blank();
-                self.open(self.t.focus.add_modifier(Modifier::BOLD));
+                let style = match level {
+                    HeadingLevel::H1 => self.t.title.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    HeadingLevel::H2 => self.t.focus.add_modifier(Modifier::BOLD),
+                    _ => self.t.ringo.add_modifier(Modifier::BOLD),
+                };
+                self.open(style);
             }
             T::BlockQuote(_) => {
                 self.flush();
                 self.quote += 1;
+                self.open(Style::new().add_modifier(Modifier::ITALIC));
             }
-            T::CodeBlock(_) => {
+            T::CodeBlock(kind) => {
                 self.flush();
                 self.code = Some(String::new());
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => info.split_whitespace().next().filter(|s| !s.is_empty()).map(str::to_string),
+                    CodeBlockKind::Indented => None,
+                };
             }
             T::List(start) => {
                 self.flush();
@@ -1148,15 +1177,22 @@ impl Md {
             }
             T::BlockQuote(_) => {
                 self.flush();
+                self.style.pop();
                 self.quote = self.quote.saturating_sub(1);
                 self.blank();
             }
             T::CodeBlock => {
                 let code = self.code.take().unwrap_or_default();
+                let lang = self.code_lang.take();
+                if let Some(ref l) = lang {
+                    self.emit_under(vec![Span::styled(format!("╭─ {l}"), self.t.dim)], 2);
+                }
                 // text written on Windows ends its lines with CRLF; the carriage returns are not content
                 let code = code.replace("\r\n", "\n").replace('\r', "\n");
                 for line in code.strip_suffix('\n').unwrap_or(&code).split('\n') {
-                    self.emit_under(vec![Span::styled(format!("  {line}"), self.t.ringo)], 2);
+                    let mut spans = vec![Span::styled("│ ", self.t.dim)];
+                    spans.extend(crate::highlight::highlight_line(lang.as_deref(), line, &self.t));
+                    self.emit_under(spans, 2);
                 }
                 if self.lists.is_empty() {
                     self.blank();
@@ -1938,6 +1974,7 @@ impl App {
                 self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who} "), style.add_modifier(Modifier::BOLD | Modifier::REVERSED)),
                                                         Span::styled(format!(" #{id}{model}"), self.theme.dim)]), 0));
             }
+            let mut streamed = false;
             for said in fresh {
                 // The owner answers what they read last: an agent's words in this folder make it the one plain lines
                 // go to, unless a line is being typed (it keeps the agent its prompt shows).
@@ -1947,12 +1984,12 @@ impl App {
                 }
                 // anything but another piece means the reply's pieces have stopped for now: what was kept back shows
                 if !matches!(said, Said::Partial(_) | Said::Reply(_)) {
+                    streamed = false;
                     self.show_stream(id, Duration::MAX);
                 }
                 match said {
-                    // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
-                    // The growing reply is fitted again (its markdown parsed) for each frame it grows in: 0.1 to
-                    // 0.4 ms a frame up to the 14.8k guide, about 1 ms at the end of a 56k reply (measured, release).
+                    // Coalesce consecutive partial deltas arriving in the same poll tick before running `show_stream`
+                    // so long replies do not re-clean and re-parse the full buffer once per small delta.
                     Said::Partial(text) => {
                         match self.streams.get_mut(&id) {
                             Some(s) if s.at < self.out.len() => {
@@ -1966,7 +2003,7 @@ impl App {
                                                                  floor: 0, due: None });
                             }
                         }
-                        self.show_stream(id, Duration::ZERO);
+                        streamed = true;
                     }
                     Said::Reply(text) => match self.streams.remove(&id) {
                         Some(s) if s.at < self.out.len() => {
@@ -2001,6 +2038,9 @@ impl App {
                     }
                 }
                 self.last = id;
+            }
+            if streamed {
+                self.show_stream(id, Duration::ZERO);
             }
             if ends {
                 self.show_stream(id, Duration::MAX); // a reply cut off stays as far as it got, all of it
@@ -2076,7 +2116,8 @@ impl App {
             Status::Running => return Vec::new(),
         };
         let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
-        let mut tail = format!(" · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
+        let ttft = job.first_token.map(|d| format!(" · {} first token", fmt_ttft(d))).unwrap_or_default();
+        let mut tail = format!(" · {}{ttft} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
         if job.unchanged {
             tail += &format!(" · no change; /drop {} removes its copy", job.id);
         } else if job.worktree.is_some() && job.status == Status::Done {
@@ -2500,6 +2541,16 @@ impl App {
                                        value: fmt_tokens(got(&week)), fill: Some(fill),
                                        note: format!("in 7 days · {} in 24 hours · {} this session", fmt_tokens(got(&day)),
                                                      fmt_tokens(got(&session))) });
+        }
+        let ttft = self.s.ttft_summary(7 * 86_400);
+        if !ttft.is_empty() {
+            let parts: Vec<String> = ttft.iter().map(|(name, (p50, p95, n))| {
+                format!("{name} p50 {} / p95 {} ({n})", fmt_ttft(Duration::from_millis(*p50)), fmt_ttft(Duration::from_millis(*p95)))
+            }).collect();
+            self.out.push(Out::Line(Line::from(vec![
+                Span::styled("  first token (7d)", t.title.add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" · {}", parts.join(" · ")), t.dim),
+            ]), 4));
         }
         // a limit a turn ran into in the last day, from Ringo's record: which, how long ago, and when it starts over
         for (name, kind, at, resets) in self.s.limits_hit_since(86_400) {
@@ -3263,7 +3314,7 @@ impl App {
             return false;
         }
         let agent = match cmd {
-            Ok(Cmd::Talk(_) | Cmd::Compact) => Some(self.main),
+            Ok(Cmd::Talk(_) | Cmd::Compact(true)) => Some(self.main),
             Ok(Cmd::Agents(agents, _)) => match agents[..] { [(a, false)] => Some(a), _ => None },
             _ => None,
         };
@@ -3357,13 +3408,17 @@ impl App {
                 let talk = if self.talking.take().is_some() { "; the agents' talk ends with the turn now running" } else { "" };
                 Some(format!("  a new conversation: each agent's next turn starts fresh{talk}"))
             }
-            Cmd::Compact => {
-                // Claude's own compaction, which the Agent SDK documents for a resumed session: `/compact` as the
-                // prompt. It is one model call over the conversation (Claude reports what it held).
+            Cmd::Context => Some(self.s.context_report(&self.agents)),
+            Cmd::Compact(false) => {
+                // Zero-token ground-truth compaction for any agent: resets its native thread so the next turn
+                // starts fresh carrying Ringo's structured handoff record.
+                Some(self.s.compact_fresh(self.main)?)
+            }
+            Cmd::Compact(true) => {
+                // Explicit `/compact llm`: Claude's own LLM compaction over the resumed session.
                 let agent = self.main;
                 if agent.spec().adapter != ringo_cli::Adapter::Claude {
-                    return Err(format!("{0} compacts its conversation on its own when it fills up; Ringo can start \
-                                        /compact only for claude, where it is documented. /clear starts {0} fresh",
+                    return Err(format!("{0} has no native LLM /compact; use `/compact` for zero-token handoff compaction",
                                        agent.name()));
                 }
                 if !self.s.has_conversation(agent) {
@@ -4845,7 +4900,7 @@ pub fn run(start: Start) -> ExitCode {
         // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
         // while jobs run (a pump is a few microseconds; redraws still happen only when something changed). Every event
         // already queued is taken before the next redraw.
-        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() || app.listing.is_some() { 25 } else { 250 };
+        let wait = if !app.streams.is_empty() { 8 } else if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() || app.listing.is_some() { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             loop {
                 match event::read() {
@@ -6017,10 +6072,13 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
     #[test]
     fn a_queued_compaction_checks_its_conversation_again() {
         let mut a = app(&["claude"]);
-        assert!(a.run(Cmd::Compact, "/compact").unwrap_err().contains("no conversation"));
+        assert!(a.run(Cmd::Compact(false), "/compact").unwrap_err().contains("no conversation"));
+        assert!(a.run(Cmd::Compact(true), "/compact llm").unwrap_err().contains("no conversation"));
         assert!(a.turn(a.main, "/compact").unwrap_err().contains("no conversation"), "nor when it comes off the queue");
         let mut b = app(&["codex"]);
-        assert!(b.run(Cmd::Compact, "/compact").unwrap_err().contains("compacts its conversation on its own"));
+        assert!(b.run(Cmd::Compact(false), "/compact").unwrap_err().contains("no conversation"));
+        assert!(b.run(Cmd::Compact(true), "/compact llm").unwrap_err().contains("zero-token handoff"));
+        assert!(b.run(Cmd::Context, "/context").unwrap().unwrap().contains("Context & compaction policy"));
     }
 
     /// A fake Claude's answer to Ringo's plan read (`get_usage`): the 5-hour limit at the percent in `$0.pct`, else 20.
@@ -6870,11 +6928,15 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert_eq!(md(wide, 40), ["name       status", "──────────────────────────", "LangGraph  yes it is there"]);
         assert_eq!(md(wide, 24), ["name       status", &"─".repeat(24), "LangGraph  yes it is", "           there"],
                    "when the first column takes half the row or less, the last one wraps under itself");
-        assert_eq!(md("```\nlet x = 1;\n```", 20), ["  let x = 1;"]);
-        assert_eq!(md("```\nlet x = 1 + 2;\n```", 10), ["  let x =", "  1 + 2;"], "wrapped code stays in its block");
+        assert_eq!(md("```\nlet x = 1;\n```", 20), ["│ let x = 1;"]);
+        assert_eq!(md("```\nlet x = 1 + 2;\n```", 10), ["│ let x =", "  1 + 2;"], "wrapped code stays in its block");
+        assert_eq!(md("```rust\nlet x = 1;\n```", 20), ["╭─ rust", "│ let x = 1;"], "fenced code shows its language");
+        assert_eq!(md("- [x] done\n- [ ] todo", 20), ["• ☑ done", "• ☐ todo"], "task list checkboxes render cleanly");
         assert_eq!(md("> aaa bbb ccc", 8), ["│ aaa", "│ bbb", "│ ccc"], "a quote's wrapped rows keep its bar");
         assert_eq!(md("1. a\n2. b\n   - c", 20), ["1. a", "2. b", "   • c"]);
         assert_eq!(md("see [the docs](https://x.dev) and [a.rs](src/a.rs)", 60), ["see the docs (https://x.dev) and a.rs"]);
+        assert_eq!(fmt_ttft(Duration::from_millis(420)), "420ms");
+        assert_eq!(fmt_ttft(Duration::from_millis(1450)), "1.4s");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! runs).
 
 mod connect;
+mod highlight;
 mod setup;
 mod theme;
 mod tui;
