@@ -762,6 +762,15 @@ in Ringo's state folder (`~/.local/share/ringo/rules.md` on macOS and Linux): wh
 ahead of the repository's file. Every line in it is read on every call, so keep it short; with no file nothing is
 added. Codex reads your `~/.codex/AGENTS.md` itself.
 
+An edit to any of these files reaches a resumed Claude conversation too, when the CLI is new enough. Claude Code keeps the system prompt it recorded
+on a conversation's first turn, so on a resumed turn the shell asks `claude --version` and passes
+`--system-prompt-snapshot off` to 2.1.257 or later (the version that added it, by its documentation), and the prompt is
+built again. If that question fails or takes more than five seconds, the turn runs without the flag and may still use
+the recorded prompt. One live check with 2.1.332 (Sonnet, a one-line instruction file): unedited, the rebuilt prompt was read
+from cache (3,324 tokens read, 25 written); edited without the flag, Claude answered with the old text; with it, the new
+text, writing 1,726 tokens again. Not measured: a long conversation, a date change, and a Claude Code update in the
+middle of one, which would rebuild the prompt and miss the cache once.
+
 A follow-up re-sends the conversation so far, so it costs a first turn plus that history, and within a turn every
 call re-reads everything before it. On a subscription login Claude runs Opus with a 1M window, where Claude Code
 compacts a conversation only near 967k tokens: one long turn started in a home folder read 3.9M tokens in all, its

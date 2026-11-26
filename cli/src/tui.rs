@@ -5570,6 +5570,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ringo-tui-talker-{}-{name}", std::process::id()));
         let cases: Vec<String> = replies.iter().enumerate().map(|(i, r)| format!("{}) reply='{r}';;", i + 1)).collect();
         let script = r##"#!/bin/sh
+[ "$1" = --version ] && exit 0
 n=$(($(cat "$0.n" 2>/dev/null || echo 0) + 1)); echo $n > "$0.n"
 for a in "$@"; do printf '%s\n' "$a"; done > "$0.argv"
 head -n 1 > "$0.in.$n"
@@ -6070,7 +6071,7 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
 
     /// A fake Claude's answer to Ringo's plan read (`get_usage`): the 5-hour limit at the percent in `$0.pct`, else 20.
     #[cfg(unix)]
-    const CLAUDE_PLAN: &str = "#!/bin/sh\ncase \"$*\" in *no-session-persistence*) read ask; pct=$(cat \"$0.pct\" 2>/dev/null || echo 20); \
+    const CLAUDE_PLAN: &str = "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\ncase \"$*\" in *no-session-persistence*) read ask; pct=$(cat \"$0.pct\" 2>/dev/null || echo 20); \
         echo '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"ringo-usage\",\"response\":\
         {\"subscription_type\":\"max\",\"rate_limits\":{\"limits\":[{\"kind\":\"session\",\"percent\":'$pct',\
         \"resets_at\":\"2099-01-01T00:00:00Z\"}]}}}}'; exit 0;; esac\n";

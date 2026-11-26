@@ -414,6 +414,29 @@ pub const ALWAYS_ASK: [&str; 16] = [
     "Write(~/.gemini/**)",
 ];
 
+/// Whether this Claude Code takes `--system-prompt-snapshot` (2.1.257 on), as its `--version` says (10 ms with
+/// 2.1.332). A failed probe, or none within five seconds, is a no: the turn runs without the flag, as before.
+fn rebuilds_prompt(program: &std::ffi::OsStr) -> bool {
+    let mut ask = Command::new(program);
+    ask.arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    let Ok(mut child) = ask.spawn() else { return false };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !matches!(child.try_wait(), Ok(Some(status)) if status.success()) {
+        // ceiling: only the probe itself is killed, not processes a wrapper script started
+        let _ = (child.kill(), child.wait());
+        return false;
+    }
+    // one read, not to the end: a process the probe left behind may hold the pipe open
+    let mut buf = [0; 128];
+    let Some(Ok(n)) = child.stdout.take().map(|mut out| std::io::Read::read(&mut out, &mut buf)) else { return false };
+    let text = String::from_utf8_lossy(&buf[..n]);
+    let mut parts = text.split(['.', ' ', '-', '\n']).map(|p| p.parse::<u32>().ok());
+    matches!((parts.next(), parts.next(), parts.next()), (Some(Some(a)), Some(Some(b)), Some(Some(c))) if (a, b, c) >= (2, 1, 257))
+}
+
 /// Claude Code tools that act outside the agent's turn, denied in every Claude turn Ringo starts.
 pub const OUT_OF_TURN_TOOLS: [&str; 15] = ["CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger",
     "PushNotification", "SendToProject", "SendToProjectContext", "EnterWorktree", "ExitWorktree", "DesignSync",
@@ -2906,6 +2929,13 @@ impl Session {
                 }
                 if let Some(session) = &resume {
                     cmd.args(["--resume", session]);
+                    // Claude Code keeps the system prompt it recorded on a conversation's first turn, so a resumed one
+                    // would not see an edit to the instructions appended below (Claude Code 2.1.332: the old text was
+                    // sent; with this flag the new, and with nothing edited the whole prompt was read from cache). An
+                    // older CLI refuses the flag, so the program about to run is asked its version, not a saved one.
+                    if rebuilds_prompt(cmd.get_program()) {
+                        cmd.args(["--system-prompt-snapshot", "off"]);
+                    }
                 }
                 // The owner's own rules (`rules_path`), which safe mode would otherwise drop with their CLAUDE.md, go
                 // first; with the repository's file as well, the two go in one file of the job's, as bytes, so neither
