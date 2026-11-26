@@ -340,6 +340,7 @@ pub fn run_cli(args: &[std::ffi::OsString]) -> ExitCode {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     let has_problem = checks.iter().any(|c| c.configured && (!c.installed || c.signed_in == Some(false)));
+    let all_ok = !has_problem && py_ok;
 
     if json_out {
         let payload = serde_json::json!({
@@ -360,10 +361,10 @@ pub fn run_cli(args: &[std::ffi::OsString]) -> ExitCode {
                 "stripped_env_vars": overrides,
             },
             "subscriptions": checks,
-            "ok": !has_problem && py_ok,
+            "ok": all_ok,
         });
         println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
-        return if has_problem { ExitCode::FAILURE } else { ExitCode::SUCCESS };
+        return if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE };
     }
 
     let t = Theme::load();
@@ -432,10 +433,8 @@ pub fn run_cli(args: &[std::ffi::OsString]) -> ExitCode {
 
     if has_problem {
         println!("\nRun `ringo setup` to sign in or manage connected subscriptions.");
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
     }
+    if all_ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 #[cfg(test)]
