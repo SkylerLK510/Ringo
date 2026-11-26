@@ -802,7 +802,7 @@ fn closed(mut text: String) -> String {
 /// How long the word being written waits for its end before it shows anyway, and a table for its last row: a
 /// reply's pieces come tens of milliseconds apart, so a pause this long is the agent stopping to think or to work.
 const WORD_HOLD: Duration = Duration::from_millis(45);
-const TABLE_HOLD: Duration = Duration::from_millis(450);
+const TABLE_HOLD: Duration = Duration::from_millis(1500);
 /// A word, or a link, longer than this shows as it grows (a path, a URL, a `[` that opens no link).
 const HELD_WORD: usize = 32;
 const HELD_LINK: usize = 60;
