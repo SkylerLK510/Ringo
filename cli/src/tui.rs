@@ -42,7 +42,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the last answer"),
     ("/attach PATH", "attach an image; /attach clipboard or Ctrl-V pastes a screenshot on macOS"),
     ("/clear", "start a new conversation"),
-    ("/compact", "shrink a long conversation so later turns cost less"),
+    ("/compact", "shrink a long conversation so later turns cost less (zero model calls; /compact llm for Claude)"),
+    ("/context", "show live context fill, cache warmth, and compaction policy"),
     ("/separate", "a conversation of its own for each agent, so none is told what the others do"),
     ("/together", "the agents back in one conversation, still working side by side"),
     ("/discuss TOPIC", "the agents talk it over among themselves, in turn, while you read (alone: the last turn)"),
@@ -273,7 +274,9 @@ pub enum Cmd {
     Copy,
     Attach(String),
     Clear,
-    Compact,
+    /// `/compact` (false: zero-token ground-truth handoff for any agent) or `/compact llm` (true: Claude native summary).
+    Compact(bool),
+    Context,
     /// `/separate` (true): each agent a conversation of its own, at the same time; `/together` (false): one again.
     Separate(bool),
     /// `?`: the keys.
@@ -450,8 +453,8 @@ fn parse_task_update(tail: &str) -> Result<TaskUpdate, String> {
 /// One input line as a command. A line without `/` or `@` is for the agent the owner is talking to; @all means every
 /// set-up agent.
 /// Commands that take nothing after them.
-const BARE: [&str; 20] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
-                          "copy", "clear", "new", "compact", "separate", "together", "auto", "usage", "cost"];
+const BARE: [&str; 21] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
+                          "copy", "clear", "new", "context", "ctx", "separate", "together", "auto", "usage", "cost"];
 
 pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
     let line = line.trim();
@@ -475,7 +478,12 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "copy" => Ok(Cmd::Copy),
             "attach" => Ok(Cmd::Attach(tail.into())),
             "clear" | "new" => Ok(Cmd::Clear),
-            "compact" => Ok(Cmd::Compact),
+            "context" | "ctx" => Ok(Cmd::Context),
+            "compact" => match (words.next(), words.next()) {
+                (None, _) => Ok(Cmd::Compact(false)),
+                (Some("llm"), None) => Ok(Cmd::Compact(true)),
+                _ => Err("/compact takes nothing after it (except `llm` for Claude's native summary): send the rest on a line of its own".into()),
+            },
             "separate" => Ok(Cmd::Separate(true)),
             "together" => Ok(Cmd::Separate(false)),
             "ask" if !tail.is_empty() => Ok(Cmd::Ask(tail.into())),
@@ -3259,7 +3267,7 @@ impl App {
             return false;
         }
         let agent = match cmd {
-            Ok(Cmd::Talk(_) | Cmd::Compact) => Some(self.main),
+            Ok(Cmd::Talk(_) | Cmd::Compact(true)) => Some(self.main),
             Ok(Cmd::Agents(agents, _)) => match agents[..] { [(a, false)] => Some(a), _ => None },
             _ => None,
         };
@@ -3353,13 +3361,17 @@ impl App {
                 let talk = if self.talking.take().is_some() { "; the agents' talk ends with the turn now running" } else { "" };
                 Some(format!("  a new conversation: each agent's next turn starts fresh{talk}"))
             }
-            Cmd::Compact => {
-                // Claude's own compaction, which the Agent SDK documents for a resumed session: `/compact` as the
-                // prompt. It is one model call over the conversation (Claude reports what it held).
+            Cmd::Context => Some(self.s.context_report(&self.agents)),
+            Cmd::Compact(false) => {
+                // Zero-token ground-truth compaction for any agent: resets its native thread so the next turn
+                // starts fresh carrying Ringo's structured handoff record.
+                Some(self.s.compact_fresh(self.main)?)
+            }
+            Cmd::Compact(true) => {
+                // Explicit `/compact llm`: Claude's own LLM compaction over the resumed session.
                 let agent = self.main;
                 if agent.spec().adapter != ringo_cli::Adapter::Claude {
-                    return Err(format!("{0} compacts its conversation on its own when it fills up; Ringo can start \
-                                        /compact only for claude, where it is documented. /clear starts {0} fresh",
+                    return Err(format!("{0} has no native LLM /compact; use `/compact` for zero-token handoff compaction",
                                        agent.name()));
                 }
                 if !self.s.has_conversation(agent) {
@@ -6004,10 +6016,13 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
     #[test]
     fn a_queued_compaction_checks_its_conversation_again() {
         let mut a = app(&["claude"]);
-        assert!(a.run(Cmd::Compact, "/compact").unwrap_err().contains("no conversation"));
+        assert!(a.run(Cmd::Compact(false), "/compact").unwrap_err().contains("no conversation"));
+        assert!(a.run(Cmd::Compact(true), "/compact llm").unwrap_err().contains("no conversation"));
         assert!(a.turn(a.main, "/compact").unwrap_err().contains("no conversation"), "nor when it comes off the queue");
         let mut b = app(&["codex"]);
-        assert!(b.run(Cmd::Compact, "/compact").unwrap_err().contains("compacts its conversation on its own"));
+        assert!(b.run(Cmd::Compact(false), "/compact").unwrap_err().contains("no conversation"));
+        assert!(b.run(Cmd::Compact(true), "/compact llm").unwrap_err().contains("zero-token handoff"));
+        assert!(b.run(Cmd::Context, "/context").unwrap().unwrap().contains("Context & compaction policy"));
     }
 
     /// A fake Claude's answer to Ringo's plan read (`get_usage`): the 5-hour limit at the percent in `$0.pct`, else 20.
