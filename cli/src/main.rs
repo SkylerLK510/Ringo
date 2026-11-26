@@ -5,6 +5,7 @@
 mod connect;
 mod doctor;
 mod highlight;
+mod mascot_art;
 mod setup;
 mod theme;
 mod tui;

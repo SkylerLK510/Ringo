@@ -1905,8 +1905,13 @@ impl App {
     fn splash(&self, panel: bool) -> Vec<Line<'static>> {
         let t = &self.theme;
         let mut rows: Vec<Line<'static>> = Vec::new();
-        if !panel && let Some(cat) = mascot("idle").first() {
-            rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
+        if !panel {
+            if let Some(cat) = crate::mascot_art::render("idle", 0, crate::mascot_art::PIXEL_W, t) {
+                rows.extend(cat);
+                rows.push(Line::default());
+            } else if let Some(cat) = mascot("idle").first() {
+                rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
+            }
         }
         rows.push(Line::from(vec![Span::styled("▲▲ ", t.brand), Span::styled("ringo", t.brand.add_modifier(Modifier::BOLD))]));
         rows.push(Line::default());
@@ -4448,7 +4453,10 @@ impl App {
         let fit = |text: &str| one_row(text, width);
         let mut out: Vec<Line<'static>> = Vec::new();
         let ((_, style), (state, frame)) = (self.mood(), self.look());
-        if let Some(rows) = mascot(state).get(frame) {
+        if let Some(rows) = crate::mascot_art::render(state, frame, width, t) {
+            out.extend(rows);
+            out.push(Line::default());
+        } else if let Some(rows) = mascot(state).get(frame) {
             out.extend(rows.iter().map(|r| Line::styled(fit(r), style)));
             out.push(Line::default());
         }
