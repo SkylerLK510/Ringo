@@ -155,9 +155,51 @@ fn version_of(memo: &mut serde_json::Value, name: &str, path: &Path) -> Option<S
     Some(have)
 }
 
+/// Installed version of `agent` on PATH, or None if not installed or `--version` did not answer.
+pub fn agent_version(agent: Agent) -> Option<String> {
+    locate(&agent.spec().program).and_then(|p| installed_version(&p))
+}
+
+/// Human-readable install method inferred from the resolved executable path.
+fn install_method(agent: Agent, path: &Path) -> &'static str {
+    let real = path.to_string_lossy().replace('\\', "/");
+    if real.contains("/Caskroom/") {
+        "brew cask"
+    } else if real.contains("/Cellar/") {
+        "brew formula"
+    } else if real.contains("/node_modules/") || real.ends_with(".cmd") {
+        "npm"
+    } else if agent.spec().self_update.is_some() {
+        "self-update"
+    } else if agent.spec().installer.is_some() {
+        "installer"
+    } else {
+        "manual"
+    }
+}
+
+/// Snapshot of one agent's update state for `/update status` and `ringo update --check`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct AgentUpdateStatus {
+    pub name: String,
+    pub installed: bool,
+    pub path: Option<String>,
+    pub current: Option<String>,
+    pub latest: Option<String>,
+    pub update_available: bool,
+    pub method: String,
+    pub command: Option<String>,
+}
+
 /// One line per agent that changed since the last session or has a newer release, and the updates that would bring
 /// each outdated agent up to date. `state` holds the installed versions and each feed's last answer; it is rewritten.
 pub fn check(agents: &[Agent], state: &Path) -> (Vec<String>, Vec<Update>) {
+    check_fresh(agents, state, false)
+}
+
+/// Like `check`, but when `force` is true bypasses the 24-hour feed cache so explicit `/update check` or
+/// `ringo update` queries live release feeds immediately.
+pub fn check_fresh(agents: &[Agent], state: &Path, force: bool) -> (Vec<String>, Vec<Update>) {
     let now = now_s();
     let mut memo = load(state);
     let releases = std::env::var_os("RINGO_NO_UPDATE_CHECK").is_none();
@@ -172,7 +214,7 @@ pub fn check(agents: &[Agent], state: &Path) -> (Vec<String>, Vec<Update>) {
                                 can change with it"));
         }
         let Some((feed, update)) = source(agent, &path).filter(|_| releases) else { continue };
-        if memo["latest"][&feed]["checked"].as_u64().is_none_or(|t| now.saturating_sub(t) >= DAY_S) {
+        if force || memo["latest"][&feed]["checked"].as_u64().is_none_or(|t| now.saturating_sub(t) >= DAY_S) {
             match fetch_version(&feed) {
                 Some(out) => memo["latest"][&feed] = serde_json::json!({"version": out, "checked": now}),
                 None => continue, // offline or the feed moved: say nothing, ask this feed again next time
@@ -185,6 +227,46 @@ pub fn check(agents: &[Agent], state: &Path) -> (Vec<String>, Vec<Update>) {
     }
     save(state, &memo);
     (lines, pending)
+}
+
+/// Detailed per-agent update status for `/update status` and `ringo update --check`.
+pub fn agent_statuses(agents: &[Agent], state: &Path, force: bool) -> Vec<AgentUpdateStatus> {
+    let now = now_s();
+    let mut memo = load(state);
+    let releases = std::env::var_os("RINGO_NO_UPDATE_CHECK").is_none();
+    let mut out = Vec::new();
+    for &agent in agents {
+        let name = agent.name().to_string();
+        let Some(path) = locate(&agent.spec().program) else {
+            out.push(AgentUpdateStatus {
+                name, installed: false, path: None, current: None, latest: None,
+                update_available: false, method: "not installed".into(), command: None,
+            });
+            continue;
+        };
+        let current = version_of(&mut memo, &name, &path);
+        let method = install_method(agent, &path).to_string();
+        let (mut latest, mut command) = (None, None);
+        if let Some((feed, update)) = source(agent, &path) {
+            command = Some(update.command);
+            if releases && (force || memo["latest"][&feed]["checked"].as_u64().is_none_or(|t| now.saturating_sub(t) >= DAY_S)) {
+                if let Some(v) = fetch_version(&feed) {
+                    memo["latest"][&feed] = serde_json::json!({"version": v, "checked": now});
+                }
+            }
+            latest = memo["latest"][&feed]["version"].as_str().map(str::to_string);
+        }
+        let update_available = match (&latest, &current) {
+            (Some(l), Some(c)) => newer(l, c),
+            _ => false,
+        };
+        out.push(AgentUpdateStatus {
+            name, installed: true, path: Some(path.display().to_string()), current, latest,
+            update_available, method, command,
+        });
+    }
+    save(state, &memo);
+    out
 }
 
 fn shell(command: &str) -> Command {
@@ -390,7 +472,10 @@ fn build(repo: &Path, new: &str, dir: &Path, bin: &Path, install: &Path, cargo: 
     let log = install.join("build.log");
     match bounded(cmd, &log, BUILD_LIMIT) {
         Some(true) => {}
-        Some(false) => return Err(format!("cargo failed; its output is in {}", log.display())),
+        Some(false) => {
+            let detail = build_error_tail(&log).map(|l| format!(" ({l})")).unwrap_or_default();
+            return Err(format!("cargo failed{detail}; its output is in {}", log.display()));
+        }
         None => return Err("cargo did not start or did not finish in 30 minutes".into()),
     }
     let out = target.join("release").join(bin.file_name().unwrap_or_default());
@@ -524,6 +609,241 @@ pub fn approve(r: &Release) -> String {
                           --expected-current {}", &r.id[..r.id.len().min(8)], r.id),
         Err(e) => format!("  the pipelines were not switched: {e}"),
     }
+}
+
+/// Most informative diagnostic line from a failed cargo build log (prefers `error[...]` / `error:`, else last line).
+fn build_error_tail(log: &Path) -> Option<String> {
+    let text = fs::read_to_string(log).ok()?;
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let picked = lines.iter().rev().find(|l| l.starts_with("error[") || l.starts_with("error:"))
+        .or_else(|| lines.last())?;
+    Some(ringo_cli::parse::short(picked, 120))
+}
+
+/// Up to `max` commit one-liners between `from` and `to` in `repo`, for showing what an update contains.
+pub fn recent_changes(repo: &Path, from: &str, to: &str, max: usize) -> Vec<String> {
+    if from.is_empty() || to.is_empty() || from == to || max == 0 {
+        return Vec::new();
+    }
+    let limit = max.to_string();
+    let range = format!("{from}..{to}");
+    git(repo, &["log", "--oneline", "--no-decorate", "-n", &limit, &range])
+        .map(|s| s.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Read-only status of Ringo's own build and how it compares to `origin/main` (fetches when `fetch_remote` is true).
+pub fn ringo_status(fetch_remote: bool) -> serde_json::Value {
+    let home = ringo_cli::ringo_home();
+    let install = ringo_cli::state_root().join("install");
+    let commit = ringo_cli::COMMIT;
+    let short_commit = &commit[..commit.len().min(7)];
+    let head = git(&home, &["rev-parse", "HEAD"]);
+    let compare_from = if commit.is_empty() { head.as_deref().unwrap_or("") } else { commit };
+    let dirty = git(&home, &["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
+    let repo = install.join("repo.git");
+    let mut latest = None;
+    let mut behind_count: u64 = 0;
+    let mut changes = Vec::new();
+    if fetch_remote && std::env::var_os("RINGO_NO_UPDATE_CHECK").is_none() {
+        let _ = fs::create_dir_all(&install);
+        let log = install.join("update.log");
+        if !repo.join("HEAD").is_file() {
+            if let Some(url) = git(&home, &["remote", "get-url", "origin"]) {
+                let tmp = install.join(format!("repo-{}.tmp", std::process::id()));
+                let mut clone = git_cmd(&install);
+                clone.args(["clone", "--bare", "--quiet", &url]).arg(&tmp);
+                if bounded(clone, &log, Duration::from_secs(120)) != Some(true) || fs::rename(&tmp, &repo).is_err() {
+                    let _ = fs::remove_dir_all(&tmp);
+                }
+            }
+        }
+        if repo.join("HEAD").is_file() {
+            let mut fetch = git_cmd(&repo);
+            fetch.args(["fetch", "--quiet", "origin", "+refs/heads/main:refs/heads/main"]);
+            let _ = bounded(fetch, &log, Duration::from_secs(60));
+        }
+    }
+    if repo.join("HEAD").is_file() {
+        latest = git(&repo, &["rev-parse", "main"]);
+        if let Some(new) = &latest {
+            if !compare_from.is_empty() && new != compare_from {
+                let on_main = git(&repo, &["merge-base", "--is-ancestor", compare_from, new]).is_some();
+                let already_has = !on_main && git(&home, &["merge-base", "--is-ancestor", new, compare_from]).is_some();
+                if !already_has {
+                    behind_count = git(&repo, &["rev-list", "--count", &format!("{compare_from}..{new}")])
+                        .and_then(|c| c.parse().ok()).unwrap_or(0);
+                    changes = recent_changes(&repo, compare_from, new, 5);
+                }
+            }
+        }
+    }
+    serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": short_commit,
+        "home": home.display().to_string(),
+        "dirty_checkout": dirty,
+        "latest_main": latest.as_deref().map(|s| &s[..s.len().min(7)]),
+        "behind_commits": behind_count,
+        "recent_changes": changes,
+    })
+}
+
+/// Crisp, aligned status summary for `/update status` and `ringo update --check`.
+pub fn format_status(agents: &[Agent], state: &Path, force: bool, auto_update: bool) -> String {
+    let r = ringo_status(force);
+    let mut out = Vec::new();
+    let ver = r["version"].as_str().unwrap_or("0.1.0");
+    let commit = r["commit"].as_str().unwrap_or("");
+    let commit_tag = if commit.is_empty() { String::new() } else { format!(" ({commit})") };
+    let behind = r["behind_commits"].as_u64().unwrap_or(0);
+    let ringo_state = if behind > 0 {
+        let latest = r["latest_main"].as_str().unwrap_or("main");
+        format!("update available -> {latest} ({behind} new commit{})", if behind == 1 { "" } else { "s" })
+    } else {
+        "up to date".into()
+    };
+    out.push(format!("  Ringo {ver}{commit_tag} · {ringo_state} · auto agent updates: {}",
+                     if auto_update { "on" } else { "off" }));
+    if let Some(items) = r["recent_changes"].as_array() {
+        for item in items.iter().filter_map(|v| v.as_str()) {
+            out.push(format!("    · {item}"));
+        }
+    }
+    let statuses = agent_statuses(agents, state, force);
+    let pad = statuses.iter().map(|s| s.name.len()).max().unwrap_or(6).max(6);
+    for s in &statuses {
+        let detail = if !s.installed {
+            "not installed".to_string()
+        } else {
+            let cur = s.current.as_deref().unwrap_or("unknown");
+            match (&s.latest, s.update_available) {
+                (Some(lat), true) => format!("{cur} -> {lat} ({}; /update)", s.method),
+                (Some(_), false) => format!("{cur} · up to date ({})", s.method),
+                (None, _) => format!("{cur} ({})", s.method),
+            }
+        };
+        out.push(format!("  {:<pad$}  {detail}", s.name));
+    }
+    if releases_on() {
+        let (line, _) = check_release(false);
+        if line.is_empty() {
+            out.push("  pipelines  up to date with this Ringo".into());
+        } else {
+            out.push(line);
+        }
+    }
+    out.join("\n")
+}
+
+const UPDATE_USAGE: &str = "\
+usage: ringo update [OPTIONS]
+
+Check and apply updates for Ringo, connected agent CLIs, and local pipeline releases.
+
+Options:
+  --check           Check for updates without modifying anything
+  --json            Emit machine-readable JSON (implies --check)
+  --agents-only     Only check/update connected agent CLIs
+  --ringo-only      Only check/update Ringo itself
+  --auto on|off     Toggle automatic package-manager agent updates on shell startup
+  -h, --help        Show this help message
+";
+
+/// Standalone `ringo update` subcommand.
+pub fn run_cli(args: &[std::ffi::OsString]) -> std::process::ExitCode {
+    let (mut check_only, mut json_out, mut agents_only, mut ringo_only) = (false, false, false, false);
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("--check") => check_only = true,
+            Some("--json") => { check_only = true; json_out = true; }
+            Some("--agents-only") => agents_only = true,
+            Some("--ringo-only") => ringo_only = true,
+            Some("--auto") => match iter.next().and_then(|v| v.to_str()) {
+                Some("on") => {
+                    match crate::theme::set_setting("auto_update", serde_json::json!(true)) {
+                        Ok(()) => { println!("ringo: automatic agent updates enabled on shell startup"); return std::process::ExitCode::SUCCESS; }
+                        Err(e) => { eprintln!("ringo update: could not save setting: {e}"); return std::process::ExitCode::from(2); }
+                    }
+                }
+                Some("off") => {
+                    match crate::theme::set_setting("auto_update", serde_json::json!(false)) {
+                        Ok(()) => { println!("ringo: automatic agent updates disabled on shell startup"); return std::process::ExitCode::SUCCESS; }
+                        Err(e) => { eprintln!("ringo update: could not save setting: {e}"); return std::process::ExitCode::from(2); }
+                    }
+                }
+                _ => {
+                    eprintln!("ringo update: --auto expects `on` or `off`");
+                    return std::process::ExitCode::from(2);
+                }
+            }
+            Some("-h" | "--help") => { print!("{UPDATE_USAGE}"); return std::process::ExitCode::SUCCESS; }
+            other => {
+                eprintln!("ringo update: unknown argument {other:?}\n\n{UPDATE_USAGE}");
+                return std::process::ExitCode::from(2);
+            }
+        }
+    }
+    if agents_only && ringo_only {
+        eprintln!("ringo update: --agents-only and --ringo-only cannot be combined");
+        return std::process::ExitCode::from(2);
+    }
+    let agents = ringo_cli::configured_agents().filter(|a| !a.is_empty()).unwrap_or_else(Agent::all);
+    let state = ringo_cli::state_root().join("engine-versions.json");
+    let auto = crate::theme::settings_all().get("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
+    if check_only {
+        if json_out {
+            let r = if agents_only { serde_json::Value::Null } else { ringo_status(true) };
+            let a = if ringo_only { Vec::new() } else { agent_statuses(&agents, &state, true) };
+            let payload = serde_json::json!({"ringo": r, "auto_update": auto, "agents": a, "releases_active": releases_on()});
+            println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+        } else {
+            println!("{}", format_status(&agents, &state, true, auto));
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+    let mut any_failed = false;
+    if !ringo_only {
+        let (lines, pending) = check_fresh(&agents, &state, true);
+        for line in &lines {
+            println!("{line}");
+        }
+        if pending.is_empty() {
+            println!("  All connected agents are up to date.");
+        } else {
+            let (done_lines, left) = apply_here(pending);
+            for line in &done_lines {
+                println!("{line}");
+            }
+            if !left.is_empty() {
+                any_failed = true;
+            }
+        }
+    }
+    if !agents_only {
+        let exe = std::env::current_exe().map(|e| fs::canonicalize(&e).unwrap_or(e)).unwrap_or_default();
+        match update_ringo(&exe) {
+            Some((line, bin)) if bin.is_file() => {
+                println!("{line}");
+                if let Err(e) = install(&exe, &bin) {
+                    eprintln!("ringo update: {e}");
+                    any_failed = true;
+                } else {
+                    println!("  Installed new Ringo binary at {}", exe.display());
+                }
+            }
+            Some((line, _)) => println!("{line}"),
+            None => println!("  Ringo itself is up to date."),
+        }
+        if releases_on() {
+            let (line, _) = check_release(false);
+            if !line.is_empty() {
+                println!("{line}");
+            }
+        }
+    }
+    if any_failed { std::process::ExitCode::FAILURE } else { std::process::ExitCode::SUCCESS }
 }
 
 #[cfg(test)]
@@ -716,6 +1036,18 @@ mod tests {
         let start = Instant::now();
         assert_eq!(bounded(shell("sleep 5"), &log, Duration::from_millis(200)), None);
         assert!(start.elapsed() < Duration::from_secs(3));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn build_error_tail_extracts_compiler_error_or_last_line() {
+        let dir = std::env::temp_dir().join(format!("ringo-err-tail-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("build.log");
+        fs::write(&log, "Compiling ringo-cli\nerror[E0425]: cannot find value `x`\nhelp: try `y`\n").unwrap();
+        assert_eq!(build_error_tail(&log).as_deref(), Some("error[E0425]: cannot find value `x`"));
+        fs::write(&log, "line one\nlast useful line\n").unwrap();
+        assert_eq!(build_error_tail(&log).as_deref(), Some("last useful line"));
         let _ = fs::remove_dir_all(dir);
     }
 }

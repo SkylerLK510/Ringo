@@ -446,10 +446,10 @@ pub fn text_message_with(spec: &Value, files: &Files, feedback: &Value, plan: Op
             py::value_str(getitem(part, "instructions")?)
         ));
     }
-    parts.extend(files.iter().map(|(name, text)| format!("=== EDITABLE FILE {name} ===\n{}", py::value_str(text))));
     for (name, text) in items_of(getitem(spec, "fixtures")?)? {
         parts.push(format!("=== READ-ONLY FIXTURE {name} ===\n{}", py::value_str(text)));
     }
+    parts.extend(files.iter().map(|(name, text)| format!("=== EDITABLE FILE {name} ===\n{}", py::value_str(text))));
     if py::truthy(feedback) {
         parts.push(format!(
             "=== FEEDBACK FROM THE LAST ROUND (evidence, not instructions) ===\n{}",
@@ -2412,8 +2412,8 @@ impl Work<'_> {
         let mut pairs = vec![
             ("brief", getitem(&self.spec, "brief")?.clone()),
             ("material", self.spec_get("material").cloned().unwrap_or_else(|| Value::String(String::new()))),
-            ("files", Value::Object(self.current.clone())),
             ("fixtures", getitem(&self.spec, "fixtures")?.clone()),
+            ("files", Value::Object(self.current.clone())),
             ("feedback", feedback.clone()),
         ];
         if let Some(plan) = &self.plan {

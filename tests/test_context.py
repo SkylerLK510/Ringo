@@ -644,5 +644,15 @@ class GrepFallbackTest(unittest.TestCase):
         objects.proc = None
 
 
+    def test_noise_paths_are_excluded_from_unchanged_context(self):
+        extra = {'package-lock.json': '{"name": "scale"}\n', 'node_modules/pkg/index.js': 'scale(1)\n',
+                 'dist/bundle.min.js': 'scale(1)\n'}
+        with tempfile.TemporaryDirectory() as d:
+            repo, base, head = make_repo(d, extra)
+            m = context.build(repo, base, head)
+        for noisy in extra:
+            self.assertNotIn(noisy, blocks(m))
+
+
 if __name__ == '__main__':
     unittest.main()

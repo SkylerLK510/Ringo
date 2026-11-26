@@ -40,6 +40,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/help", "the guide (also /usrman)"),
     ("/undo", "take back the last change an agent made here"),
     ("/copy", "copy the last answer"),
+    ("/export [PATH]", "save this conversation as Markdown (zero model calls)"),
     ("/attach PATH", "attach an image; /attach clipboard or Ctrl-V pastes a screenshot on macOS"),
     ("/clear", "start a new conversation"),
     ("/compact", "shrink a long conversation so later turns cost less (zero model calls; /compact llm for Claude)"),
@@ -69,7 +70,12 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/drop N", "remove job N's worktree"),
     ("/kill N", "stop job N"),
     ("/setup", "add an agent and sign in to it"),
+    ("/connect [NAME|web yes|no]", "manage connected services (GitHub, Git, ClickUp...) and web access yes/no"),
+    ("/doctor", "check connected subscriptions, billing hygiene, versions and environment"),
+    ("/status", "show connected subscriptions and session status"),
     ("/update", "update the agents found out of date, and check the pipelines' release"),
+    ("/update check", "re-check Ringo and agent updates right now"),
+    ("/update status", "show installed vs. latest versions for Ringo and connected agents"),
     ("/update approve", "move the pipelines to the release /update checked"),
     ("/restart", "start Ringo again (an update applies), the conversations going on"),
     ("/theme NAME", "colours"),
@@ -272,6 +278,8 @@ pub enum Cmd {
     Ask(String),
     Undo,
     Copy,
+    /// `/export [PATH]`: write the conversation transcript to a Markdown file (zero model calls).
+    Export(Option<String>),
     Attach(String),
     Clear,
     /// `/compact` (false: zero-token ground-truth handoff for any agent) or `/compact llm` (true: Claude native summary).
@@ -295,9 +303,15 @@ pub enum Cmd {
     Task(TaskCmd),
     Help,
     Setup,
+    Connect(String),
+    Doctor,
     Theme(Option<String>),
     /// `/update` (None) or `/update auto on|off`.
     Update(Option<bool>),
+    /// `/update check`: force a fresh update check for Ringo and connected agents.
+    UpdateCheck,
+    /// `/update status`: show installed vs. latest versions for Ringo and connected agents.
+    UpdateStatus,
     /// `/update approve`: the pipelines move to the release `/update` checked.
     Approve,
     /// `/mode` (None: show it) or `/mode ask|auto|read`.
@@ -453,8 +467,8 @@ fn parse_task_update(tail: &str) -> Result<TaskUpdate, String> {
 /// One input line as a command. A line without `/` or `@` is for the agent the owner is talking to; @all means every
 /// set-up agent.
 /// Commands that take nothing after them.
-const BARE: [&str; 21] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
-                          "copy", "clear", "new", "context", "ctx", "separate", "together", "auto", "usage", "cost"];
+const BARE: [&str; 23] = ["usrman", "instructions", "manual", "help", "?", "quit", "exit", "q", "restart", "setup", "undo",
+                          "copy", "clear", "new", "context", "ctx", "separate", "together", "auto", "usage", "cost", "doctor", "status"];
 
 pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
     let line = line.trim();
@@ -474,8 +488,11 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "quit" | "exit" | "q" => Ok(Cmd::Quit),
             "restart" => Ok(Cmd::Restart),
             "setup" => Ok(Cmd::Setup),
+            "connect" => Ok(Cmd::Connect(tail.into())),
+            "doctor" | "status" => Ok(Cmd::Doctor),
             "undo" => Ok(Cmd::Undo),
             "copy" => Ok(Cmd::Copy),
+            "export" => Ok(Cmd::Export((!tail.is_empty()).then(|| tail.to_string()))),
             "attach" => Ok(Cmd::Attach(tail.into())),
             "clear" | "new" => Ok(Cmd::Clear),
             "context" | "ctx" => Ok(Cmd::Context),
@@ -534,10 +551,12 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "theme" => Ok(Cmd::Theme(words.next().map(str::to_string))),
             "update" => match (words.next(), words.next()) {
                 (None, _) => Ok(Cmd::Update(None)),
+                (Some("check"), None) => Ok(Cmd::UpdateCheck),
+                (Some("status"), None) => Ok(Cmd::UpdateStatus),
                 (Some("auto"), Some("on")) => Ok(Cmd::Update(Some(true))),
                 (Some("auto"), Some("off")) => Ok(Cmd::Update(Some(false))),
                 (Some("approve"), None) => Ok(Cmd::Approve),
-                _ => Err("/update, /update approve, or /update auto on|off".into()),
+                _ => Err("/update, /update check, /update status, /update approve, or /update auto on|off".into()),
             },
             "backend" if !tail.is_empty() => Ok(Cmd::Backend(tail.into())),
             "show" => job_number(words.next()).map(Cmd::Show),
@@ -554,7 +573,15 @@ pub fn parse(line: &str, all: &[Agent]) -> Result<Cmd, String> {
             "research" if !tail.is_empty() => Ok(Cmd::Research(tail.into())),
             "work" if !tail.is_empty() => Ok(Cmd::Work(tail.into())),
             "task" => task_command(tail),
-            _ => Err(format!("unknown or incomplete command /{name}; /help lists them")),
+            _ => {
+                let heads: Vec<&str> = COMMANDS.iter()
+                    .filter_map(|(c, _)| c.strip_prefix('/')?.split_whitespace().next())
+                    .collect();
+                let did_you_mean = crate::closest_match(name, &heads, 2)
+                    .map(|m| format!(" — did you mean /{m}?"))
+                    .unwrap_or_default();
+                Err(format!("unknown or incomplete command /{name}{did_you_mean}; /help lists them"))
+            },
         };
     }
     let mut agents = Vec::new();
@@ -1719,6 +1746,7 @@ struct App {
     updated: Option<String>,
     staged: Option<PathBuf>,
     setup: bool,
+    access: crate::connect::AccessConfig,
     label: String,
     agents: Vec<Agent>,
     theme: Theme,
@@ -1728,6 +1756,8 @@ struct App {
     /// Agent updates found when the shell opened (None until that check reports), and `/update` asked for.
     pending: Option<Vec<crate::updates::Update>>,
     update: bool,
+    /// `/update check` asked for a fresh background check of Ringo and connected agents.
+    recheck: bool,
     /// The pipelines' release being checked or approved in the background (updates::check_release), and a checked
     /// one waiting for `/update approve`.
     releasing: Option<std::thread::JoinHandle<(String, Option<crate::updates::Release>)>>,
@@ -1836,8 +1866,8 @@ impl App {
               fitted_w: 0, scroll: 0, scrolled: 0, anchor: None, view: Rect::default(), top: 0, sel: None, dragging: false, toast: None,
               ended_at: None, drawn_look: ("", 0), streams: Default::default(),
               main: first_choice(&agents), queue: VecDeque::new(), pick: 0, menu_off: false, menu_page: 6, choice: 0, ended: Vec::new(),
-              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, label, agents, theme,
-              started: Instant::now(), asked: None, pending: None, update: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
+              last_key: Instant::now(), last: 0, quit_armed: false, quit: false, restart: false, updated: None, staged: None, setup: false, access: crate::connect::AccessConfig::default(), label, agents, theme,
+              started: Instant::now(), asked: None, pending: None, update: false, recheck: false, releasing: None, release: None, plans: Vec::new(), listing: None, offered: Vec::new(), asked_models: false, limits: Vec::new(),
               limits_at: None, spoke: false, pointed: false, checking: None, talking: None,
               revision: None, revision_id: None, task_turns: Default::default(), quota: None, reviewer: None }
     }
@@ -1875,8 +1905,13 @@ impl App {
     fn splash(&self, panel: bool) -> Vec<Line<'static>> {
         let t = &self.theme;
         let mut rows: Vec<Line<'static>> = Vec::new();
-        if !panel && let Some(cat) = mascot("idle").first() {
-            rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
+        if !panel {
+            if let Some(cat) = crate::mascot_art::render("idle", 0, crate::mascot_art::PIXEL_W, t) {
+                rows.extend(cat);
+                rows.push(Line::default());
+            } else if let Some(cat) = mascot("idle").first() {
+                rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
+            }
         }
         rows.push(Line::from(vec![Span::styled("▲▲ ", t.brand), Span::styled("ringo", t.brand.add_modifier(Modifier::BOLD))]));
         rows.push(Line::default());
@@ -2134,9 +2169,13 @@ impl App {
             lines.push(Line::styled(format!("  ⚠ same files as {}", overlaps.join("; ")), t.warn));
         }
         // a plan that does not include the model chosen fails the turn: say where the choice came from
-        if matches!(job.status, Status::Failed(_)) && let Kind::Agent { agent, .. } = job.kind
-            && let Some(model) = self.s.models.get(&agent) {
-            lines.push(Line::styled(format!("  it ran on {model}, your choice for {0}: /model {0} default goes back to its own", agent.name()), t.dim));
+        if let Status::Failed(ref reason) = job.status && let Kind::Agent { agent, .. } = job.kind {
+            if let Some(model) = self.s.models.get(&agent) {
+                lines.push(Line::styled(format!("  it ran on {model}, your choice for {0}: /model {0} default goes back to its own", agent.name()), t.dim));
+            }
+            if let Some(hint) = crate::doctor::failure_hint(agent, reason, &self.agents) {
+                lines.push(Line::styled(format!("  hint: {hint}"), t.warn));
+            }
         }
         lines
     }
@@ -3393,6 +3432,53 @@ impl App {
                 self.note(if copy(&text) { "copied the last answer" } else { "asked the terminal to copy the last answer" });
                 None
             }
+            Cmd::Export(path) => {
+                if self.out.is_empty() {
+                    return Err("nothing in this conversation to export yet".into());
+                }
+                let dest = match path {
+                    Some(p) => {
+                        let pb = PathBuf::from(&p);
+                        if pb.is_absolute() { pb } else { self.s.repo.join(pb) }
+                    }
+                    None => {
+                        let stamp = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        self.s.repo.join(format!("ringo-session-{stamp}.md"))
+                    }
+                };
+                let mut md = String::new();
+                md.push_str(&format!("# Ringo Session ({})\n\n", self.s.repo.display()));
+                for entry in &self.out {
+                    match entry {
+                        Out::Line(line, _) => {
+                            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                            md.push_str(&text);
+                            md.push('\n');
+                        }
+                        Out::Reply(text) => {
+                            md.push_str(text);
+                            md.push_str("\n\n");
+                        }
+                        Out::Step(step) => {
+                            md.push_str(&format!("- `{step}`\n"));
+                        }
+                        Out::Looked([r, s, l]) => {
+                            md.push_str(&format!("- _inspected: {r} reads, {s} searches, {l} listings_\n"));
+                        }
+                        Out::Meter { label, value, note, .. } => {
+                            md.push_str(&format!("- **{label}**: {value} {note}\n"));
+                        }
+                    }
+                }
+                if let Some(parent) = dest.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                std::fs::write(&dest, md).map_err(|e| format!("could not write {}: {e}", dest.display()))?;
+                Some(format!("  exported conversation to {} (zero model calls)", dest.display()))
+            }
             Cmd::Clear => {
                 self.s.forget();
                 self.out.clear();
@@ -3571,6 +3657,17 @@ impl App {
                 // Ringo's own update, said again: the head points here for one that /restart does not apply
                 [self.updated.clone(), agents, pipelines].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"))
             }
+            Cmd::Doctor => Some(crate::doctor::shell_report(&self.agents, &self.s.repo, self.s.git)),
+            Cmd::UpdateCheck => {
+                self.pending = None;
+                self.recheck = true;
+                Some("  checking Ringo and connected agent updates now...".into())
+            }
+            Cmd::UpdateStatus => {
+                let state = ringo_cli::state_root().join("engine-versions.json");
+                let auto = crate::theme::settings_all().get("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
+                Some(crate::updates::format_status(&self.agents, &state, false, auto))
+            }
             Cmd::Approve if self.releasing.is_some() => Some("  the pipelines' release is still being checked".into()),
             Cmd::Approve => match self.release.take() {
                 None => Some("  nothing to approve: /update checks the pipelines' release first".into()),
@@ -3598,6 +3695,12 @@ impl App {
             Cmd::Setup => {
                 self.setup = true;
                 None
+            }
+            Cmd::Connect(args) => {
+                let out = crate::connect::handle_shell(&args, &mut self.access, &self.s.repo)?;
+                self.s.web_access = self.access.web_access;
+                self.s.paused_connectors = self.access.paused_keywords();
+                Some(out)
             }
             Cmd::Backend(spec) => {
                 self.s.backend = spec;
@@ -4350,7 +4453,10 @@ impl App {
         let fit = |text: &str| one_row(text, width);
         let mut out: Vec<Line<'static>> = Vec::new();
         let ((_, style), (state, frame)) = (self.mood(), self.look());
-        if let Some(rows) = mascot(state).get(frame) {
+        if let Some(rows) = crate::mascot_art::render(state, frame, width, t) {
+            out.extend(rows);
+            out.push(Line::default());
+        } else if let Some(rows) = mascot(state).get(frame) {
             out.extend(rows.iter().map(|r| Line::styled(fit(r), style)));
             out.push(Line::default());
         }
@@ -4819,6 +4925,9 @@ pub fn run(start: Start) -> ExitCode {
             app.s.models.insert(agent, model.to_string());
         }
     }
+    app.access = crate::connect::AccessConfig::from_settings(&saved);
+    app.s.web_access = app.access.web_access;
+    app.s.paused_connectors = app.access.paused_keywords();
     match resume.as_ref().and_then(|(path, _)| app.s.go_on(path)) {
         Some(before) => {
             if let Some(why) = app.s.selected_task_error.take() {
@@ -4844,11 +4953,11 @@ pub fn run(start: Start) -> ExitCode {
     app.read_limits(&asked, false); // for the side panel's gauges
     app.releasing = Some(std::thread::spawn(|| crate::updates::check_release(false))); // are the pipelines behind?
     let (notes, news) = std::sync::mpsc::channel();
-    let (agents, state) = (app.agents.clone(), ringo_cli::state_root().join("engine-versions.json"));
+    let state = ringo_cli::state_root().join("engine-versions.json");
     let auto = saved.get("auto_update").and_then(|v| v.as_bool()).unwrap_or(false);
-    let check = notes.clone();
+    let (check, check_agents, check_state) = (notes.clone(), app.agents.clone(), state.clone());
     std::thread::spawn(move || {
-        let _ = check.send((false, crate::updates::check(&agents, &state)));
+        let _ = check.send((false, crate::updates::check(&check_agents, &check_state)));
     });
     // Ringo's own update: when the shell opens, then hourly, one at a time
     let (updated, update_news) = std::sync::mpsc::channel();
@@ -4994,6 +5103,17 @@ pub fn run(start: Start) -> ExitCode {
             dirty = true;
             if let Some(line) = app.check_pipelines() {
                 app.say(line);
+            }
+        }
+        if app.recheck {
+            app.recheck = false;
+            let (check, check_agents, check_state) = (notes.clone(), app.agents.clone(), state.clone());
+            std::thread::spawn(move || {
+                let _ = check.send((false, crate::updates::check_fresh(&check_agents, &check_state, true)));
+            });
+            if !updating {
+                (updating, updated_at) = (true, Instant::now());
+                update_ringo(updated.clone(), exe.clone());
             }
         }
         if let Ok(news) = update_news.try_recv() {
@@ -5147,11 +5267,19 @@ mod tests {
                    (Ok(Cmd::Undo), Ok(Cmd::Copy), Ok(Cmd::Clear)));
         assert!(parse("   ", Codex).is_err());
         assert_eq!(parse("/update", Codex), Ok(Cmd::Update(None)));
+        assert_eq!(parse("/update check", Codex), Ok(Cmd::UpdateCheck));
+        assert_eq!(parse("/update status", Codex), Ok(Cmd::UpdateStatus));
         assert_eq!(parse("/update auto on", Codex), Ok(Cmd::Update(Some(true))));
         assert_eq!(parse("/update auto off", Codex), Ok(Cmd::Update(Some(false))));
         assert!(parse("/update auto", Codex).is_err());
         assert_eq!(parse("/update approve", Codex), Ok(Cmd::Approve));
         assert!(parse("/update approve now", Codex).is_err());
+        assert_eq!(parse("/doctor", Codex), Ok(Cmd::Doctor));
+        assert_eq!(parse("/status", Codex), Ok(Cmd::Doctor));
+        assert!(parse("/doctor extra", Codex).is_err());
+        assert_eq!(parse("/export", Codex), Ok(Cmd::Export(None)));
+        assert_eq!(parse("/export notes.md", Codex), Ok(Cmd::Export(Some("notes.md".into()))));
+        assert!(parse("/updtae", Codex).unwrap_err().contains("did you mean /update?"));
         assert_eq!(parse("@codex why is it slow?", Codex), Ok(Cmd::Agents(vec![(Codex, false)], "why is it slow?".into())));
         assert_eq!(parse("@claude! fix it", Codex), Ok(Cmd::Agents(vec![(Claude, true)], "fix it".into())));
         assert_eq!(parse("@codex @claude! do x", Grok), Ok(Cmd::Agents(vec![(Codex, false), (Claude, true)], "do x".into())));

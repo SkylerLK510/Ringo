@@ -188,15 +188,68 @@ pub fn run() -> Vec<Agent> {
         }
     } else {
         let names: Vec<&str> = agents.iter().map(|a| a.name()).collect();
-        println!("Agents set up: {}.", names.join(", "));
+        println!("{}", t.paint(t.title, "Connected subscriptions:"));
+        for &agent in &agents {
+            let program = PathBuf::from(&agent.spec().program);
+            let installed = ringo_cli::installed(&program);
+            let ver = crate::updates::agent_version(agent).map(|v| format!(" {v}")).unwrap_or_default();
+            let status = if !installed {
+                t.paint(t.fail, "not installed")
+            } else {
+                match ringo_cli::sign_in(agent, &program) {
+                    SignIn::Yes(how) => format!("{} ({how})", t.paint(t.ok, "✓ signed in")),
+                    SignIn::No(why) => format!("{} ({why})", t.paint(t.warn, "✗ not signed in")),
+                    SignIn::Unknown => t.paint(t.dim, "· installed (status unknown)"),
+                }
+            };
+            println!("  {:<8}{ver}  {status}", agent.name());
+        }
+        println!("\nAgents set up: {}.", names.join(", "));
+        println!("Commands: type an agent name to add or re-sign in, `login NAME` to re-authenticate, `remove NAME` to disconnect, or Enter to finish.");
     }
     let known: Vec<&str> = Agent::all().into_iter().map(|a| a.name()).collect();
-    println!("Type the command you start an agent with, as you would in a terminal ({}).", known.join(", "));
+    println!("Known agents: {}.", known.join(", "));
     while let Some(answer) = ask("agent> ") {
         if answer.is_empty() {
             if agents.is_empty() { continue } else { break }
         }
-        let typed = answer.to_lowercase();
+        let lower = answer.to_lowercase();
+        let mut parts = lower.split_whitespace();
+        match (parts.next(), parts.next()) {
+            (Some("remove" | "rm"), Some(target)) => {
+                if let Some(agent) = Agent::from_name(target) && agents.contains(&agent) {
+                    if agents.len() == 1 {
+                        println!("  Cannot remove {target}: keep at least one agent configured, or add another first.");
+                    } else {
+                        agents.retain(|a| *a != agent);
+                        match ringo_cli::save_agents(&agents) {
+                            Ok(()) => println!("  Removed {target} from Ringo (the CLI itself is untouched)."),
+                            Err(e) => println!("  could not save the setup: {e}"),
+                        }
+                    }
+                } else {
+                    println!("  {target} is not currently configured in Ringo.");
+                }
+                continue;
+            }
+            (Some("login" | "auth"), Some(target)) => {
+                if let Some(agent) = Agent::from_name(target) {
+                    let program = PathBuf::from(&agent.spec().program);
+                    if !ringo_cli::installed(&program) {
+                        println!("  {target} is not installed; install it with:\n    {}", agent.spec().install);
+                    } else {
+                        println!("  Starting `{target} {}`...", agent.spec().login.join(" "));
+                        let _ = Command::new(&program).args(&agent.spec().login).status();
+                        connect(agent, &t);
+                    }
+                } else {
+                    println!("  Unknown agent `{target}`.");
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let typed = lower;
         if let Some(agent) = Agent::from_name(&typed).or_else(|| unknown(&typed, &answer))
             && connect(agent, &t) && !agents.contains(&agent) {
             agents.push(agent);
@@ -204,7 +257,7 @@ pub fn run() -> Vec<Agent> {
                 println!("  could not save the setup: {e}");
             }
         }
-        if !agents.is_empty() && !yes("Would you like to add another agent [y/n] ") {
+        if !agents.is_empty() && !yes("Would you like to add or manage another agent [y/n] ") {
             break;
         }
     }
