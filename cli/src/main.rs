@@ -2,6 +2,7 @@
 //! runtime unless a release decides otherwise (then, and for the other commands, Ringo's Python harness `ringo.py`
 //! runs).
 
+mod connect;
 mod doctor;
 mod highlight;
 mod setup;
@@ -21,8 +22,9 @@ Interactive shell:
   ringo                     open the shell (on a terminal); type /help there
   ringo --resume | -r       resume a previous conversation in this folder
 
-Subscriptions & updates:
+Subscriptions, access & updates:
   ringo setup               connect, re-sign in, or remove coding agents (claude, codex, agy, grok)
+  ringo connect             manage connected services (GitHub, Git, ClickUp...) and web access (yes/no)
   ringo doctor | status     check connected subscriptions, billing hygiene, Python/git & limits (--json, --limits)
   ringo update              check and apply updates for Ringo, connected agents & pipelines (--check, --json, --auto on|off)
 
@@ -47,7 +49,7 @@ Prompts and plans come from RINGO_HOME (default: the checkout ringo was built fr
 
 /// Known top-level subcommands, used for fuzzy "did you mean" suggestions on typos.
 const KNOWN_COMMANDS: &[&str] = &[
-    "setup", "doctor", "status", "update", "review", "design", "work", "research", "wait", "release", "tools", "version",
+    "setup", "connect", "doctor", "status", "update", "review", "design", "work", "research", "wait", "release", "tools", "version",
 ];
 
 /// Levenshtein edit distance between two ASCII/UTF-8 strings (case-insensitive).
@@ -110,6 +112,7 @@ fn main() -> ExitCode {
             setup::run();
             ExitCode::SUCCESS
         }
+        Some("connect") => connect::run_cli(&args[1..]),
         Some("doctor" | "status") => doctor::run_cli(&args[1..]),
         Some("update") => updates::run_cli(&args[1..]),
         Some("-V" | "--version" | "version") => {

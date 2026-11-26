@@ -359,6 +359,7 @@ after every turn, so a crash loses at most the turn it cut short.
 | Command | What it does |
 |---|---|
 | `/setup` | connect, re-sign in, or remove an agent |
+| `/connect [NAME\|web yes\|no]` | manage connected services (GitHub, Git, ClickUp...) and web access yes/no |
 | `/doctor` | check connected subscriptions, subscription-only billing hygiene, and Python/git readiness (also `/status`) |
 | `/update` | update the agents that are out of date, with no tokens; `/update auto on` does it when Ringo opens. If you use releases, it also checks whether the pipelines' release is behind this Ringo |
 | `/update check` | re-check Ringo, connected agents, and pipelines for updates right now |
