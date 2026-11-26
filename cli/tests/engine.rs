@@ -2388,7 +2388,7 @@ fn an_older_claude_that_reports_a_running_total_is_counted_once() {
     let state = root().join("claude-running-total-state");
     let _ = fs::remove_dir_all(&state);
     // Claude Code before 2.1.316: modelUsage alone, the whole session's so far (100, then 150 after a second turn)
-    let claude = fake(&root(), "claude-running-total", "#!/bin/sh\nhead -n 1 >/dev/null\n\
+    let claude = fake(&root(), "claude-running-total", "#!/bin/sh\n[ \"$1\" = --version ] && exit 0\nhead -n 1 >/dev/null\n\
         n=$(cat \"$0.n\" 2>/dev/null || echo 0); n=$((n + 1)); echo $n > \"$0.n\"\n\
         echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-o\",\"apiKeySource\":\"none\"}'\n\
         echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"modelUsage\":{\"m\":{\"inputTokens\":'$((50 + 50 * n))',\"outputTokens\":0}}}'\n");
@@ -2857,6 +2857,35 @@ fn an_agent_asks_another_in_the_middle_of_its_turn() {
     let served = Command::new(env!("CARGO_BIN_EXE_ringo")).args(["ask-server", "/nonexistent", "codex"]).env("RINGO_CHILD", "1")
         .stdin(std::process::Stdio::null()).output().unwrap();
     assert_eq!(served.status.code(), Some(0), "with nothing asked it ends when its input does");
+}
+
+/// A resumed Claude turn rebuilds its system prompt, so an edit to the instructions reaches it: Claude Code otherwise
+/// sends the prompt it recorded on the first turn. Only for a CLI that takes the flag (2.1.257 on), asked at each
+/// resume: an older one would refuse every resumed turn, and a conversation kept by an earlier Ringo gets it at once.
+#[test]
+fn a_resumed_claude_turn_rebuilds_its_prompt_when_the_cli_takes_the_flag() {
+    let r = repo("snapshot");
+    let claude = fake(&root(), "claude-snapshot", "#!/bin/sh\n\
+        if [ \"$1\" = --version ]; then cat \"$0.version\"\n\
+        grep -q hang \"$0.version\" && exec sleep 30; grep -q broken \"$0.version\" && exit 1; exit 0; fi\n\
+        for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$0.argv\"\nhead -n 1 >/dev/null\n\
+        echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s-1\",\"apiKeySource\":\"none\"}'\n\
+        echo '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n");
+    let off = |s: &mut Session, version: &str| -> bool {
+        fs::write(format!("{}.version", claude.display()), version).unwrap();
+        said(s, "claude", "a question");
+        let argv = fs::read_to_string(format!("{}.argv", claude.display())).unwrap();
+        argv.contains("--system-prompt-snapshot\noff\n")
+    };
+    let mut s = session(&r, agent("claude"), &claude);
+    assert!(!off(&mut s, "2.1.332 (Claude Code)\n"), "a first turn has nothing recorded to replace");
+    assert!(off(&mut s, "2.1.332 (Claude Code)\n"));
+    assert!(off(&mut s, "2.1.257\n"), "the first that takes it");
+    assert!(off(&mut s, "3.0.0 (Claude Code)\n"));
+    assert!(!off(&mut s, "2.1.256 (Claude Code)\n"), "a downgrade: the older CLI is not given a flag it refuses");
+    assert!(!off(&mut s, "not a version\n"));
+    assert!(!off(&mut s, "2.1.332 broken\n"), "a probe that fails is no answer");
+    assert!(!off(&mut s, "2.1.332 hang\n"), "a probe that never returns is killed and the turn runs");
 }
 
 /// Claude Code 2.1.330 says "No conversation found with session ID" when the session a turn resumes is not in its
