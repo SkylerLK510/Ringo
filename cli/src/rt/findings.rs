@@ -37,7 +37,7 @@ pub static FILE: LazyLock<String> = LazyLock::new(|| file(""));
 fn file(more: &str) -> String {
     let seg = seg();
     format!(
-        r"(?<![{W}./\\@+\-\[\]])(/?(?:{seg}+[/\\])*{seg}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z])|/?(?:{seg}+[/\\])+{seg}+|Dockerfile|Makefile|Gemfile|Rakefile|Procfile{more})(?![{W}@+\-\[\]/]|\.[{W}])"
+        r"(?<![{W}./\\@+\-\[\]])(/?(?:{seg}+[/\\])*{seg}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z][A-Z0-9]{{0,9}})|/?(?:{seg}+[/\\])+{seg}+|Dockerfile|Makefile|Gemfile|Rakefile|Procfile{more})(?![{W}@+\-\[\]/]|\.[{W}])"
     )
 }
 

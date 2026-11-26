@@ -107,10 +107,17 @@ def private_root(path=None):
 @contextlib.contextmanager
 def locked(root):
     import backends
+    import errno
     lock = root / '.lock'
     if lock.is_symlink():
         raise ValueError('release lock cannot be a symlink')
-    with lock.open('a') as f, backends.file_lock(f):
+    try:
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError('release lock cannot be a symlink') from None
+        raise
+    with os.fdopen(fd, 'a') as f, backends.file_lock(f):
         yield
 
 
@@ -289,12 +296,24 @@ def stage(source, root, candidate_plan=None, evaluation_store=None, digest=None,
             return rid
         (tmp / 'release.json').write_bytes(canonical(manifest) + b'\n')
         # The bundle is owner-readonly against accidents, not a same-user security boundary.
-        for path in tmp.rglob('*'):
-            if path.is_file():
-                with path.open('r+b' if os.name == 'nt' else 'rb') as f:  # Windows flushes only a writable handle
-                    os.fsync(f.fileno())
-            path.chmod(0o555 if path.is_dir() or path == tmp / NATIVE['binary'] else 0o444)
-        os.rename(tmp, target)
+        entries = list(tmp.rglob('*'))
+        dirs = sorted((p for p in entries if p.is_dir()), key=lambda p: len(p.parts), reverse=True)
+        try:
+            for path in entries:
+                if path.is_file():
+                    with path.open('r+b' if os.name == 'nt' else 'rb') as f:  # Windows flushes only a writable handle
+                        os.fsync(f.fileno())
+                    path.chmod(0o555 if path == tmp / NATIVE['binary'] else 0o444)
+            for path in dirs:
+                path.chmod(0o555)
+            os.rename(tmp, target)
+        except BaseException:
+            for path in reversed(dirs):
+                with contextlib.suppress(OSError):
+                    path.chmod(0o700)
+            with contextlib.suppress(OSError):
+                tmp.chmod(0o700)
+            raise
         target.chmod(0o555)
         fsync_dir(target.parent)
         # private_tempdir's cleanup tolerates the moved-away path.
@@ -409,6 +428,9 @@ def activate(root, rid, report, approved_by, expected_current, uncertain_reason=
             raise ValueError('latency suite lacks required startup/review/tracing/large/design/work coverage')
         if ambiguous and (not isinstance(uncertain_reason, str) or not uncertain_reason.strip()):
             raise ValueError('uncertain latency needs a human decision and explicit rationale')
+        if manifest['python_cache_tag'] != sys.implementation.cache_tag:
+            raise ValueError(f"release was staged for Python {manifest['python_cache_tag']}, not "
+                             f"{sys.implementation.cache_tag}; restage under this interpreter")
         evidence = manifest['quality']
         if evidence.get('kind') == 'rrsi':
             refreshed = quality(evidence['store'], evidence['digest'],

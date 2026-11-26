@@ -19,7 +19,7 @@ MESSAGE = 2500  # characters per message
 SEG = r'[\w.@+\-\[\]]'
 # A path ('/' or '\\' separated, cleaned later): segments with a final '.ext' (lower-case led, or one capital such as .R), or at least one '/', or a
 # well-known bare file name. Not inside a longer token, and not followed by more path characters.
-FILE = (rf'(?<![\w./\\@+\-\[\]])(/?(?:{SEG}+[/\\])*{SEG}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z])|/?(?:{SEG}+[/\\])+{SEG}+'
+FILE = (rf'(?<![\w./\\@+\-\[\]])(/?(?:{SEG}+[/\\])*{SEG}*\.(?:[a-z][A-Za-z0-9]{{0,9}}|[A-Z][A-Z0-9]{{0,9}})|/?(?:{SEG}+[/\\])+{SEG}+'
         rf'|Dockerfile|Makefile|Gemfile|Rakefile|Procfile)(?![\w@+\-\[\]/]|\.\w)')
 LINES = r'`?(?:(?::L?|#L|:\s*lines?\s+)~?(\d+)(?:\s*[-–]\s*L?~?(\d+))?)?'
 LOC = re.compile(FILE + LINES)

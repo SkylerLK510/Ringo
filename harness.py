@@ -20,7 +20,7 @@ only the person running the command names it, never a plan file, which a model m
 usage:
   python3 ringo.py review --input MATERIAL [--backend claude] [--checker-backend SPEC] [--pipeline PLAN.json]
                             [--out FILE] [--trace DIR] [--max-cost USD] [--unpriced-call-usd USD] [--timeout S]
-  python3 ringo.py review --repo PATH --base SHA --head SHA [--pr-text FILE] [--context-budget BYTES] [same options]
+  python3 ringo.py review --repo PATH --base SHA --head SHA [--pr-text FILE] [--context-budget BYTES] [--context-mode auto|full|windowed] [same options]
   python3 ringo.py review ... --findings-json FILE [--rb-pr-json PR.json] [--agent NAME]
   python3 ringo.py design --input BRIEF [same options]
 
@@ -800,6 +800,13 @@ class Run:
             self.calls -= 1
             self.admission_refusals += 1
 
+    def cancel_reservation(self):
+        """Release a reservation when a local process failed to launch (OSError) before any call ran."""
+        with self.lock:
+            if self.calls < 1:
+                raise ValueError('no call reservation to release')
+            self.calls -= 1
+
     def record(self, rec, reply=None, raw=None):
         """Add one trace record. reply: the text of a returned reply; raw: a failed call's stdout, written whole
         to the step's .raw.txt artifact (a private 0700 folder) while the record keeps only a bounded excerpt of
@@ -1079,6 +1086,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
         'MATERIAL', material, 'untrusted change material written by its author')
     system_hash = sha(system)
     replies, skipped = {}, set()
+    state_lock = threading.Lock()
     gates, gate_lock, stop, failures = {}, threading.Lock(), threading.Event(), []
 
     def one(label, p, message):
@@ -1148,6 +1156,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
                             'seconds': round(time.monotonic() - t0, 6)})
                 raise
             except OSError as exc:  # the command cannot run: every retry would fail too
+                run.cancel_reservation()
                 run.record({**rec, 'status': 'fatal', 'error': f'{type(exc).__name__}: {exc}',
                             'seconds': round(time.monotonic() - t0, 6)})
                 raise
@@ -1183,20 +1192,22 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
             return text
 
     def step(p):
-        if 'when' in p and (p['when'] in skipped or not pipelines.has_issues(replies[p['when']])):
-            skipped.add(p['id'])
-            run.record({'step': p['id'], 'attempt': 0, 'pass': p['id'], 'status': 'skipped'})
-            return
-        messages = pipelines.requests(plan, p, replies)
-        if not messages:  # a checker with no findings to check
-            replies[p['id']] = ''
-            return
+        with state_lock:
+            if 'when' in p and (p['when'] in skipped or not pipelines.has_issues(replies[p['when']])):
+                skipped.add(p['id'])
+                run.record({'step': p['id'], 'attempt': 0, 'pass': p['id'], 'status': 'skipped'})
+                return
+            messages = pipelines.requests(plan, p, replies)
+            if not messages:  # a checker with no findings to check
+                replies[p['id']] = ''
+                return
         if len(messages) == 1 or run.max_cost is not None:  # under a dollar cap, one call at a time
             texts = [one(p['id'] if len(messages) == 1 else f"{p['id']}.batch-{k + 1}", p, m) for k, m in enumerate(messages)]
         else:
             texts = parallel(lambda km: one(f"{p['id']}.batch-{km[0] + 1}", p, km[1]),
                              list(enumerate(messages)), min(8, len(messages)))
-        replies[p['id']] = pipelines.combine(plan, p, replies, texts)
+        with state_lock:
+            replies[p['id']] = pipelines.combine(plan, p, replies, texts)
 
     for wave in pipelines.waves(plan):
         if len(wave) == 1 or run.max_cost is not None:  # under a dollar cap, one call at a time
@@ -1216,7 +1227,7 @@ def run_plan(plan, material, backend_spec, run, call_fn=call, timeout_s=TIMEOUT_
 def repo_material(args):
     """Review material built from a repository (context.py); the PR text file, if any, is read as UTF-8."""
     pr_text = Path(args.pr_text).read_text(encoding='utf-8') if args.pr_text else None
-    return context.build(args.repo, args.base, args.head, pr_text, args.context_budget)
+    return context.build(args.repo, args.base, args.head, pr_text, args.context_budget, args.context_mode)
 
 
 def findings_pr(args):
@@ -1358,6 +1369,11 @@ def main(argv=None, *, prog='harness.py'):
             p.add_argument('--context-budget', type=int,
                            help=f'with --repo: material size limit in bytes (default {context.BUDGET}); the change '
                                 'itself is never dropped, only unchanged context blocks')
+            p.add_argument('--context-mode', choices=context.MODES,
+                           help='with --repo: how changed files are sent (default auto): full sends every changed file '
+                                'whole; windowed sends a file over 16000 bytes as line windows around its changes plus an '
+                                'outline, and lock/generated files as a stat line; auto is full unless the change alone '
+                                'is over the budget, then windowed, re-widened to fill the budget')
             p.add_argument('--findings-json', help='also write the findings as ReviewBench agent-contract JSON here '
                                                    '(anchors checked against --head with --repo, unchecked otherwise)')
             p.add_argument('--rb-pr-json', help="with --findings-json: ReviewBench's pr.json, for the pr block's repo "
@@ -1390,7 +1406,7 @@ def main(argv=None, *, prog='harness.py'):
         p.add_argument('--max-calls', help=argparse.SUPPRESS)  # removed; kept only to explain why it fails
     args = parser.parse_args(argv)
     if args.command == 'review':
-        repo_flags = [f for f in ('base', 'head', 'pr_text', 'context_budget') if getattr(args, f) is not None]
+        repo_flags = [f for f in ('base', 'head', 'pr_text', 'context_budget', 'context_mode') if getattr(args, f) is not None]
         if (args.input is None) == (args.repo is None):
             parser.error('review needs exactly one of --input and --repo')
         if args.repo and (args.base is None or args.head is None):
@@ -1403,6 +1419,8 @@ def main(argv=None, *, prog='harness.py'):
             parser.error('--rb-pr-json works only with --findings-json')
         if args.repo and args.context_budget is None:
             args.context_budget = context.BUDGET
+        if args.repo and args.context_mode is None:
+            args.context_mode = 'auto'
     if args.max_calls is not None:
         parser.error('--max-calls was removed: the plan sets the number of calls (docs/HARNESS.md)')
     return task(args, args.command)

@@ -767,6 +767,27 @@ print(json.dumps({key:max(levels,key=levels.get) if levels else qid.startswith('
         prefix_end = seen[0][1].index('"files"')
         self.assertEqual(seen[0][1][:prefix_end], seen[1][1][:prefix_end])
 
+    def test_oserror_launch_failure_releases_reservation_in_workflow(self):
+        path = self.root / 'task.json'
+        path.write_text(json.dumps(self.spec))
+        def fail(*args):
+            raise FileNotFoundError('missing backend binary')
+        report = workflow.run(path, self.root / 'run', call_fn=fail)
+        self.assertEqual(report['status'], 'error')
+        self.assertEqual((report['usage']['calls'], report['usage']['unfinished_calls'], report['usage']['unpriced_calls']),
+                         (0, 0, 0))
+        trace = (self.root / 'run/trace.jsonl').read_text()
+        self.assertIn('"status": "fatal"', trace)
+
+    def test_mutation_check_rejects_symlink_inside_candidate_root(self):
+        code = ("import os\nfrom pathlib import Path\n"
+                "Path('copy.py').write_text(Path('check.py').read_text())\n"
+                "Path('check.py').unlink()\nPath('check.py').symlink_to('copy.py')\n"
+                "def f(x): return 2*x\n")
+        report, _ = self.execute([self.proposal(code)])
+        self.assertEqual(report['status'], 'error')
+        self.assertIn('mutated', report['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

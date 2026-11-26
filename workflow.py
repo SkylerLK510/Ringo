@@ -944,6 +944,11 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
                 accounting.record({**record, 'status': 'admission_refused', 'error': str(exc),
                                    'seconds': round(time.monotonic() - t0, 6)})
                 raise
+            except OSError as exc:
+                accounting.cancel_reservation()
+                accounting.record({**record, 'status': 'fatal', 'error': f'{type(exc).__name__}: {exc}',
+                                   'seconds': round(time.monotonic() - t0, 6)})
+                raise
             except BaseException as exc:
                 stopped = harness.stop_reason(exc, watch)
                 accounting.record({**record, 'status': 'error', 'usage': getattr(exc, 'usage', None),
@@ -1107,7 +1112,7 @@ def run(spec_path, out, call_fn=harness.call, *, progress='auto',
             # changed, and the file as written counted as mutated.
             for name, original in expected.items():
                 path = root / name
-                if any(p.is_symlink() for p in [path, *path.parents] if p != root.parent) \
+                if any(p.is_symlink() for p in [path, *path.parents] if p != root and p.is_relative_to(root)) \
                         or not path.is_file() or path.read_bytes().decode('utf-8') != original:
                     raise ValueError('a check mutated a submitted file or protected fixture')
             result = None
