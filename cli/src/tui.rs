@@ -761,8 +761,8 @@ fn closed(mut text: String) -> String {
 
 /// How long the word being written waits for its end before it shows anyway, and a table for its last row: a
 /// reply's pieces come tens of milliseconds apart, so a pause this long is the agent stopping to think or to work.
-const WORD_HOLD: Duration = Duration::from_millis(150);
-const TABLE_HOLD: Duration = Duration::from_millis(1500);
+const WORD_HOLD: Duration = Duration::from_millis(45);
+const TABLE_HOLD: Duration = Duration::from_millis(450);
 /// A word, or a link, longer than this shows as it grows (a path, a URL, a `[` that opens no link).
 const HELD_WORD: usize = 32;
 const HELD_LINK: usize = 60;
@@ -1934,6 +1934,7 @@ impl App {
                 self.out.push(Out::Line(Line::from(vec![Span::styled(format!(" {who} "), style.add_modifier(Modifier::BOLD | Modifier::REVERSED)),
                                                         Span::styled(format!(" #{id}{model}"), self.theme.dim)]), 0));
             }
+            let mut streamed = false;
             for said in fresh {
                 // The owner answers what they read last: an agent's words in this folder make it the one plain lines
                 // go to, unless a line is being typed (it keeps the agent its prompt shows).
@@ -1943,12 +1944,12 @@ impl App {
                 }
                 // anything but another piece means the reply's pieces have stopped for now: what was kept back shows
                 if !matches!(said, Said::Partial(_) | Said::Reply(_)) {
+                    streamed = false;
                     self.show_stream(id, Duration::MAX);
                 }
                 match said {
-                    // A piece of the reply grows the job's open reply, or opens one; the whole reply replaces it.
-                    // The growing reply is fitted again (its markdown parsed) for each frame it grows in: 0.1 to
-                    // 0.4 ms a frame up to the 14.8k guide, about 1 ms at the end of a 56k reply (measured, release).
+                    // Coalesce consecutive partial deltas arriving in the same poll tick before running `show_stream`
+                    // so long replies do not re-clean and re-parse the full buffer once per small delta.
                     Said::Partial(text) => {
                         match self.streams.get_mut(&id) {
                             Some(s) if s.at < self.out.len() => {
@@ -1962,7 +1963,7 @@ impl App {
                                                                  floor: 0, due: None });
                             }
                         }
-                        self.show_stream(id, Duration::ZERO);
+                        streamed = true;
                     }
                     Said::Reply(text) => match self.streams.remove(&id) {
                         Some(s) if s.at < self.out.len() => {
@@ -1997,6 +1998,9 @@ impl App {
                     }
                 }
                 self.last = id;
+            }
+            if streamed {
+                self.show_stream(id, Duration::ZERO);
             }
             if ends {
                 self.show_stream(id, Duration::MAX); // a reply cut off stays as far as it got, all of it
@@ -4832,7 +4836,7 @@ pub fn run(start: Start) -> ExitCode {
         // Job events arrive on a channel, not as terminal input, so the poll timeout is how late one is shown: 25 ms
         // while jobs run (a pump is a few microseconds; redraws still happen only when something changed). Every event
         // already queued is taken before the next redraw.
-        let wait = if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() || app.listing.is_some() { 25 } else { 250 };
+        let wait = if !app.streams.is_empty() { 8 } else if app.s.running() > 0 || app.toast.is_some() || !app.plans.is_empty() || app.listing.is_some() { 25 } else { 250 };
         if event::poll(Duration::from_millis(wait)).unwrap_or(false) {
             loop {
                 match event::read() {
