@@ -1910,12 +1910,12 @@ impl App {
                         Line::styled("/usrman how it works · / commands · ? keys", t.dim)];
         let mut rows: Vec<Line<'static>> = Vec::new();
         if !panel {
-            // the pixel cat is the tall one: only where the words under it still fit, since a splash too tall is not drawn
+            // a cat only where the words under it still fit, since a splash too tall is not drawn at all
             if let Some(cat) = crate::mascot_art::render("idle", 0, crate::mascot_art::PIXEL_W, t)
                 .filter(|cat| cat.len() + 1 + text.len() <= room) {
                 rows.extend(cat);
                 rows.push(Line::default());
-            } else if let Some(cat) = mascot("idle").first() {
+            } else if let Some(cat) = mascot("idle").first().filter(|cat| cat.len() + text.len() <= room) {
                 rows.extend(cat.iter().map(|r| Line::styled(r.to_string(), t.brand)));
             }
         }
@@ -4553,9 +4553,10 @@ impl App {
                 out.push(Line::styled(fit(&format!("↳ {}: {}", agent.name(), clean(task).replace('\n', " "))), t.selected));
             }
         }
-        // the pixel cat only where it hides nothing below it; else the text cat
-        let cat = crate::mascot_art::render(state, frame, width, t).filter(|cat| cat.len() + 1 + out.len() <= height)
-            .or_else(|| mascot(state).get(frame).map(|rows| rows.iter().map(|r| Line::styled(fit(r), style)).collect()));
+        // a cat only where it hides nothing below it: the pixel cat, else the text cat, else neither
+        let fits = |cat: &Vec<Line<'static>>| cat.len() + 1 + out.len() <= height;
+        let cat = crate::mascot_art::render(state, frame, width, t).filter(fits)
+            .or_else(|| mascot(state).get(frame).map(|rows| rows.iter().map(|r| Line::styled(fit(r), style)).collect()).filter(fits));
         if let Some(mut cat) = cat {
             cat.push(Line::default());
             out.splice(0..0, cat);
@@ -5620,6 +5621,9 @@ mod tests {
         assert!(has(&plain(&a.splash(false, 30)), "▀"));
         let small = a.splash(false, 10);
         assert!(small.len() <= 10 && !has(&plain(&small), "▀") && has(&plain(&small), "in your own words"), "{small:?}");
+        assert_eq!(a.splash(false, 4).len(), 4, "no room for either cat: the words alone");
+        let rows = short.iter().position(|r| r == "AGENTS").map(|at| short.len() - at).expect("the agents");
+        assert_eq!(plain(&a.panel(31, rows))[0], "AGENTS", "no room for either cat: the status alone");
     }
 
     #[test]
