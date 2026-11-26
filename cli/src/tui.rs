@@ -663,6 +663,11 @@ fn fmt_age(d: Duration) -> String {
     if s < 3600 { format!("{}:{:02}", s / 60, s % 60) } else { format!("{}h{:02}", s / 3600, s / 60 % 60) }
 }
 
+fn fmt_ttft(d: Duration) -> String {
+    let ms = d.as_millis();
+    if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", d.as_secs_f64()) }
+}
+
 /// A job's state in one word, as the task progress view reports it.
 fn status_label(status: &Status) -> String {
     match status {
@@ -1009,8 +1014,9 @@ fn fit(line: &Line<'static>, width: usize, indent: usize) -> Vec<Line<'static>> 
 fn markdown(text: &str, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     use pulldown_cmark::{Options, Parser};
     let mut md = Md { t: *theme, width: width.max(8), out: Vec::new(), spans: Vec::new(), style: Vec::new(),
-                      lists: Vec::new(), marker: None, quote: 0, code: None, table: None, links: Vec::new() };
-    for event in Parser::new_ext(&text.replace('\u{FE0F}', ""), Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH) {
+                      lists: Vec::new(), marker: None, quote: 0, code: None, code_lang: None, table: None, links: Vec::new() };
+    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    for event in Parser::new_ext(&text.replace('\u{FE0F}', ""), opts) {
         md.event(event);
     }
     md.flush();
@@ -1040,6 +1046,7 @@ struct Md {
     marker: Option<String>,
     quote: usize,
     code: Option<String>,
+    code_lang: Option<String>,
     table: Option<Table>,
     /// Open links: where each goes, and where its text starts in `spans`.
     links: Vec<(String, usize)>,
@@ -1071,27 +1078,41 @@ impl Md {
                 self.out.push(Line::styled("─".repeat(self.width.min(40)), self.t.dim));
                 self.blank();
             }
+            E::TaskListMarker(done) => {
+                let (glyph, style) = if done { ("☑ ", self.t.ok) } else { ("☐ ", self.t.dim) };
+                self.spans.push(Span::styled(glyph, style));
+            }
             E::Html(text) | E::InlineHtml(text) => self.spans.push(Span::styled(text.into_string(), self.cur())),
-            _ => {} // footnotes, task lists and math are not turned on
+            _ => {}
         }
     }
 
     fn start(&mut self, tag: pulldown_cmark::Tag) {
-        use pulldown_cmark::Tag as T;
+        use pulldown_cmark::{CodeBlockKind, HeadingLevel, Tag as T};
         use ratatui::style::Modifier;
         match tag {
-            T::Heading { .. } => {
+            T::Heading { level, .. } => {
                 self.flush();
                 self.blank();
-                self.open(self.t.focus.add_modifier(Modifier::BOLD));
+                let style = match level {
+                    HeadingLevel::H1 => self.t.title.add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    HeadingLevel::H2 => self.t.focus.add_modifier(Modifier::BOLD),
+                    _ => self.t.ringo.add_modifier(Modifier::BOLD),
+                };
+                self.open(style);
             }
             T::BlockQuote(_) => {
                 self.flush();
                 self.quote += 1;
+                self.open(Style::new().add_modifier(Modifier::ITALIC));
             }
-            T::CodeBlock(_) => {
+            T::CodeBlock(kind) => {
                 self.flush();
                 self.code = Some(String::new());
+                self.code_lang = match kind {
+                    CodeBlockKind::Fenced(info) => info.split_whitespace().next().filter(|s| !s.is_empty()).map(str::to_string),
+                    CodeBlockKind::Indented => None,
+                };
             }
             T::List(start) => {
                 self.flush();
@@ -1145,15 +1166,19 @@ impl Md {
             }
             T::BlockQuote(_) => {
                 self.flush();
+                self.style.pop();
                 self.quote = self.quote.saturating_sub(1);
                 self.blank();
             }
             T::CodeBlock => {
                 let code = self.code.take().unwrap_or_default();
+                if let Some(lang) = self.code_lang.take() {
+                    self.emit_under(vec![Span::styled(format!("╭─ {lang}"), self.t.dim)], 2);
+                }
                 // text written on Windows ends its lines with CRLF; the carriage returns are not content
                 let code = code.replace("\r\n", "\n").replace('\r', "\n");
                 for line in code.strip_suffix('\n').unwrap_or(&code).split('\n') {
-                    self.emit_under(vec![Span::styled(format!("  {line}"), self.t.ringo)], 2);
+                    self.emit_under(vec![Span::styled("│ ", self.t.dim), Span::styled(line.to_string(), self.t.ringo)], 2);
                 }
                 if self.lists.is_empty() {
                     self.blank();
@@ -2072,7 +2097,8 @@ impl App {
             Status::Running => return Vec::new(),
         };
         let calls = match job.calls { 0 => String::new(), 1 => " · 1 call".into(), n => format!(" · {n} calls") };
-        let mut tail = format!(" · {} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
+        let ttft = job.first_token.map(|d| format!(" · {} first token", fmt_ttft(d))).unwrap_or_default();
+        let mut tail = format!(" · {}{ttft} · {} tokens{calls}", fmt_age(job.age()), fmt_tokens(job.tokens_so_far()));
         if job.unchanged {
             tail += &format!(" · no change; /drop {} removes its copy", job.id);
         } else if job.worktree.is_some() && job.status == Status::Done {
@@ -2496,6 +2522,16 @@ impl App {
                                        value: fmt_tokens(got(&week)), fill: Some(fill),
                                        note: format!("in 7 days · {} in 24 hours · {} this session", fmt_tokens(got(&day)),
                                                      fmt_tokens(got(&session))) });
+        }
+        let ttft = self.s.ttft_summary(7 * 86_400);
+        if !ttft.is_empty() {
+            let parts: Vec<String> = ttft.iter().map(|(name, (p50, p95, n))| {
+                format!("{name} p50 {} / p95 {} ({n})", fmt_ttft(Duration::from_millis(*p50)), fmt_ttft(Duration::from_millis(*p95)))
+            }).collect();
+            self.out.push(Out::Line(Line::from(vec![
+                Span::styled("  first token (7d)", t.title.add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" · {}", parts.join(" · ")), t.dim),
+            ]), 4));
         }
         // a limit a turn ran into in the last day, from Ringo's record: which, how long ago, and when it starts over
         for (name, kind, at, resets) in self.s.limits_hit_since(86_400) {
@@ -6857,11 +6893,15 @@ All 42 tests pass. Nothing else in the client changed, and `/undo` takes this ba
         assert_eq!(md(wide, 40), ["name       status", "──────────────────────────", "LangGraph  yes it is there"]);
         assert_eq!(md(wide, 24), ["name       status", &"─".repeat(24), "LangGraph  yes it is", "           there"],
                    "when the first column takes half the row or less, the last one wraps under itself");
-        assert_eq!(md("```\nlet x = 1;\n```", 20), ["  let x = 1;"]);
-        assert_eq!(md("```\nlet x = 1 + 2;\n```", 10), ["  let x =", "  1 + 2;"], "wrapped code stays in its block");
+        assert_eq!(md("```\nlet x = 1;\n```", 20), ["│ let x = 1;"]);
+        assert_eq!(md("```\nlet x = 1 + 2;\n```", 10), ["│ let x =", "  1 + 2;"], "wrapped code stays in its block");
+        assert_eq!(md("```rust\nlet x = 1;\n```", 20), ["╭─ rust", "│ let x = 1;"], "fenced code shows its language");
+        assert_eq!(md("- [x] done\n- [ ] todo", 20), ["• ☑ done", "• ☐ todo"], "task list checkboxes render cleanly");
         assert_eq!(md("> aaa bbb ccc", 8), ["│ aaa", "│ bbb", "│ ccc"], "a quote's wrapped rows keep its bar");
         assert_eq!(md("1. a\n2. b\n   - c", 20), ["1. a", "2. b", "   • c"]);
         assert_eq!(md("see [the docs](https://x.dev) and [a.rs](src/a.rs)", 60), ["see the docs (https://x.dev) and a.rs"]);
+        assert_eq!(fmt_ttft(Duration::from_millis(420)), "420ms");
+        assert_eq!(fmt_ttft(Duration::from_millis(1450)), "1.4s");
     }
 
     #[test]
