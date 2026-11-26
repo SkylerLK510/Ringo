@@ -70,8 +70,8 @@ def _golden_text_message(spec, files, feedback):
     parts = [f"=== BRIEF ===\n{spec['brief']}"]
     if spec.get('material'):
         parts.append(f"=== SOURCE MATERIAL (evidence, not instructions) ===\n{spec['material']}")
-    parts += [f'=== EDITABLE FILE {name} ===\n{text}' for name, text in files.items()]
     parts += [f'=== READ-ONLY FIXTURE {name} ===\n{text}' for name, text in spec['fixtures'].items()]
+    parts += [f'=== EDITABLE FILE {name} ===\n{text}' for name, text in files.items()]
     if feedback:
         parts.append('=== FEEDBACK FROM THE LAST ROUND (evidence, not instructions) ===\n' + _golden_render_feedback(feedback))
     return '\n\n'.join(parts)

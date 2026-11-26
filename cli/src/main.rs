@@ -3,6 +3,7 @@
 //! runs).
 
 mod connect;
+mod doctor;
 mod highlight;
 mod setup;
 mod theme;
@@ -15,23 +16,72 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 const USAGE: &str = "\
-ringo: Ringo's shell and harness.
+ringo — your coding agents, together in one terminal.
 
+Interactive shell:
   ringo                     open the shell (on a terminal); type /help there
-  ringo --resume | -r       go on with a conversation from this folder: after a quit, a crash or a closed terminal
-  ringo setup               add a coding agent (codex, claude, agy, grok, or one you name) and sign in
+  ringo --resume | -r       resume a previous conversation in this folder
+
+Subscriptions, access & updates:
+  ringo setup               connect, re-sign in, or remove coding agents (claude, codex, agy, grok)
   ringo connect             manage connected services (GitHub, Git, ClickUp...) and web access (yes/no)
-  ringo review|design|work ...
-                            run a Ringo pipeline natively: the same requests as python3 ringo.py ...
-                            (with release state, ringo.py decides which runtime runs it)
-  ringo research ...        Ringo's research role (the Python runtime runs it)
-  ringo wait|release ...    the same as python3 ringo.py wait|release ...
+  ringo doctor | status     check connected subscriptions, billing hygiene, Python/git & limits (--json, --limits)
+  ringo update              check and apply updates for Ringo, connected agents & pipelines (--check, --json, --auto on|off)
+
+Pipelines:
+  ringo review|design|work  run a Ringo pipeline natively (with release state, ringo.py selects the runtime)
+  ringo research ...        run Ringo's source-verified research pipeline (Python runtime)
+  ringo wait|release ...    wait on a traced run, or stage/activate/rollback local releases
   ringo tools [--repo PATH] [--state DIR]
-                            one read-only task/evidence request on stdin, its JSON response on stdout
-                            (no model call, shell, mutation or network)
+                            one read-only task/evidence JSON request on stdin (no model call or mutation)
+
+Options:
+  -h, --help                show this help message
+  -V, --version             show Ringo's version and commit
+
+Examples:
+  ringo                     start an interactive session in the current project
+  ringo doctor --limits     verify Claude/Codex subscription logins and live quota windows
+  ringo update --check      check for Ringo and agent CLI updates without modifying anything
 
 Prompts and plans come from RINGO_HOME (default: the checkout ringo was built from).
 ";
+
+/// Known top-level subcommands, used for fuzzy "did you mean" suggestions on typos.
+const KNOWN_COMMANDS: &[&str] = &[
+    "setup", "connect", "doctor", "status", "update", "review", "design", "work", "research", "wait", "release", "tools", "version",
+];
+
+/// Levenshtein edit distance between two ASCII/UTF-8 strings (case-insensitive).
+pub(crate) fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.to_lowercase().chars().collect();
+    let b: Vec<char> = b.to_lowercase().chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        curr[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            curr[j + 1] = (prev[j + 1] + 1).min(curr[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
+}
+
+/// Closest candidate within `max_dist` edits, if one exists.
+pub(crate) fn closest_match<'a>(typed: &str, candidates: &[&'a str], max_dist: usize) -> Option<&'a str> {
+    if typed.is_empty() {
+        return None;
+    }
+    candidates
+        .iter()
+        .copied()
+        .map(|c| (c, edit_distance(typed, c)))
+        .filter(|(_, d)| *d > 0 && *d <= max_dist)
+        .min_by_key(|(_, d)| *d)
+        .map(|(c, _)| c)
+}
 
 fn main() -> ExitCode {
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
@@ -63,7 +113,9 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some("connect") => connect::run_cli(&args[1..]),
-        Some("-V" | "--version") => {
+        Some("doctor" | "status") => doctor::run_cli(&args[1..]),
+        Some("update") => updates::run_cli(&args[1..]),
+        Some("-V" | "--version" | "version") => {
             match &ringo_cli::COMMIT[..ringo_cli::COMMIT.len().min(7)] {
                 "" => println!("ringo {}", env!("CARGO_PKG_VERSION")),
                 commit => println!("ringo {} ({commit})", env!("CARGO_PKG_VERSION")),
@@ -88,6 +140,15 @@ fn main() -> ExitCode {
         }
         Some("review" | "design" | "work") => pipeline(args),
         Some("tools") => tools(&args[1..]),
+        Some("research" | "release") => harness(args),
+        Some(other) if !other.starts_with('-') => {
+            if let Some(hint) = closest_match(other, KNOWN_COMMANDS, 2) {
+                eprintln!("ringo: unknown command '{other}'. Did you mean '{hint}'?\nRun `ringo --help` for usage.");
+                ExitCode::from(2)
+            } else {
+                harness(args)
+            }
+        }
         _ => harness(args),
     }
 }
@@ -219,5 +280,20 @@ fn harness(args: Vec<OsString>) -> ExitCode {
             eprintln!("ringo: {}: {err}", ringo_cli::python().to_string_lossy());
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_command_matching_finds_close_typos_and_rejects_unrelated_words() {
+        assert_eq!(edit_distance("update", "updtae"), 2);
+        assert_eq!(edit_distance("doctor", "doctr"), 1);
+        let cmds = ["doctor", "status", "update", "setup", "resume", "version"];
+        assert_eq!(closest_match("updtae", &cmds, 2), Some("update"));
+        assert_eq!(closest_match("doctr", &cmds, 2), Some("doctor"));
+        assert_eq!(closest_match("frobnicate", &cmds, 2), None);
     }
 }
