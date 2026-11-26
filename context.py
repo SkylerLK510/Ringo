@@ -40,6 +40,10 @@ GENERATED_SUFFIXES = ('.min.js', '.min.css', '.map')
 GENERATED_MARKS = ('@generated', 'DO NOT EDIT')  # in a file's first five lines
 READMES = ('README.md', 'README.rst', 'README.txt', 'README')
 PROSE = {'.md', '.markdown', '.rst', '.txt', '.adoc'}  # changed prose names no symbols ('the function above...')
+NOISE_DIRS = {'node_modules', 'dist', 'build', 'vendor', '__snapshots__', '.venv', 'venv'}
+NOISE_FILES = {'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml', 'Cargo.lock', 'poetry.lock',
+               'composer.lock', 'Gemfile.lock', 'uv.lock'}
+NOISE_SUFFIXES = ('.min.js', '.min.css', '.map', '.snap')
 # GIT_LITERAL_PATHSPECS: a changed path such as 'pages/[id].tsx' or ':x' names that file, never a glob or magic.
 ENV = {'GIT_NO_LAZY_FETCH': '1', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0', 'GIT_LITERAL_PATHSPECS': '1'}
 
@@ -340,6 +344,15 @@ def symbols(repo, mb, head, pairs, objects=None):
     return sorted(filter(keep, found)), sorted(filter(keep, owners - found))
 
 
+def is_noise(path):
+    """Generated, vendored, lockfile or minified paths that bloat unchanged context without helping review."""
+    parts = PurePosixPath(path).parts
+    name = parts[-1]
+    return (any(p in NOISE_DIRS for p in parts[:-1])
+            or name in NOISE_FILES
+            or name.endswith(NOISE_SUFFIXES))
+
+
 def is_test(path):
     parts = PurePosixPath(path).parts
     name = parts[-1]
@@ -404,7 +417,7 @@ def matches(repo, head, syms, owners, exclude):
         if len(bits) < 3 or not bits[0].startswith(prefix):
             continue
         path, lineno, text = bits[0][len(prefix):], int(bits[1]), '\0'.join(bits[2:])
-        if path in exclude:
+        if path in exclude or is_noise(path):
             continue
         why = set()
         for sym in dict.fromkeys(word.findall(text)):
