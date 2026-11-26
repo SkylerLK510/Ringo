@@ -2,6 +2,7 @@
 //! runtime unless a release decides otherwise (then, and for the other commands, Ringo's Python harness `ringo.py`
 //! runs).
 
+mod highlight;
 mod setup;
 mod theme;
 mod tui;

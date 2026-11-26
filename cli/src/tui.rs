@@ -1172,13 +1172,16 @@ impl Md {
             }
             T::CodeBlock => {
                 let code = self.code.take().unwrap_or_default();
-                if let Some(lang) = self.code_lang.take() {
-                    self.emit_under(vec![Span::styled(format!("╭─ {lang}"), self.t.dim)], 2);
+                let lang = self.code_lang.take();
+                if let Some(ref l) = lang {
+                    self.emit_under(vec![Span::styled(format!("╭─ {l}"), self.t.dim)], 2);
                 }
                 // text written on Windows ends its lines with CRLF; the carriage returns are not content
                 let code = code.replace("\r\n", "\n").replace('\r', "\n");
                 for line in code.strip_suffix('\n').unwrap_or(&code).split('\n') {
-                    self.emit_under(vec![Span::styled("│ ", self.t.dim), Span::styled(line.to_string(), self.t.ringo)], 2);
+                    let mut spans = vec![Span::styled("│ ", self.t.dim)];
+                    spans.extend(crate::highlight::highlight_line(lang.as_deref(), line, &self.t));
+                    self.emit_under(spans, 2);
                 }
                 if self.lists.is_empty() {
                     self.blank();
