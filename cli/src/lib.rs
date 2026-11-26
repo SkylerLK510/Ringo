@@ -2466,7 +2466,8 @@ impl Session {
         // put back if the turn never starts: what the handoff took as heard, and the turns before a restart it took as told
         let (heard, untold) = (self.heard.get(&agent).cloned(), self.told.get(&agent).cloned());
         let connectors = prompt.trim() != "/compact"
-            && (names_connector_allowed(prompt, &self.paused_connectors) || (!write && self.reached(agent, id)));
+            && (names_connector_allowed(prompt, &self.paused_connectors)
+                || (!write && self.paused_connectors.is_empty() && self.reached(agent, id)));
         if !write {
             self.jobs[id - 1].lane = self.separate.then_some(agent);
             if prompt.trim() != "/compact" && let Some((text, note)) = self.handoff(id, agent, &mut resume, prompt) {
@@ -2599,8 +2600,10 @@ impl Session {
                     // Auto + web_access: sandbox has network; otherwise strictly off, overriding user Codex config.
                     cmd.args(["-c", &format!("sandbox_workspace_write.network_access={net}")]);
                 }
-                // Harness-level override of Codex web_search setting (`/connect web yes|no`).
-                cmd.args(["-c", if self.web_access { "web_search=\"live\"" } else { "web_search=\"disabled\"" }]);
+                // Harness-level override: block Codex web_search when `/connect web no` is active.
+                if !self.web_access {
+                    cmd.args(["-c", "web_search=\"disabled\""]);
+                }
                 cmd.args(["-c", "forced_login_method=\"chatgpt\"", "-c", "model_provider=\"openai\""]);
                 // Codex cannot stop to ask here, so the ask tool and its mode instructions go, and analytics (its
                 // upload delays the exit by about 0.33 s). Plugins and apps (documents, browser and computer-use
