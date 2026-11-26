@@ -681,6 +681,18 @@ pub fn symbols(repo: &Path, mb: &str, head: &str, pairs: &[Pair], mut objects: O
     Ok((syms, owners))
 }
 
+const NOISE_DIRS: [&str; 7] = ["node_modules", "dist", "build", "vendor", "__snapshots__", ".venv", "venv"];
+const NOISE_FILES: [&str; 8] = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "Cargo.lock", "poetry.lock", "composer.lock", "Gemfile.lock", "Pipfile.lock"];
+const NOISE_SUFFIXES: [&str; 4] = [".min.js", ".min.css", ".map", ".snap"];
+
+pub fn is_noise(path: &str) -> bool {
+    let parts = parts(path);
+    let name = parts.last().copied().unwrap_or("");
+    parts[..parts.len().saturating_sub(1)].iter().any(|p| NOISE_DIRS.contains(p))
+        || NOISE_FILES.contains(&name)
+        || NOISE_SUFFIXES.iter().any(|s| name.ends_with(s))
+}
+
 pub fn is_test(path: &str) -> bool {
     let parts = parts(path);
     let name = parts.last().copied().unwrap_or("");
@@ -848,7 +860,7 @@ pub fn matches(repo: &Path, head: &str, syms: &[String], owners: &[String], excl
             Error::value(format!("invalid literal for int() with base 10: {}", py::repr(bits[1])))
         })?;
         let text = bits[2..].join("\0");
-        if exclude.contains(path) {
+        if exclude.contains(path) || is_noise(path) {
             continue;
         }
         let test = is_test(path);
